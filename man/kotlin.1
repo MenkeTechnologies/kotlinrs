@@ -1,0 +1,59 @@
+.TH KOTLIN 1 "2026" "kotlinrs 0.1.0" "User Commands"
+.SH NAME
+kotlin \- compiled Kotlin runtime on the fusevm bytecode VM (no JVM)
+.SH SYNOPSIS
+.B kotlin
+[\fIOPTIONS\fR]
+\fIFILE.kt\fR
+[\fIargs\fR...]
+.br
+.B kotlin
+.B \-e
+\fISRC\fR
+[\fB\-e\fR \fISRC\fR ...]
+.SH DESCRIPTION
+.B kotlinrs
+runs Kotlin programs by lexing and parsing to an AST, lowering to
+.B fusevm
+bytecode, and executing on a shared bytecode VM with a three-tier Cranelift
+JIT \(em with no JVM and no bytecode interpreter of its own. Arithmetic,
+comparison, control flow, locals, and calls lower to native fusevm ops so the
+JIT can trace hot loops; a small runtime host supplies the Kotlin display form
+of
+.BR Boolean / Double
+and truncating integer division.
+.SH OPTIONS
+.TP
+.BR \-e ", " \-\-eval " " \fISRC\fR
+Run a snippet instead of a file. Repeatable; multiple
+.B \-e
+snippets are joined with newlines. A snippet with no
+.B fun main
+is wrapped as a
+.B main
+body (script mode).
+.TP
+.B \-\-dump\-tokens
+Print the lexer token stream and exit.
+.TP
+.B \-\-dump\-ast
+Print the parsed AST and exit.
+.TP
+.BR \-\-dump\-bytecode ", " \-\-disasm
+Print the lowered fusevm chunk disassembly and exit.
+.TP
+.BR \-v ", " \-\-version
+Print the version and exit.
+.TP
+.BR \-h ", " \-\-help
+Print help and exit.
+.SH DIAGNOSTICS
+Errors are written to standard error in the terse form
+.BR "kotlin: <reason>" .
+An integer division by zero is reported as an uncaught
+.B java.lang.ArithmeticException
+and exits non-zero.
+.SH SEE ALSO
+.BR fusevm (1)
+.SH HOMEPAGE
+https://github.com/MenkeTechnologies/kotlinrs

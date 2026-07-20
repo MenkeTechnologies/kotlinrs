@@ -1,0 +1,22 @@
+#compdef kotlin
+# Zsh completion for the kotlinrs `kotlin` binary.
+
+_kotlin() {
+  local -a opts
+  opts=(
+    '*-e[run a snippet, wrapped in `fun main` if it has none (repeatable)]:source'
+    '--eval[run a snippet (repeatable)]:source'
+    '--dump-tokens[print the lexer token stream and exit]'
+    '--dump-ast[print the parsed AST and exit]'
+    '--dump-bytecode[print the lowered fusevm chunk disassembly and exit]'
+    '--disasm[alias of --dump-bytecode]'
+    '-v[show version]'
+    '--version[show version]'
+    '-h[show help]'
+    '--help[show help]'
+    '*:Kotlin script:_files -g "*.kt"'
+  )
+  _arguments -s $opts
+}
+
+_kotlin "$@"

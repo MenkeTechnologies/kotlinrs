@@ -1,0 +1,52 @@
+[package]
+name = "kotlinrs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+authors = ["MenkeTechnologies <linux.dev25@gmail.com>"]
+description = "Kotlin as a fusevm frontend: a lexer/parser and compiler to fusevm::Chunk on a KtHost object heap, with no bespoke VM or JIT — the first compiled standalone Kotlin runtime with no JVM"
+license = "MIT"
+repository = "https://github.com/MenkeTechnologies/kotlinrs"
+homepage = "https://menketechnologies.github.io/kotlinrs/"
+documentation = "https://docs.rs/kotlinrs"
+readme = "README.md"
+keywords = ["kotlin", "interpreter", "compiler", "jit", "fusevm"]
+categories = ["command-line-utilities", "compilers"]
+publish = true
+# Dev-only artifacts kept out of the published crate. Consumers get src + the
+# `kotlin`/dump bins, the man page, and shell completions — not the HUD site, CI
+# config, integration-test corpus, or self-test .kt examples. None are referenced
+# at compile time (no include_str! into them), so the packaged crate still builds.
+exclude = [
+    "/docs/",
+    "/.github/",
+    "/tests/",
+    "/examples/",
+]
+
+# kotlinrs is a standalone crate, not a workspace member. An explicit empty
+# `[workspace]` stops cargo walking up to the MenkeTechnologiesMeta parent.
+[workspace]
+
+[lib]
+name = "kotlinrs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kotlin"
+path = "src/main.rs"
+
+[dependencies]
+# Kotlin executes on fusevm. kotlinrs is a pure frontend: it lowers Kotlin to
+# fusevm bytecode (src/compiler.rs) and hosts Kotlin-specific coercions
+# (src/host.rs, reached from fusevm's extension handler) that the language-
+# agnostic ops can't express — Kotlin `Boolean`/`Double` display form and
+# truncating integer `/`/`%` (fusevm's native `Div` is always-float).
+#
+# `jit` turns on fusevm's three-tier Cranelift JIT so arithmetic and comparison
+# operators — which kotlinrs lowers to *native* fusevm ops — can be block- and
+# trace-compiled on hot loops instead of dispatched.
+fusevm = { version = "0.14.11", features = ["jit"] }
+
+[dev-dependencies]
+tempfile = "3"
