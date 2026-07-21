@@ -576,7 +576,8 @@ impl Compiler {
                         }
                         let nidx = self.b.add_constant(Value::str(name.to_string()));
                         self.b.emit(Op::LoadConst(nidx), line);
-                        self.b.emit(Op::Extended(KT_FFI_CALL, args.len() as u8), line);
+                        self.b
+                            .emit(Op::Extended(KT_FFI_CALL, args.len() as u8), line);
                         Ok(Type::Unknown)
                     }
                     None => Err(format!("unresolved reference: {name}")),
@@ -750,16 +751,12 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
 }
 
 fn if_has_ffi(ie: &IfExpr) -> bool {
-    expr_has_ffi(&ie.cond)
-        || body_has_ffi(&ie.then)
-        || ie.els.as_deref().is_some_and(body_has_ffi)
+    expr_has_ffi(&ie.cond) || body_has_ffi(&ie.then) || ie.els.as_deref().is_some_and(body_has_ffi)
 }
 
 fn expr_has_ffi(e: &Expr) -> bool {
     match e {
-        Expr::Call { name, args, .. } => {
-            name == RUST_COMPILE || args.iter().any(expr_has_ffi)
-        }
+        Expr::Call { name, args, .. } => name == RUST_COMPILE || args.iter().any(expr_has_ffi),
         Expr::Unary { expr, .. } => expr_has_ffi(expr),
         Expr::Binary { l, r, .. } => expr_has_ffi(l) || expr_has_ffi(r),
         Expr::If(ie) => if_has_ffi(ie),
