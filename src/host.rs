@@ -36,6 +36,11 @@ pub const KT_FFI_COMPILE: u16 = 5;
 /// `Str`) on top. Dispatches through `fusevm::ffi::try_call` and pushes the
 /// result.
 pub const KT_FFI_CALL: u16 = 6;
+/// Dispatch a Kotlin stdlib member/method on a receiver. The `arg` payload is
+/// the argument count. Stack layout: `[recv, arg0 .. arg{n-1}, name]` with the
+/// method/property name (a `Str`) on top. Pops all, computes the result, and
+/// pushes it. Property reads (`"s".length`) dispatch with `n == 0`.
+pub const KT_METHOD: u16 = 7;
 
 thread_local! {
     /// Set by a runtime fault (e.g. integer divide-by-zero) so the CLI can
@@ -83,6 +88,24 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
                 }
                 None => {
                     fault(vm, format!("unresolved reference: {name}"));
+                    vm.push(Value::Undef);
+                }
+            }
+        }
+        KT_METHOD => {
+            // Stack: [recv, arg0 .. arg{n-1}, name]; name on top.
+            let name = vm.pop().to_str();
+            let n = arg as usize;
+            let mut args = Vec::with_capacity(n);
+            for _ in 0..n {
+                args.push(vm.pop());
+            }
+            args.reverse();
+            let recv = vm.pop();
+            match kt_method(&recv, &name, &args) {
+                Ok(v) => vm.push(v),
+                Err(e) => {
+                    fault(vm, e);
                     vm.push(Value::Undef);
                 }
             }
@@ -147,6 +170,48 @@ pub fn install_debug(vm: &mut VM) {
 
 fn is_int(v: &Value) -> bool {
     matches!(v, Value::Int(_))
+}
+
+/// Dispatch a Kotlin stdlib member/method on `recv`. `Ok(value)` on success;
+/// `Err(message)` for an unresolved member (surfaced as an uncaught exception,
+/// matching Kotlin's compile-time `unresolved reference`).
+///
+/// Only the members faithfully backed here are handled — extend this table as
+/// stdlib coverage grows. `String.length` counts UTF-16 code units, matching
+/// the JVM `kotlin.String.length` contract (not Unicode scalar count).
+fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    match (recv, name) {
+        // ── kotlin.String ──
+        (Value::Str(s), "length") => Ok(Value::Int(s.encode_utf16().count() as i64)),
+        (Value::Str(s), "uppercase" | "toUpperCase") => Ok(Value::str(s.to_uppercase())),
+        (Value::Str(s), "lowercase" | "toLowerCase") => Ok(Value::str(s.to_lowercase())),
+        (Value::Str(s), "trim") => Ok(Value::str(s.trim().to_string())),
+        (Value::Str(s), "isEmpty") => Ok(Value::Bool(s.is_empty())),
+        (Value::Str(s), "isNotEmpty") => Ok(Value::Bool(!s.is_empty())),
+
+        // ── kotlin.Any.toString() — defined on every type ──
+        (_, "toString") => Ok(Value::str(kotlin_string(recv))),
+
+        _ => {
+            let _ = args; // reserved for arg-taking members
+            Err(format!(
+                "unresolved reference: {name} on {}",
+                type_label(recv)
+            ))
+        }
+    }
+}
+
+/// A coarse Kotlin type label for `recv`, for the `unresolved reference`
+/// diagnostic. Not a full type name — just enough to identify the receiver kind.
+fn type_label(v: &Value) -> &'static str {
+    match v {
+        Value::Bool(_) => "Boolean",
+        Value::Int(_) => "Int",
+        Value::Float(_) => "Double",
+        Value::Str(_) => "String",
+        _ => "value",
+    }
 }
 
 /// Kotlin `Any?.toString()` for the value kinds kotlinrs produces.

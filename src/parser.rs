@@ -3,7 +3,7 @@
 //! Grammar (informal):
 //! ```text
 //! program  := funDecl*
-//! funDecl  := 'fun' IDENT '(' params? ')' (':' TYPE)? block
+//! funDecl  := 'fun' IDENT '(' params? ')' (':' TYPE)? (block | '=' expr)
 //! block    := '{' stmt* '}'
 //! stmt     := letDecl | 'return' expr? | 'while' '(' expr ')' block
 //!           | 'for' '(' IDENT 'in' range ')' block | ifStmt | assign | exprStmt
@@ -14,7 +14,8 @@
 //! cmp      := add (('<'|'>'|'<='|'>=') add)*
 //! add      := mul (('+'|'-') mul)*
 //! mul      := unary (('*'|'/'|'%') unary)*
-//! unary    := ('-'|'!') unary | primary
+//! unary    := ('-'|'!') unary | postfix
+//! postfix  := primary ('.' IDENT ('(' args? ')')?)*
 //! primary  := INT | FLOAT | STRING | BOOL | ifExpr | call | IDENT | '(' expr ')'
 //! ```
 
@@ -99,13 +100,30 @@ impl Parser {
             }
         }
         self.eat(&Tok::RParen)?;
-        let ret = if self.at(&Tok::Colon) {
+        let ret_annot = if self.at(&Tok::Colon) {
             self.bump();
-            self.type_name()?
+            Some(self.type_name()?)
         } else {
-            Type::Unit
+            None
         };
-        let body = self.block()?;
+        // Body is either a block `{ … }` or a single-expression body `= expr`
+        // (Kotlin `fun f(...) = expr`), which desugars to `{ return expr }`.
+        let (body, is_expr_body) = if self.at(&Tok::Assign) {
+            self.bump();
+            let e = self.expr()?;
+            (vec![Stmt::new(line, StmtKind::Return(Some(e)))], true)
+        } else {
+            (self.block()?, false)
+        };
+        // With no explicit return annotation, a block body defaults to `Unit`
+        // (its value is discarded); an `= expr` body's type is the expression's,
+        // which the frontend doesn't fully infer — leave it `Unknown` so callers
+        // lower conservatively rather than being forced to `Unit`.
+        let ret = match ret_annot {
+            Some(t) => t,
+            None if is_expr_body => Type::Unknown,
+            None => Type::Unit,
+        };
         Ok(FunDecl {
             name,
             params,
@@ -410,8 +428,46 @@ impl Parser {
                     expr: Box::new(self.unary()?),
                 })
             }
-            _ => self.primary(),
+            _ => self.postfix(),
         }
+    }
+
+    /// Postfix `.` chains: `recv.property` and `recv.method(args)`, left-
+    /// associative and chainable (`a.b.c()`). Binds tighter than the prefix
+    /// unary operators, so `-a.b` is `-(a.b)`, matching Kotlin.
+    fn postfix(&mut self) -> Result<Expr, String> {
+        let mut e = self.primary()?;
+        while self.at(&Tok::Dot) {
+            let line = self.line();
+            self.bump(); // `.`
+            let name = self.ident()?;
+            if self.at(&Tok::LParen) {
+                self.bump();
+                let mut args = Vec::new();
+                while !self.at(&Tok::RParen) {
+                    args.push(self.expr()?);
+                    if self.at(&Tok::Comma) {
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+                self.eat(&Tok::RParen)?;
+                e = Expr::MethodCall {
+                    recv: Box::new(e),
+                    name,
+                    args,
+                    line,
+                };
+            } else {
+                e = Expr::Member {
+                    recv: Box::new(e),
+                    name,
+                    line,
+                };
+            }
+        }
+        Ok(e)
     }
 
     fn primary(&mut self) -> Result<Expr, String> {

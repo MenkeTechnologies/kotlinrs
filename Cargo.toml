@@ -57,7 +57,7 @@ path = "src/bin/gen_docs.rs"
 # block compiles to a cached cdylib whose exported functions become callable by
 # name from Kotlin (src/rust_ffi.rs desugars the block; src/host.rs routes the
 # `__rust_compile` / by-name-call dispatch into `fusevm::ffi`).
-fusevm = { version = "0.14.11", features = ["jit", "ffi"] }
+fusevm = { version = "0.14.12", features = ["jit", "ffi"] }
 
 # LSP (`kotlin --lsp`) + DAP (`kotlin --dap`) over stdio. libc gives the DAP
 # server a pipe + dup2 to capture the debuggee's stdout (println) so program

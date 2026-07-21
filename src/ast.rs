@@ -162,6 +162,20 @@ pub enum Expr {
         args: Vec<Expr>,
         line: u32,
     },
+    /// Property access on a receiver: `receiver.property` (e.g. `"s".length`).
+    Member {
+        recv: Box<Expr>,
+        name: String,
+        line: u32,
+    },
+    /// Method call on a receiver: `receiver.method(args)` (e.g.
+    /// `"s".uppercase()`, `42.toString()`). Chainable via nested receivers.
+    MethodCall {
+        recv: Box<Expr>,
+        name: String,
+        args: Vec<Expr>,
+        line: u32,
+    },
     /// `if` used as an expression (each branch's last statement is its value).
     If(IfExpr),
 }

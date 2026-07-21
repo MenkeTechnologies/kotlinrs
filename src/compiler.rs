@@ -20,46 +20,104 @@
 //! ```
 
 use crate::ast::*;
-use crate::host::{KT_DBG_LINE, KT_FFI_CALL, KT_FFI_COMPILE, KT_IDIV, KT_IMOD, KT_TO_STRING};
+use crate::host::{
+    KT_DBG_LINE, KT_FFI_CALL, KT_FFI_COMPILE, KT_IDIV, KT_IMOD, KT_METHOD, KT_TO_STRING,
+};
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::collections::HashMap;
 
 /// The desugar target a `rust { ... }` block lowers to (see [`crate::rust_ffi`]).
 const RUST_COMPILE: &str = "__rust_compile";
 
-/// Per-function lowering scope: slot assignments and coarse types.
-struct Scope {
-    slots: HashMap<String, u16>,
-    types: HashMap<String, Type>,
+/// A single name binding: its slot, coarse type, and whether it is a `var`
+/// (reassignable) or a `val` (write-once).
+#[derive(Clone)]
+struct Binding {
+    slot: u16,
+    ty: Type,
+    mutable: bool,
+}
+
+/// A checkpoint of scope state, taken on block entry and restored on block exit
+/// so bindings declared inside a nested block drop when the block ends. See
+/// [`Scope::enter`] / [`Scope::exit`].
+struct ScopeMark {
     next_slot: u16,
+    undo_len: usize,
+}
+
+/// Per-function lowering scope: lexical name → binding, with nested-block
+/// entry/exit so inner declarations don't leak and shadowing is restored on
+/// exit. Slots are freed (reused) when a block ends; the VM's slot frame is
+/// sized to the high-water mark, so reuse is safe.
+struct Scope {
+    map: HashMap<String, Binding>,
+    next_slot: u16,
+    /// Undo log: each `declare` records the name and the binding it displaced
+    /// (`None` if the name was previously unbound). [`Scope::exit`] replays it
+    /// back to a mark, restoring shadowed outer bindings.
+    undo: Vec<(String, Option<Binding>)>,
 }
 
 impl Scope {
     fn new() -> Self {
         Scope {
-            slots: HashMap::new(),
-            types: HashMap::new(),
+            map: HashMap::new(),
             next_slot: 0,
+            undo: Vec::new(),
         }
     }
-    fn declare(&mut self, name: &str, ty: Type) -> u16 {
+    /// Declare (or shadow) `name`. `mutable` is `true` for `var`, `false` for
+    /// `val`. Returns the assigned slot.
+    fn declare(&mut self, name: &str, ty: Type, mutable: bool) -> u16 {
         let slot = self.next_slot;
         self.next_slot += 1;
-        self.slots.insert(name.to_string(), slot);
-        self.types.insert(name.to_string(), ty);
+        let prev = self
+            .map
+            .insert(name.to_string(), Binding { slot, ty, mutable });
+        self.undo.push((name.to_string(), prev));
         slot
     }
-    /// A fresh anonymous slot (loop end/step temporaries).
+    /// A fresh anonymous slot (loop end/step temporaries). Reclaimed on the next
+    /// enclosing [`Scope::exit`] via the `next_slot` restore.
     fn temp(&mut self) -> u16 {
         let slot = self.next_slot;
         self.next_slot += 1;
         slot
     }
+    /// Open a nested block. Pair with [`Scope::exit`].
+    fn enter(&self) -> ScopeMark {
+        ScopeMark {
+            next_slot: self.next_slot,
+            undo_len: self.undo.len(),
+        }
+    }
+    /// Close a nested block: undo every declaration made since the matching
+    /// [`Scope::enter`] (restoring any shadowed outer binding) and free the
+    /// slots the block used.
+    fn exit(&mut self, mark: ScopeMark) {
+        while self.undo.len() > mark.undo_len {
+            let (name, prev) = self.undo.pop().unwrap();
+            match prev {
+                Some(b) => {
+                    self.map.insert(name, b);
+                }
+                None => {
+                    self.map.remove(&name);
+                }
+            }
+        }
+        self.next_slot = mark.next_slot;
+    }
     fn slot(&self, name: &str) -> Option<u16> {
-        self.slots.get(name).copied()
+        self.map.get(name).map(|b| b.slot)
     }
     fn ty(&self, name: &str) -> Type {
-        self.types.get(name).copied().unwrap_or(Type::Unknown)
+        self.map.get(name).map(|b| b.ty).unwrap_or(Type::Unknown)
+    }
+    /// Whether `name` is currently bound as a reassignable `var`.
+    fn is_mutable(&self, name: &str) -> Option<bool> {
+        self.map.get(name).map(|b| b.mutable)
     }
 }
 
@@ -137,9 +195,10 @@ impl Compiler {
         self.b.add_sub_entry(name_idx, entry);
 
         let mut sc = Scope::new();
-        // Parameters occupy slots 0..n in declaration order.
+        // Parameters occupy slots 0..n in declaration order. Kotlin function
+        // parameters are read-only (`val`), so they are declared immutable.
         for (pname, pty) in &f.params {
-            sc.declare(pname, *pty);
+            sc.declare(pname, *pty, false);
         }
         // Bind args (stack top = last arg) into slots, deepest last.
         for i in (0..f.params.len()).rev() {
@@ -171,14 +230,19 @@ impl Compiler {
                 name,
                 ty,
                 init,
-                mutable: _,
+                mutable,
             } => {
                 let it = self.compile_expr(sc, init)?;
                 let vty = ty.unwrap_or(it);
-                let slot = sc.declare(name, vty);
+                let slot = sc.declare(name, vty, *mutable);
                 self.b.emit(Op::SetSlot(slot), 0);
             }
             StmtKind::Assign { name, op, value } => {
+                // A `val` (write-once) binding cannot be reassigned — Kotlin
+                // reports this at compile time.
+                if sc.is_mutable(name) == Some(false) {
+                    return Err(format!("val cannot be reassigned: {name}"));
+                }
                 let slot = sc
                     .slot(name)
                     .ok_or_else(|| format!("unresolved reference: {name}"))?;
@@ -214,9 +278,11 @@ impl Compiler {
                 let start = self.b.current_pos();
                 self.compile_expr(sc, cond)?;
                 let jf = self.b.emit(Op::JumpIfFalse(0), 0);
+                let mark = sc.enter();
                 for s in body {
                     self.compile_stmt(sc, s)?;
                 }
+                sc.exit(mark);
                 self.b.emit(Op::Jump(start), 0);
                 let end = self.b.current_pos();
                 self.b.patch_jump(jf, end);
@@ -254,8 +320,13 @@ impl Compiler {
         step: &Option<Expr>,
         body: &[Stmt],
     ) -> Result<(), String> {
-        // Loop counter and one-shot end/step temporaries.
-        let vslot = sc.declare(var, Type::Int);
+        // The loop variable and end/step temporaries live in the loop's own
+        // scope: they drop when the loop ends and are invisible afterward.
+        let mark = sc.enter();
+        // Loop counter (Kotlin's `for` variable is read-only `val`; the
+        // compiler-emitted increment writes the slot directly, bypassing the
+        // user-facing `val` reassignment check).
+        let vslot = sc.declare(var, Type::Int, false);
         self.compile_expr(sc, start)?;
         self.b.emit(Op::SetSlot(vslot), 0);
         let eslot = sc.temp();
@@ -305,6 +376,7 @@ impl Compiler {
         self.b.emit(Op::Jump(top), 0);
         let done = self.b.current_pos();
         self.b.patch_jump(jf, done);
+        sc.exit(mark);
         Ok(())
     }
 
@@ -355,8 +427,37 @@ impl Compiler {
             }
             Expr::Binary { op, l, r } => self.compile_binary(sc, *op, l, r),
             Expr::Call { name, args, line } => self.compile_call(sc, name, args, *line),
+            Expr::Member { recv, name, line } => self.compile_member(sc, recv, name, &[], *line),
+            Expr::MethodCall {
+                recv,
+                name,
+                args,
+                line,
+            } => self.compile_member(sc, recv, name, args, *line),
             Expr::If(ie) => self.compile_if(sc, ie),
         }
+    }
+
+    /// Lower a member/method access to a `KT_METHOD` host dispatch. The receiver
+    /// and arguments are pushed deepest-first, then the member name (a `Str`
+    /// constant) on top; the extension `arg` carries the argument count. A bare
+    /// property read (`recv.property`) passes `args = []` (arg count 0).
+    fn compile_member(
+        &mut self,
+        sc: &mut Scope,
+        recv: &Expr,
+        name: &str,
+        args: &[Expr],
+        line: u32,
+    ) -> Result<Type, String> {
+        self.compile_expr(sc, recv)?;
+        for a in args {
+            self.compile_expr(sc, a)?;
+        }
+        let nidx = self.b.add_constant(Value::str(name.to_string()));
+        self.b.emit(Op::LoadConst(nidx), line);
+        self.b.emit(Op::Extended(KT_METHOD, args.len() as u8), line);
+        Ok(method_ret_type(name))
     }
 
     fn compile_str(&mut self, sc: &mut Scope, parts: &[StrExpr]) -> Result<(), String> {
@@ -606,8 +707,16 @@ impl Compiler {
     }
 
     /// Compile a branch body leaving exactly one value: the last statement's
-    /// expression value, or `Undef` (Unit).
+    /// expression value, or `Undef` (Unit). The body is its own lexical scope —
+    /// bindings it declares drop at the block's end (see [`Scope::enter`]).
     fn compile_block_value(&mut self, sc: &mut Scope, body: &[Stmt]) -> Result<Type, String> {
+        let mark = sc.enter();
+        let res = self.compile_block_value_inner(sc, body);
+        sc.exit(mark);
+        res
+    }
+
+    fn compile_block_value_inner(&mut self, sc: &mut Scope, body: &[Stmt]) -> Result<Type, String> {
         if body.is_empty() {
             self.b.emit(Op::LoadUndef, 0);
             return Ok(Type::Unit);
@@ -698,6 +807,7 @@ impl Compiler {
                     .map(|(t, _)| *t)
                     .unwrap_or(Type::Unknown),
             },
+            Expr::Member { name, .. } | Expr::MethodCall { name, .. } => method_ret_type(name),
             Expr::If(ie) => {
                 let tt = ie
                     .then
@@ -731,6 +841,20 @@ impl Compiler {
     }
 }
 
+/// Static return type of a Kotlin stdlib member/method, mirroring the runtime
+/// dispatch in [`crate::host::kt_method`]. Members not modeled here fall back to
+/// `Unknown` (they still dispatch; only static typing of the result is coarse).
+fn method_ret_type(name: &str) -> Type {
+    match name {
+        "length" => Type::Int,
+        "isEmpty" | "isNotEmpty" => Type::Boolean,
+        "uppercase" | "toUpperCase" | "lowercase" | "toLowerCase" | "trim" | "toString" => {
+            Type::String
+        }
+        _ => Type::Unknown,
+    }
+}
+
 // ── FFI detection (does the program contain a `rust { ... }` block?) ────────
 
 /// True if any statement in `body` (recursively) evaluates a `__rust_compile`
@@ -757,6 +881,8 @@ fn if_has_ffi(ie: &IfExpr) -> bool {
 fn expr_has_ffi(e: &Expr) -> bool {
     match e {
         Expr::Call { name, args, .. } => name == RUST_COMPILE || args.iter().any(expr_has_ffi),
+        Expr::Member { recv, .. } => expr_has_ffi(recv),
+        Expr::MethodCall { recv, args, .. } => expr_has_ffi(recv) || args.iter().any(expr_has_ffi),
         Expr::Unary { expr, .. } => expr_has_ffi(expr),
         Expr::Binary { l, r, .. } => expr_has_ffi(l) || expr_has_ffi(r),
         Expr::If(ie) => if_has_ffi(ie),

@@ -108,23 +108,29 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 
 - **Types** — `Int`/`Long` (`i64`), `Double`/`Float` (`f64`), `Boolean`,
   `String`, `Unit`; annotations optional, coarsely inferred otherwise.
-- **Declarations** — top-level `fun` with typed parameters and return type;
-  `val`/`var` locals; `fun main()` entry (with or without `args`).
+- **Declarations** — top-level `fun` with typed parameters and return type,
+  block bodies **and** single-expression bodies (`fun f(...) = expr`);
+  `val`/`var` locals (`val` reassignment is a compile error, matching Kotlin);
+  `fun main()` entry (with or without `args`).
 - **Expressions** — `+ - * / %`, unary `-`/`!`, comparisons `== != < > <= >=`,
   short-circuit `&&`/`||`, parentheses. `Int/Int` truncates toward zero;
   `Double` division is IEEE.
 - **Strings** — literals with `\n`/`\t`/`\\`/`\"`/`\$` escapes and `$name` /
   `${expr}` templates; `+` concatenates when either side is a `String`.
+- **Member access** — chainable postfix `.`: `String.length`,
+  `.uppercase()`/`.lowercase()`, `.trim()`, `.isEmpty()`/`.isNotEmpty()`, and
+  `Any.toString()`.
 - **Control flow** — `if`/`else` (statement **and** expression, incl.
   `else if`), `while`, and `for` over `a..b`, `a until b`, `a downTo b`, with
-  optional `step`.
+  optional `step`. Blocks are lexically scoped: bindings declared in a nested
+  block (and the `for` variable) drop at the block's end; shadowing is restored.
 - **Functions** — user calls, recursion, `return`, `Unit` functions.
 - **Built-ins** — `println(...)` / `print(...)`.
 - **Comments** — `//` and nested `/* … */`.
 
 Not yet in M0 (see roadmap): classes/objects, collections and their methods,
-lambdas, `when`, nullability, generics beyond parse-and-ignore, and the
-standard library.
+lambdas, `when`, nullability, generics beyond parse-and-ignore, and the rest of
+the standard library beyond the `String`/`Any` members above.
 
 ## [0x04] COMMAND-LINE FLAGS
 

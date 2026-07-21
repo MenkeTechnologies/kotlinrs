@@ -124,6 +124,83 @@ fn unresolved_reference_is_a_compile_error() {
 }
 
 #[test]
+fn val_cannot_be_reassigned() {
+    // A `val` is write-once: reassigning it is a compile error.
+    let out = eval("val x = 5; x = 6; println(x)");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("val cannot be reassigned"),
+        "stderr was: {err}"
+    );
+
+    // Compound assignment to a `val` is equally rejected.
+    let out = eval("val x = 5; x += 1");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("val cannot be reassigned"));
+
+    // A function parameter is a read-only `val`.
+    let out = eval("fun f(n: Int): Int { n = 3; return n }\nfun main() { println(f(1)) }");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("val cannot be reassigned"));
+
+    // A `var`, by contrast, reassigns fine.
+    assert_eq!(stdout("var x = 5; x = 6; println(x)"), "6\n");
+}
+
+#[test]
+fn block_scoping_drops_inner_bindings() {
+    // A binding declared inside an inner block is not visible after the block.
+    let out = eval("fun main() { if (true) { val y = 5 }; println(y) }");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unresolved reference"),
+        "stderr was: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A `for` loop variable is likewise out of scope after the loop.
+    let out = eval("fun main() { for (i in 1..3) { print(i) }; println(i) }");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unresolved reference"));
+
+    // Shadowing inside a block is restored to the outer binding on exit:
+    // the inner `x` prints 99, the outer `x` remains 1.
+    assert_eq!(
+        stdout("fun main() { val x = 1; if (true) { val x = 99; println(x) }; println(x) }"),
+        "99\n1\n"
+    );
+}
+
+#[test]
+fn member_and_method_access() {
+    // String property + methods dispatched through the host path.
+    assert_eq!(stdout(r#"println("hello".length)"#), "5\n");
+    assert_eq!(stdout(r#"println("hello".uppercase())"#), "HELLO\n");
+    assert_eq!(stdout(r#"println("ABC".lowercase())"#), "abc\n");
+    // Int.toString() (the `.` lexes distinctly from a float point).
+    assert_eq!(stdout("println(42.toString())"), "42\n");
+    // Chained calls: trim then uppercase.
+    assert_eq!(stdout(r#"println("  hi  ".trim().uppercase())"#), "HI\n");
+    // A member result flows into further expressions.
+    assert_eq!(stdout(r#"println("abc".length + 1)"#), "4\n");
+}
+
+#[test]
+fn single_expression_function_body() {
+    // `fun f(...) = expr` desugars to `{ return expr }`.
+    assert_eq!(
+        stdout("fun sq(n: Int): Int = n * n\nfun main() { println(sq(7)) }"),
+        "49\n"
+    );
+    // Works without a return-type annotation, and with a method call in the body.
+    assert_eq!(
+        stdout("fun shout(s: String) = s.uppercase()\nfun main() { println(shout(\"hi\")) }"),
+        "HI\n"
+    );
+}
+
+#[test]
 fn bytecode_lowers_to_native_ops() {
     // The whole point: arithmetic lowers to native fusevm ops, not host calls.
     let out = Command::new(env!("CARGO_BIN_EXE_kotlin"))
