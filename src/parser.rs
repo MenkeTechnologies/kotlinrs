@@ -569,10 +569,10 @@ impl Parser {
     }
 
     fn and_expr(&mut self) -> Result<Expr, String> {
-        let mut l = self.to_expr()?;
+        let mut l = self.pair_expr()?;
         while self.at(&Tok::AndAnd) {
             self.bump();
-            let r = self.to_expr()?;
+            let r = self.pair_expr()?;
             l = Expr::Binary {
                 op: BinOp::And,
                 l: Box::new(l),
@@ -584,7 +584,7 @@ impl Parser {
 
     /// The `to` infix operator, building a `Pair` — `k to v` (used by
     /// `mapOf(k to v, …)`). `to` is a soft keyword lexed as an identifier.
-    fn to_expr(&mut self) -> Result<Expr, String> {
+    fn pair_expr(&mut self) -> Result<Expr, String> {
         let mut l = self.eq_expr()?;
         while matches!(self.peek(), Tok::Ident(n) if n == "to") {
             self.bump();
