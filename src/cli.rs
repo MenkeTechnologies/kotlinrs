@@ -27,7 +27,7 @@ pub struct Cli {
     pub dap: bool,
 }
 
-/// Parse `std::env::args()` (minus argv[0]).
+/// Parse `std::env::args()` (minus `argv[0]`).
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
     let mut cli = Cli::default();
     let mut it = args.into_iter();

@@ -11,7 +11,7 @@
 //!   `Op::Div` is always-float, and Kotlin `Int` division truncates toward zero
 //!   with an `ArithmeticException` on a zero divisor.
 //!
-//! Integer division by zero stores a message in [`KT_ERROR`] and halts the VM;
+//! Integer division by zero stores a message in `KT_ERROR` and halts the VM;
 //! the runtime surfaces it as `kotlin: <reason>` on stderr (an uncaught
 //! `ArithmeticException`).
 
@@ -129,7 +129,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
 /// Register the Kotlin extension handler on a fresh VM (normal run). A
 /// `KT_DBG_LINE` marker — present only in a `--dap` chunk — is a no-op here.
 pub fn install(vm: &mut VM) {
-    vm.set_extension_handler(Box::new(|vm, id, arg| handle_coercion(vm, id, arg)));
+    vm.set_extension_handler(Box::new(handle_coercion));
 }
 
 /// Register the debug extension handler on a fresh VM (`kotlin --dap`). Identical
