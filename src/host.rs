@@ -15,7 +15,7 @@
 //! the runtime surfaces it as `kotlin: <reason>` on stderr (an uncaught
 //! `ArithmeticException`).
 
-use fusevm::{Value, VM};
+use fusevm::{Frame, VMResult, Value, VM};
 use std::cell::RefCell;
 
 /// Coerce the top of stack to its Kotlin `toString()` form.
@@ -83,6 +83,37 @@ pub const KT_LISTPUSH: u16 = 21;
 /// `[a, b]`; pushes a `Bool`.
 pub const KT_OBJEQ: u16 = 22;
 
+// ── Builtin ids (`Op::CallBuiltin`) ─────────────────────────────────────────
+//
+// These are a SEPARATE dispatch namespace from the `Op::Extended` ids above:
+// `Op::CallBuiltin` routes through the VM's `builtin_table` (a stable `fn`
+// table), which — unlike `Op::Extended`'s take/restore of the single extension
+// handler — stays live across a *re-entrant* `vm.run()`. That re-entrancy is
+// exactly what invoking a first-class lambda needs (run the lambda's body chunk
+// while the enclosing run is paused), and it keeps every `KT_*` extension op
+// usable *inside* a lambda body. Numeric overlap with the `KT_*` ids above is
+// harmless — the two tables never share a lookup.
+
+/// Build a closure value. Stack: `[cap0 .. cap{k-1}, name_idx, params, ncap]`
+/// (top is `ncap`); the three trailing ints are the body's name-pool index, the
+/// parameter count, and the capture count. Registers a heap closure carrying the
+/// captured upvalue values (by value) and returns its `Value::Obj` handle.
+pub const KT_MAKE_CLOSURE: u16 = 100;
+/// Invoke a closure `f(args)`. Stack: `[closure, arg0 .. arg{n-1}]` with `argc`
+/// = `n`. Runs the closure body through a nested `vm.run()` and pushes its
+/// result; faults when the value is not a closure.
+pub const KT_CLOSURE_CALL: u16 = 101;
+/// Dispatch a higher-order collection method that takes a lambda value. Stack:
+/// `[recv, extra0 .. extra{m-1}, closure, nameStr]` with the method name (a
+/// `Str`) on top and `argc` = `m` (the count of non-closure leading args, e.g.
+/// `fold`'s initial value). Iterates `recv`, invoking `closure` per element, and
+/// pushes the method's result.
+pub const KT_COLL_HOF: u16 = 102;
+/// Dispatch an `it`-form scope function (`let`/`also`/`takeIf`) on any receiver.
+/// Stack: `[recv, closure, nameStr]` with the name (a `Str`) on top. Invokes the
+/// lambda with the receiver bound to `it` and pushes the scope function's result.
+pub const KT_SCOPE_FN: u16 = 103;
+
 thread_local! {
     /// Set by a runtime fault (e.g. integer divide-by-zero) so the CLI can
     /// report it as an uncaught exception after `VM::run` returns.
@@ -110,6 +141,15 @@ enum HeapObj {
     /// Insertion-ordered key/value pairs (Kotlin `mapOf` preserves order).
     Map(Vec<(Value, Value)>),
     Pair(Value, Value),
+    /// A first-class lambda: the body's chunk name-pool index (resolved to an
+    /// entry via `Chunk::find_sub` at call time), its parameter count, and the
+    /// values captured from the enclosing frame at creation (its upvalues, stored
+    /// by value so a lambda outlives the frame it closed over).
+    Closure {
+        name_idx: u16,
+        params: u8,
+        captures: Vec<Value>,
+    },
 }
 
 /// Clear the object heap. Called on every VM install so a fresh run starts with
@@ -407,7 +447,19 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
 /// `KT_DBG_LINE` marker — present only in a `--dap` chunk — is a no-op here.
 pub fn install(vm: &mut VM) {
     reset_heap();
+    register_builtins(vm);
     vm.set_extension_handler(Box::new(handle_coercion));
+}
+
+/// Register the lambda builtins (`Op::CallBuiltin` dispatch). Shared by the
+/// normal and debug installs. These live in the VM's `builtin_table`, which
+/// survives the re-entrant `vm.run()` a lambda invocation drives — see the
+/// builtin-id doc comments above.
+fn register_builtins(vm: &mut VM) {
+    vm.register_builtin(KT_MAKE_CLOSURE, b_make_closure);
+    vm.register_builtin(KT_CLOSURE_CALL, b_closure_call);
+    vm.register_builtin(KT_COLL_HOF, b_coll_hof);
+    vm.register_builtin(KT_SCOPE_FN, b_scope_fn);
 }
 
 /// Register the debug extension handler on a fresh VM (`kotlin --dap`). Identical
@@ -415,6 +467,7 @@ pub fn install(vm: &mut VM) {
 /// DAP line hook (breakpoint / step check) instead of being ignored.
 pub fn install_debug(vm: &mut VM) {
     reset_heap();
+    register_builtins(vm);
     vm.set_extension_handler(Box::new(|vm, id, arg| {
         if id == KT_DBG_LINE {
             crate::dap::on_debug_line(vm);
@@ -426,6 +479,341 @@ pub fn install_debug(vm: &mut VM) {
 
 fn is_int(v: &Value) -> bool {
     matches!(v, Value::Int(_))
+}
+
+// ── First-class lambdas ─────────────────────────────────────────────────────
+
+/// `KT_MAKE_CLOSURE`: pop the capture count, parameter count, and body name
+/// index, then the captured upvalue values (deepest-first), and register the
+/// closure. Returns its `Value::Obj` handle.
+fn b_make_closure(vm: &mut VM, _argc: u8) -> Value {
+    let ncap = vm.pop().to_int() as usize;
+    let params = vm.pop().to_int() as u8;
+    let name_idx = vm.pop().to_int() as u16;
+    let mut captures = Vec::with_capacity(ncap);
+    for _ in 0..ncap {
+        captures.push(vm.pop());
+    }
+    captures.reverse();
+    alloc(HeapObj::Closure {
+        name_idx,
+        params,
+        captures,
+    })
+}
+
+/// Read a copy of a closure handle's metadata, if `v` is a closure.
+fn closure_meta(v: &Value) -> Option<(u16, u8, Vec<Value>)> {
+    with_obj(v, |o| match o {
+        HeapObj::Closure {
+            name_idx,
+            params,
+            captures,
+        } => Some((*name_idx, *params, captures.clone())),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// Invoke closure `clo` with `args`, running its body through the fusevm frame
+/// ABI via a nested `vm.run()`. The body's prologue expects exactly the declared
+/// parameter count followed by the captures, so missing args are padded with
+/// `null` and extras dropped. See [`run_sub`] for the frame mechanics.
+fn invoke_closure(vm: &mut VM, clo: &Value, args: &[Value]) -> Result<Value, String> {
+    let (name_idx, params, captures) =
+        closure_meta(clo).ok_or_else(|| "kotlin: value is not a function".to_string())?;
+    let entry = vm
+        .chunk
+        .find_sub(name_idx)
+        .ok_or_else(|| "kotlin: lambda body not found".to_string())?;
+    let want = params as usize;
+    let stack_base = vm.stack.len();
+    for i in 0..want {
+        vm.stack.push(args.get(i).cloned().unwrap_or(Value::Undef));
+    }
+    for cap in &captures {
+        vm.stack.push(cap.clone());
+    }
+    run_sub(vm, entry, stack_base)
+}
+
+/// Run a subroutine body already positioned on the value stack (its prologue
+/// values pushed above `stack_base`) via a nested `vm.run()`. A call frame whose
+/// `return_ip` is past the chunk end is pushed so the nested run halts exactly
+/// when the body's `ReturnValue` pops that frame; the interpreter IP is saved and
+/// restored so the paused enclosing dispatch loop resumes cleanly. This is the
+/// re-entrant pattern the mature fusevm frontends (groovyrs/scalars) use to give
+/// closures their own frame without any VM change.
+fn run_sub(vm: &mut VM, entry: usize, stack_base: usize) -> Result<Value, String> {
+    let return_ip = vm.chunk.ops.len();
+    vm.frames.push(Frame {
+        return_ip,
+        stack_base,
+        slots: Vec::new(),
+    });
+    let saved_ip = vm.ip;
+    vm.ip = entry;
+    let result = vm.run();
+    vm.ip = saved_ip;
+    match result {
+        VMResult::Ok(v) => Ok(v),
+        // A `request_halt` from a fault inside the body (e.g. `/ by zero`) ends
+        // the nested run as `Halted`; the parked `KT_ERROR` propagates via the
+        // still-set halt flag, which stops the enclosing run too.
+        VMResult::Halted => Ok(vm.stack.pop().unwrap_or(Value::Undef)),
+        VMResult::Error(e) => Err(e),
+    }
+}
+
+/// `KT_CLOSURE_CALL`: invoke a closure directly, `f(args)`. Stack (top-down):
+/// `arg{n-1} .. arg0, closure`, with `argc` = `n`.
+fn b_closure_call(vm: &mut VM, argc: u8) -> Value {
+    let n = argc as usize;
+    let mut args = Vec::with_capacity(n);
+    for _ in 0..n {
+        args.push(vm.pop());
+    }
+    args.reverse();
+    let clo = vm.pop();
+    match invoke_closure(vm, &clo, &args) {
+        Ok(v) => v,
+        Err(e) => {
+            fault(vm, e);
+            Value::Undef
+        }
+    }
+}
+
+/// `KT_COLL_HOF`: a higher-order collection method taking a lambda. Stack
+/// (top-down): `nameStr, closure, extra{m-1} .. extra0, recv`, with `argc` = `m`
+/// (the leading non-closure args, e.g. `fold`'s initial). Iterates `recv`,
+/// invoking `closure` per element, and returns the method's result.
+fn b_coll_hof(vm: &mut VM, argc: u8) -> Value {
+    let name = vm.pop().to_str();
+    let clo = vm.pop();
+    let m = argc as usize;
+    let mut extras = Vec::with_capacity(m);
+    for _ in 0..m {
+        extras.push(vm.pop());
+    }
+    extras.reverse();
+    let recv = vm.pop();
+    match coll_hof(vm, &name, &recv, &extras, &clo) {
+        Ok(v) => v,
+        Err(e) => {
+            fault(vm, e);
+            Value::Undef
+        }
+    }
+}
+
+/// `KT_SCOPE_FN`: an `it`-form scope function on any receiver. Stack (top-down):
+/// `nameStr, closure, recv`.
+fn b_scope_fn(vm: &mut VM, _argc: u8) -> Value {
+    let name = vm.pop().to_str();
+    let clo = vm.pop();
+    let recv = vm.pop();
+    let res = match name.as_str() {
+        // `let` — run the block with `it` = receiver, yield the block's result.
+        "let" => invoke_closure(vm, &clo, std::slice::from_ref(&recv)),
+        // `also` — run the block for its side effect, yield the receiver.
+        "also" => invoke_closure(vm, &clo, std::slice::from_ref(&recv)).map(|_| recv),
+        // `takeIf` — yield the receiver when the predicate holds, else null.
+        "takeIf" => invoke_closure(vm, &clo, std::slice::from_ref(&recv)).map(|p| {
+            if truthy(&p) {
+                recv
+            } else {
+                Value::Undef
+            }
+        }),
+        _ => Err(format!("unresolved reference: {name}")),
+    };
+    match res {
+        Ok(v) => v,
+        Err(e) => {
+            fault(vm, e);
+            Value::Undef
+        }
+    }
+}
+
+/// Snapshot a `List` receiver's elements (a clone taken under a shared borrow, so
+/// the borrow is released before any closure runs — a closure body may re-enter
+/// the heap). `Map`/`Pair` receivers aren't iterable by these methods here.
+fn list_snapshot(recv: &Value) -> Option<Vec<Value>> {
+    with_obj(recv, |o| match o {
+        HeapObj::List(items) => Some(items.clone()),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// Kotlin predicate truthiness: predicates return `Boolean`, so only `true`
+/// counts (a `null`/non-Bool result is treated as `false`).
+fn truthy(v: &Value) -> bool {
+    matches!(v, Value::Bool(true))
+}
+
+/// Total order over the comparable values a selector yields: strings compare
+/// lexicographically, everything else numerically. Used by `sortedBy` /
+/// `maxByOrNull` selector results.
+fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Str(x), Value::Str(y)) => x.cmp(y),
+        _ => a
+            .to_float()
+            .partial_cmp(&b.to_float())
+            .unwrap_or(Ordering::Equal),
+    }
+}
+
+/// The higher-order collection methods, over a snapshot of `recv`'s elements,
+/// invoking `clo` per element. Mirrors the Kotlin stdlib signatures faithfully.
+fn coll_hof(
+    vm: &mut VM,
+    name: &str,
+    recv: &Value,
+    extras: &[Value],
+    clo: &Value,
+) -> Result<Value, String> {
+    let items = list_snapshot(recv)
+        .ok_or_else(|| format!("unresolved reference: {name} on {}", obj_label(recv)))?;
+    match name {
+        "map" => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                out.push(invoke_closure(vm, clo, &[it])?);
+            }
+            Ok(alloc(HeapObj::List(out)))
+        }
+        "filter" => {
+            let mut out = Vec::new();
+            for it in items {
+                if truthy(&invoke_closure(vm, clo, std::slice::from_ref(&it))?) {
+                    out.push(it);
+                }
+            }
+            Ok(alloc(HeapObj::List(out)))
+        }
+        "forEach" => {
+            for it in items {
+                invoke_closure(vm, clo, &[it])?;
+            }
+            Ok(Value::Undef)
+        }
+        "fold" => {
+            let mut acc = extras.first().cloned().unwrap_or(Value::Undef);
+            for it in items {
+                acc = invoke_closure(vm, clo, &[acc, it])?;
+            }
+            Ok(acc)
+        }
+        "reduce" => {
+            let mut iter = items.into_iter();
+            let mut acc = iter.next().ok_or_else(|| {
+                "java.lang.UnsupportedOperationException: Empty collection can't be reduced."
+                    .to_string()
+            })?;
+            for it in iter {
+                acc = invoke_closure(vm, clo, &[acc, it])?;
+            }
+            Ok(acc)
+        }
+        "any" => {
+            for it in items {
+                if truthy(&invoke_closure(vm, clo, &[it])?) {
+                    return Ok(Value::Bool(true));
+                }
+            }
+            Ok(Value::Bool(false))
+        }
+        "all" => {
+            for it in items {
+                if !truthy(&invoke_closure(vm, clo, &[it])?) {
+                    return Ok(Value::Bool(false));
+                }
+            }
+            Ok(Value::Bool(true))
+        }
+        "count" => {
+            let mut n = 0i64;
+            for it in items {
+                if truthy(&invoke_closure(vm, clo, &[it])?) {
+                    n += 1;
+                }
+            }
+            Ok(Value::Int(n))
+        }
+        "sumOf" => {
+            let mut mapped = Vec::with_capacity(items.len());
+            for it in items {
+                mapped.push(invoke_closure(vm, clo, &[it])?);
+            }
+            Ok(sum_values(&mapped))
+        }
+        "maxByOrNull" => {
+            let mut best: Option<(Value, Value)> = None; // (element, selector)
+            for it in items {
+                let sel = invoke_closure(vm, clo, std::slice::from_ref(&it))?;
+                let take = match &best {
+                    Some((_, bsel)) => value_cmp(&sel, bsel) == std::cmp::Ordering::Greater,
+                    None => true,
+                };
+                if take {
+                    best = Some((it, sel));
+                }
+            }
+            Ok(best.map(|(el, _)| el).unwrap_or(Value::Undef))
+        }
+        "sortedBy" => {
+            // Decorate with the selector, stable-sort, undecorate (schwartzian) —
+            // keeps the closure evaluated once per element and preserves the
+            // input order among equal keys (Kotlin `sortedBy` is stable).
+            let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(items.len());
+            for it in items {
+                let key = invoke_closure(vm, clo, std::slice::from_ref(&it))?;
+                keyed.push((key, it));
+            }
+            keyed.sort_by(|a, b| value_cmp(&a.0, &b.0));
+            Ok(alloc(HeapObj::List(
+                keyed.into_iter().map(|(_, it)| it).collect(),
+            )))
+        }
+        "associateWith" => {
+            let mut entries: Vec<(Value, Value)> = Vec::with_capacity(items.len());
+            for it in items {
+                let v = invoke_closure(vm, clo, std::slice::from_ref(&it))?;
+                // Later duplicate keys overwrite (Kotlin `associateWith`).
+                if let Some(slot) = entries.iter_mut().find(|(k, _)| value_eq(k, &it)) {
+                    slot.1 = v;
+                } else {
+                    entries.push((it, v));
+                }
+            }
+            Ok(alloc(HeapObj::Map(entries)))
+        }
+        "groupBy" => {
+            // key → list of elements, keys in first-appearance order.
+            let mut entries: Vec<(Value, Vec<Value>)> = Vec::new();
+            for it in items {
+                let key = invoke_closure(vm, clo, std::slice::from_ref(&it))?;
+                match entries.iter_mut().find(|(k, _)| value_eq(k, &key)) {
+                    Some(slot) => slot.1.push(it),
+                    None => entries.push((key, vec![it])),
+                }
+            }
+            let entries = entries
+                .into_iter()
+                .map(|(k, v)| (k, alloc(HeapObj::List(v))))
+                .collect();
+            Ok(alloc(HeapObj::Map(entries)))
+        }
+        _ => Err(format!(
+            "unresolved reference: {name} on {}",
+            obj_label(recv)
+        )),
+    }
 }
 
 /// Dispatch a Kotlin stdlib member/method on `recv`. `Ok(value)` on success;
@@ -629,7 +1017,7 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
             2 => Some(b.clone()),
             _ => None,
         },
-        HeapObj::Map(_) => None,
+        HeapObj::Map(_) | HeapObj::Closure { .. } => None,
     })
     .flatten()
     .ok_or_else(|| format!("no component{n} on {}", obj_label(recv)))
@@ -785,6 +1173,7 @@ fn obj_hash(recv: &Value) -> i64 {
                     kotlin_string(v).hash(&mut h);
                 }
             }
+            HeapObj::Closure { name_idx, .. } => name_idx.hash(&mut h),
         }
         h.finish() as i64
     })
@@ -798,6 +1187,7 @@ fn obj_label(recv: &Value) -> String {
         HeapObj::List(_) => "List".to_string(),
         HeapObj::Map(_) => "Map".to_string(),
         HeapObj::Pair(_, _) => "Pair".to_string(),
+        HeapObj::Closure { .. } => "Function".to_string(),
     })
     .unwrap_or_else(|| "value".to_string())
 }
@@ -844,6 +1234,11 @@ fn display_obj(id: u32) -> String {
                 format!("{{{body}}}")
             }
             HeapObj::Pair(a, b) => format!("({}, {})", kotlin_string(a), kotlin_string(b)),
+            // Kotlin renders a lambda as an opaque `Function` reference; the exact
+            // JVM form is `(kotlin.jvm.functions.FunctionN)…`, which we don't
+            // reproduce — a stable placeholder is enough (lambdas are rarely
+            // printed, only invoked).
+            HeapObj::Closure { params, .. } => format!("(lambda arity={params})"),
         }
     })
 }

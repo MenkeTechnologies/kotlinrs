@@ -21,9 +21,10 @@
 
 use crate::ast::*;
 use crate::host::{
-    KT_CHR_STRING, KT_DBG_LINE, KT_FFI_CALL, KT_FFI_COMPILE, KT_GETFIELD, KT_IDIV, KT_IMOD,
-    KT_INDEX_GET, KT_INDEX_SET, KT_IS, KT_ISNULL, KT_LIST, KT_LISTPUSH, KT_MAP, KT_METHOD, KT_NEW,
-    KT_NEWLIST, KT_NOTNULL, KT_OBJEQ, KT_PAIR, KT_SETFIELD, KT_TO_STRING,
+    KT_CHR_STRING, KT_CLOSURE_CALL, KT_COLL_HOF, KT_DBG_LINE, KT_FFI_CALL, KT_FFI_COMPILE,
+    KT_GETFIELD, KT_IDIV, KT_IMOD, KT_INDEX_GET, KT_INDEX_SET, KT_IS, KT_ISNULL, KT_LIST,
+    KT_MAKE_CLOSURE, KT_MAP, KT_METHOD, KT_NEW, KT_NOTNULL, KT_OBJEQ, KT_PAIR, KT_SCOPE_FN,
+    KT_SETFIELD, KT_TO_STRING,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::collections::HashMap;
@@ -138,6 +139,20 @@ impl Scope {
     fn is_mutable(&self, name: &str) -> Option<bool> {
         self.map.get(name).map(|b| b.mutable)
     }
+    /// Every currently-visible binding as `(name, slot, ty, class)`, ordered by
+    /// slot for deterministic capture layout. This is the lexical environment a
+    /// lambda closes over — capturing the whole visible set (by value) is always
+    /// correct for reads and avoids a separate free-variable pass; unreferenced
+    /// captures only cost an unused slot.
+    fn visible(&self) -> Vec<(String, u16, Type, Option<String>)> {
+        let mut out: Vec<(String, u16, Type, Option<String>)> = self
+            .map
+            .iter()
+            .map(|(n, b)| (n.clone(), b.slot, b.ty, b.class.clone()))
+            .collect();
+        out.sort_by_key(|(_, slot, _, _)| *slot);
+        out
+    }
 }
 
 /// A stored property of a class (or `object`).
@@ -215,6 +230,26 @@ pub struct Compiler {
     /// so `break`/`continue` can backpatch their jumps to the loop's exit /
     /// next-iteration point. See [`LoopCtx`].
     loops: Vec<LoopCtx>,
+    /// Lambda bodies discovered while lowering, awaiting emission as subroutine
+    /// regions after all functions/methods (a queue because emitting one lambda
+    /// may enqueue further nested lambdas). See [`Compiler::compile_lambda`].
+    pending_lambdas: Vec<PendingLambda>,
+    /// Monotonic id for synthetic lambda sub names (`$lambda$0`, `$lambda$1`, …).
+    lambdas_seen: u32,
+}
+
+/// A lambda body queued for emission as a subroutine. `params` already has the
+/// implicit `it` injected when the literal had no explicit parameters. `captures`
+/// are the enclosing-frame bindings the lambda closes over (its upvalues), in the
+/// same order the make-closure site pushed their values and the body's prologue
+/// pops them into slots. `class` carries the enclosing class context so a lambda
+/// defined inside a method can still reach `this`/fields.
+struct PendingLambda {
+    name_idx: u16,
+    params: Vec<(String, Type)>,
+    captures: Vec<(String, Type, Option<String>)>,
+    body: Vec<Stmt>,
+    class: Option<String>,
 }
 
 /// Backpatch bookkeeping for one enclosing loop. `break`/`continue` emit a
@@ -327,6 +362,8 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
         debug,
         has_ffi,
         loops: Vec::new(),
+        pending_lambdas: Vec::new(),
+        lambdas_seen: 0,
     };
 
     // Preamble: build `object` singletons into globals, then bind main's args
@@ -354,6 +391,11 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
         for m in &cd.methods {
             c.compile_fun(m, Some(&cd.name))?;
         }
+    }
+    // Lambda bodies emit as subroutine regions last. Draining may enqueue further
+    // lambdas (one nested inside another), so loop until the queue is empty.
+    while let Some(pl) = c.pending_lambdas.pop() {
+        c.compile_lambda_body(pl)?;
     }
 
     let end = c.b.current_pos();
@@ -803,11 +845,7 @@ impl Compiler {
                 self.b.emit(Op::Extended(KT_PAIR, 0), 0);
                 Ok(Type::Obj)
             }
-            // A lambda is only meaningful inlined into a collection HOF (handled
-            // in `compile_member`); standalone it has no first-class value here.
-            Expr::Lambda { .. } => {
-                Err("a lambda is only supported as a map/filter/forEach argument".into())
-            }
+            Expr::Lambda { params, body } => self.compile_lambda(sc, params, body),
             Expr::If(ie) => self.compile_if(sc, ie),
             Expr::When(w) => self.compile_when(sc, w),
         }
@@ -877,11 +915,21 @@ impl Compiler {
             self.b.emit(Op::Extended(KT_CHR_STRING, 0), line);
             return Ok(Type::String);
         }
-        // Collection higher-order functions — the compiler inlines the lambda.
-        if let ["map" | "filter" | "forEach"] = [name] {
-            if let [Expr::Lambda { params, body }] = args {
-                return self.compile_hof(sc, recv, name, params, body, line);
-            }
+        // Collection higher-order functions take a first-class lambda VALUE (a
+        // trailing-lambda literal or a passed closure) and invoke it per element
+        // at runtime via the `KT_COLL_HOF` builtin.
+        if is_coll_hof(name) && !args.is_empty() {
+            return self.compile_coll_hof(sc, recv, name, args, line);
+        }
+        // `it`-form scope functions on any receiver: `x.let { … }` /
+        // `x.also { … }` / `x.takeIf { … }`.
+        if matches!(name, "let" | "also" | "takeIf") && args.len() == 1 {
+            self.compile_expr(sc, recv)?;
+            self.compile_expr(sc, &args[0])?; // the lambda → closure value
+            let nidx = self.b.add_constant(Value::str(name.to_string()));
+            self.b.emit(Op::LoadConst(nidx), line);
+            self.b.emit(Op::CallBuiltin(KT_SCOPE_FN, 0), line);
+            return Ok(Type::Unknown);
         }
         // A statically-known user class: dispatch a user method as a native
         // `Op::Call`, read a property directly, or route a `data` member.
@@ -991,106 +1039,110 @@ impl Compiler {
         Ok(Type::Obj)
     }
 
-    /// Inline a collection higher-order call (`map`/`filter`/`forEach`) over
-    /// `recv` with the given lambda. `map`/`filter` build a fresh accumulator
-    /// list; `forEach` runs the body for effect and yields Unit.
-    fn compile_hof(
+    /// Build a first-class lambda value at its literal site. The body is queued
+    /// for emission as a subroutine (`compile_lambda_body`); here we push each
+    /// captured upvalue (read from the enclosing frame), then the body's name
+    /// index, parameter count, and capture count, and register the closure via
+    /// the `KT_MAKE_CLOSURE` builtin (which returns a `Value::Obj` handle). An
+    /// implicit-`it` lambda (no explicit params) takes one parameter, `it`.
+    fn compile_lambda(
+        &mut self,
+        sc: &mut Scope,
+        params: &[(String, Type)],
+        body: &[Stmt],
+    ) -> Result<Type, String> {
+        // An unparameterized lambda has the single implicit parameter `it`.
+        let effective: Vec<(String, Type)> = if params.is_empty() {
+            vec![("it".to_string(), Type::Unknown)]
+        } else {
+            params.to_vec()
+        };
+        // Capture the whole visible enclosing environment (by value), minus names
+        // the lambda's own parameters shadow. Captures use slots after the params
+        // in the body; the push order here matches the body prologue's pop order.
+        let caps: Vec<(String, u16, Type, Option<String>)> = sc
+            .visible()
+            .into_iter()
+            .filter(|(n, _, _, _)| !effective.iter().any(|(p, _)| p == n))
+            .collect();
+        for (_, slot, _, _) in &caps {
+            self.b.emit(Op::GetSlot(*slot), 0);
+        }
+        let id = self.lambdas_seen;
+        self.lambdas_seen += 1;
+        let name_idx = self.b.add_name(&format!("$lambda${id}"));
+        self.pending_lambdas.push(PendingLambda {
+            name_idx,
+            params: effective.clone(),
+            captures: caps
+                .iter()
+                .map(|(n, _, ty, cl)| (n.clone(), *ty, cl.clone()))
+                .collect(),
+            body: body.to_vec(),
+            class: self.cur_class.clone(),
+        });
+        self.b.emit(Op::LoadInt(name_idx as i64), 0);
+        self.b.emit(Op::LoadInt(effective.len() as i64), 0);
+        self.b.emit(Op::LoadInt(caps.len() as i64), 0);
+        self.b.emit(Op::CallBuiltin(KT_MAKE_CLOSURE, 0), 0);
+        Ok(Type::Unknown)
+    }
+
+    /// Emit a queued lambda body as a subroutine region. Slots hold the
+    /// parameters first (`0..n`), then the captured upvalues (`n..n+k`); the
+    /// prologue pops the pushed params + captures top-down into those slots. The
+    /// body lowers as a block-value (its last expression is the lambda's result),
+    /// then a `ReturnValue` hands that value back to the invoking builtin.
+    fn compile_lambda_body(&mut self, pl: PendingLambda) -> Result<(), String> {
+        let entry = self.b.current_pos();
+        self.b.add_sub_entry(pl.name_idx, entry);
+
+        let mut sc = Scope::new();
+        for (p, ty) in &pl.params {
+            sc.declare(p, *ty, false);
+        }
+        for (n, ty, cl) in &pl.captures {
+            sc.declare_obj(n, *ty, false, cl.clone());
+        }
+        let total = pl.params.len() + pl.captures.len();
+        for i in (0..total).rev() {
+            self.b.emit(Op::SetSlot(i as u16), 0);
+        }
+
+        let saved = self.cur_class.take();
+        self.cur_class = pl.class.clone();
+        let res = self.compile_block_value(&mut sc, &pl.body);
+        self.cur_class = saved;
+        res?;
+        self.b.emit(Op::ReturnValue, 0);
+        Ok(())
+    }
+
+    /// Lower a higher-order collection call `recv.name(extra…) { lambda }` to the
+    /// `KT_COLL_HOF` builtin. The receiver, any leading non-closure args (e.g.
+    /// `fold`'s initial), the closure (the last argument), and the method-name
+    /// string are pushed; the builtin iterates and invokes the lambda per element.
+    fn compile_coll_hof(
         &mut self,
         sc: &mut Scope,
         recv: &Expr,
-        kind: &str,
-        params: &[String],
-        body: &[Stmt],
-        _line: u32,
+        name: &str,
+        args: &[Expr],
+        line: u32,
     ) -> Result<Type, String> {
-        if params.len() > 1 {
-            return Err(format!("{kind} lambda takes a single parameter"));
-        }
-        let pname = params.first().map(String::as_str).unwrap_or("it");
-        let collects = kind != "forEach";
-        let mark = sc.enter();
-
-        // src, size, index (and accumulator for map/filter) in temp slots.
+        // The lambda is always the last argument (trailing-lambda syntax, or a
+        // passed closure value); anything before it is a leading value arg.
+        let (closure, extras) = args.split_last().unwrap();
         self.compile_expr(sc, recv)?;
-        let src = sc.temp();
-        self.b.emit(Op::SetSlot(src), 0);
-        self.b.emit(Op::GetSlot(src), 0);
-        let sz_name = self.b.add_constant(Value::str("size"));
-        self.b.emit(Op::LoadConst(sz_name), 0);
-        self.b.emit(Op::Extended(KT_METHOD, 0), 0);
-        let szslot = sc.temp();
-        self.b.emit(Op::SetSlot(szslot), 0);
-        let islot = sc.temp();
-        self.b.emit(Op::LoadInt(0), 0);
-        self.b.emit(Op::SetSlot(islot), 0);
-        let accslot = if collects {
-            let a = sc.temp();
-            self.b.emit(Op::Extended(KT_NEWLIST, 0), 0);
-            self.b.emit(Op::SetSlot(a), 0);
-            Some(a)
-        } else {
-            None
-        };
-        // The lambda parameter gets a fixed slot, reassigned each iteration.
-        let pslot = sc.declare(pname, Type::Unknown, false);
-
-        let top = self.b.current_pos();
-        self.b.emit(Op::GetSlot(islot), 0);
-        self.b.emit(Op::GetSlot(szslot), 0);
-        self.b.emit(Op::NumLt, 0);
-        let jf = self.b.emit(Op::JumpIfFalse(0), 0);
-
-        // it = src[i]
-        self.b.emit(Op::GetSlot(src), 0);
-        self.b.emit(Op::GetSlot(islot), 0);
-        self.b.emit(Op::Extended(KT_INDEX_GET, 0), 0);
-        self.b.emit(Op::SetSlot(pslot), 0);
-
-        // Run the lambda body, leaving its value on the stack.
-        self.compile_block_value(sc, body)?;
-        match kind {
-            "forEach" => {
-                self.b.emit(Op::Pop, 0);
-            }
-            "map" => {
-                // [v] → [acc, v] → append
-                self.b.emit(Op::GetSlot(accslot.unwrap()), 0);
-                self.b.emit(Op::Swap, 0);
-                self.b.emit(Op::Extended(KT_LISTPUSH, 0), 0);
-            }
-            "filter" => {
-                // [bool]: on true, append the current element to the accumulator.
-                let skip = self.b.emit(Op::JumpIfFalse(0), 0);
-                self.b.emit(Op::GetSlot(accslot.unwrap()), 0);
-                self.b.emit(Op::GetSlot(pslot), 0);
-                self.b.emit(Op::Extended(KT_LISTPUSH, 0), 0);
-                let after = self.b.current_pos();
-                self.b.patch_jump(skip, after);
-            }
-            _ => unreachable!(),
+        for e in extras {
+            self.compile_expr(sc, e)?;
         }
-
-        // i += 1
-        self.b.emit(Op::GetSlot(islot), 0);
-        self.b.emit(Op::LoadInt(1), 0);
-        self.b.emit(Op::Add, 0);
-        self.b.emit(Op::SetSlot(islot), 0);
-        self.b.emit(Op::Jump(top), 0);
-        let end = self.b.current_pos();
-        self.b.patch_jump(jf, end);
-
-        let ty = match accslot {
-            Some(a) => {
-                self.b.emit(Op::GetSlot(a), 0);
-                Type::Obj
-            }
-            None => {
-                self.b.emit(Op::LoadUndef, 0);
-                Type::Unit
-            }
-        };
-        sc.exit(mark);
-        Ok(ty)
+        self.compile_expr(sc, closure)?;
+        let nidx = self.b.add_constant(Value::str(name.to_string()));
+        self.b.emit(Op::LoadConst(nidx), line);
+        self.b
+            .emit(Op::CallBuiltin(KT_COLL_HOF, extras.len() as u8), line);
+        Ok(hof_ret_type(name))
     }
 
     /// `recv.field (op)= value` — an object property write.
@@ -1411,6 +1463,18 @@ impl Compiler {
             }
             self.b.emit(Op::LoadUndef, line);
             return Ok(Type::Unit);
+        }
+        // A call on a local binding invokes a first-class lambda value `f(args)`
+        // — the local holds a closure handle. Locals win over same-named free
+        // functions (lexical shadowing), matching Kotlin.
+        if let Some(slot) = sc.slot(name) {
+            self.b.emit(Op::GetSlot(slot), line);
+            for a in args {
+                self.compile_expr(sc, a)?;
+            }
+            self.b
+                .emit(Op::CallBuiltin(KT_CLOSURE_CALL, args.len() as u8), line);
+            return Ok(Type::Unknown);
         }
         match name {
             "println" | "print" => {
@@ -1828,9 +1892,9 @@ impl Compiler {
                 method_ret_type(name)
             }
             Expr::MethodCall { recv, name, .. } => {
-                // `map`/`filter` yield a `List` (heap object).
-                if matches!(name.as_str(), "map" | "filter") {
-                    return Type::Obj;
+                // A higher-order collection method's result type is fixed.
+                if is_coll_hof(name) {
+                    return hof_ret_type(name);
                 }
                 if let Some(cls) = self.infer_class(sc, recv) {
                     if let Some(sig) = self.classes.get(&cls).and_then(|m| m.methods.get(name)) {
@@ -1925,8 +1989,10 @@ impl Compiler {
                     .and_then(|p| p.class.clone())
             }
             Expr::MethodCall { recv, name, .. } => {
-                if matches!(name.as_str(), "map" | "filter") {
-                    return Some("List".to_string());
+                match name.as_str() {
+                    "map" | "filter" | "sortedBy" => return Some("List".to_string()),
+                    "associateWith" | "groupBy" => return Some("Map".to_string()),
+                    _ => {}
                 }
                 let cls = self.infer_class(sc, recv)?;
                 self.classes
@@ -1963,6 +2029,40 @@ fn method_ret_type(name: &str) -> Type {
         "uppercase" | "toUpperCase" | "lowercase" | "toLowerCase" | "trim" | "toString" => {
             Type::String
         }
+        _ => Type::Unknown,
+    }
+}
+
+/// The higher-order collection methods that take a first-class lambda value and
+/// route to the `KT_COLL_HOF` builtin (see [`crate::host::coll_hof`]).
+fn is_coll_hof(name: &str) -> bool {
+    matches!(
+        name,
+        "map"
+            | "filter"
+            | "forEach"
+            | "fold"
+            | "reduce"
+            | "any"
+            | "all"
+            | "count"
+            | "sumOf"
+            | "maxByOrNull"
+            | "sortedBy"
+            | "associateWith"
+            | "groupBy"
+    )
+}
+
+/// Static result type of a higher-order collection method, for display/`==` op
+/// selection. Collection-returning methods yield a heap `Obj`; the rest are
+/// coarse (`Unknown` display routes through the generic Kotlin stringifier).
+fn hof_ret_type(name: &str) -> Type {
+    match name {
+        "map" | "filter" | "sortedBy" | "associateWith" | "groupBy" => Type::Obj,
+        "forEach" => Type::Unit,
+        "any" | "all" => Type::Boolean,
+        "count" => Type::Int,
         _ => Type::Unknown,
     }
 }

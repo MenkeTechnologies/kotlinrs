@@ -282,6 +282,28 @@ impl Parser {
     /// container name the compiler needs for method dispatch (`Person`,
     /// `List`, `Map`, …).
     fn type_ref(&mut self) -> Result<(Type, Option<String>), String> {
+        // A function type `(T1, …) -> R` (chainable: `(Int) -> (Int) -> Int`).
+        // The coarse type can't carry a signature, so the parameter/return types
+        // are consumed and discarded; the annotation only needs to mark the
+        // binding as a callable value (its lowering is closure-invoke by slot).
+        if self.at(&Tok::LParen) {
+            self.bump();
+            let mut depth = 1i32;
+            while depth > 0 {
+                match self.bump() {
+                    Tok::LParen => depth += 1,
+                    Tok::RParen => depth -= 1,
+                    Tok::Eof => return Err("unterminated function type".into()),
+                    _ => {}
+                }
+            }
+            self.eat(&Tok::Arrow)?;
+            let _ret = self.type_ref()?; // return type (may itself be a fn type)
+            if self.at(&Tok::Question) {
+                self.bump(); // nullable function type `((Int) -> Int)?`
+            }
+            return Ok((Type::Unknown, Some("Function".to_string())));
+        }
         let name = self.ident()?;
         if self.at(&Tok::Lt) {
             let mut depth = 0;
@@ -779,22 +801,40 @@ impl Parser {
         self.eat(&Tok::LBrace)?;
         // Optional parameter list ending in `->`. Speculatively scan a run of
         // `IDENT (',' IDENT)* '->'`; roll back if it isn't there.
-        let mut params = Vec::new();
+        let mut params: Vec<(String, Type)> = Vec::new();
         let save = self.pos;
         if matches!(self.peek(), Tok::Ident(_)) {
-            let mut tmp = Vec::new();
+            let mut tmp: Vec<(String, Type)> = Vec::new();
             let mut ok = true;
             loop {
-                match self.peek() {
+                let pname = match self.peek() {
                     Tok::Ident(n) => {
-                        tmp.push(n.clone());
+                        let n = n.clone();
                         self.bump();
+                        n
                     }
                     _ => {
                         ok = false;
                         break;
                     }
+                };
+                // Optional per-parameter type annotation `p: Type`. A simple named
+                // type is captured (so `Int`/`Long` params drive integer op
+                // selection in the body); a complex/function type is consumed and
+                // left `Unknown`. On a run-in to a block terminator, roll back —
+                // the `{ … }` was a body, not a parameter list.
+                let mut pty = Type::Unknown;
+                if self.at(&Tok::Colon) {
+                    self.bump();
+                    match self.skip_lambda_param_type() {
+                        Some(t) => pty = t,
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
                 }
+                tmp.push((pname, pty));
                 if self.at(&Tok::Comma) {
                     self.bump();
                 } else {
@@ -820,6 +860,49 @@ impl Parser {
         }
         self.eat(&Tok::RBrace)?;
         Ok(Expr::Lambda { params, body })
+    }
+
+    /// Consume the tokens of a lambda parameter's type annotation, stopping
+    /// before the next top-level `,` or `->`. The coarse type of a simple named
+    /// annotation (`Int`, `String`, …) is returned so the body can pick integer
+    /// vs float ops; a complex/function/generic type yields `Unknown`. Nested
+    /// `<…>`/`(…)`/`[…]` are balanced so a generic type is skipped whole.
+    /// Returns `None` on a run-in to a block terminator — the speculative param
+    /// scan then rolls back (the `{ … }` was a body, not a parameter list).
+    fn skip_lambda_param_type(&mut self) -> Option<Type> {
+        // A lone leading identifier at depth 0 is the coarse type name; anything
+        // more (generics, nullable, function type) widens it to `Unknown`.
+        let mut ty = match self.peek() {
+            Tok::Ident(n) => Type::from_name(n),
+            _ => Type::Unknown,
+        };
+        let mut consumed_simple = false;
+        let mut depth = 0i32;
+        loop {
+            match self.peek() {
+                Tok::Comma | Tok::Arrow if depth == 0 => return Some(ty),
+                Tok::Lt | Tok::LParen | Tok::LBracket => {
+                    depth += 1;
+                    ty = Type::Unknown;
+                    self.bump();
+                }
+                Tok::Gt | Tok::RParen | Tok::RBracket => {
+                    depth -= 1;
+                    self.bump();
+                }
+                Tok::RBrace | Tok::Eof => return None,
+                Tok::Ident(_) if depth == 0 && !consumed_simple => {
+                    consumed_simple = true;
+                    self.bump();
+                }
+                _ => {
+                    // A second token at depth 0 (`Int?`, `a.B`, …) is not a plain
+                    // simple type — fall back to `Unknown`.
+                    ty = Type::Unknown;
+                    self.bump();
+                }
+            }
+        }
     }
 
     fn primary(&mut self) -> Result<Expr, String> {
@@ -851,6 +934,10 @@ impl Parser {
             }
             Tok::If => Ok(Expr::If(self.if_expr()?)),
             Tok::When => Ok(Expr::When(self.when_expr()?)),
+            // A brace in expression position is a lambda literal (`val f = { … }`,
+            // `f({ … })`). Trailing-lambda braces are consumed by `postfix` /
+            // `primary`'s call arms before reaching here.
+            Tok::LBrace => self.lambda(),
             Tok::LParen => {
                 self.bump();
                 let e = self.expr()?;
@@ -871,7 +958,21 @@ impl Parser {
                         }
                     }
                     self.eat(&Tok::RParen)?;
+                    // Trailing-lambda syntax on a free call: `apply(x) { … }`.
+                    if self.at(&Tok::LBrace) {
+                        args.push(self.lambda()?);
+                    }
                     Ok(Expr::Call { name, args, line })
+                } else if self.at(&Tok::LBrace) {
+                    // Bare trailing-lambda call `run { … }` (no parenthesized
+                    // args). `Ident {` is unambiguously a call in Kotlin's
+                    // expression grammar — there are no anonymous block statements.
+                    let lam = self.lambda()?;
+                    Ok(Expr::Call {
+                        name,
+                        args: vec![lam],
+                        line,
+                    })
                 } else {
                     Ok(Expr::Var(name))
                 }

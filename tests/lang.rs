@@ -739,3 +739,300 @@ fn constructor_lowers_to_host_extension_op() {
         "expected a host Extended op in:\n{asm}"
     );
 }
+
+// ── First-class lambda values ───────────────────────────────────────────────
+
+#[test]
+fn lambda_value_binding_and_invocation() {
+    // A lambda stored in a `val` of function type, then invoked by `f(args)`.
+    assert_eq!(
+        stdout("val f: (Int) -> Int = { it * 2 }\nprintln(f(3))"),
+        "6\n"
+    );
+    // Implicit `it` and an explicit single parameter are interchangeable.
+    assert_eq!(
+        stdout("val g = { x: Int -> x + 100 }\nprintln(g(5))"),
+        "105\n"
+    );
+}
+
+#[test]
+fn lambda_multiple_parameters() {
+    assert_eq!(
+        stdout("val add = { a: Int, b: Int -> a + b }\nprintln(add(2, 5))"),
+        "7\n"
+    );
+}
+
+#[test]
+fn lambda_captures_enclosing_scope() {
+    // The lambda reads `n` from the enclosing frame — a by-value upvalue capture.
+    let src = "\
+fun main() {
+    val n = 10
+    val addN = { x: Int -> x + n }
+    println(addN(5))
+    println(addN(20))
+}";
+    assert_eq!(prog(src), "15\n30\n");
+}
+
+#[test]
+fn lambda_capture_survives_returning_frame() {
+    // A lambda returned from a function still sees the captured `n` after the
+    // defining frame has returned — the capture is stored by value in the handle.
+    let src = "\
+fun adder(n: Int): (Int) -> Int = { it + n }
+fun main() {
+    val add100 = adder(100)
+    val add1 = adder(1)
+    println(add100(5))
+    println(add1(5))
+}";
+    assert_eq!(prog(src), "105\n6\n");
+}
+
+#[test]
+fn function_type_parameter_is_invoked() {
+    // A function-typed parameter is a first-class value the callee invokes.
+    let src = "\
+fun apply(f: (Int) -> Int, x: Int) = f(x)
+fun main() {
+    println(apply({ it + 1 }, 41))
+    println(apply({ it * it }, 9))
+}";
+    assert_eq!(prog(src), "42\n81\n");
+}
+
+#[test]
+fn trailing_lambda_on_free_function() {
+    // A trailing-lambda call with no parenthesized args: `run2 { … }`.
+    let src = "\
+fun run2(f: (Int) -> Int) = f(10)
+fun main() {
+    println(run2 { it * 3 })
+}";
+    assert_eq!(prog(src), "30\n");
+}
+
+#[test]
+fn nested_curried_closures() {
+    // A closure returning a closure — the inner one captures the outer parameter.
+    let src = "\
+fun main() {
+    val make = { x: Int -> { y: Int -> x + y } }
+    val add10 = make(10)
+    val add100 = make(100)
+    println(add10(5))
+    println(add100(1))
+}";
+    assert_eq!(prog(src), "15\n101\n");
+}
+
+#[test]
+fn lambda_body_uses_host_ops_via_reentrant_run() {
+    // The lambda body runs on a re-entrant `vm.run()`; string interpolation
+    // (a `KT_*` host op) inside the body must still resolve — proving the
+    // extension handler stays live across the nested run (lambda invocation is a
+    // `CallBuiltin`, which does not take/restore the handler).
+    assert_eq!(
+        stdout("val g = { x: Int -> \"val=$x\" }\nprintln(g(7))"),
+        "val=7\n"
+    );
+}
+
+#[test]
+fn lambda_lowers_to_make_closure_builtin() {
+    // A lambda literal lowers to the `KT_MAKE_CLOSURE` builtin (a `CallBuiltin`,
+    // id 100) that registers a heap closure — confirming the heap-closure model
+    // rather than any fusevm-core change.
+    let out = Command::new(env!("CARGO_BIN_EXE_kotlin"))
+        .arg("--dump-bytecode")
+        .arg("-e")
+        .arg("val f = { it * 2 }\nprintln(f(3))")
+        .output()
+        .unwrap();
+    let asm = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        asm.contains("CallBuiltin"),
+        "expected a CallBuiltin (make-closure / closure-call) in:\n{asm}"
+    );
+}
+
+// ── Higher-order collection functions (real lambda values) ──────────────────
+
+#[test]
+fn hof_map_filter_foreach_with_lambda_values() {
+    assert_eq!(
+        stdout("println(listOf(1, 2, 3, 4).map { it * it })"),
+        "[1, 4, 9, 16]\n"
+    );
+    assert_eq!(
+        stdout("println(listOf(1, 2, 3, 4, 5, 6).filter { it % 2 == 0 })"),
+        "[2, 4, 6]\n"
+    );
+    assert_eq!(
+        stdout("listOf(\"a\", \"b\").forEach { println(it) }"),
+        "a\nb\n"
+    );
+}
+
+#[test]
+fn hof_accepts_a_lambda_passed_by_name() {
+    // The HOF takes a first-class lambda VALUE — a variable holding a closure,
+    // not just an inline literal.
+    let src = "\
+fun main() {
+    val dbl = { x: Int -> x * 2 }
+    println(listOf(1, 2, 3).map(dbl))
+}";
+    assert_eq!(prog(src), "[2, 4, 6]\n");
+}
+
+#[test]
+fn hof_fold_and_reduce() {
+    assert_eq!(
+        stdout("println(listOf(1, 2, 3, 4).fold(0) { acc, x -> acc + x })"),
+        "10\n"
+    );
+    // `fold`'s initial seeds the accumulator (here building a String — the
+    // accumulator param is annotated `String` so `+` is concatenation, not
+    // arithmetic, under the coarse typing).
+    assert_eq!(
+        stdout("println(listOf(1, 2, 3).fold(\"n\") { acc: String, x: Int -> acc + x })"),
+        "n123\n"
+    );
+    assert_eq!(
+        stdout("println(listOf(1, 2, 3, 4, 5).reduce { a, b -> a + b })"),
+        "15\n"
+    );
+}
+
+#[test]
+fn hof_reduce_on_empty_collection_throws() {
+    // Kotlin `reduce` on an empty collection throws UnsupportedOperationException.
+    let err =
+        prog_err("fun main() { println(listOf(1).filter { it > 9 }.reduce { a, b -> a + b }) }");
+    assert!(
+        err.contains("UnsupportedOperationException"),
+        "stderr was: {err}"
+    );
+}
+
+#[test]
+fn hof_any_all_count() {
+    assert_eq!(stdout("println(listOf(1, 2, 3).any { it > 2 })"), "true\n");
+    assert_eq!(stdout("println(listOf(1, 2, 3).any { it > 9 })"), "false\n");
+    assert_eq!(stdout("println(listOf(1, 2, 3).all { it > 0 })"), "true\n");
+    assert_eq!(stdout("println(listOf(1, 2, 3).all { it > 1 })"), "false\n");
+    assert_eq!(
+        stdout("println(listOf(1, 2, 3, 4, 5).count { it % 2 == 1 })"),
+        "3\n"
+    );
+}
+
+#[test]
+fn hof_sum_of_and_max_by() {
+    assert_eq!(stdout("println(listOf(1, 2, 3).sumOf { it * it })"), "14\n");
+    // `maxByOrNull` returns the ELEMENT with the greatest selector value.
+    assert_eq!(
+        stdout("println(listOf(1, 2, 3).maxByOrNull { -it })"),
+        "1\n"
+    );
+    assert_eq!(
+        stdout("println(listOf(\"a\", \"bbb\", \"cc\").maxByOrNull { it.length })"),
+        "bbb\n"
+    );
+}
+
+#[test]
+fn hof_sorted_by_is_stable_and_selector_driven() {
+    assert_eq!(
+        stdout("println(listOf(3, 1, 2).sortedBy { it })"),
+        "[1, 2, 3]\n"
+    );
+    // Sort by a derived key (descending via negation).
+    assert_eq!(
+        stdout("println(listOf(1, 2, 3).sortedBy { -it })"),
+        "[3, 2, 1]\n"
+    );
+}
+
+#[test]
+fn hof_group_by_and_associate_with() {
+    // groupBy keeps keys in first-appearance order, values in input order.
+    assert_eq!(
+        stdout("println(listOf(1, 2, 3, 4).groupBy { it % 2 })"),
+        "{1=[1, 3], 0=[2, 4]}\n"
+    );
+    assert_eq!(
+        stdout("println(listOf(1, 2, 3).associateWith { it * 10 })"),
+        "{1=10, 2=20, 3=30}\n"
+    );
+}
+
+#[test]
+fn hof_chained_pipeline() {
+    // Each stage takes a fresh lambda value; the result of one feeds the next.
+    assert_eq!(
+        stdout("println(listOf(1, 2, 3, 4, 5, 6).filter { it % 2 == 0 }.map { it * 10 })"),
+        "[20, 40, 60]\n"
+    );
+}
+
+#[test]
+fn lambda_can_close_over_this_and_mutate_a_field() {
+    // A lambda defined in a method captures the enclosing `this`; mutating a
+    // `var` field through it is visible after the call (the instance is a shared
+    // heap handle).
+    let src = "\
+class Counter(var n: Int) {
+    fun addAll(xs: List<Int>) {
+        xs.forEach { n = n + it }
+    }
+}
+fun main() {
+    val c = Counter(0)
+    c.addAll(listOf(1, 2, 3, 4))
+    println(c.n)
+}";
+    assert_eq!(prog(src), "10\n");
+}
+
+#[test]
+fn typed_lambda_param_uses_integer_division() {
+    // An explicitly `Int`-typed lambda parameter drives Kotlin integer division
+    // (truncating), and division by zero throws ArithmeticException.
+    assert_eq!(
+        stdout("val d = { a: Int, b: Int -> a / b }\nprintln(d(7, 2))"),
+        "3\n"
+    );
+    let err = prog_err("fun main() { val d = { a: Int, b: Int -> a / b }; println(d(10, 0)) }");
+    assert!(err.contains("ArithmeticException"), "stderr was: {err}");
+}
+
+// ── Scope functions ─────────────────────────────────────────────────────────
+
+#[test]
+fn scope_function_let_transforms_receiver() {
+    assert_eq!(stdout("val n = 5\nprintln(n.let { it * 2 })"), "10\n");
+    assert_eq!(stdout("println(\"hi\".let { it.uppercase() })"), "HI\n");
+}
+
+#[test]
+fn scope_function_also_returns_receiver() {
+    // `also` runs the block for its side effect and yields the receiver itself.
+    let src = "\
+fun main() {
+    val xs = mutableListOf(1, 2)
+    val same = xs.also { it.add(3) }
+    println(same)
+}";
+    assert_eq!(prog(src), "[1, 2, 3]\n");
+}
+
+#[test]
+fn scope_function_take_if() {
+    assert_eq!(stdout("println(10.takeIf { it > 5 })"), "10\n");
+    assert_eq!(stdout("println(3.takeIf { it > 5 })"), "null\n");
+}

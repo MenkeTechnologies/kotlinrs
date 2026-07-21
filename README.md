@@ -138,8 +138,18 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 - **Collections** — `listOf`/`mutableListOf` and `mapOf`/`mutableMapOf` (with
   `k to v` `Pair`s), indexing `xs[i]` / `m[k]` (and indexed assignment), `.size`,
   `.add`/`.get`/`.contains`/`.indexOf`/`.sum` on lists, `.containsKey`/`.keys`/
-  `.values`/`.put` on maps, and the closure-taking `.map`/`.filter`/`.forEach`
-  (the lambda is inlined at the call site; `it` is the implicit parameter).
+  `.values`/`.put` on maps.
+- **First-class lambdas** — `{ it * 2 }`, `{ a, b -> a + b }`, function-type
+  values (`val f: (Int) -> Int = …`) and parameters (`fun apply(f: (Int) -> Int, x: Int) = f(x)`);
+  store, pass, return, and invoke (`f(3)`); trailing-lambda call syntax; captures
+  the enclosing scope by value (a returned lambda keeps its upvalues). Each
+  lambda is a heap closure object invoked through a re-entrant VM run — no
+  compiler inlining and no fusevm-core change.
+- **Higher-order stdlib** — the lambda-taking collection functions operate on
+  real lambda values: `.map`/`.filter`/`.forEach`, `.fold`/`.reduce`,
+  `.any`/`.all`/`.count`, `.sumOf`, `.maxByOrNull`, `.sortedBy`,
+  `.associateWith`, `.groupBy`. `it` is the implicit parameter.
+- **Scope functions** — the `it`-form `.let`/`.also`/`.takeIf` on any receiver.
 - **Control flow** — `if`/`else` (statement **and** expression, incl.
   `else if`); `when` (statement **and** expression) in subject and subjectless
   forms, with literal, comma-grouped, `in`/`!in` range, `is`/`!is` type, and
@@ -155,10 +165,12 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 - **Built-ins** — `println(...)` / `print(...)`.
 - **Comments** — `//` and nested `/* … */`.
 
-Not yet (see roadmap): generics beyond parse-and-ignore, first-class /
-standalone lambda values (lambdas exist only as `map`/`filter`/`forEach`
-arguments), interfaces/inheritance, class body property initializers, named /
-default arguments, and the rest of the standard-library surface.
+Not yet (see roadmap): generics beyond parse-and-ignore, the `this`-receiver
+scope functions (`.apply`/`.run`), directly invoking a call result (`f()()`;
+bind it first), lambda element-type inference (an unannotated `it` is coarsely
+typed, so `/` and `%` on it default to float — annotate the parameter `Int` for
+integer semantics), interfaces/inheritance, class body property initializers,
+named / default arguments, and the rest of the standard-library surface.
 
 ## [0x04] COMMAND-LINE FLAGS
 
@@ -189,19 +201,24 @@ Kotlin source
    ▼
 fusevm::VM  ──►  three-tier Cranelift JIT (linear · block · tracing)
    ▲
-   │  host.rs       → value coercions + object heap (classes, List/Map/Pair)
+   │  host.rs       → value coercions + object heap (classes, List/Map/Pair,
+   │                  closures) + lambda builtins (make/call/HOF/scope)
 ```
 
 - `compiler.rs` keeps one invariant: every expression leaves exactly one value
   on the stack and every statement is stack-neutral, so `if`/`while`/`for`/`when`
   balance without a separate analysis pass.
 - The only Kotlin-specific runtime code is a set of extension ops in `host.rs`
-  (value coercions, member dispatch, `is` checks, null tests) plus a
-  **frontend-owned object heap**: a `Value::Obj(u32)` handle indexes a host-side
-  table of class instances, lists, maps, and pairs. fusevm just carries the
-  handle (identity-comparable); the frontend owns the pointed-to object — the
-  same model the other mature fusevm frontends use. Everything else is a
-  universal fusevm op.
+  (value coercions, member dispatch, `is` checks, null tests), a few builtins
+  (`Op::CallBuiltin`) for the lambda operations (make-closure, closure-call, the
+  higher-order collection dispatch, scope functions), plus a **frontend-owned
+  object heap**: a `Value::Obj(u32)` handle indexes a host-side table of class
+  instances, lists, maps, pairs, and closures. A lambda is a heap closure (body
+  chunk index + captured upvalues) invoked through a re-entrant `vm.run()` — the
+  builtin dispatch keeps the extension handler live across that nested run, so
+  host ops work inside a lambda body. fusevm just carries the handle
+  (identity-comparable); the frontend owns the pointed-to object — the same model
+  the other mature fusevm frontends use. Everything else is a universal fusevm op.
 
 ## [0x06] STATUS & ROADMAP
 
@@ -209,12 +226,17 @@ M0 (this release): the running language subset above, with a headless test
 suite and `--dump-*` introspection.
 
 Landed since M0: a host-side object heap backing classes, `data class`es,
-`object` singletons, `List`/`Map`/`Pair` collections and their methods, and the
-closure-taking `map`/`filter`/`forEach`.
+`object` singletons, `List`/`Map`/`Pair` collections and their methods;
+first-class lambda values (capture, store/pass/return/invoke, trailing-lambda
+syntax) as heap closures; the lambda-taking higher-order collection functions
+(`map`/`filter`/`forEach`/`fold`/`reduce`/`any`/`all`/`count`/`sumOf`/
+`maxByOrNull`/`sortedBy`/`associateWith`/`groupBy`); and the `it`-form scope
+functions (`let`/`also`/`takeIf`).
 
-Next: generics, `Set`, first-class lambda values and more higher-order
-functions, interfaces/inheritance, named/default arguments, and a growing
-standard-library surface — alongside the sibling parity tooling (LSP/DAP,
+Next: generics, `Set`, the `this`-receiver scope functions (`apply`/`run`),
+lambda element-type inference, interfaces/inheritance, named/default arguments,
+and a growing standard-library surface — alongside the sibling parity tooling
+(LSP/DAP,
 reference generator, differential harness).
 
 ## [0xFF] LICENSE

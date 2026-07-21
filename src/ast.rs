@@ -349,11 +349,12 @@ pub enum Expr {
         first: Box<Expr>,
         second: Box<Expr>,
     },
-    /// A lambda `{ params -> body }`. First-class only inside the collection
-    /// higher-order calls (`map`/`filter`/`forEach`), where the compiler inlines
-    /// the body; used elsewhere it is a compile error.
+    /// A first-class lambda `{ params -> body }`. Each parameter carries its
+    /// (optionally annotated) coarse type — `Unknown` when unannotated, which is
+    /// the case for the implicit `it`. The compiler lowers the body to a
+    /// subroutine and builds a heap closure value at the literal site.
     Lambda {
-        params: Vec<String>,
+        params: Vec<(String, Type)>,
         body: Vec<Stmt>,
     },
     /// `if` used as an expression (each branch's last statement is its value).
