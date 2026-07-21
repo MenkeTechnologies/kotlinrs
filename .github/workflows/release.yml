@@ -1,0 +1,212 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    # Per-target failures are tolerated on the flaky variants so the
+    # downstream publish + tap job ships from whichever targets did
+    # build. `needs: build` is satisfied either way.
+    continue-on-error: ${{ matrix.allow_failure || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- macOS native ---
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          # --- Linux glibc ---
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            # Cross-compile from ubuntu-latest x86_64 via cross-rs Docker —
+            # more reliable than native ubuntu-24.04-arm runners which
+            # occasionally evict mid-build. No allow_failure: this target
+            # must succeed so the formula's on_linux/on_arm block emits.
+            use_cross: true
+          # --- Linux musl static (portable across glibc/musl distros) ---
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            allow_failure: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            allow_failure: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl') && !matrix.use_cross
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: |
+          # Prefer the prebuilt binary release over `cargo install`
+          # to save ~5 min of compile time per cross-build runner.
+          CROSS_VER="v0.2.5"
+          curl -sSLf -o /tmp/cross.tar.gz \
+            "https://github.com/cross-rs/cross/releases/download/${CROSS_VER}/cross-x86_64-unknown-linux-gnu.tar.gz"
+          tar -C /tmp -xzf /tmp/cross.tar.gz
+          sudo install -m 755 /tmp/cross /usr/local/bin/cross
+
+      - uses: Swatinem/rust-cache@v2
+        if: '!matrix.use_cross'
+
+      - name: Build (native)
+        if: '!matrix.use_cross'
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin kotlin
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release --locked --target ${{ matrix.target }} --bin kotlin
+
+      - name: Package
+        shell: bash
+        run: |
+          # Tarball keeps the `kotlinrs-` name (the release/repo is kotlinrs);
+          # the binary inside it is `kotlin`.
+          cd target/${{ matrix.target }}/release
+          strip kotlin 2>/dev/null || true
+          tar czf ../../../kotlinrs-${{ github.ref_name }}-${{ matrix.target }}.tar.gz kotlin
+          cd ../../..
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: kotlinrs-${{ matrix.target }}
+          path: kotlinrs-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create ${{ github.ref_name }} \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            artifacts/*.tar.gz
+
+  homebrew:
+    name: Update Homebrew tap
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Compute SHA256 sums
+        id: sha
+        shell: bash
+        run: |
+          for f in artifacts/*.tar.gz; do
+            base=$(basename "$f")
+            sum=$(sha256sum "$f" | awk '{print $1}')
+            # e.g. kotlinrs-vX.Y.Z-aarch64-apple-darwin.tar.gz → aarch64_apple_darwin
+            key=$(echo "$base" | sed 's/kotlinrs-v[^-]*-//; s/\.tar\.gz//; s/-/_/g; s/\./_/g')
+            echo "${key}=${sum}" >> "$GITHUB_OUTPUT"
+          done
+
+      - uses: actions/checkout@v6
+        with:
+          repository: MenkeTechnologies/homebrew-menketech
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update formula
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+          SHA_ARM_MACOS: ${{ steps.sha.outputs.aarch64_apple_darwin }}
+          SHA_X86_MACOS: ${{ steps.sha.outputs.x86_64_apple_darwin }}
+          SHA_X86_LINUX: ${{ steps.sha.outputs.x86_64_unknown_linux_gnu }}
+          SHA_ARM_LINUX: ${{ steps.sha.outputs.aarch64_unknown_linux_gnu }}
+          SHA_X86_LINUX_MUSL: ${{ steps.sha.outputs.x86_64_unknown_linux_musl }}
+          SHA_ARM_LINUX_MUSL: ${{ steps.sha.outputs.aarch64_unknown_linux_musl }}
+        run: |
+          set -eu
+          V="${VERSION#v}"
+          BASE="https://github.com/MenkeTechnologies/kotlinrs/releases/download/v${V}"
+          # macOS arm is the primary target — a missing binary there is a
+          # release failure, not a platform to silently drop.
+          if [ -z "${SHA_ARM_MACOS}" ]; then
+            echo "::error::aarch64-apple-darwin binary missing — refusing to ship a broken formula" >&2
+            exit 1
+          fi
+          # Helper: emit an on_arm / on_intel block when its SHA is non-empty.
+          emit() { local guard="$1" arch="$2" sha="$3"; [ -n "$sha" ] || return 0; printf '    %s do\n      url "%s/kotlinrs-v%s-%s.tar.gz"\n      sha256 "%s"\n    end\n' "$guard" "$BASE" "$V" "$arch" "$sha"; }
+          mac_blocks=$( { emit on_arm aarch64-apple-darwin "$SHA_ARM_MACOS"; emit on_intel x86_64-apple-darwin "$SHA_X86_MACOS"; } )
+          linux_blocks=$( { emit on_intel x86_64-unknown-linux-gnu "$SHA_X86_LINUX"; emit on_arm aarch64-unknown-linux-gnu "$SHA_ARM_LINUX"; } )
+          {
+            printf 'class Kotlinrs < Formula\n'
+            printf '  desc "Compiled Kotlin runtime on the fusevm bytecode VM + Cranelift JIT (no JVM)"\n'
+            printf '  homepage "https://github.com/MenkeTechnologies/kotlinrs"\n'
+            printf '  license "MIT"\n'
+            printf '  version "%s"\n\n' "$V"
+            [ -n "$mac_blocks" ] && printf '  on_macos do\n%s\n  end\n\n' "$mac_blocks"
+            [ -n "$linux_blocks" ] && printf '  on_linux do\n%s\n  end\n\n' "$linux_blocks"
+            printf '  def install\n'
+            printf '    bin.install "kotlin"\n'
+            printf '  end\n\n'
+            printf '  test do\n'
+            printf '    (testpath/"t.kt").write("fun main() { println(6*7) }")\n'
+            printf '    assert_match "42", shell_output("#{bin}/kotlin #{testpath}/t.kt")\n'
+            printf '  end\n'
+            # musl tarballs as trailing comment — Homebrew has no on_libc
+            # gate, so static binaries are referenced by URL for users
+            # targeting Alpine / scratch / distroless.
+            if [ -n "$SHA_X86_LINUX_MUSL" ] || [ -n "$SHA_ARM_LINUX_MUSL" ]; then
+              printf '\n  # Static musl tarballs also published at this release:\n'
+              [ -n "$SHA_X86_LINUX_MUSL" ] && printf '  #   kotlinrs-v%s-x86_64-unknown-linux-musl.tar.gz  sha256: %s\n' "$V" "$SHA_X86_LINUX_MUSL"
+              [ -n "$SHA_ARM_LINUX_MUSL" ] && printf '  #   kotlinrs-v%s-aarch64-unknown-linux-musl.tar.gz  sha256: %s\n' "$V" "$SHA_ARM_LINUX_MUSL"
+            fi
+            printf 'end\n'
+          } > tap/Formula/kotlinrs.rb
+
+      - name: Push formula update
+        run: |
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/kotlinrs.rb
+          if git diff --cached --quiet; then
+            echo "no changes — formula already up to date"
+            exit 0
+          fi
+          git commit -m "kotlinrs: bump to ${{ github.ref_name }}"
+          git push
