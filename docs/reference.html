@@ -123,6 +123,32 @@ while (i &lt; 3) { i += 1 }</code></pre>
           <p>the Boolean false literal</p>
           <pre><code class="lang-kotlin">val done: Boolean = false</code></pre>
         </article>
+        <article class="doc-entry" id="doc-keyword-15">
+          <h3><a class="doc-anchor" href="#doc-keyword-15">#</a> <code>when</code></h3>
+          <p>multi-way branch (statement or expression); subject or subjectless</p>
+          <pre><code class="lang-kotlin">when (n) { 1 -&gt; "one"; in 2..9 -&gt; "few"; else -&gt; "many" }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-16">
+          <h3><a class="doc-anchor" href="#doc-keyword-16">#</a> <code>is</code></h3>
+          <p>runtime type check in a `when` arm: `is String`, `!is Int`</p>
+          <pre><code class="lang-kotlin">when (x) { is String -&gt; "str"; is Int -&gt; "int"; else -&gt; "?" }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-17">
+          <h3><a class="doc-anchor" href="#doc-keyword-17">#</a> <code>break</code></h3>
+          <p>exit the enclosing loop; `break@label` targets a labeled loop</p>
+          <pre><code class="lang-kotlin">for (i in 1..9) { if (i == 5) break }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-18">
+          <h3><a class="doc-anchor" href="#doc-keyword-18">#</a> <code>continue</code></h3>
+          <p>skip to the loop's next iteration; `continue@label` for a labeled loop</p>
+          <pre><code class="lang-kotlin">for (i in 1..9) { if (i % 2 == 0) continue; println(i) }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-19">
+          <h3><a class="doc-anchor" href="#doc-keyword-19">#</a> <code>null</code></h3>
+          <p>the null reference; used with `T?`, `?.`, `?:`, and `!!`</p>
+          <pre><code class="lang-kotlin">val x: Int? = null
+println(x ?: 0)   // 0</code></pre>
+        </article>
       </section>
 
       <section class="tutorial-section" id="ch-type">
@@ -153,12 +179,18 @@ while (i &lt; 3) { i += 1 }</code></pre>
           <pre><code class="lang-kotlin">val b: Boolean = 1 &lt; 2</code></pre>
         </article>
         <article class="doc-entry" id="doc-type-6">
-          <h3><a class="doc-anchor" href="#doc-type-6">#</a> <code>String</code></h3>
+          <h3><a class="doc-anchor" href="#doc-type-6">#</a> <code>Char</code></h3>
+          <p>a single character (code unit); integral — `'A' + 1`, `.code`, `.toChar()`</p>
+          <pre><code class="lang-kotlin">val c: Char = 'A'
+println(c + 1)   // B</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-type-7">
+          <h3><a class="doc-anchor" href="#doc-type-7">#</a> <code>String</code></h3>
           <p>text; `+` concatenates and `"$x"` interpolates</p>
           <pre><code class="lang-kotlin">val s: String = "n = ${1 + 1}"</code></pre>
         </article>
-        <article class="doc-entry" id="doc-type-7">
-          <h3><a class="doc-anchor" href="#doc-type-7">#</a> <code>Unit</code></h3>
+        <article class="doc-entry" id="doc-type-8">
+          <h3><a class="doc-anchor" href="#doc-type-8">#</a> <code>Unit</code></h3>
           <p>the no-value type; the result of a function with no return</p>
           <pre><code class="lang-kotlin">fun log(): Unit { println("hi") }</code></pre>
         </article>

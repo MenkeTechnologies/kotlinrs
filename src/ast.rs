@@ -13,17 +13,24 @@ pub enum Type {
     Long,
     Double,
     Boolean,
+    Char,
     String,
     Unit,
     Unknown,
 }
 
 impl Type {
+    /// Integral kinds for op selection. `Char` is included because it is backed
+    /// by an integer code unit at runtime, so `==`/comparisons on it use the
+    /// numeric ops; only its *display* and add/sub result type differ.
     pub fn is_int(self) -> bool {
-        matches!(self, Type::Int | Type::Long)
+        matches!(self, Type::Int | Type::Long | Type::Char)
     }
     pub fn is_num(self) -> bool {
-        matches!(self, Type::Int | Type::Long | Type::Double | Type::Unknown)
+        matches!(
+            self,
+            Type::Int | Type::Long | Type::Double | Type::Char | Type::Unknown
+        )
     }
     /// Parse a type annotation name (`Int`, `Double`, `String`, …).
     pub fn from_name(s: &str) -> Type {
@@ -32,6 +39,7 @@ impl Type {
             "Long" => Type::Long,
             "Double" | "Float" => Type::Double,
             "Boolean" => Type::Boolean,
+            "Char" => Type::Char,
             "String" => Type::String,
             "Unit" => Type::Unit,
             _ => Type::Unknown,
@@ -82,6 +90,8 @@ pub enum StmtKind {
     While {
         cond: Expr,
         body: Vec<Stmt>,
+        /// Optional loop label (`outer@ while (…)`) for `break@outer`.
+        label: Option<String>,
     },
     /// `for (v in start..end)` / `until` / `downTo`, optional `step`.
     For {
@@ -91,9 +101,18 @@ pub enum StmtKind {
         kind: RangeKind,
         step: Option<Expr>,
         body: Vec<Stmt>,
+        /// Optional loop label (`outer@ for (…)`) for `break@outer`.
+        label: Option<String>,
     },
+    /// `break` / `break@label` — jump past the (labeled) enclosing loop.
+    Break(Option<String>),
+    /// `continue` / `continue@label` — jump to the (labeled) enclosing loop's
+    /// next-iteration point.
+    Continue(Option<String>),
     /// A bare `if` used as a statement (its value, if any, is discarded).
     If(IfExpr),
+    /// A `when` used as a statement (its value, if any, is discarded).
+    When(WhenExpr),
     /// An expression evaluated for effect (e.g. a `println(...)` call).
     Expr(Expr),
 }
@@ -114,6 +133,47 @@ pub struct IfExpr {
     pub then: Vec<Stmt>,
     pub els: Option<Vec<Stmt>>,
     pub line: u32,
+}
+
+/// A `when` — subject form (`when (x) { … }`) or subjectless (`when { … }`).
+/// Usable as an expression (its matched arm's value) or a statement (value
+/// discarded). Arms are tested top-to-bottom; the first match wins.
+#[derive(Debug, Clone)]
+pub struct WhenExpr {
+    /// The subject in `when (subject) { … }`; `None` for the subjectless form,
+    /// where each arm guard is a standalone boolean expression.
+    pub subject: Option<Box<Expr>>,
+    pub arms: Vec<WhenArm>,
+    pub line: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct WhenArm {
+    pub guard: WhenGuard,
+    pub body: Vec<Stmt>,
+}
+
+#[derive(Debug, Clone)]
+pub enum WhenGuard {
+    /// `else -> …` — the fallthrough arm.
+    Else,
+    /// One or more comma-separated conditions; the arm matches if *any* holds.
+    Conds(Vec<WhenCond>),
+}
+
+#[derive(Debug, Clone)]
+pub enum WhenCond {
+    /// Subject form: `subject == expr`. Subjectless form: a boolean `expr`.
+    Expr(Expr),
+    /// `in a..b` (or `!in …`) — subject-form range membership.
+    InRange {
+        negated: bool,
+        start: Expr,
+        end: Expr,
+        kind: RangeKind,
+    },
+    /// `is Type` (or `!is …`) — subject-form runtime type check.
+    Is { negated: bool, ty: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +204,10 @@ pub enum Expr {
     Int(i64),
     Float(f64),
     Bool(bool),
+    /// A `Char` literal, carrying its UTF-16 code unit.
+    Char(i64),
+    /// The `null` literal.
+    Null,
     /// String literal, split into literal runs and interpolated sub-expressions.
     Str(Vec<StrExpr>),
     Var(String),
@@ -163,21 +227,34 @@ pub enum Expr {
         line: u32,
     },
     /// Property access on a receiver: `receiver.property` (e.g. `"s".length`).
+    /// `safe` marks a safe access `receiver?.property` (short-circuits to null).
     Member {
         recv: Box<Expr>,
         name: String,
+        safe: bool,
         line: u32,
     },
     /// Method call on a receiver: `receiver.method(args)` (e.g.
     /// `"s".uppercase()`, `42.toString()`). Chainable via nested receivers.
+    /// `safe` marks a safe call `receiver?.method(args)`.
     MethodCall {
         recv: Box<Expr>,
         name: String,
         args: Vec<Expr>,
+        safe: bool,
         line: u32,
     },
+    /// Elvis `left ?: right` — `right` when `left` is null, else `left`.
+    Elvis {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    /// Not-null assertion `expr!!` — throws NPE when `expr` is null.
+    NotNull(Box<Expr>),
     /// `if` used as an expression (each branch's last statement is its value).
     If(IfExpr),
+    /// `when` used as an expression (the matched arm's value).
+    When(WhenExpr),
 }
 
 #[derive(Debug, Clone)]

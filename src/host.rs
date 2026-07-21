@@ -41,6 +41,19 @@ pub const KT_FFI_CALL: u16 = 6;
 /// method/property name (a `Str`) on top. Pops all, computes the result, and
 /// pushes it. Property reads (`"s".length`) dispatch with `n == 0`.
 pub const KT_METHOD: u16 = 7;
+/// `when`'s `is Type` runtime type check. Stack: `[value, typeName]`; pops both
+/// and pushes a `Bool` — whether `value`'s runtime kind matches `typeName`.
+pub const KT_IS: u16 = 8;
+/// Coerce a `Char` (carried as its integer code unit) to its one-character
+/// string form. Pops the code, pushes the `Str`.
+pub const KT_CHR_STRING: u16 = 9;
+/// Test the top of stack for Kotlin `null` (fusevm `Undef`). Pops the value,
+/// pushes a `Bool`. Backs the `?.` / `?:` short-circuit checks.
+pub const KT_ISNULL: u16 = 10;
+/// Not-null assertion `!!`. Peeks the top of stack: leaves it unchanged when
+/// non-null, or raises a `NullPointerException` (halting the VM) when it is
+/// `null`.
+pub const KT_NOTNULL: u16 = 11;
 
 thread_local! {
     /// Set by a runtime fault (e.g. integer divide-by-zero) so the CLI can
@@ -113,6 +126,32 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
         KT_TO_STRING => {
             let v = vm.pop();
             vm.push(Value::str(kotlin_string(&v)));
+        }
+        KT_IS => {
+            // Stack: [value, typeName]; typeName on top.
+            let ty = vm.pop().to_str();
+            let v = vm.pop();
+            vm.push(Value::Bool(value_is_type(&v, &ty)));
+        }
+        KT_CHR_STRING => {
+            let code = vm.pop().to_int();
+            let s = char::from_u32(code as u32)
+                .map(|c| c.to_string())
+                .unwrap_or_default();
+            vm.push(Value::str(s));
+        }
+        KT_ISNULL => {
+            let v = vm.pop();
+            vm.push(Value::Bool(matches!(v, Value::Undef)));
+        }
+        KT_NOTNULL => {
+            let v = vm.pop();
+            if matches!(v, Value::Undef) {
+                fault(vm, "java.lang.NullPointerException");
+                vm.push(Value::Undef);
+            } else {
+                vm.push(v);
+            }
         }
         KT_IDIV => {
             let b = vm.pop();
@@ -189,6 +228,13 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
         (Value::Str(s), "isEmpty") => Ok(Value::Bool(s.is_empty())),
         (Value::Str(s), "isNotEmpty") => Ok(Value::Bool(!s.is_empty())),
 
+        // ── kotlin.Char (carried as its integer code unit) ──
+        // `Char.code` → the code unit as `Int`; `Int.toChar()` → a `Char` (the
+        // low 16 bits). Both keep the same underlying integer value; the coarse
+        // static type (Char vs Int) drives display, not the runtime tag.
+        (Value::Int(n), "code") => Ok(Value::Int(*n)),
+        (Value::Int(n), "toChar") => Ok(Value::Int(*n & 0xFFFF)),
+
         // ── kotlin.Any.toString() — defined on every type ──
         (_, "toString") => Ok(Value::str(kotlin_string(recv))),
 
@@ -199,6 +245,21 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
                 type_label(recv)
             ))
         }
+    }
+}
+
+/// Whether `v`'s runtime kind matches the Kotlin type name `ty` — backs
+/// `when`'s `is Type` check. `Char` is carried as an `Int` at runtime and is
+/// not distinguishable here, so `is Char` is treated as `is Int`.
+fn value_is_type(v: &Value, ty: &str) -> bool {
+    match ty {
+        "Int" | "Long" | "Char" | "Byte" | "Short" => matches!(v, Value::Int(_)),
+        "Double" | "Float" => matches!(v, Value::Float(_)),
+        "Boolean" => matches!(v, Value::Bool(_)),
+        "String" | "CharSequence" => matches!(v, Value::Str(_)),
+        // `Any` matches any non-null value; unknown names never match.
+        "Any" => !matches!(v, Value::Undef),
+        _ => false,
     }
 }
 
@@ -221,7 +282,11 @@ pub fn kotlin_string(v: &Value) -> String {
         Value::Int(n) => n.to_string(),
         Value::Float(f) => format_double(*f),
         Value::Str(s) => s.to_string(),
-        Value::Undef => "kotlin.Unit".to_string(),
+        // Kotlin `null` (carried as `Undef`) stringifies to `null` in
+        // interpolation / `println`. `Unit` is displayed statically by the
+        // compiler (it emits the literal `kotlin.Unit`), so it never reaches
+        // here as an `Undef`.
+        Value::Undef => "null".to_string(),
         other => other.to_str(),
     }
 }

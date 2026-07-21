@@ -20,6 +20,8 @@ pub enum Tok {
     Float(f64),
     Str(Vec<StrPart>),
     Bool(bool),
+    /// A `Char` literal (`'A'`), carrying its UTF-16 code unit as an integer.
+    Char(i64),
     Ident(String),
 
     // Keywords
@@ -35,6 +37,11 @@ pub enum Tok {
     Until,
     DownTo,
     Step,
+    When,
+    Is,
+    Break,
+    Continue,
+    Null,
 
     // Punctuation
     LParen,
@@ -45,8 +52,10 @@ pub enum Tok {
     Colon,
     Semi,
     Dot,
-    DotDot, // ..
-    Arrow,  // ->
+    DotDot,   // ..
+    Arrow,    // ->
+    At,       // @  (loop labels: `outer@ for (...)`, `break@outer`)
+    Question, // ?  (safe-call `?.`, elvis `?:`, nullable type `T?`)
 
     // Operators
     Plus,

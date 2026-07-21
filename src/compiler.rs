@@ -21,7 +21,8 @@
 
 use crate::ast::*;
 use crate::host::{
-    KT_DBG_LINE, KT_FFI_CALL, KT_FFI_COMPILE, KT_IDIV, KT_IMOD, KT_METHOD, KT_TO_STRING,
+    KT_CHR_STRING, KT_DBG_LINE, KT_FFI_CALL, KT_FFI_COMPILE, KT_IDIV, KT_IMOD, KT_IS, KT_ISNULL,
+    KT_METHOD, KT_NOTNULL, KT_TO_STRING,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::collections::HashMap;
@@ -135,6 +136,22 @@ pub struct Compiler {
     /// runtime FFI dispatch instead of a compile error — so non-FFI programs keep
     /// their exact "unresolved reference" compile-time diagnostic.
     has_ffi: bool,
+    /// Stack of enclosing loops, innermost last. Each records the (labeled) loop
+    /// so `break`/`continue` can backpatch their jumps to the loop's exit /
+    /// next-iteration point. See [`LoopCtx`].
+    loops: Vec<LoopCtx>,
+}
+
+/// Backpatch bookkeeping for one enclosing loop. `break`/`continue` emit a
+/// `Jump(0)` and stash its op index here; the loop patches them once its exit
+/// and continue targets are known.
+struct LoopCtx {
+    label: Option<String>,
+    /// Op indices of `break` jumps — patched to the loop's exit.
+    breaks: Vec<usize>,
+    /// Op indices of `continue` jumps — patched to the loop's next-iteration
+    /// point (the `while` condition, or the `for` increment).
+    continues: Vec<usize>,
 }
 
 /// Compile a program to a runnable chunk. Requires a `fun main`.
@@ -166,6 +183,7 @@ pub fn compile_with(program: &[FunDecl], debug: bool) -> Result<Chunk, String> {
         fun_sig,
         debug,
         has_ffi,
+        loops: Vec::new(),
     };
 
     // Preamble: bind main's args (an empty Array per declared parameter — the
@@ -274,18 +292,31 @@ impl Compiler {
                 }
                 self.b.emit(Op::ReturnValue, 0);
             }
-            StmtKind::While { cond, body } => {
+            StmtKind::While { cond, body, label } => {
                 let start = self.b.current_pos();
                 self.compile_expr(sc, cond)?;
                 let jf = self.b.emit(Op::JumpIfFalse(0), 0);
+                self.loops.push(LoopCtx {
+                    label: label.clone(),
+                    breaks: Vec::new(),
+                    continues: Vec::new(),
+                });
                 let mark = sc.enter();
                 for s in body {
                     self.compile_stmt(sc, s)?;
                 }
                 sc.exit(mark);
+                let ctx = self.loops.pop().unwrap();
+                // `continue` re-tests the condition, so it targets the loop top.
+                for j in &ctx.continues {
+                    self.b.patch_jump(*j, start);
+                }
                 self.b.emit(Op::Jump(start), 0);
                 let end = self.b.current_pos();
                 self.b.patch_jump(jf, end);
+                for j in &ctx.breaks {
+                    self.b.patch_jump(*j, end);
+                }
             }
             StmtKind::For {
                 var,
@@ -294,12 +325,25 @@ impl Compiler {
                 kind,
                 step,
                 body,
+                label,
             } => {
-                self.compile_for(sc, var, start, end, *kind, step, body)?;
+                self.compile_for(sc, var, start, end, *kind, step, body, label)?;
+            }
+            StmtKind::Break(label) => {
+                let j = self.b.emit(Op::Jump(0), 0);
+                self.loop_for_label(label, s.line)?.breaks.push(j);
+            }
+            StmtKind::Continue(label) => {
+                let j = self.b.emit(Op::Jump(0), 0);
+                self.loop_for_label(label, s.line)?.continues.push(j);
             }
             StmtKind::If(ie) => {
                 self.compile_if(sc, ie)?;
                 self.b.emit(Op::Pop, ie.line); // statement position discards value
+            }
+            StmtKind::When(w) => {
+                self.compile_when(sc, w)?;
+                self.b.emit(Op::Pop, w.line); // statement position discards value
             }
             StmtKind::Expr(e) => {
                 self.compile_expr(sc, e)?;
@@ -307,6 +351,29 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    /// Resolve the [`LoopCtx`] a `break`/`continue` targets: the innermost loop
+    /// for a bare form, or the nearest enclosing loop carrying `label`. Errors if
+    /// used outside a loop or the label is unknown (both Kotlin compile errors).
+    fn loop_for_label(
+        &mut self,
+        label: &Option<String>,
+        line: u32,
+    ) -> Result<&mut LoopCtx, String> {
+        let idx = match label {
+            Some(l) => self
+                .loops
+                .iter()
+                .rposition(|c| c.label.as_deref() == Some(l.as_str()))
+                .ok_or_else(|| format!("unresolved label: {l} (line {line})"))?,
+            None => self
+                .loops
+                .len()
+                .checked_sub(1)
+                .ok_or_else(|| format!("break/continue outside a loop (line {line})"))?,
+        };
+        Ok(&mut self.loops[idx])
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -319,6 +386,7 @@ impl Compiler {
         kind: RangeKind,
         step: &Option<Expr>,
         body: &[Stmt],
+        label: &Option<String>,
     ) -> Result<(), String> {
         // The loop variable and end/step temporaries live in the loop's own
         // scope: they drop when the loop ends and are invisible afterward.
@@ -354,8 +422,20 @@ impl Compiler {
         );
         let jf = self.b.emit(Op::JumpIfFalse(0), 0);
 
+        self.loops.push(LoopCtx {
+            label: label.clone(),
+            breaks: Vec::new(),
+            continues: Vec::new(),
+        });
         for s in body {
             self.compile_stmt(sc, s)?;
+        }
+        let ctx = self.loops.pop().unwrap();
+        // `continue` skips the rest of the body but still advances the counter,
+        // so it targets the increment section below.
+        let cont_target = self.b.current_pos();
+        for j in &ctx.continues {
+            self.b.patch_jump(*j, cont_target);
         }
 
         // counter += step (or -= step for downTo).
@@ -376,6 +456,9 @@ impl Compiler {
         self.b.emit(Op::Jump(top), 0);
         let done = self.b.current_pos();
         self.b.patch_jump(jf, done);
+        for j in &ctx.breaks {
+            self.b.patch_jump(*j, done);
+        }
         sc.exit(mark);
         Ok(())
     }
@@ -396,6 +479,17 @@ impl Compiler {
                 self.b
                     .emit(if *b { Op::LoadTrue } else { Op::LoadFalse }, 0);
                 Ok(Type::Boolean)
+            }
+            // A `Char` lowers to its integer code unit; the static `Char` type
+            // carries display and Char-arithmetic semantics.
+            Expr::Char(c) => {
+                self.b.emit(Op::LoadInt(*c), 0);
+                Ok(Type::Char)
+            }
+            // Kotlin `null` is fusevm `Undef`.
+            Expr::Null => {
+                self.b.emit(Op::LoadUndef, 0);
+                Ok(Type::Unknown)
             }
             Expr::Str(parts) => {
                 self.compile_str(sc, parts)?;
@@ -427,29 +521,94 @@ impl Compiler {
             }
             Expr::Binary { op, l, r } => self.compile_binary(sc, *op, l, r),
             Expr::Call { name, args, line } => self.compile_call(sc, name, args, *line),
-            Expr::Member { recv, name, line } => self.compile_member(sc, recv, name, &[], *line),
+            Expr::Member {
+                recv,
+                name,
+                safe,
+                line,
+            } => self.compile_member(sc, recv, name, &[], *safe, *line),
             Expr::MethodCall {
                 recv,
                 name,
                 args,
+                safe,
                 line,
-            } => self.compile_member(sc, recv, name, args, *line),
+            } => self.compile_member(sc, recv, name, args, *safe, *line),
+            Expr::Elvis { left, right } => self.compile_elvis(sc, left, right),
+            Expr::NotNull(inner) => {
+                let t = self.compile_expr(sc, inner)?;
+                self.b.emit(Op::Extended(KT_NOTNULL, 0), 0);
+                Ok(t)
+            }
             Expr::If(ie) => self.compile_if(sc, ie),
+            Expr::When(w) => self.compile_when(sc, w),
         }
+    }
+
+    /// Emit the ops that turn the top-of-stack value of static type `t` into its
+    /// Kotlin `toString()` display form. `String` is already displayable;
+    /// `Char` uses the char-coercion op; `Unit` becomes the literal
+    /// `kotlin.Unit`; everything else routes through the generic coercion.
+    fn emit_display(&mut self, t: Type) {
+        match t {
+            Type::String => {}
+            Type::Char => {
+                self.b.emit(Op::Extended(KT_CHR_STRING, 0), 0);
+            }
+            Type::Unit => {
+                self.b.emit(Op::Pop, 0);
+                let idx = self.b.add_constant(Value::str("kotlin.Unit"));
+                self.b.emit(Op::LoadConst(idx), 0);
+            }
+            _ => {
+                self.b.emit(Op::Extended(KT_TO_STRING, 0), 0);
+            }
+        }
+    }
+
+    /// Elvis `left ?: right`: evaluate `left`; if it is `null`, discard it and
+    /// yield `right`, otherwise keep `left`.
+    fn compile_elvis(&mut self, sc: &mut Scope, left: &Expr, right: &Expr) -> Result<Type, String> {
+        let lt = self.compile_expr(sc, left)?; // [L]
+        self.b.emit(Op::Dup, 0); // [L, L]
+        self.b.emit(Op::Extended(KT_ISNULL, 0), 0); // [L, isNull]
+                                                    // Not null → jump to end keeping L; null → fall through and replace.
+        let jf = self.b.emit(Op::JumpIfFalse(0), 0); // pops isNull → [L]
+        self.b.emit(Op::Pop, 0); // drop the null L → []
+        let rt = self.compile_expr(sc, right)?; // [R]
+        let end = self.b.current_pos();
+        self.b.patch_jump(jf, end);
+        Ok(if lt == rt { lt } else { Type::Unknown })
     }
 
     /// Lower a member/method access to a `KT_METHOD` host dispatch. The receiver
     /// and arguments are pushed deepest-first, then the member name (a `Str`
     /// constant) on top; the extension `arg` carries the argument count. A bare
     /// property read (`recv.property`) passes `args = []` (arg count 0).
+    #[allow(clippy::too_many_arguments)]
     fn compile_member(
         &mut self,
         sc: &mut Scope,
         recv: &Expr,
         name: &str,
         args: &[Expr],
+        safe: bool,
         line: u32,
     ) -> Result<Type, String> {
+        // A safe call `recv?.member` short-circuits to null when the receiver is
+        // null: evaluate the receiver into a slot, branch on null, and only
+        // dispatch the member on the non-null path.
+        if safe {
+            return self.compile_safe_member(sc, recv, name, args, line);
+        }
+        // `Char.toString()` must render the character, not its code. The runtime
+        // value is an `Int`, so the host's generic `toString` can't tell it is a
+        // Char — resolve it statically here from the receiver's coarse type.
+        if name == "toString" && args.is_empty() && self.infer(sc, recv) == Type::Char {
+            self.compile_expr(sc, recv)?;
+            self.b.emit(Op::Extended(KT_CHR_STRING, 0), line);
+            return Ok(Type::String);
+        }
         self.compile_expr(sc, recv)?;
         for a in args {
             self.compile_expr(sc, a)?;
@@ -457,6 +616,42 @@ impl Compiler {
         let nidx = self.b.add_constant(Value::str(name.to_string()));
         self.b.emit(Op::LoadConst(nidx), line);
         self.b.emit(Op::Extended(KT_METHOD, args.len() as u8), line);
+        Ok(method_ret_type(name))
+    }
+
+    /// Lower a safe member/method access `recv?.member(args)`. Evaluates the
+    /// receiver into a temp slot; if it is null the whole access is null,
+    /// otherwise it dispatches the member as usual.
+    fn compile_safe_member(
+        &mut self,
+        sc: &mut Scope,
+        recv: &Expr,
+        name: &str,
+        args: &[Expr],
+        line: u32,
+    ) -> Result<Type, String> {
+        let mark = sc.enter();
+        self.compile_expr(sc, recv)?; // [recv]
+        let rslot = sc.temp();
+        self.b.emit(Op::SetSlot(rslot), 0); // []
+        self.b.emit(Op::GetSlot(rslot), 0); // [recv]
+        self.b.emit(Op::Extended(KT_ISNULL, 0), 0); // [isNull]
+                                                    // Not null → jump to the call; null → fall through to the null result.
+        let jf = self.b.emit(Op::JumpIfFalse(0), line);
+        self.b.emit(Op::LoadUndef, 0); // [null]
+        let jend = self.b.emit(Op::Jump(0), 0);
+        let call_pos = self.b.current_pos();
+        self.b.patch_jump(jf, call_pos);
+        self.b.emit(Op::GetSlot(rslot), 0); // [recv]
+        for a in args {
+            self.compile_expr(sc, a)?;
+        }
+        let nidx = self.b.add_constant(Value::str(name.to_string()));
+        self.b.emit(Op::LoadConst(nidx), line);
+        self.b.emit(Op::Extended(KT_METHOD, args.len() as u8), line);
+        let end = self.b.current_pos();
+        self.b.patch_jump(jend, end);
+        sc.exit(mark);
         Ok(method_ret_type(name))
     }
 
@@ -474,9 +669,7 @@ impl Compiler {
                 }
                 StrExpr::Expr(e) => {
                     let t = self.compile_expr(sc, e)?;
-                    if t != Type::String {
-                        self.b.emit(Op::Extended(KT_TO_STRING, 0), 0);
-                    }
+                    self.emit_display(t);
                 }
             }
             if i > 0 {
@@ -521,13 +714,9 @@ impl Compiler {
         // `+` is string concatenation when either side is a String.
         if op == BinOp::Add && (lt == Type::String || rt == Type::String) {
             self.compile_expr(sc, l)?;
-            if lt != Type::String {
-                self.b.emit(Op::Extended(KT_TO_STRING, 0), 0);
-            }
+            self.emit_display(lt);
             self.compile_expr(sc, r)?;
-            if rt != Type::String {
-                self.b.emit(Op::Extended(KT_TO_STRING, 0), 0);
-            }
+            self.emit_display(rt);
             self.b.emit(Op::Concat, 0);
             return Ok(Type::String);
         }
@@ -542,15 +731,27 @@ impl Compiler {
         } else {
             Type::Int
         };
+        // Kotlin `Char` arithmetic: `Char + Int` / `Char - Int` → `Char`,
+        // `Char - Char` → `Int`. Backed by the same integer ops; only the
+        // result type (hence display) differs.
+        let char_involved = lt == Type::Char || rt == Type::Char;
+        let add_ty = if char_involved { Type::Char } else { num_ty };
+        let sub_ty = if lt == Type::Char && rt == Type::Char {
+            Type::Int
+        } else if char_involved {
+            Type::Char
+        } else {
+            num_ty
+        };
 
         let ty = match op {
             BinOp::Add => {
                 self.b.emit(Op::Add, 0);
-                num_ty
+                add_ty
             }
             BinOp::Sub => {
                 self.b.emit(Op::Sub, 0);
-                num_ty
+                sub_ty
             }
             BinOp::Mul => {
                 self.b.emit(Op::Mul, 0);
@@ -627,9 +828,7 @@ impl Compiler {
                 }
                 if let Some(a) = args.first() {
                     let t = self.compile_expr(sc, a)?;
-                    if t != Type::String {
-                        self.b.emit(Op::Extended(KT_TO_STRING, 0), 0);
-                    }
+                    self.emit_display(t);
                     self.b.emit(
                         if name == "println" {
                             Op::PrintLn(1)
@@ -706,6 +905,131 @@ impl Compiler {
         Ok(if tt == et { tt } else { Type::Unknown })
     }
 
+    /// Lower a `when` to a chain of guard tests. The subject (if any) is
+    /// evaluated once into a temp slot; each arm's conditions are tested in
+    /// order and the first match runs the arm body, whose value becomes the
+    /// `when`'s value. With no matching arm and no `else`, the value is `null`
+    /// (Unit in statement position, discarded by the caller).
+    fn compile_when(&mut self, sc: &mut Scope, w: &WhenExpr) -> Result<Type, String> {
+        let mark = sc.enter();
+        // Evaluate the subject once; remember its static type for `==` op choice.
+        let subj = if let Some(subject) = &w.subject {
+            let t = self.compile_expr(sc, subject)?;
+            let slot = sc.temp();
+            self.b.emit(Op::SetSlot(slot), 0);
+            Some((slot, t))
+        } else {
+            None
+        };
+
+        let mut end_jumps: Vec<usize> = Vec::new();
+        let mut result_ty: Option<Type> = None;
+        let mut has_else = false;
+
+        for arm in &w.arms {
+            match &arm.guard {
+                WhenGuard::Else => {
+                    has_else = true;
+                    let t = self.compile_block_value(sc, &arm.body)?;
+                    result_ty = Some(join_ty(result_ty, t));
+                    // `else` is terminal — later arms are unreachable.
+                    break;
+                }
+                WhenGuard::Conds(conds) => {
+                    // The arm matches if any condition holds: test each, jumping
+                    // to the body on the first true; if none match, skip the body.
+                    let mut hit_jumps: Vec<usize> = Vec::new();
+                    for cond in conds {
+                        self.compile_when_cond(sc, subj, cond)?; // [bool]
+                        hit_jumps.push(self.b.emit(Op::JumpIfTrue(0), 0)); // pops bool
+                    }
+                    let skip = self.b.emit(Op::Jump(0), 0);
+                    let body_pos = self.b.current_pos();
+                    for j in hit_jumps {
+                        self.b.patch_jump(j, body_pos);
+                    }
+                    let t = self.compile_block_value(sc, &arm.body)?;
+                    result_ty = Some(join_ty(result_ty, t));
+                    end_jumps.push(self.b.emit(Op::Jump(0), 0));
+                    let next = self.b.current_pos();
+                    self.b.patch_jump(skip, next);
+                }
+            }
+        }
+        // Non-exhaustive fallthrough: the value is `null` (Undef).
+        if !has_else {
+            self.b.emit(Op::LoadUndef, 0);
+            result_ty = Some(join_ty(result_ty, Type::Unit));
+        }
+        let end = self.b.current_pos();
+        for j in end_jumps {
+            self.b.patch_jump(j, end);
+        }
+        sc.exit(mark);
+        Ok(result_ty.unwrap_or(Type::Unit))
+    }
+
+    /// Compile one `when` arm condition, leaving a `Bool` on the stack.
+    ///
+    /// Subject form (`subj` is `Some`): `Expr` is an equality against the
+    /// subject, `InRange` a range-membership test, `Is` a runtime type check.
+    /// Subjectless form (`subj` is `None`): `Expr` is a standalone boolean.
+    fn compile_when_cond(
+        &mut self,
+        sc: &mut Scope,
+        subj: Option<(u16, Type)>,
+        cond: &WhenCond,
+    ) -> Result<(), String> {
+        match cond {
+            WhenCond::Expr(e) => match subj {
+                Some((slot, sty)) => {
+                    self.b.emit(Op::GetSlot(slot), 0);
+                    let et = self.compile_expr(sc, e)?;
+                    let str_eq = sty == Type::String || et == Type::String;
+                    self.b.emit(if str_eq { Op::StrEq } else { Op::NumEq }, 0);
+                }
+                None => {
+                    self.compile_expr(sc, e)?;
+                }
+            },
+            WhenCond::InRange {
+                negated,
+                start,
+                end,
+                kind,
+            } => {
+                let (slot, _) = subj.ok_or("`in` condition requires a `when` subject")?;
+                // subject >= lo AND subject <= hi (orientation depends on `kind`).
+                let (lo_cmp, hi_cmp) = match kind {
+                    RangeKind::Inclusive => (Op::NumGe, Op::NumLe),
+                    RangeKind::Until => (Op::NumGe, Op::NumLt),
+                    RangeKind::DownTo => (Op::NumLe, Op::NumGe),
+                };
+                self.b.emit(Op::GetSlot(slot), 0);
+                self.compile_expr(sc, start)?;
+                self.b.emit(lo_cmp, 0);
+                self.b.emit(Op::GetSlot(slot), 0);
+                self.compile_expr(sc, end)?;
+                self.b.emit(hi_cmp, 0);
+                self.b.emit(Op::LogAnd, 0);
+                if *negated {
+                    self.b.emit(Op::LogNot, 0);
+                }
+            }
+            WhenCond::Is { negated, ty } => {
+                let (slot, _) = subj.ok_or("`is` condition requires a `when` subject")?;
+                self.b.emit(Op::GetSlot(slot), 0);
+                let nidx = self.b.add_constant(Value::str(ty.clone()));
+                self.b.emit(Op::LoadConst(nidx), 0);
+                self.b.emit(Op::Extended(KT_IS, 0), 0);
+                if *negated {
+                    self.b.emit(Op::LogNot, 0);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Compile a branch body leaving exactly one value: the last statement's
     /// expression value, or `Undef` (Unit). The body is its own lexical scope —
     /// bindings it declares drop at the block's end (see [`Scope::enter`]).
@@ -744,6 +1068,10 @@ impl Compiler {
                 mark(self);
                 self.compile_if(sc, ie)
             }
+            StmtKind::When(w) => {
+                mark(self);
+                self.compile_when(sc, w)
+            }
             _ => {
                 self.compile_stmt(sc, last)?;
                 self.b.emit(Op::LoadUndef, 0);
@@ -759,6 +1087,8 @@ impl Compiler {
             Expr::Int(_) => Type::Int,
             Expr::Float(_) => Type::Double,
             Expr::Bool(_) => Type::Boolean,
+            Expr::Char(_) => Type::Char,
+            Expr::Null => Type::Unknown,
             Expr::Str(_) => Type::String,
             Expr::Var(n) => sc.ty(n),
             Expr::Unary { op, expr } => match op {
@@ -785,13 +1115,28 @@ impl Compiler {
                     let rt = self.infer(sc, r);
                     if lt == Type::String || rt == Type::String {
                         Type::String
+                    } else if lt == Type::Char || rt == Type::Char {
+                        Type::Char // Char + Int → Char
                     } else if lt == Type::Double || rt == Type::Double {
                         Type::Double
                     } else {
                         Type::Int
                     }
                 }
-                BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+                BinOp::Sub => {
+                    let lt = self.infer(sc, l);
+                    let rt = self.infer(sc, r);
+                    if lt == Type::Char && rt == Type::Char {
+                        Type::Int // Char - Char → Int
+                    } else if lt == Type::Char || rt == Type::Char {
+                        Type::Char // Char - Int → Char
+                    } else if lt == Type::Double || rt == Type::Double {
+                        Type::Double
+                    } else {
+                        Type::Int
+                    }
+                }
+                BinOp::Mul | BinOp::Div | BinOp::Mod => {
                     if self.infer(sc, l) == Type::Double || self.infer(sc, r) == Type::Double {
                         Type::Double
                     } else {
@@ -808,6 +1153,16 @@ impl Compiler {
                     .unwrap_or(Type::Unknown),
             },
             Expr::Member { name, .. } | Expr::MethodCall { name, .. } => method_ret_type(name),
+            Expr::Elvis { left, right } => {
+                let lt = self.infer(sc, left);
+                let rt = self.infer(sc, right);
+                if lt == rt {
+                    lt
+                } else {
+                    Type::Unknown
+                }
+            }
+            Expr::NotNull(inner) => self.infer(sc, inner),
             Expr::If(ie) => {
                 let tt = ie
                     .then
@@ -829,6 +1184,10 @@ impl Compiler {
                     None => Type::Unit,
                 }
             }
+            // `when`'s result type isn't statically joined here (arms can be
+            // heterogeneous); leave it `Unknown` so display routes through the
+            // generic coercion, which is correct for the common Int/String cases.
+            Expr::When(_) => Type::Unknown,
         }
     }
 
@@ -836,8 +1195,19 @@ impl Compiler {
         match &s.kind {
             StmtKind::Expr(e) => self.infer(sc, e),
             StmtKind::If(ie) => self.infer(sc, &Expr::If(ie.clone())),
+            StmtKind::When(w) => self.infer(sc, &Expr::When(w.clone())),
             _ => Type::Unit,
         }
+    }
+}
+
+/// Join two coarse branch types: identical types collapse to that type, an
+/// absent prior type adopts the new one, and any mismatch widens to `Unknown`.
+fn join_ty(prev: Option<Type>, next: Type) -> Type {
+    match prev {
+        None => next,
+        Some(t) if t == next => t,
+        Some(_) => Type::Unknown,
     }
 }
 
@@ -846,8 +1216,9 @@ impl Compiler {
 /// `Unknown` (they still dispatch; only static typing of the result is coarse).
 fn method_ret_type(name: &str) -> Type {
     match name {
-        "length" => Type::Int,
+        "length" | "code" => Type::Int,
         "isEmpty" | "isNotEmpty" => Type::Boolean,
+        "toChar" => Type::Char,
         "uppercase" | "toUpperCase" | "lowercase" | "toLowerCase" | "trim" | "toString" => {
             Type::String
         }
@@ -865,17 +1236,36 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
         StmtKind::Assign { value, .. } => expr_has_ffi(value),
         StmtKind::Return(Some(e)) => expr_has_ffi(e),
         StmtKind::Return(None) => false,
-        StmtKind::While { cond, body } => expr_has_ffi(cond) || body_has_ffi(body),
+        StmtKind::While { cond, body, .. } => expr_has_ffi(cond) || body_has_ffi(body),
         StmtKind::For {
             start, end, body, ..
         } => expr_has_ffi(start) || expr_has_ffi(end) || body_has_ffi(body),
+        StmtKind::Break(_) | StmtKind::Continue(_) => false,
         StmtKind::If(ie) => if_has_ffi(ie),
+        StmtKind::When(w) => when_has_ffi(w),
         StmtKind::Expr(e) => expr_has_ffi(e),
     })
 }
 
 fn if_has_ffi(ie: &IfExpr) -> bool {
     expr_has_ffi(&ie.cond) || body_has_ffi(&ie.then) || ie.els.as_deref().is_some_and(body_has_ffi)
+}
+
+fn when_has_ffi(w: &WhenExpr) -> bool {
+    w.subject.as_deref().is_some_and(expr_has_ffi)
+        || w.arms.iter().any(|arm| {
+            body_has_ffi(&arm.body)
+                || match &arm.guard {
+                    WhenGuard::Else => false,
+                    WhenGuard::Conds(conds) => conds.iter().any(|c| match c {
+                        WhenCond::Expr(e) => expr_has_ffi(e),
+                        WhenCond::InRange { start, end, .. } => {
+                            expr_has_ffi(start) || expr_has_ffi(end)
+                        }
+                        WhenCond::Is { .. } => false,
+                    }),
+                }
+        })
 }
 
 fn expr_has_ffi(e: &Expr) -> bool {
@@ -885,11 +1275,19 @@ fn expr_has_ffi(e: &Expr) -> bool {
         Expr::MethodCall { recv, args, .. } => expr_has_ffi(recv) || args.iter().any(expr_has_ffi),
         Expr::Unary { expr, .. } => expr_has_ffi(expr),
         Expr::Binary { l, r, .. } => expr_has_ffi(l) || expr_has_ffi(r),
+        Expr::Elvis { left, right } => expr_has_ffi(left) || expr_has_ffi(right),
+        Expr::NotNull(inner) => expr_has_ffi(inner),
         Expr::If(ie) => if_has_ffi(ie),
+        Expr::When(w) => when_has_ffi(w),
         Expr::Str(parts) => parts.iter().any(|p| match p {
             StrExpr::Expr(e) => expr_has_ffi(e),
             StrExpr::Text(_) => false,
         }),
-        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Var(_) => false,
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::Char(_)
+        | Expr::Null
+        | Expr::Var(_) => false,
     }
 }

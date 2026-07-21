@@ -107,7 +107,8 @@ fun main() {
 The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 
 - **Types** — `Int`/`Long` (`i64`), `Double`/`Float` (`f64`), `Boolean`,
-  `String`, `Unit`; annotations optional, coarsely inferred otherwise.
+  `Char` (integral code unit), `String`, `Unit`; annotations optional (including
+  nullable `T?`), coarsely inferred otherwise.
 - **Declarations** — top-level `fun` with typed parameters and return type,
   block bodies **and** single-expression bodies (`fun f(...) = expr`);
   `val`/`var` locals (`val` reassignment is a compile error, matching Kotlin);
@@ -117,20 +118,30 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `Double` division is IEEE.
 - **Strings** — literals with `\n`/`\t`/`\\`/`\"`/`\$` escapes and `$name` /
   `${expr}` templates; `+` concatenates when either side is a `String`.
+- **Char** — `'A'` literals (with `\n`/`\t`/`\uXXXX`/… escapes); integral
+  arithmetic (`'A' + 1` → `Char`, `'D' - 'A'` → `Int`), `.code` (→ `Int`) and
+  `Int.toChar()` (→ `Char`), ordering by code unit.
 - **Member access** — chainable postfix `.`: `String.length`,
-  `.uppercase()`/`.lowercase()`, `.trim()`, `.isEmpty()`/`.isNotEmpty()`, and
-  `Any.toString()`.
+  `.uppercase()`/`.lowercase()`, `.trim()`, `.isEmpty()`/`.isNotEmpty()`,
+  `Char.code`, `Int.toChar()`, and `Any.toString()`.
 - **Control flow** — `if`/`else` (statement **and** expression, incl.
-  `else if`), `while`, and `for` over `a..b`, `a until b`, `a downTo b`, with
-  optional `step`. Blocks are lexically scoped: bindings declared in a nested
-  block (and the `for` variable) drop at the block's end; shadowing is restored.
+  `else if`); `when` (statement **and** expression) in subject and subjectless
+  forms, with literal, comma-grouped, `in`/`!in` range, `is`/`!is` type, and
+  `else` arms; `while`, and `for` over `a..b`, `a until b`, `a downTo b`, with
+  optional `step`; `break`/`continue`, including labeled `outer@ for (…)` with
+  `break@outer` / `continue@outer`. Blocks are lexically scoped: bindings
+  declared in a nested block (and the `for` variable) drop at the block's end;
+  shadowing is restored.
+- **Null safety** — `null` literal and nullable types `T?`; safe call `?.`
+  (short-circuits to null), Elvis `?:`, and the not-null assertion `!!` (throws
+  `NullPointerException` on null).
 - **Functions** — user calls, recursion, `return`, `Unit` functions.
 - **Built-ins** — `println(...)` / `print(...)`.
 - **Comments** — `//` and nested `/* … */`.
 
 Not yet in M0 (see roadmap): classes/objects, collections and their methods,
-lambdas, `when`, nullability, generics beyond parse-and-ignore, and the rest of
-the standard library beyond the `String`/`Any` members above.
+lambdas, generics beyond parse-and-ignore, and the rest of the standard library
+beyond the `String`/`Char`/`Any` members above.
 
 ## [0x04] COMMAND-LINE FLAGS
 
@@ -157,17 +168,18 @@ share the language-server corpus, so they never drift.
 Kotlin source
    │  lexer.rs      → tokens (string templates pre-split)
    │  parser.rs     → AST (ast.rs)
-   │  compiler.rs   → fusevm::Chunk   (native ops + 3 extension ops)
+   │  compiler.rs   → fusevm::Chunk   (native ops + Kotlin extension ops)
    ▼
 fusevm::VM  ──►  three-tier Cranelift JIT (linear · block · tracing)
    ▲
-   │  host.rs       → KT_TO_STRING / KT_IDIV / KT_IMOD
+   │  host.rs       → value coercions (toString / idiv / imod / Char / is / null)
 ```
 
 - `compiler.rs` keeps one invariant: every expression leaves exactly one value
-  on the stack and every statement is stack-neutral, so `if`/`while`/`for`
+  on the stack and every statement is stack-neutral, so `if`/`while`/`for`/`when`
   balance without a separate analysis pass.
-- The only Kotlin-specific runtime code is three extension ops in `host.rs`;
+- The only Kotlin-specific runtime code is a small set of extension ops in
+  `host.rs` (value coercions, member dispatch, `is` checks, null tests);
   everything else is a universal fusevm op.
 
 ## [0x06] STATUS & ROADMAP
@@ -175,10 +187,10 @@ fusevm::VM  ──►  three-tier Cranelift JIT (linear · block · tracing)
 M0 (this release): the running language subset above, with a headless test
 suite and `--dump-*` introspection.
 
-Next: collections (`List`/`Map`/`Set`) and their methods, `when`, classes and
-data classes, lambdas and higher-order functions, nullability, and a growing
-standard-library surface — followed by the sibling parity tooling (LSP/DAP,
-reference generator, differential harness).
+Next: collections (`List`/`Map`/`Set`) and their methods, classes and data
+classes, lambdas and higher-order functions, and a growing standard-library
+surface — followed by the sibling parity tooling (LSP/DAP, reference generator,
+differential harness).
 
 ## [0xFF] LICENSE
 

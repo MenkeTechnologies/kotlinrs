@@ -115,6 +115,36 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "the Boolean false literal",
         "val done: Boolean = false",
     ),
+    (
+        "when",
+        "Keyword",
+        "multi-way branch (statement or expression); subject or subjectless",
+        "when (n) { 1 -> \"one\"; in 2..9 -> \"few\"; else -> \"many\" }",
+    ),
+    (
+        "is",
+        "Keyword",
+        "runtime type check in a `when` arm: `is String`, `!is Int`",
+        "when (x) { is String -> \"str\"; is Int -> \"int\"; else -> \"?\" }",
+    ),
+    (
+        "break",
+        "Keyword",
+        "exit the enclosing loop; `break@label` targets a labeled loop",
+        "for (i in 1..9) { if (i == 5) break }",
+    ),
+    (
+        "continue",
+        "Keyword",
+        "skip to the loop's next iteration; `continue@label` for a labeled loop",
+        "for (i in 1..9) { if (i % 2 == 0) continue; println(i) }",
+    ),
+    (
+        "null",
+        "Keyword",
+        "the null reference; used with `T?`, `?.`, `?:`, and `!!`",
+        "val x: Int? = null\nprintln(x ?: 0)   // 0",
+    ),
     // ── Type ──
     (
         "Int",
@@ -145,6 +175,12 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "Type",
         "true/false; prints as `true` or `false`",
         "val b: Boolean = 1 < 2",
+    ),
+    (
+        "Char",
+        "Type",
+        "a single character (code unit); integral — `'A' + 1`, `.code`, `.toChar()`",
+        "val c: Char = 'A'\nprintln(c + 1)   // B",
     ),
     (
         "String",

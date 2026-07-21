@@ -43,6 +43,13 @@ impl Parser {
     fn peek(&self) -> &Tok {
         &self.toks[self.pos].tok
     }
+    /// The token `n` positions ahead (clamped to `Eof` past the end).
+    fn peek_at(&self, n: usize) -> &Tok {
+        self.toks
+            .get(self.pos + n)
+            .map(|s| &s.tok)
+            .unwrap_or(&Tok::Eof)
+    }
     fn line(&self) -> u32 {
         self.toks[self.pos].line
     }
@@ -133,8 +140,10 @@ impl Parser {
         })
     }
 
-    /// A type reference — `Int`, `String`, `Array<String>`, … Generic args are
-    /// consumed but ignored (coarse typing).
+    /// A type reference — `Int`, `String`, `Array<String>`, `Int?`, … Generic
+    /// args are consumed but ignored (coarse typing), and a trailing `?`
+    /// (nullable) is accepted and discarded — nullability is tracked at the
+    /// value/flow level, not in the coarse static type.
     fn type_name(&mut self) -> Result<Type, String> {
         let name = self.ident()?;
         if self.at(&Tok::Lt) {
@@ -152,6 +161,9 @@ impl Parser {
                     _ => {}
                 }
             }
+        }
+        if self.at(&Tok::Question) {
+            self.bump(); // nullable marker `T?`
         }
         Ok(Type::from_name(&name))
     }
@@ -174,6 +186,21 @@ impl Parser {
 
     fn stmt(&mut self) -> Result<Stmt, String> {
         let line = self.line();
+        // A loop label: `outer@ for (…)` / `outer@ while (…)`.
+        if matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::At) {
+            let label = self.ident()?;
+            self.eat(&Tok::At)?;
+            let kind = match self.peek() {
+                Tok::While => self.while_stmt(Some(label))?,
+                Tok::For => self.for_stmt(Some(label))?,
+                other => {
+                    return Err(format!(
+                        "a label must precede a loop (`for`/`while`), found {other:?}"
+                    ))
+                }
+            };
+            return Ok(Stmt::new(line, kind));
+        }
         let kind = match self.peek() {
             Tok::Val | Tok::Var => self.let_decl()?,
             Tok::Return => {
@@ -186,12 +213,31 @@ impl Parser {
                     StmtKind::Return(Some(self.expr()?))
                 }
             }
-            Tok::While => self.while_stmt()?,
-            Tok::For => self.for_stmt()?,
+            Tok::While => self.while_stmt(None)?,
+            Tok::For => self.for_stmt(None)?,
             Tok::If => StmtKind::If(self.if_expr()?),
+            Tok::When => StmtKind::When(self.when_expr()?),
+            Tok::Break => {
+                self.bump();
+                StmtKind::Break(self.opt_label()?)
+            }
+            Tok::Continue => {
+                self.bump();
+                StmtKind::Continue(self.opt_label()?)
+            }
             _ => self.assign_or_expr()?,
         };
         Ok(Stmt::new(line, kind))
+    }
+
+    /// An optional `@label` after `break`/`continue`.
+    fn opt_label(&mut self) -> Result<Option<String>, String> {
+        if self.at(&Tok::At) {
+            self.bump();
+            Ok(Some(self.ident()?))
+        } else {
+            Ok(None)
+        }
     }
 
     fn let_decl(&mut self) -> Result<StmtKind, String> {
@@ -213,16 +259,16 @@ impl Parser {
         })
     }
 
-    fn while_stmt(&mut self) -> Result<StmtKind, String> {
+    fn while_stmt(&mut self, label: Option<String>) -> Result<StmtKind, String> {
         self.eat(&Tok::While)?;
         self.eat(&Tok::LParen)?;
         let cond = self.expr()?;
         self.eat(&Tok::RParen)?;
         let body = self.block()?;
-        Ok(StmtKind::While { cond, body })
+        Ok(StmtKind::While { cond, body, label })
     }
 
-    fn for_stmt(&mut self) -> Result<StmtKind, String> {
+    fn for_stmt(&mut self, label: Option<String>) -> Result<StmtKind, String> {
         self.eat(&Tok::For)?;
         self.eat(&Tok::LParen)?;
         let var = self.ident()?;
@@ -263,6 +309,7 @@ impl Parser {
             kind,
             step,
             body,
+            label,
         })
     }
 
@@ -353,7 +400,7 @@ impl Parser {
     }
 
     fn cmp_expr(&mut self) -> Result<Expr, String> {
-        let mut l = self.additive()?;
+        let mut l = self.elvis_expr()?;
         loop {
             let op = match self.peek() {
                 Tok::Lt => BinOp::Lt,
@@ -363,7 +410,7 @@ impl Parser {
                 _ => break,
             };
             self.bump();
-            let r = self.additive()?;
+            let r = self.elvis_expr()?;
             l = Expr::Binary {
                 op,
                 l: Box::new(l),
@@ -371,6 +418,25 @@ impl Parser {
             };
         }
         Ok(l)
+    }
+
+    /// Elvis `a ?: b`, right-associative, binding tighter than comparison and
+    /// looser than additive (matching Kotlin, which places `?:` above named
+    /// checks and comparisons). `?:` is `Question` immediately followed by
+    /// `Colon`; a `?` followed by `.` is a safe call and stays in `postfix`.
+    fn elvis_expr(&mut self) -> Result<Expr, String> {
+        let l = self.additive()?;
+        if self.at(&Tok::Question) && matches!(self.peek_at(1), Tok::Colon) {
+            self.bump(); // ?
+            self.bump(); // :
+            let r = self.elvis_expr()?;
+            Ok(Expr::Elvis {
+                left: Box::new(l),
+                right: Box::new(r),
+            })
+        } else {
+            Ok(l)
+        }
     }
 
     fn additive(&mut self) -> Result<Expr, String> {
@@ -437,7 +503,24 @@ impl Parser {
     /// unary operators, so `-a.b` is `-(a.b)`, matching Kotlin.
     fn postfix(&mut self) -> Result<Expr, String> {
         let mut e = self.primary()?;
-        while self.at(&Tok::Dot) {
+        loop {
+            // Not-null assertion `expr!!` — two consecutive `!` tokens (`!=`
+            // lexes as a single `NotEq`, so this only fires on a literal `!!`).
+            if self.at(&Tok::Not) && matches!(self.peek_at(1), Tok::Not) {
+                self.bump();
+                self.bump();
+                e = Expr::NotNull(Box::new(e));
+                continue;
+            }
+            // Plain member/method `.` or safe-call `?.`.
+            let safe = if self.at(&Tok::Dot) {
+                false
+            } else if self.at(&Tok::Question) && matches!(self.peek_at(1), Tok::Dot) {
+                self.bump(); // `?`
+                true
+            } else {
+                break;
+            };
             let line = self.line();
             self.bump(); // `.`
             let name = self.ident()?;
@@ -457,12 +540,14 @@ impl Parser {
                     recv: Box::new(e),
                     name,
                     args,
+                    safe,
                     line,
                 };
             } else {
                 e = Expr::Member {
                     recv: Box::new(e),
                     name,
+                    safe,
                     line,
                 };
             }
@@ -485,11 +570,20 @@ impl Parser {
                 self.bump();
                 Ok(Expr::Bool(b))
             }
+            Tok::Char(c) => {
+                self.bump();
+                Ok(Expr::Char(c))
+            }
+            Tok::Null => {
+                self.bump();
+                Ok(Expr::Null)
+            }
             Tok::Str(parts) => {
                 self.bump();
                 Ok(Expr::Str(self.str_parts(&parts)?))
             }
             Tok::If => Ok(Expr::If(self.if_expr()?)),
+            Tok::When => Ok(Expr::When(self.when_expr()?)),
             Tok::LParen => {
                 self.bump();
                 let e = self.expr()?;
@@ -546,14 +640,123 @@ impl Parser {
         })
     }
 
-    /// An `if`/`else` branch body: either a `{ … }` block or a single
-    /// expression (Kotlin allows `if (c) e1 else e2`).
+    /// A `when` — subject form `when (x) { … }` or subjectless `when { … }`.
+    /// Arms are `guard -> body`, with `guard` either `else`, or one or more
+    /// comma-separated conditions.
+    fn when_expr(&mut self) -> Result<WhenExpr, String> {
+        let line = self.line();
+        self.eat(&Tok::When)?;
+        let subject = if self.at(&Tok::LParen) {
+            self.bump();
+            let e = self.expr()?;
+            self.eat(&Tok::RParen)?;
+            Some(Box::new(e))
+        } else {
+            None
+        };
+        let has_subject = subject.is_some();
+        self.eat(&Tok::LBrace)?;
+        let mut arms = Vec::new();
+        while !self.at(&Tok::RBrace) && !self.at(&Tok::Eof) {
+            if self.at(&Tok::Semi) {
+                self.bump();
+                continue;
+            }
+            let guard = if self.at(&Tok::Else) {
+                self.bump();
+                WhenGuard::Else
+            } else {
+                let mut conds = vec![self.when_cond(has_subject)?];
+                while self.at(&Tok::Comma) {
+                    self.bump();
+                    conds.push(self.when_cond(has_subject)?);
+                }
+                WhenGuard::Conds(conds)
+            };
+            self.eat(&Tok::Arrow)?;
+            let body = self.branch_body()?;
+            arms.push(WhenArm { guard, body });
+        }
+        self.eat(&Tok::RBrace)?;
+        Ok(WhenExpr {
+            subject,
+            arms,
+            line,
+        })
+    }
+
+    /// A single `when` arm condition. In subject form it may be `in range`,
+    /// `!in range`, `is Type`, `!is Type`, or an expression (equality against
+    /// the subject). In subjectless form it is a boolean expression.
+    fn when_cond(&mut self, has_subject: bool) -> Result<WhenCond, String> {
+        if has_subject {
+            match self.peek() {
+                Tok::In => {
+                    self.bump();
+                    return self.when_range(false);
+                }
+                Tok::Is => {
+                    self.bump();
+                    let ty = self.ident()?;
+                    return Ok(WhenCond::Is { negated: false, ty });
+                }
+                // `!in` / `!is` — a `!` immediately followed by `in`/`is`.
+                Tok::Not if matches!(self.peek_at(1), Tok::In) => {
+                    self.bump();
+                    self.bump();
+                    return self.when_range(true);
+                }
+                Tok::Not if matches!(self.peek_at(1), Tok::Is) => {
+                    self.bump();
+                    self.bump();
+                    let ty = self.ident()?;
+                    return Ok(WhenCond::Is { negated: true, ty });
+                }
+                _ => {}
+            }
+        }
+        Ok(WhenCond::Expr(self.expr()?))
+    }
+
+    /// The range after `in`/`!in` in a `when` arm — `a..b`, `a until b`, or
+    /// `a downTo b`.
+    fn when_range(&mut self, negated: bool) -> Result<WhenCond, String> {
+        let start = self.range_bound()?;
+        let (kind, end) = match self.peek() {
+            Tok::DotDot => {
+                self.bump();
+                (RangeKind::Inclusive, self.range_bound()?)
+            }
+            Tok::Until => {
+                self.bump();
+                (RangeKind::Until, self.range_bound()?)
+            }
+            Tok::DownTo => {
+                self.bump();
+                (RangeKind::DownTo, self.range_bound()?)
+            }
+            other => return Err(format!(
+                "`in` condition needs a range (`a..b`, `a until b`, `a downTo b`), found {other:?}"
+            )),
+        };
+        Ok(WhenCond::InRange {
+            negated,
+            start,
+            end,
+            kind,
+        })
+    }
+
+    /// An `if`/`else`/`when` branch body: either a `{ … }` block or a single
+    /// statement. The single form covers a value expression (`if (c) e1 else e2`)
+    /// as well as the control-flow forms Kotlin permits there — `break`,
+    /// `continue`, `return`, and a nested `when` — which are statements, not
+    /// expressions.
     fn branch_body(&mut self) -> Result<Vec<Stmt>, String> {
         if self.at(&Tok::LBrace) {
             self.block()
         } else {
-            let line = self.line();
-            Ok(vec![Stmt::new(line, StmtKind::Expr(self.expr()?))])
+            Ok(vec![self.stmt()?])
         }
     }
 

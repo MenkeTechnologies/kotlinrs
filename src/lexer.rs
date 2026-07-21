@@ -7,6 +7,16 @@
 
 use crate::token::{Spanned, StrPart, Tok};
 
+/// Byte length of the UTF-8 sequence whose leading byte is `b`.
+fn utf8_len(b: u8) -> usize {
+    match b {
+        0x00..=0x7f => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        _ => 4,
+    }
+}
+
 pub struct Lexer<'a> {
     src: &'a [u8],
     pos: usize,
@@ -98,9 +108,67 @@ impl<'a> Lexer<'a> {
         match c {
             b'0'..=b'9' => Ok(self.number()),
             b'"' => self.string(),
+            b'\'' => self.char_literal(),
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => Ok(self.ident_or_keyword()),
             _ => self.operator(),
         }
+    }
+
+    /// A `Char` literal `'A'` — a single UTF-16 unit (or escape). Kotlin `Char`
+    /// is integral; the code unit is carried in [`Tok::Char`] and lowers to a
+    /// plain integer at runtime, statically typed `Char` so display and `Char`
+    /// arithmetic stay faithful.
+    fn char_literal(&mut self) -> Result<Tok, String> {
+        self.bump(); // opening '
+        if self.pos >= self.src.len() {
+            return Err("unterminated char literal".into());
+        }
+        let ch = if self.peek() == b'\\' {
+            self.bump();
+            let e = self.bump();
+            match e {
+                b'n' => '\n',
+                b't' => '\t',
+                b'r' => '\r',
+                b'\\' => '\\',
+                b'\'' => '\'',
+                b'"' => '"',
+                b'$' => '$',
+                b'0' => '\0',
+                b'b' => '\u{8}',
+                b'u' => {
+                    // `\uXXXX` — exactly four hex digits.
+                    let mut code: u32 = 0;
+                    for _ in 0..4 {
+                        let h = self.bump();
+                        let d = (h as char)
+                            .to_digit(16)
+                            .ok_or("invalid `\\u` escape in char literal")?;
+                        code = code * 16 + d;
+                    }
+                    char::from_u32(code).ok_or("invalid unicode scalar in char literal")?
+                }
+                other => other as char,
+            }
+        } else {
+            // A UTF-8 encoded scalar. Decode from the raw bytes so multi-byte
+            // characters (`'é'`) lex to a single Char.
+            let start = self.pos;
+            let first = self.peek();
+            let len = utf8_len(first);
+            for _ in 0..len {
+                self.bump();
+            }
+            std::str::from_utf8(&self.src[start..self.pos])
+                .ok()
+                .and_then(|s| s.chars().next())
+                .ok_or("invalid char literal")?
+        };
+        if self.peek() != b'\'' {
+            return Err("unterminated char literal (expected closing `'`)".into());
+        }
+        self.bump(); // closing '
+        Ok(Tok::Char(ch as i64))
     }
 
     fn number(&mut self) -> Tok {
@@ -169,6 +237,11 @@ impl<'a> Lexer<'a> {
             "until" => Tok::Until,
             "downTo" => Tok::DownTo,
             "step" => Tok::Step,
+            "when" => Tok::When,
+            "is" => Tok::Is,
+            "break" => Tok::Break,
+            "continue" => Tok::Continue,
+            "null" => Tok::Null,
             "true" => Tok::Bool(true),
             "false" => Tok::Bool(false),
             _ => Tok::Ident(s.to_string()),
@@ -298,6 +371,8 @@ impl<'a> Lexer<'a> {
             (b':', _) => Tok::Colon,
             (b';', _) => Tok::Semi,
             (b'.', _) => Tok::Dot,
+            (b'@', _) => Tok::At,
+            (b'?', _) => Tok::Question,
             (other, _) => {
                 return Err(format!("unexpected character '{}'", other as char));
             }
