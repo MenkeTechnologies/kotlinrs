@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="kotlinrs — Kotlin in Rust. A compiled Kotlin runtime: source lexed and parsed to an AST, lowered to fusevm bytecode, and run on the shared bytecode VM with a three-tier Cranelift JIT. No JVM. MIT licensed.">
+  <title>kotlinrs — Documentation</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&amp;family=Share+Tech+Mono&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="hud-static.css">
+  <link rel="stylesheet" href="tutorial.css">
+  <style>
+    .tutorial-main { max-width: 68rem; }
+    .docs-build-line { margin: 0.35rem 0 0; font-family: 'Share Tech Mono', ui-monospace, monospace; font-size: 11px; color: var(--text-dim); letter-spacing: 0.03em; max-width: 42rem; opacity: 0.75; }
+    .cat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr)); gap: 0.6rem; margin: 0.7rem 0; }
+    .cat-card { border: 1px solid var(--border); border-left: 2px solid var(--cyan); padding: 0.6rem 0.8rem; background: color-mix(in srgb, var(--bg-card) 92%, transparent); border-radius: 2px; }
+    .cat-card h4 { font-family: 'Orbitron', sans-serif; font-size: 11px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; color: var(--cyan); margin: 0 0 0.35rem; }
+    .cat-card p { margin: 0; font-size: 11.5px; color: var(--text-dim); line-height: 1.5; }
+    .cat-card code { font-size: 11px; color: var(--accent-light); }
+    .reflection-table { width: 100%; border-collapse: collapse; margin: 0.6rem 0 0.2rem; font-size: 12px; }
+    .reflection-table th { background: var(--bg-secondary); color: var(--cyan); font-family: 'Orbitron', sans-serif; font-size: 10px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; text-align: left; padding: 6px 10px; border: 1px solid var(--border); }
+    .reflection-table td { padding: 6px 10px; border: 1px solid var(--border); color: var(--text-dim); vertical-align: top; }
+    .reflection-table td code { color: var(--accent-light); background: var(--bg); }
+    .status-pill { display: inline-block; font-family: 'Orbitron', sans-serif; font-size: 9px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; padding: 2px 7px; border-radius: 2px; border: 1px solid var(--border); }
+    .status-implemented { color: var(--green); border-color: var(--green); }
+    .status-progress { color: var(--accent-light); }
+    .status-planned { color: var(--text-muted); }
+  </style>
+</head>
+<body>
+  <div class="app tutorial-app" id="docsApp">
+    <div class="crt-scanline" id="crtH" aria-hidden="true"></div>
+    <div class="crt-scanline-v" id="crtV" aria-hidden="true"></div>
+
+    <header class="tutorial-header">
+      <div class="tutorial-header-inner">
+        <div>
+          <h1 class="tutorial-brand">// KOTLINRS — KOTLIN IN RUST</h1>
+          <nav class="tutorial-crumbs" aria-label="Breadcrumb">
+            <span class="current">Docs</span>
+            <span class="sep">/</span>
+            <a href="report.html">Engineering Report</a>
+            <span class="sep">/</span>
+            <a href="reference.html">Reference</a>
+            <span class="sep">/</span>
+            <a href="https://github.com/MenkeTechnologies/kotlinrs" target="_blank" rel="noopener noreferrer">GitHub</a>
+          </nav>
+          <p class="docs-build-line">kotlinrs v0.1.0 · Kotlin on fusevm · lex/parse → AST → bytecode → Cranelift JIT · no JVM · a fusevm language host (with zshrs, stryke, awkrs, elisprs, rubylang, phplang, pythonrs, node-js) · MIT · in active development</p>
+        </div>
+        <div class="tutorial-toolbar">
+          <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
+          <button type="button" class="btn btn-secondary active" id="btnCrt" title="CRT scanline overlay">CRT</button>
+          <button type="button" class="btn btn-secondary active" id="btnNeon" title="Neon border pulse">Neon</button>
+          <a class="btn btn-secondary" href="report.html">Report</a>
+          <a class="btn btn-secondary" href="reference.html">Reference</a>
+          <a class="btn btn-secondary" href="https://github.com/MenkeTechnologies/kotlinrs" target="_blank" rel="noopener noreferrer">GitHub</a>
+        </div>
+      </div>
+    </header>
+
+    <main class="tutorial-main">
+      <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>KOTLINRS REFERENCE</h2>
+      <p class="tutorial-subtitle">A compiled Kotlin runtime written in Rust. Source is lexed and parsed to an AST, lowered to <code>fusevm</code> bytecode, and executed on the same language-agnostic VM + three-tier Cranelift JIT that hosts <code>zshrs</code>, <code>stryke</code>, <code>awkrs</code>, <code>elisprs</code>, <code>rubylang</code>, <code>phplang</code>, <code>pythonrs</code>, and <code>node-js</code>. No JVM, no <code>kotlinc</code>, no <code>.class</code> files. <strong>In active development.</strong></p>
+
+      <section class="tutorial-section">
+        <h2>What it is</h2>
+        <p><code>kotlinrs</code> runs Kotlin programs as ordinary compiled bytecode: it lexes and parses the source, lowers it to <code>fusevm</code> instructions, and lets the shared engine execute and JIT-compile them. There is no bespoke VM or tree-walker — arithmetic, comparison, control flow, locals, and calls lower to <em>native</em> fusevm ops so the Cranelift JIT can trace hot loops. A small runtime host (<code>src/host.rs</code>) supplies only the three Kotlin behaviours the universal ops cannot express: the <code>Boolean</code>/<code>Double</code> display form (<code>true</code>/<code>false</code>, <code>1.0</code>) and truncating integer <code>/</code> and <code>%</code> with an <code>ArithmeticException</code> on a zero divisor.</p>
+        <p>It is another language hosted on <a href="https://github.com/MenkeTechnologies/fusevm">fusevm</a>, the shared bytecode VM and Cranelift JIT. kotlinrs carries no VM or JIT of its own.</p>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Architecture</h2>
+        <pre>Kotlin source  →  lexer  →  parser (AST)  →  lower to fusevm bytecode  →  fusevm VM + Cranelift JIT
+                                                    │
+                                          KtHost extension handler (toString / idiv / imod)</pre>
+        <div class="cat-grid">
+          <div class="cat-card"><h4>fusevm-hosted</h4><p>No local <code>vm.rs</code> / <code>jit.rs</code>. Kotlin is lowered to fusevm bytecode and executed on the shared three-tier Cranelift JIT.</p></div>
+          <div class="cat-card"><h4>Native ops</h4><p>Arithmetic, comparison, <code>if</code>/<code>while</code>/<code>for</code>, locals, and calls compile to native fusevm ops (<code>Add</code>, <code>NumLt</code>, <code>Call</code>, …) — so the JIT can trace hot loops, not a bespoke interpreter.</p></div>
+          <div class="cat-card"><h4>Thin host</h4><p>Only Kotlin display form and truncating integer <code>/</code>/<code>%</code> are handled by the extension handler; everything else is language-agnostic bytecode.</p></div>
+          <div class="cat-card"><h4>Editor tooling</h4><p>An LSP server (<code>--lsp</code>), a DAP debugger (<code>--dap</code>), inline Rust FFI (<code>rust { … }</code>), and bytecode disassembly (<code>--disasm</code>) ship in-tree.</p></div>
+        </div>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Example</h2>
+<pre>fun fib(n: Int): Int {
+    if (n &lt; 2) return n
+    return fib(n - 1) + fib(n - 2)
+}
+
+fun main() {
+    for (i in 0..10) {
+        println("fib($i) = ${fib(i)}")
+    }
+
+    var total = 0
+    for (x in 1..4) total += x
+    println(total)          // =&gt; 10
+
+    val half = 7 / 2        // truncating Int division =&gt; 3
+    println(half)
+}</pre>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Toolchain</h2>
+        <div class="cat-grid">
+          <div class="cat-card"><h4>--lsp</h4><p>A Language Server Protocol server on stdio: parser-driven diagnostics, plus keyword / type / builtin completion and hover from the reference corpus (<code>src/lsp.rs</code>).</p></div>
+          <div class="cat-card"><h4>--dap</h4><p>A Debug Adapter Protocol server on stdio: source-line breakpoints, step in/over/out, a stack frame, and live local values, with the debuggee's stdout streamed as output events (<code>src/dap.rs</code>).</p></div>
+          <div class="cat-card"><h4>rust { … } FFI</h4><p>An inline <code>rust { pub extern "C" fn … }</code> block compiles to a cached cdylib whose exported functions are callable by name from Kotlin (<code>src/rust_ffi.rs</code>, <code>fusevm::ffi</code>).</p></div>
+          <div class="cat-card"><h4>Introspection</h4><p><code>--dump-tokens</code>, <code>--dump-ast</code>, and <code>--disasm</code> (a fusevm bytecode disassembly listing) print each stage and exit.</p></div>
+        </div>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Status &amp; roadmap</h2>
+        <table class="reflection-table">
+          <thead><tr><th>Component</th><th>State</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td>Lexer / parser → AST</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Kotlin subset: <code>fun</code>, <code>val</code>/<code>var</code>, <code>if</code>/<code>while</code>/<code>for</code>, ranges, string interpolation (<code>src/lexer.rs</code>, <code>src/parser.rs</code>).</td></tr>
+            <tr><td>AST → fusevm bytecode lowering</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Native arithmetic / comparison / control flow; no local VM (<code>src/compiler.rs</code>).</td></tr>
+            <tr><td>Kotlin runtime host</td><td><span class="status-pill status-implemented">Implemented</span></td><td><code>toString()</code> display form, truncating integer <code>/</code>/<code>%</code>, zero-divisor <code>ArithmeticException</code> (<code>src/host.rs</code>).</td></tr>
+            <tr><td>Standalone <code>kotlin</code> binary</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Run <code>.kt</code> files and <code>-e</code> one-liners (<code>src/main.rs</code>).</td></tr>
+            <tr><td>LSP server (<code>--lsp</code>)</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Parser diagnostics, keyword/type/builtin completion and hover (<code>src/lsp.rs</code>).</td></tr>
+            <tr><td>DAP adapter (<code>--dap</code>)</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Line breakpoints, step in/over/out, stack + live locals, streamed stdout (<code>src/dap.rs</code>).</td></tr>
+            <tr><td>Inline Rust FFI (<code>rust { … }</code>)</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Cached cdylib, exported functions callable by name (<code>src/rust_ffi.rs</code>, <code>fusevm::ffi</code>).</td></tr>
+            <tr><td>Bytecode disassembly (<code>--disasm</code>)</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Shared <code>fusevm::Chunk::disassemble</code> listing.</td></tr>
+            <tr><td>Classes, collections, lambdas, stdlib</td><td><span class="status-pill status-planned">Planned</span></td><td>The wider Kotlin language and standard library beyond the current subset are pending.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Building from source</h2>
+        <p>kotlinrs builds as a standalone Rust crate (it is not a workspace member of the meta repo):</p>
+<pre># clone
+git clone https://github.com/MenkeTechnologies/kotlinrs
+cd kotlinrs
+
+# build (produces target/debug/kotlin)
+cargo build
+
+# run a script or a one-liner
+./target/debug/kotlin examples/fib.kt
+./target/debug/kotlin -e 'println(6 * 7)'
+
+# editor tooling
+./target/debug/kotlin --lsp        # Language Server Protocol on stdio
+./target/debug/kotlin --dap        # Debug Adapter Protocol on stdio
+./target/debug/kotlin --disasm examples/hello.kt
+
+# run tests
+cargo test</pre>
+        <p>fusevm is pulled from crates.io with the <code>jit</code> and <code>ffi</code> features.</p>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>License</h2>
+        <p>kotlinrs is <strong>MIT licensed</strong> — free and open source. See <a href="https://github.com/MenkeTechnologies/kotlinrs/blob/main/LICENSE">LICENSE</a>.</p>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Repository &amp; links</h2>
+        <ul>
+          <li><strong>Engineering report</strong> — <a href="report.html">report.html</a> (architecture, fusevm hosting, roadmap, dependency posture)</li>
+          <li><strong>Language reference</strong> — <a href="reference.html">reference.html</a> (keywords, types, builtins)</li>
+          <li><strong>Source</strong> — <a href="https://github.com/MenkeTechnologies/kotlinrs">github.com/MenkeTechnologies/kotlinrs</a></li>
+          <li><strong>The shared VM</strong> — <a href="https://github.com/MenkeTechnologies/fusevm">fusevm</a> (also behind <code>zshrs</code>, <code>stryke</code>, <code>awkrs</code>, <code>elisprs</code>, <code>rubylang</code>, <code>phplang</code>, <code>pythonrs</code>, <code>node-js</code>)</li>
+        </ul>
+      </section>
+    </main>
+  </div>
+
+  <script src="hud-theme.js"></script>
+</body>
+</html>

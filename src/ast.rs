@@ -48,8 +48,23 @@ pub struct FunDecl {
     pub line: u32,
 }
 
+/// A statement plus the 1-based source line it started on. The line drives
+/// `--dap` breakpoints/stepping (the compiler emits a per-statement debug marker
+/// carrying it) and terse diagnostics.
 #[derive(Debug, Clone)]
-pub enum Stmt {
+pub struct Stmt {
+    pub line: u32,
+    pub kind: StmtKind,
+}
+
+impl Stmt {
+    pub fn new(line: u32, kind: StmtKind) -> Stmt {
+        Stmt { line, kind }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum StmtKind {
     /// `val`/`var` binding. `mutable` distinguishes `var`.
     Let {
         name: String,

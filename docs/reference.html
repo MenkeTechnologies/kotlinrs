@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="kotlinrs — Language reference. Keywords, types, and builtins recognized by the current kotlinrs build. MIT licensed.">
+  <title>kotlinrs &mdash; Language Reference</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="hud-static.css">
+  <link rel="stylesheet" href="tutorial.css">
+  <style>
+    .tutorial-main { max-width: 76rem; }
+    .docs-build-line { margin:0.35rem 0 0;font-family:'Share Tech Mono',ui-monospace,monospace;font-size:11px;color:var(--text-dim);letter-spacing:0.03em;max-width:52rem;opacity:0.75; }
+  </style>
+</head>
+<body>
+  <div class="app tutorial-app" id="docsApp">
+    <div class="crt-scanline" id="crtH" aria-hidden="true"></div>
+    <div class="crt-scanline-v" id="crtV" aria-hidden="true"></div>
+
+    <header class="tutorial-header">
+      <div class="tutorial-header-inner">
+        <div>
+          <h1 class="tutorial-brand">// KOTLINRS — LANGUAGE REFERENCE</h1>
+          <nav class="tutorial-crumbs" aria-label="Breadcrumb">
+            <a href="index.html">Docs</a>
+            <span class="sep">/</span>
+            <span class="current">Language Reference</span>
+            <span class="sep">/</span>
+            <a href="https://github.com/MenkeTechnologies/kotlinrs" target="_blank" rel="noopener noreferrer">GitHub</a>
+          </nav>
+          <p class="docs-build-line">kotlinrs v0.1.0 · Kotlin on fusevm · lex/parse → AST → bytecode → Cranelift JIT · no JVM · MIT · in active development</p>
+        </div>
+        <div class="tutorial-toolbar">
+          <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
+          <button type="button" class="btn btn-secondary active" id="btnCrt" title="CRT scanline overlay">CRT</button>
+          <button type="button" class="btn btn-secondary active" id="btnNeon" title="Neon border pulse">Neon</button>
+          <a class="btn btn-secondary" href="index.html">Docs</a>
+          <a class="btn btn-secondary" href="https://github.com/MenkeTechnologies/kotlinrs" target="_blank" rel="noopener noreferrer">GitHub</a>
+        </div>
+      </div>
+    </header>
+
+    <main class="tutorial-main">
+      <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>LANGUAGE REFERENCE</h2>
+      <p class="tutorial-subtitle">Every reserved keyword, built-in type, and builtin call the current kotlinrs build recognizes, grouped by keyword then type then builtin. This page is generated from the language-server corpus (<code>src/lsp.rs</code>) by the <code>gen-docs</code> binary, so it stays in sync with what the runtime and editor tooling actually know about. Keywords mirror <code>lexer.rs</code>, types mirror <code>ast::Type::from_name</code>, and each builtin mirrors a real arm in <code>compiler::compile_call</code>.</p>
+
+      <section class="tutorial-section" id="ch-keyword">
+        <h2>Keyword</h2>
+        <article class="doc-entry" id="doc-keyword-1">
+          <h3><a class="doc-anchor" href="#doc-keyword-1">#</a> <code>fun</code></h3>
+          <p>declare a function; execution enters `fun main`</p>
+          <pre><code class="lang-kotlin">fun square(n: Int): Int { return n * n }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-2">
+          <h3><a class="doc-anchor" href="#doc-keyword-2">#</a> <code>val</code></h3>
+          <p>declare a read-only (immutable) binding</p>
+          <pre><code class="lang-kotlin">val x = 41
+println(x + 1)   // 42</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-3">
+          <h3><a class="doc-anchor" href="#doc-keyword-3">#</a> <code>var</code></h3>
+          <p>declare a reassignable (mutable) binding</p>
+          <pre><code class="lang-kotlin">var i = 0
+i += 1   // i == 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-4">
+          <h3><a class="doc-anchor" href="#doc-keyword-4">#</a> <code>if</code></h3>
+          <p>conditional branch; also usable as an expression</p>
+          <pre><code class="lang-kotlin">val m = if (a &gt; b) a else b</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-5">
+          <h3><a class="doc-anchor" href="#doc-keyword-5">#</a> <code>else</code></h3>
+          <p>the fallback branch of an `if`</p>
+          <pre><code class="lang-kotlin">if (n % 2 == 0) println("even") else println("odd")</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-6">
+          <h3><a class="doc-anchor" href="#doc-keyword-6">#</a> <code>while</code></h3>
+          <p>loop while the condition stays true</p>
+          <pre><code class="lang-kotlin">var i = 0
+while (i &lt; 3) { i += 1 }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-7">
+          <h3><a class="doc-anchor" href="#doc-keyword-7">#</a> <code>for</code></h3>
+          <p>iterate a range: `for (x in a..b)`</p>
+          <pre><code class="lang-kotlin">for (i in 1..5) println(i)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-8">
+          <h3><a class="doc-anchor" href="#doc-keyword-8">#</a> <code>in</code></h3>
+          <p>the `for (x in range)` separator</p>
+          <pre><code class="lang-kotlin">for (c in 0 until 3) println(c)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-9">
+          <h3><a class="doc-anchor" href="#doc-keyword-9">#</a> <code>return</code></h3>
+          <p>return a value (or Unit) from the current function</p>
+          <pre><code class="lang-kotlin">fun answer(): Int { return 42 }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-10">
+          <h3><a class="doc-anchor" href="#doc-keyword-10">#</a> <code>until</code></h3>
+          <p>half-open ascending range: `a until b` excludes b</p>
+          <pre><code class="lang-kotlin">for (i in 0 until 3) println(i)   // 0 1 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-11">
+          <h3><a class="doc-anchor" href="#doc-keyword-11">#</a> <code>downTo</code></h3>
+          <p>descending inclusive range: `a downTo b`</p>
+          <pre><code class="lang-kotlin">for (i in 3 downTo 1) println(i)   // 3 2 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-12">
+          <h3><a class="doc-anchor" href="#doc-keyword-12">#</a> <code>step</code></h3>
+          <p>stride for a range: `a..b step n`</p>
+          <pre><code class="lang-kotlin">for (i in 0..10 step 2) println(i)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-13">
+          <h3><a class="doc-anchor" href="#doc-keyword-13">#</a> <code>true</code></h3>
+          <p>the Boolean true literal</p>
+          <pre><code class="lang-kotlin">val ok: Boolean = true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-14">
+          <h3><a class="doc-anchor" href="#doc-keyword-14">#</a> <code>false</code></h3>
+          <p>the Boolean false literal</p>
+          <pre><code class="lang-kotlin">val done: Boolean = false</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-type">
+        <h2>Type</h2>
+        <article class="doc-entry" id="doc-type-1">
+          <h3><a class="doc-anchor" href="#doc-type-1">#</a> <code>Int</code></h3>
+          <p>32/64-bit signed integer; `/` and `%` truncate toward zero</p>
+          <pre><code class="lang-kotlin">val n: Int = 7 / 2   // 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-type-2">
+          <h3><a class="doc-anchor" href="#doc-type-2">#</a> <code>Long</code></h3>
+          <p>64-bit signed integer; shares Int's integer division rules</p>
+          <pre><code class="lang-kotlin">val big: Long = 1000</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-type-3">
+          <h3><a class="doc-anchor" href="#doc-type-3">#</a> <code>Double</code></h3>
+          <p>IEEE-754 double; prints with a trailing `.0` when whole</p>
+          <pre><code class="lang-kotlin">val d: Double = 3.0   // "3.0"</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-type-4">
+          <h3><a class="doc-anchor" href="#doc-type-4">#</a> <code>Float</code></h3>
+          <p>floating-point value (coerced to Double behavior here)</p>
+          <pre><code class="lang-kotlin">val f: Float = 1.5f</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-type-5">
+          <h3><a class="doc-anchor" href="#doc-type-5">#</a> <code>Boolean</code></h3>
+          <p>true/false; prints as `true` or `false`</p>
+          <pre><code class="lang-kotlin">val b: Boolean = 1 &lt; 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-type-6">
+          <h3><a class="doc-anchor" href="#doc-type-6">#</a> <code>String</code></h3>
+          <p>text; `+` concatenates and `"$x"` interpolates</p>
+          <pre><code class="lang-kotlin">val s: String = "n = ${1 + 1}"</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-type-7">
+          <h3><a class="doc-anchor" href="#doc-type-7">#</a> <code>Unit</code></h3>
+          <p>the no-value type; the result of a function with no return</p>
+          <pre><code class="lang-kotlin">fun log(): Unit { println("hi") }</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-builtin">
+        <h2>Builtin</h2>
+        <article class="doc-entry" id="doc-builtin-1">
+          <h3><a class="doc-anchor" href="#doc-builtin-1">#</a> <code>println</code></h3>
+          <p>write a value to stdout followed by a newline</p>
+          <pre><code class="lang-kotlin">println(6 * 7)   // 42</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-2">
+          <h3><a class="doc-anchor" href="#doc-builtin-2">#</a> <code>print</code></h3>
+          <p>write a value to stdout with no trailing newline</p>
+          <pre><code class="lang-kotlin">print("a"); print("b")   // ab</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>More</h2>
+        <ul>
+          <li><strong>Docs</strong> — <a href="index.html">index.html</a> (overview, architecture, examples)</li>
+          <li><strong>Engineering report</strong> — <a href="report.html">report.html</a> (value model, status, dependencies)</li>
+          <li><strong>Source</strong> — <a href="https://github.com/MenkeTechnologies/kotlinrs">github.com/MenkeTechnologies/kotlinrs</a></li>
+        </ul>
+      </section>
+    </main>
+
+  </div>
+
+  <script src="hud-theme.js"></script>
+</body>
+</html>

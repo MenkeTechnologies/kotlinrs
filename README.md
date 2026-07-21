@@ -134,8 +134,16 @@ standard library.
 | `--dump-tokens` | Print the lexer token stream and exit. |
 | `--dump-ast` | Print the parsed AST and exit. |
 | `--dump-bytecode`, `--disasm` | Print the lowered fusevm chunk disassembly and exit. |
+| `--lsp` | Speak the Language Server Protocol over stdio (diagnostics, completion, hover). |
+| `--dap` | Speak the Debug Adapter Protocol over stdio (breakpoints, stepping, live locals). |
 | `-v`, `--version` | Print the version and exit. |
 | `-h`, `--help` | Print help and exit. |
+
+An inline `rust { pub extern "C" fn … }` block inside a function body compiles
+to a cached cdylib whose exported functions are callable by name from Kotlin
+(via `fusevm::ffi`). Editor tooling (`--lsp`, `--dap`) and a generated
+[reference page](https://menketechnologies.github.io/kotlinrs/reference.html)
+share the language-server corpus, so they never drift.
 
 ## [0x05] ARCHITECTURE
 

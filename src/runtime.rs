@@ -8,7 +8,8 @@ use fusevm::{VMResult, VM};
 /// Parse, compile, and run `src`. Returns the process exit code (`0` on normal
 /// completion) or an error string for a compile error or uncaught exception.
 pub fn run_source(src: &str) -> Result<i32, String> {
-    let program = parser::parse_program(src)?;
+    let src = crate::rust_ffi::desugar(src);
+    let program = parser::parse_program(&src)?;
     let chunk = compiler::compile(&program)?;
     let _ = host::take_error(); // clear any stale fault from a prior run
     let mut vm = VM::new(chunk);
@@ -28,7 +29,8 @@ pub fn run_source(src: &str) -> Result<i32, String> {
 
 /// `--dump-tokens`: the lexer output, one token per line.
 pub fn dump_tokens(src: &str) -> Result<String, String> {
-    let toks = crate::lexer::Lexer::new(src).tokenize()?;
+    let src = crate::rust_ffi::desugar(src);
+    let toks = crate::lexer::Lexer::new(&src).tokenize()?;
     let mut out = String::new();
     for t in &toks {
         out.push_str(&format!("{:>4}  {:?}\n", t.line, t.tok));
@@ -38,13 +40,15 @@ pub fn dump_tokens(src: &str) -> Result<String, String> {
 
 /// `--dump-ast`: the parsed program as a pretty-printed AST.
 pub fn dump_ast(src: &str) -> Result<String, String> {
-    let program = parser::parse_program(src)?;
+    let src = crate::rust_ffi::desugar(src);
+    let program = parser::parse_program(&src)?;
     Ok(format!("{program:#?}\n"))
 }
 
-/// `--dump-bytecode`: the lowered fusevm chunk, disassembled.
+/// `--dump-bytecode` / `--disasm`: the lowered fusevm chunk, disassembled.
 pub fn dump_bytecode(src: &str) -> Result<String, String> {
-    let program = parser::parse_program(src)?;
+    let src = crate::rust_ffi::desugar(src);
+    let program = parser::parse_program(&src)?;
     let chunk = compiler::compile(&program)?;
     Ok(chunk.disassemble())
 }

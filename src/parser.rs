@@ -155,26 +155,28 @@ impl Parser {
     // ── Statements ─────────────────────────────────────────────────
 
     fn stmt(&mut self) -> Result<Stmt, String> {
-        match self.peek() {
-            Tok::Val | Tok::Var => self.let_decl(),
+        let line = self.line();
+        let kind = match self.peek() {
+            Tok::Val | Tok::Var => self.let_decl()?,
             Tok::Return => {
                 self.bump();
                 // A `return` with no expression (Unit) — the next token starts a
                 // new statement or closes the block.
                 if matches!(self.peek(), Tok::RBrace | Tok::Semi | Tok::Eof) {
-                    Ok(Stmt::Return(None))
+                    StmtKind::Return(None)
                 } else {
-                    Ok(Stmt::Return(Some(self.expr()?)))
+                    StmtKind::Return(Some(self.expr()?))
                 }
             }
-            Tok::While => self.while_stmt(),
-            Tok::For => self.for_stmt(),
-            Tok::If => Ok(Stmt::If(self.if_expr()?)),
-            _ => self.assign_or_expr(),
-        }
+            Tok::While => self.while_stmt()?,
+            Tok::For => self.for_stmt()?,
+            Tok::If => StmtKind::If(self.if_expr()?),
+            _ => self.assign_or_expr()?,
+        };
+        Ok(Stmt::new(line, kind))
     }
 
-    fn let_decl(&mut self) -> Result<Stmt, String> {
+    fn let_decl(&mut self) -> Result<StmtKind, String> {
         let mutable = matches!(self.bump(), Tok::Var);
         let name = self.ident()?;
         let ty = if self.at(&Tok::Colon) {
@@ -185,7 +187,7 @@ impl Parser {
         };
         self.eat(&Tok::Assign)?;
         let init = self.expr()?;
-        Ok(Stmt::Let {
+        Ok(StmtKind::Let {
             name,
             ty,
             init,
@@ -193,16 +195,16 @@ impl Parser {
         })
     }
 
-    fn while_stmt(&mut self) -> Result<Stmt, String> {
+    fn while_stmt(&mut self) -> Result<StmtKind, String> {
         self.eat(&Tok::While)?;
         self.eat(&Tok::LParen)?;
         let cond = self.expr()?;
         self.eat(&Tok::RParen)?;
         let body = self.block()?;
-        Ok(Stmt::While { cond, body })
+        Ok(StmtKind::While { cond, body })
     }
 
-    fn for_stmt(&mut self) -> Result<Stmt, String> {
+    fn for_stmt(&mut self) -> Result<StmtKind, String> {
         self.eat(&Tok::For)?;
         self.eat(&Tok::LParen)?;
         let var = self.ident()?;
@@ -236,7 +238,7 @@ impl Parser {
         };
         self.eat(&Tok::RParen)?;
         let body = self.block()?;
-        Ok(Stmt::For {
+        Ok(StmtKind::For {
             var,
             start,
             end,
@@ -252,7 +254,7 @@ impl Parser {
         self.additive()
     }
 
-    fn assign_or_expr(&mut self) -> Result<Stmt, String> {
+    fn assign_or_expr(&mut self) -> Result<StmtKind, String> {
         // Look for `IDENT (op)=` — an assignment — before falling back to an
         // expression statement.
         if let Tok::Ident(name) = self.peek().clone() {
@@ -269,14 +271,14 @@ impl Parser {
                 self.bump(); // ident
                 self.bump(); // assign token
                 let value = self.expr()?;
-                return Ok(Stmt::Assign {
+                return Ok(StmtKind::Assign {
                     name,
                     op: binop,
                     value,
                 });
             }
         }
-        Ok(Stmt::Expr(self.expr()?))
+        Ok(StmtKind::Expr(self.expr()?))
     }
 
     // ── Expressions ────────────────────────────────────────────────
@@ -472,7 +474,8 @@ impl Parser {
             self.bump();
             if self.at(&Tok::If) {
                 // `else if` chains as an else-branch holding a single if-stmt.
-                Some(vec![Stmt::If(self.if_expr()?)])
+                let l = self.line();
+                Some(vec![Stmt::new(l, StmtKind::If(self.if_expr()?))])
             } else {
                 Some(self.branch_body()?)
             }
@@ -493,7 +496,8 @@ impl Parser {
         if self.at(&Tok::LBrace) {
             self.block()
         } else {
-            Ok(vec![Stmt::Expr(self.expr()?)])
+            let line = self.line();
+            Ok(vec![Stmt::new(line, StmtKind::Expr(self.expr()?))])
         }
     }
 

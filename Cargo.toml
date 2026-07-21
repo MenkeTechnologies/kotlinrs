@@ -36,6 +36,12 @@ path = "src/lib.rs"
 name = "kotlin"
 path = "src/main.rs"
 
+# Offline generator for docs/reference.html — renders the keyword/builtin/type
+# reference (src/lsp.rs corpus) as a static page. Run before publishing Pages.
+[[bin]]
+name = "gen-docs"
+path = "src/bin/gen_docs.rs"
+
 [dependencies]
 # Kotlin executes on fusevm. kotlinrs is a pure frontend: it lowers Kotlin to
 # fusevm bytecode (src/compiler.rs) and hosts Kotlin-specific coercions
@@ -46,7 +52,21 @@ path = "src/main.rs"
 # `jit` turns on fusevm's three-tier Cranelift JIT so arithmetic and comparison
 # operators — which kotlinrs lowers to *native* fusevm ops — can be block- and
 # trace-compiled on hot loops instead of dispatched.
-fusevm = { version = "0.14.11", features = ["jit"] }
+#
+# `ffi` enables fusevm's inline-Rust FFI bridge: a `rust { pub extern "C" fn … }`
+# block compiles to a cached cdylib whose exported functions become callable by
+# name from Kotlin (src/rust_ffi.rs desugars the block; src/host.rs routes the
+# `__rust_compile` / by-name-call dispatch into `fusevm::ffi`).
+fusevm = { version = "0.14.11", features = ["jit", "ffi"] }
+
+# LSP (`kotlin --lsp`) + DAP (`kotlin --dap`) over stdio. libc gives the DAP
+# server a pipe + dup2 to capture the debuggee's stdout (println) so program
+# output streams as `output` events instead of corrupting the JSON-RPC channel.
+lsp-server = "0.7.9"
+lsp-types = "0.97.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

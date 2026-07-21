@@ -21,6 +21,10 @@ pub struct Cli {
     pub show_version: bool,
     pub show_help: bool,
     pub dump: Option<Dump>,
+    /// `--lsp`: speak the Language Server Protocol on stdio.
+    pub lsp: bool,
+    /// `--dap`: speak the Debug Adapter Protocol on stdio.
+    pub dap: bool,
 }
 
 /// Parse `std::env::args()` (minus argv[0]).
@@ -34,6 +38,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
             "--dump-tokens" => cli.dump = Some(Dump::Tokens),
             "--dump-ast" => cli.dump = Some(Dump::Ast),
             "--dump-bytecode" | "--disasm" => cli.dump = Some(Dump::Bytecode),
+            "--lsp" => cli.lsp = true,
+            "--dap" => cli.dap = true,
             "-e" | "--eval" => {
                 let expr = it.next().ok_or("-e requires an argument")?;
                 cli.eval.push(expr);

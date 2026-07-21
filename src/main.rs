@@ -21,6 +21,9 @@ OPTIONS:
     --dump-tokens        Print the lexer token stream and exit.
     --dump-ast           Print the parsed AST and exit.
     --dump-bytecode      Print the lowered fusevm chunk (disassembly) and exit.
+    --disasm             Alias for --dump-bytecode.
+    --lsp                Speak the Language Server Protocol over stdio.
+    --dap                Speak the Debug Adapter Protocol over stdio.
     -v, --version        Print the version and exit.
     -h, --help           Print this help and exit.
 ";
@@ -38,6 +41,20 @@ fn main() -> ExitCode {
     if cli.show_version {
         println!("{}", kotlinrs::version_banner());
         return ExitCode::SUCCESS;
+    }
+
+    // Protocol servers speak JSON-RPC on stdio and never run a script.
+    if cli.lsp {
+        return match kotlinrs::lsp::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e),
+        };
+    }
+    if cli.dap {
+        return match kotlinrs::dap::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e),
+        };
     }
 
     // Resolve the source: `-e` snippets (joined) or a file.

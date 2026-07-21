@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="kotlinrs — Engineering report. Architecture, value model, fusevm hosting, toolchain, and dependency posture of the compiled Kotlin runtime. MIT licensed.">
+  <title>kotlinrs — Engineering Report</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&amp;family=Share+Tech+Mono&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="hud-static.css">
+  <link rel="stylesheet" href="tutorial.css">
+  <style>
+    .tutorial-main { max-width: 68rem; }
+    .docs-build-line { margin: 0.35rem 0 0; font-family: 'Share Tech Mono', ui-monospace, monospace; font-size: 11px; color: var(--text-dim); letter-spacing: 0.03em; max-width: 42rem; opacity: 0.75; }
+    .reflection-table { width: 100%; border-collapse: collapse; margin: 0.6rem 0 0.2rem; font-size: 12px; }
+    .reflection-table th { background: var(--bg-secondary); color: var(--cyan); font-family: 'Orbitron', sans-serif; font-size: 10px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; text-align: left; padding: 6px 10px; border: 1px solid var(--border); }
+    .reflection-table td { padding: 6px 10px; border: 1px solid var(--border); color: var(--text-dim); vertical-align: top; }
+    .reflection-table td code { color: var(--accent-light); background: var(--bg); }
+    .cat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr)); gap: 0.6rem; margin: 0.7rem 0; }
+    .cat-card { border: 1px solid var(--border); border-left: 2px solid var(--cyan); padding: 0.6rem 0.8rem; background: color-mix(in srgb, var(--bg-card) 92%, transparent); border-radius: 2px; }
+    .cat-card h4 { font-family: 'Orbitron', sans-serif; font-size: 11px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; color: var(--cyan); margin: 0 0 0.35rem; }
+    .cat-card p { margin: 0; font-size: 11.5px; color: var(--text-dim); line-height: 1.5; }
+    .cat-card code { font-size: 11px; color: var(--accent-light); }
+  </style>
+</head>
+<body>
+  <div class="app tutorial-app" id="docsApp">
+    <div class="crt-scanline" id="crtH" aria-hidden="true"></div>
+    <div class="crt-scanline-v" id="crtV" aria-hidden="true"></div>
+
+    <header class="tutorial-header">
+      <div class="tutorial-header-inner">
+        <div>
+          <h1 class="tutorial-brand">// KOTLINRS — ENGINEERING REPORT</h1>
+          <nav class="tutorial-crumbs" aria-label="Breadcrumb">
+            <a href="index.html">Docs</a>
+            <span class="sep">/</span>
+            <span class="current">Engineering Report</span>
+            <span class="sep">/</span>
+            <a href="https://github.com/MenkeTechnologies/kotlinrs" target="_blank" rel="noopener noreferrer">GitHub</a>
+          </nav>
+          <p class="docs-build-line">kotlinrs v0.1.0 · Kotlin on fusevm · lex/parse → AST → bytecode → Cranelift JIT · no JVM · MIT · in active development</p>
+        </div>
+        <div class="tutorial-toolbar">
+          <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
+          <button type="button" class="btn btn-secondary active" id="btnCrt" title="CRT scanline overlay">CRT</button>
+          <button type="button" class="btn btn-secondary active" id="btnNeon" title="Neon border pulse">Neon</button>
+          <a class="btn btn-secondary" href="index.html">Docs</a>
+          <a class="btn btn-secondary" href="reference.html">Reference</a>
+          <a class="btn btn-secondary" href="https://github.com/MenkeTechnologies/kotlinrs" target="_blank" rel="noopener noreferrer">GitHub</a>
+        </div>
+      </div>
+    </header>
+
+    <main class="tutorial-main">
+      <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>ENGINEERING REPORT</h2>
+      <p class="tutorial-subtitle">How kotlinrs is put together: a pure Kotlin frontend over the <code>fusevm</code> bytecode VM and Cranelift JIT, with no bespoke VM or JIT of its own.</p>
+
+      <section class="tutorial-section">
+        <h2>Value model</h2>
+        <p>kotlinrs values ride through the VM as fusevm <code>Value</code> variants — <code>Int</code>, <code>Float</code> (Kotlin <code>Double</code>), <code>Bool</code>, <code>Str</code>, and <code>Undef</code> (Kotlin <code>Unit</code>). The compiler tracks coarse static types (<code>ast::Type</code>) so it can pick <code>+</code> versus string concatenation and integer versus float division at lowering time without a full type checker. Only three behaviours the universal ops cannot express are served by the extension handler: Kotlin <code>toString()</code> display form, and truncating integer <code>/</code> and <code>%</code>.</p>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Compilation pipeline</h2>
+        <table class="reflection-table">
+          <thead><tr><th>Stage</th><th>File</th><th>Output</th></tr></thead>
+          <tbody>
+            <tr><td>Lexing</td><td><code>src/lexer.rs</code></td><td>Token stream with pre-split string-interpolation parts and per-token source lines.</td></tr>
+            <tr><td>Parsing</td><td><code>src/parser.rs</code></td><td>A list of <code>FunDecl</code> AST nodes; each statement carries its source line for diagnostics and debugging.</td></tr>
+            <tr><td>Lowering</td><td><code>src/compiler.rs</code></td><td>A single <code>fusevm::Chunk</code>: native ops for arithmetic / comparison / control flow / calls, extension ops for the three Kotlin coercions.</td></tr>
+            <tr><td>Execution</td><td><code>src/runtime.rs</code>, <code>src/host.rs</code></td><td>fusevm VM run with the Kotlin extension handler installed; the Cranelift JIT can trace hot loops.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Toolchain internals</h2>
+        <div class="cat-grid">
+          <div class="cat-card"><h4>LSP (<code>src/lsp.rs</code>)</h4><p>Diagnostics reuse the runtime's own <code>parser::parse_program</code>, so an editor error maps to the exact line the runtime would report. Completion and hover draw on a single corpus that also feeds the generated reference page — the server and the docs never drift.</p></div>
+          <div class="cat-card"><h4>DAP (<code>src/dap.rs</code>)</h4><p>A debug-only compile emits a stack-neutral <code>KT_DBG_LINE</code> marker before each statement. The debug extension handler fires a line hook that checks breakpoints and step targets, reads live locals from the current frame's slots, and services DAP requests in place. The debuggee's stdout is redirected to a pipe and forwarded as output events.</p></div>
+          <div class="cat-card"><h4>FFI (<code>src/rust_ffi.rs</code>)</h4><p>A <code>rust { … }</code> block is desugared at the source level (via <code>fusevm::RustSugar</code>) into a <code>__rust_compile</code> call; the host routes it to <code>fusevm::ffi</code>, which compiles a cached cdylib. Exported <code>extern "C"</code> functions become callable by name.</p></div>
+          <div class="cat-card"><h4>Disassembly (<code>--disasm</code>)</h4><p>Reuses the shared <code>fusevm::Chunk::disassemble</code>, so the printed listing is exactly the engine's own view of the lowered bytecode.</p></div>
+        </div>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Dependency posture</h2>
+        <p>The core runtime depends only on <code>fusevm</code> (with the <code>jit</code> and <code>ffi</code> features). The toolchain adds <code>lsp-server</code> / <code>lsp-types</code> / <code>serde</code> / <code>serde_json</code> for the LSP and DAP protocol servers and <code>libc</code> for the DAP stdout pipe. There is no JVM, no <code>kotlinc</code>, and no bespoke VM or JIT — execution and codegen live entirely in fusevm, shared with the sibling language hosts.</p>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Links</h2>
+        <ul>
+          <li><strong>Docs</strong> — <a href="index.html">index.html</a> (overview, architecture, examples)</li>
+          <li><strong>Language reference</strong> — <a href="reference.html">reference.html</a> (keywords, types, builtins)</li>
+          <li><strong>Source</strong> — <a href="https://github.com/MenkeTechnologies/kotlinrs">github.com/MenkeTechnologies/kotlinrs</a></li>
+          <li><strong>The shared VM</strong> — <a href="https://github.com/MenkeTechnologies/fusevm">fusevm</a></li>
+        </ul>
+      </section>
+    </main>
+  </div>
+
+  <script src="hud-theme.js"></script>
+</body>
+</html>

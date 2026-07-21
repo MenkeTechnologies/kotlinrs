@@ -1,0 +1,107 @@
+.TH KOTLINALL 1 "2026" "kotlinrs 0.1.0" "User Commands"
+.SH NAME
+kotlinall \- full language and toolchain reference for the kotlinrs \fBkotlin\fR command
+.SH SYNOPSIS
+.B kotlin
+[\fIOPTIONS\fR]
+\fIFILE.kt\fR
+.SH DESCRIPTION
+This page is the consolidated reference for
+.BR kotlinrs ,
+the compiled Kotlin runtime hosted on the
+.B fusevm
+bytecode VM and Cranelift JIT (no JVM). It documents the recognized language
+subset, the runtime coercions, and the full toolchain surface of the single
+.B kotlin
+binary. For the terse invocation summary see
+.BR kotlin (1).
+.SH "LANGUAGE SUBSET"
+.TP
+.B Declarations
+.B fun
+(functions; execution enters
+.BR "fun main" "),"
+.B val
+(read-only binding),
+.B var
+(mutable binding). Coarse type annotations:
+.BR Int ", " Long ", " Double ", " Float ", " Boolean ", " String ", " Unit .
+.TP
+.B Control flow
+.B if
+/
+.B else
+(statement or expression),
+.B while
+loops, and
+.B for
+loops over ranges:
+.BR a..b " (inclusive), " "a until b" " (half-open), " "a downTo b" " (descending), optional " "step n" .
+.TP
+.B Expressions
+integer / floating arithmetic
+.RB ( + " " \- " " * " " / " " % ),
+comparison and equality, short-circuiting
+.BR && " / " || ,
+unary
+.BR \- " / " ! ,
+and string templates with
+.BR "$name" " / " "${expr}" .
+.TP
+.B Builtins
+.BR println " and " print
+write a single value to standard output.
+.SH "RUNTIME COERCIONS"
+Three Kotlin behaviours the language-agnostic ops cannot express are served by
+the runtime host:
+.BR Boolean / Double
+display form
+.RB ( true / false ", " 1.0 ),
+and truncating integer
+.BR / " and " %
+(with a
+.B java.lang.ArithmeticException
+on a zero divisor). Everything else is native fusevm bytecode.
+.SH OPTIONS
+.TP
+.BR \-e ", " \-\-eval " " \fISRC\fR
+Run a snippet (repeatable, newline-joined; wrapped in
+.B fun main
+if it has none).
+.TP
+.B \-\-dump\-tokens
+Print the lexer token stream and exit.
+.TP
+.B \-\-dump\-ast
+Print the parsed AST and exit.
+.TP
+.BR \-\-dump\-bytecode ", " \-\-disasm
+Print the lowered fusevm chunk disassembly and exit.
+.TP
+.B \-\-lsp
+Language Server Protocol over stdio (diagnostics, completion, hover).
+.TP
+.B \-\-dap
+Debug Adapter Protocol over stdio (breakpoints, stepping, locals).
+.TP
+.BR \-v ", " \-\-version ", " \-h ", " \-\-help
+Print the version / help and exit.
+.SH "INLINE RUST FFI"
+A
+.B rust { ... }
+block inside a function body compiles to a cached cdylib whose exported
+.B extern "C"
+functions are callable by name from Kotlin. The block is desugared at the
+source level and dispatched through
+.BR fusevm::ffi .
+.SH "EDITOR TOOLING"
+The LSP corpus (keywords, types, builtins) is the single source of truth for
+.BR \-\-lsp
+completion / hover and for the generated
+.I docs/reference.html
+page, so the language server and the published reference never drift.
+.SH SEE ALSO
+.BR kotlin (1),
+.BR fusevm (1)
+.SH HOMEPAGE
+https://github.com/MenkeTechnologies/kotlinrs

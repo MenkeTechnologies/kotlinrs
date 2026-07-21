@@ -14,10 +14,13 @@
 pub mod ast;
 pub mod cli;
 pub mod compiler;
+pub mod dap;
 pub mod host;
 pub mod lexer;
+pub mod lsp;
 pub mod parser;
 pub mod runtime;
+pub mod rust_ffi;
 pub mod token;
 
 use lexer::Lexer;
