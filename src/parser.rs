@@ -28,15 +28,25 @@ pub struct Parser {
     pos: usize,
 }
 
-/// Parse a full program (top-level `fun` declarations).
-pub fn parse_program(src: &str) -> Result<Vec<FunDecl>, String> {
+/// Parse a full program: top-level `fun`, `class`/`data class`, and `object`
+/// declarations.
+pub fn parse_program(src: &str) -> Result<Program, String> {
     let toks = Lexer::new(src).tokenize()?;
     let mut p = Parser { toks, pos: 0 };
-    let mut funs = Vec::new();
+    let mut prog = Program::default();
     while !p.at(&Tok::Eof) {
-        funs.push(p.fun_decl()?);
+        match p.peek() {
+            Tok::Fun => prog.funs.push(p.fun_decl()?),
+            Tok::Class | Tok::Data | Tok::Object => prog.classes.push(p.class_decl()?),
+            other => {
+                return Err(format!(
+                    "expected a top-level `fun`, `class`, or `object`, found {other:?} (line {})",
+                    p.line()
+                ))
+            }
+        }
     }
-    Ok(funs)
+    Ok(prog)
 }
 
 impl Parser {
@@ -93,13 +103,17 @@ impl Parser {
         let mut params = Vec::new();
         while !self.at(&Tok::RParen) {
             let pname = self.ident()?;
-            let ty = if self.at(&Tok::Colon) {
+            let (ty, class) = if self.at(&Tok::Colon) {
                 self.bump();
-                self.type_name()?
+                self.type_ref()?
             } else {
-                Type::Unknown
+                (Type::Unknown, None)
             };
-            params.push((pname, ty));
+            params.push(Param {
+                name: pname,
+                ty,
+                class,
+            });
             if self.at(&Tok::Comma) {
                 self.bump();
             } else {
@@ -107,11 +121,12 @@ impl Parser {
             }
         }
         self.eat(&Tok::RParen)?;
-        let ret_annot = if self.at(&Tok::Colon) {
+        let (ret_annot, ret_class) = if self.at(&Tok::Colon) {
             self.bump();
-            Some(self.type_name()?)
+            let (t, c) = self.type_ref()?;
+            (Some(t), c)
         } else {
-            None
+            (None, None)
         };
         // Body is either a block `{ … }` or a single-expression body `= expr`
         // (Kotlin `fun f(...) = expr`), which desugars to `{ return expr }`.
@@ -135,7 +150,121 @@ impl Parser {
             name,
             params,
             ret,
+            ret_class,
             body,
+            line,
+        })
+    }
+
+    /// A `class C(...)`, `data class C(...)`, or `object O { ... }`.
+    fn class_decl(&mut self) -> Result<ClassDecl, String> {
+        let line = self.line();
+        let is_data = if self.at(&Tok::Data) {
+            self.bump();
+            true
+        } else {
+            false
+        };
+        let is_object = if self.at(&Tok::Object) {
+            if is_data {
+                return Err("`data object` is not supported".into());
+            }
+            self.bump();
+            true
+        } else {
+            self.eat(&Tok::Class)?;
+            false
+        };
+        let name = self.ident()?;
+
+        // Primary constructor (classes only). `object`s have none.
+        let mut params = Vec::new();
+        if !is_object && self.at(&Tok::LParen) {
+            self.bump();
+            while !self.at(&Tok::RParen) {
+                let kind = match self.peek() {
+                    Tok::Val => {
+                        self.bump();
+                        PropKind::Val
+                    }
+                    Tok::Var => {
+                        self.bump();
+                        PropKind::Var
+                    }
+                    _ => PropKind::None,
+                };
+                let pname = self.ident()?;
+                self.eat(&Tok::Colon)?;
+                let (ty, class) = self.type_ref()?;
+                params.push(CtorProp {
+                    name: pname,
+                    ty,
+                    class,
+                    kind,
+                });
+                if self.at(&Tok::Comma) {
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+            self.eat(&Tok::RParen)?;
+        }
+        if is_data && params.iter().all(|p| p.kind == PropKind::None) {
+            return Err(format!(
+                "data class {name} needs at least one `val`/`var` constructor property"
+            ));
+        }
+
+        // Body: methods, plus (for `object`) property initializers.
+        let mut methods = Vec::new();
+        let mut obj_props = Vec::new();
+        if self.at(&Tok::LBrace) {
+            self.bump();
+            while !self.at(&Tok::RBrace) && !self.at(&Tok::Eof) {
+                if self.at(&Tok::Semi) {
+                    self.bump();
+                    continue;
+                }
+                match self.peek() {
+                    Tok::Fun => methods.push(self.fun_decl()?),
+                    Tok::Val | Tok::Var => {
+                        if !is_object {
+                            return Err(format!(
+                                "class {name}: body properties are unsupported; declare stored \
+                                 properties in the primary constructor"
+                            ));
+                        }
+                        self.bump(); // val/var
+                        let pname = self.ident()?;
+                        let (ty, class) = if self.at(&Tok::Colon) {
+                            self.bump();
+                            self.type_ref()?
+                        } else {
+                            (Type::Unknown, None)
+                        };
+                        self.eat(&Tok::Assign)?;
+                        let init = self.expr()?;
+                        obj_props.push((pname, ty, class, init));
+                    }
+                    other => {
+                        return Err(format!(
+                            "class {name}: expected `fun` or a property, found {other:?} (line {})",
+                            self.line()
+                        ))
+                    }
+                }
+            }
+            self.eat(&Tok::RBrace)?;
+        }
+
+        Ok(ClassDecl {
+            name,
+            params,
+            obj_props,
+            methods,
+            is_data,
+            is_object,
             line,
         })
     }
@@ -145,6 +274,14 @@ impl Parser {
     /// (nullable) is accepted and discarded — nullability is tracked at the
     /// value/flow level, not in the coarse static type.
     fn type_name(&mut self) -> Result<Type, String> {
+        Ok(self.type_ref()?.0)
+    }
+
+    /// Like [`Parser::type_name`], but also returns the raw type name when it is
+    /// not a builtin primitive — a heap-object type (`Type::Obj`) whose class /
+    /// container name the compiler needs for method dispatch (`Person`,
+    /// `List`, `Map`, …).
+    fn type_ref(&mut self) -> Result<(Type, Option<String>), String> {
         let name = self.ident()?;
         if self.at(&Tok::Lt) {
             let mut depth = 0;
@@ -165,7 +302,14 @@ impl Parser {
         if self.at(&Tok::Question) {
             self.bump(); // nullable marker `T?`
         }
-        Ok(Type::from_name(&name))
+        let ty = Type::from_name(&name);
+        // A non-primitive annotation names a heap object (a user class or a
+        // container like `List`/`Map`); keep its name for dispatch.
+        if ty == Type::Unknown {
+            Ok((Type::Obj, Some(name)))
+        } else {
+            Ok((ty, None))
+        }
     }
 
     fn block(&mut self) -> Result<Vec<Stmt>, String> {
@@ -242,6 +386,23 @@ impl Parser {
 
     fn let_decl(&mut self) -> Result<StmtKind, String> {
         let mutable = matches!(self.bump(), Tok::Var);
+        // Destructuring: `val (a, b, …) = expr`.
+        if self.at(&Tok::LParen) {
+            self.bump();
+            let mut names = Vec::new();
+            while !self.at(&Tok::RParen) {
+                names.push(self.ident()?);
+                if self.at(&Tok::Comma) {
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+            self.eat(&Tok::RParen)?;
+            self.eat(&Tok::Assign)?;
+            let init = self.expr()?;
+            return Ok(StmtKind::Destructure { names, init });
+        }
         let name = self.ident()?;
         let ty = if self.at(&Tok::Colon) {
             self.bump();
@@ -320,30 +481,49 @@ impl Parser {
     }
 
     fn assign_or_expr(&mut self) -> Result<StmtKind, String> {
-        // Look for `IDENT (op)=` — an assignment — before falling back to an
-        // expression statement.
-        if let Tok::Ident(name) = self.peek().clone() {
-            let op = match self.toks.get(self.pos + 1).map(|s| &s.tok) {
-                Some(Tok::Assign) => Some(None),
-                Some(Tok::PlusEq) => Some(Some(BinOp::Add)),
-                Some(Tok::MinusEq) => Some(Some(BinOp::Sub)),
-                Some(Tok::StarEq) => Some(Some(BinOp::Mul)),
-                Some(Tok::SlashEq) => Some(Some(BinOp::Div)),
-                Some(Tok::PercentEq) => Some(Some(BinOp::Mod)),
-                _ => None,
-            };
-            if let Some(binop) = op {
-                self.bump(); // ident
-                self.bump(); // assign token
-                let value = self.expr()?;
-                return Ok(StmtKind::Assign {
-                    name,
-                    op: binop,
-                    value,
-                });
-            }
+        // Parse a (potential) lvalue expression, then look for an assignment
+        // operator. This uniformly covers `x = …`, `obj.field = …`, and
+        // `coll[i] = …` (plus their `op=` forms) without special-casing.
+        let lhs = self.expr()?;
+        let op = match self.peek() {
+            Tok::Assign => Some(None),
+            Tok::PlusEq => Some(Some(BinOp::Add)),
+            Tok::MinusEq => Some(Some(BinOp::Sub)),
+            Tok::StarEq => Some(Some(BinOp::Mul)),
+            Tok::SlashEq => Some(Some(BinOp::Div)),
+            Tok::PercentEq => Some(Some(BinOp::Mod)),
+            _ => None,
+        };
+        let Some(binop) = op else {
+            return Ok(StmtKind::Expr(lhs));
+        };
+        self.bump(); // the assign token
+        let value = self.expr()?;
+        match lhs {
+            Expr::Var(name) => Ok(StmtKind::Assign {
+                name,
+                op: binop,
+                value,
+            }),
+            Expr::Member {
+                recv,
+                name,
+                safe: false,
+                ..
+            } => Ok(StmtKind::SetMember {
+                recv: *recv,
+                name,
+                op: binop,
+                value,
+            }),
+            Expr::Index { recv, index, .. } => Ok(StmtKind::SetIndex {
+                recv: *recv,
+                index: *index,
+                op: binop,
+                value,
+            }),
+            _ => Err(format!("invalid assignment target (line {})", self.line())),
         }
-        Ok(StmtKind::Expr(self.expr()?))
     }
 
     // ── Expressions ────────────────────────────────────────────────
@@ -367,14 +547,29 @@ impl Parser {
     }
 
     fn and_expr(&mut self) -> Result<Expr, String> {
-        let mut l = self.eq_expr()?;
+        let mut l = self.to_expr()?;
         while self.at(&Tok::AndAnd) {
             self.bump();
-            let r = self.eq_expr()?;
+            let r = self.to_expr()?;
             l = Expr::Binary {
                 op: BinOp::And,
                 l: Box::new(l),
                 r: Box::new(r),
+            };
+        }
+        Ok(l)
+    }
+
+    /// The `to` infix operator, building a `Pair` — `k to v` (used by
+    /// `mapOf(k to v, …)`). `to` is a soft keyword lexed as an identifier.
+    fn to_expr(&mut self) -> Result<Expr, String> {
+        let mut l = self.eq_expr()?;
+        while matches!(self.peek(), Tok::Ident(n) if n == "to") {
+            self.bump();
+            let r = self.eq_expr()?;
+            l = Expr::Pair {
+                first: Box::new(l),
+                second: Box::new(r),
             };
         }
         Ok(l)
@@ -512,6 +707,19 @@ impl Parser {
                 e = Expr::NotNull(Box::new(e));
                 continue;
             }
+            // Indexed access `recv[index]` (chainable: `m[k][i]`).
+            if self.at(&Tok::LBracket) {
+                let line = self.line();
+                self.bump();
+                let index = self.expr()?;
+                self.eat(&Tok::RBracket)?;
+                e = Expr::Index {
+                    recv: Box::new(e),
+                    index: Box::new(index),
+                    line,
+                };
+                continue;
+            }
             // Plain member/method `.` or safe-call `?.`.
             let safe = if self.at(&Tok::Dot) {
                 false
@@ -524,9 +732,11 @@ impl Parser {
             let line = self.line();
             self.bump(); // `.`
             let name = self.ident()?;
+            let mut args = Vec::new();
+            let mut is_call = false;
             if self.at(&Tok::LParen) {
+                is_call = true;
                 self.bump();
-                let mut args = Vec::new();
                 while !self.at(&Tok::RParen) {
                     args.push(self.expr()?);
                     if self.at(&Tok::Comma) {
@@ -536,6 +746,13 @@ impl Parser {
                     }
                 }
                 self.eat(&Tok::RParen)?;
+            }
+            // Trailing-lambda syntax: `list.map { … }` / `list.map(sel) { … }`.
+            if self.at(&Tok::LBrace) {
+                is_call = true;
+                args.push(self.lambda()?);
+            }
+            if is_call {
                 e = Expr::MethodCall {
                     recv: Box::new(e),
                     name,
@@ -553,6 +770,56 @@ impl Parser {
             }
         }
         Ok(e)
+    }
+
+    /// A lambda literal `{ (p1, p2, …) -> body }` or `{ body }` (implicit `it`).
+    /// The body is a statement sequence whose last statement's value is the
+    /// lambda's result.
+    fn lambda(&mut self) -> Result<Expr, String> {
+        self.eat(&Tok::LBrace)?;
+        // Optional parameter list ending in `->`. Speculatively scan a run of
+        // `IDENT (',' IDENT)* '->'`; roll back if it isn't there.
+        let mut params = Vec::new();
+        let save = self.pos;
+        if matches!(self.peek(), Tok::Ident(_)) {
+            let mut tmp = Vec::new();
+            let mut ok = true;
+            loop {
+                match self.peek() {
+                    Tok::Ident(n) => {
+                        tmp.push(n.clone());
+                        self.bump();
+                    }
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+                if self.at(&Tok::Comma) {
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+            if ok && self.at(&Tok::Arrow) {
+                self.bump();
+                params = tmp;
+            } else {
+                self.pos = save;
+            }
+        } else if self.at(&Tok::Arrow) {
+            self.bump(); // `{ -> … }` — explicitly no parameters
+        }
+        let mut body = Vec::new();
+        while !self.at(&Tok::RBrace) && !self.at(&Tok::Eof) {
+            if self.at(&Tok::Semi) {
+                self.bump();
+                continue;
+            }
+            body.push(self.stmt()?);
+        }
+        self.eat(&Tok::RBrace)?;
+        Ok(Expr::Lambda { params, body })
     }
 
     fn primary(&mut self) -> Result<Expr, String> {
@@ -735,9 +1002,11 @@ impl Parser {
                 self.bump();
                 (RangeKind::DownTo, self.range_bound()?)
             }
-            other => return Err(format!(
+            other => {
+                return Err(format!(
                 "`in` condition needs a range (`a..b`, `a until b`, `a downTo b`), found {other:?}"
-            )),
+            ))
+            }
         };
         Ok(WhenCond::InRange {
             negated,

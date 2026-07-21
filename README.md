@@ -124,6 +124,22 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 - **Member access** — chainable postfix `.`: `String.length`,
   `.uppercase()`/`.lowercase()`, `.trim()`, `.isEmpty()`/`.isNotEmpty()`,
   `Char.code`, `Int.toChar()`, and `Any.toString()`.
+- **Classes** — `class C(val x: Int, var y: Int) { fun m() {…} }`: primary-
+  constructor properties (`val`/`var`), instance methods (dispatched as native
+  fusevm `Op::Call`s with an implicit `this`), property get/set (`p.x`, `p.y =
+  …`), and implicit-`this` member access inside methods. `val`-property
+  reassignment is a compile error.
+- **`data class`** — auto-generated `equals`/`hashCode` (structural),
+  `toString()` (`C(x=1, y=2)`), `copy(...)` (positional overrides), and
+  `componentN`, so `val (a, b) = p` destructures. `==` on a data class /
+  collection is structural.
+- **`object`** — singleton declarations with `val`/`var` properties and methods,
+  built once and reachable by name (`Counter.inc()`).
+- **Collections** — `listOf`/`mutableListOf` and `mapOf`/`mutableMapOf` (with
+  `k to v` `Pair`s), indexing `xs[i]` / `m[k]` (and indexed assignment), `.size`,
+  `.add`/`.get`/`.contains`/`.indexOf`/`.sum` on lists, `.containsKey`/`.keys`/
+  `.values`/`.put` on maps, and the closure-taking `.map`/`.filter`/`.forEach`
+  (the lambda is inlined at the call site; `it` is the implicit parameter).
 - **Control flow** — `if`/`else` (statement **and** expression, incl.
   `else if`); `when` (statement **and** expression) in subject and subjectless
   forms, with literal, comma-grouped, `in`/`!in` range, `is`/`!is` type, and
@@ -139,9 +155,10 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 - **Built-ins** — `println(...)` / `print(...)`.
 - **Comments** — `//` and nested `/* … */`.
 
-Not yet in M0 (see roadmap): classes/objects, collections and their methods,
-lambdas, generics beyond parse-and-ignore, and the rest of the standard library
-beyond the `String`/`Char`/`Any` members above.
+Not yet (see roadmap): generics beyond parse-and-ignore, first-class /
+standalone lambda values (lambdas exist only as `map`/`filter`/`forEach`
+arguments), interfaces/inheritance, class body property initializers, named /
+default arguments, and the rest of the standard-library surface.
 
 ## [0x04] COMMAND-LINE FLAGS
 
@@ -172,25 +189,33 @@ Kotlin source
    ▼
 fusevm::VM  ──►  three-tier Cranelift JIT (linear · block · tracing)
    ▲
-   │  host.rs       → value coercions (toString / idiv / imod / Char / is / null)
+   │  host.rs       → value coercions + object heap (classes, List/Map/Pair)
 ```
 
 - `compiler.rs` keeps one invariant: every expression leaves exactly one value
   on the stack and every statement is stack-neutral, so `if`/`while`/`for`/`when`
   balance without a separate analysis pass.
-- The only Kotlin-specific runtime code is a small set of extension ops in
-  `host.rs` (value coercions, member dispatch, `is` checks, null tests);
-  everything else is a universal fusevm op.
+- The only Kotlin-specific runtime code is a set of extension ops in `host.rs`
+  (value coercions, member dispatch, `is` checks, null tests) plus a
+  **frontend-owned object heap**: a `Value::Obj(u32)` handle indexes a host-side
+  table of class instances, lists, maps, and pairs. fusevm just carries the
+  handle (identity-comparable); the frontend owns the pointed-to object — the
+  same model the other mature fusevm frontends use. Everything else is a
+  universal fusevm op.
 
 ## [0x06] STATUS & ROADMAP
 
 M0 (this release): the running language subset above, with a headless test
 suite and `--dump-*` introspection.
 
-Next: collections (`List`/`Map`/`Set`) and their methods, classes and data
-classes, lambdas and higher-order functions, and a growing standard-library
-surface — followed by the sibling parity tooling (LSP/DAP, reference generator,
-differential harness).
+Landed since M0: a host-side object heap backing classes, `data class`es,
+`object` singletons, `List`/`Map`/`Pair` collections and their methods, and the
+closure-taking `map`/`filter`/`forEach`.
+
+Next: generics, `Set`, first-class lambda values and more higher-order
+functions, interfaces/inheritance, named/default arguments, and a growing
+standard-library surface — alongside the sibling parity tooling (LSP/DAP,
+reference generator, differential harness).
 
 ## [0xFF] LICENSE
 

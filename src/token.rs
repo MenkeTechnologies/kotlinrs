@@ -42,12 +42,17 @@ pub enum Tok {
     Break,
     Continue,
     Null,
+    Class,
+    Object,
+    Data,
 
     // Punctuation
     LParen,
     RParen,
     LBrace,
     RBrace,
+    LBracket, // [
+    RBracket, // ]
     Comma,
     Colon,
     Semi,

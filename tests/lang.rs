@@ -409,3 +409,333 @@ fn bytecode_lowers_to_native_ops() {
         "expected native branch in:\n{asm}"
     );
 }
+
+// ─── Host object model: classes, data classes, collections, lambdas ───────
+//
+// These exercise the frontend-owned object heap (`Value::Obj(u32)` handles into
+// `src/host.rs`). Each drives a full program with `fun main` through the binary.
+
+/// Run a whole-program source (must contain `fun main`) and return stdout.
+fn prog(src: &str) -> String {
+    let out = eval(src);
+    assert!(
+        out.status.success(),
+        "expected success for program; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Run a whole-program source expected to fail; return combined stderr.
+fn prog_err(src: &str) -> String {
+    let out = eval(src);
+    assert!(!out.status.success(), "expected failure, got success");
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+#[test]
+fn class_primary_ctor_properties_and_methods() {
+    // Primary-ctor `val`/`var` become stored properties; a method reads them via
+    // implicit `this`; a `var` property is reassignable through `this`.
+    let src = "\
+class Point(val x: Int, var y: Int) {
+    fun sum(): Int = x + y
+    fun bump() { y = y + 1 }
+}
+fun main() {
+    val p = Point(3, 4)
+    println(p.sum())
+    p.bump()
+    println(p.sum())
+    println(p.x)
+    p.y = 100
+    println(p.y)
+}";
+    assert_eq!(prog(src), "7\n8\n3\n100\n");
+}
+
+#[test]
+fn val_property_cannot_be_reassigned() {
+    // A `val` primary-ctor property is write-once — reassigning it is a
+    // compile-time error, mirroring Kotlin.
+    let err = prog_err("class C(val x: Int)\nfun main() { val c = C(1); c.x = 2 }");
+    assert!(
+        err.contains("val cannot be reassigned"),
+        "stderr was: {err}"
+    );
+}
+
+#[test]
+fn instances_have_distinct_heap_identity() {
+    // Two constructions are distinct objects: mutating one must not touch the
+    // other (the heap handle is the identity).
+    let src = "\
+class Box(var n: Int)
+fun main() {
+    val a = Box(1)
+    val b = Box(1)
+    a.n = 99
+    println(a.n)
+    println(b.n)
+}";
+    assert_eq!(prog(src), "99\n1\n");
+}
+
+#[test]
+fn data_class_tostring_form() {
+    // `data class` renders as `Name(field=value, …)`.
+    let src = "\
+data class Person(val name: String, val age: Int)
+fun main() { println(Person(\"Ann\", 30)) }";
+    assert_eq!(prog(src), "Person(name=Ann, age=30)\n");
+}
+
+#[test]
+fn data_class_structural_equality_and_hashcode() {
+    // `==` is structural; equal instances share a hashCode; differing ones don't
+    // compare equal.
+    let src = "\
+data class Pt(val x: Int, val y: Int)
+fun main() {
+    val a = Pt(1, 2)
+    val b = Pt(1, 2)
+    val c = Pt(1, 3)
+    println(a == b)
+    println(a == c)
+    println(a != c)
+    println(a.hashCode() == b.hashCode())
+}";
+    assert_eq!(prog(src), "true\nfalse\ntrue\ntrue\n");
+}
+
+#[test]
+fn data_class_copy_positional_override() {
+    // `copy()` clones; `copy(arg)` overrides leading properties in order.
+    let src = "\
+data class Pt(val x: Int, val y: Int)
+fun main() {
+    val a = Pt(1, 2)
+    println(a.copy())
+    println(a.copy(9))
+    println(a == a.copy())
+}";
+    assert_eq!(prog(src), "Pt(x=1, y=2)\nPt(x=9, y=2)\ntrue\n");
+}
+
+#[test]
+fn data_class_destructuring() {
+    // `val (a, b) = p` binds via `componentN`; `_` discards a component.
+    let src = "\
+data class Pt(val x: Int, val y: Int)
+fun main() {
+    val p = Pt(10, 20)
+    val (a, b) = p
+    println(a + b)
+    val (_, y) = p
+    println(y)
+}";
+    assert_eq!(prog(src), "30\n20\n");
+}
+
+#[test]
+fn class_typed_parameters_and_returns() {
+    // A function taking and returning a class type dispatches faithfully.
+    let src = "\
+data class Vec2(val x: Int, val y: Int)
+fun add(a: Vec2, b: Vec2): Vec2 = Vec2(a.x + b.x, a.y + b.y)
+fun main() { println(add(Vec2(1, 2), Vec2(3, 4))) }";
+    assert_eq!(prog(src), "Vec2(x=4, y=6)\n");
+}
+
+#[test]
+fn method_returning_instance_chains() {
+    // A method whose return type is its own class chains method calls.
+    let src = "\
+data class Box(val n: Int) { fun bump(): Box = Box(n + 1) }
+fun main() { println(Box(1).bump().bump()) }";
+    assert_eq!(prog(src), "Box(n=3)\n");
+}
+
+#[test]
+fn implicit_this_method_call() {
+    // A bare call inside a method resolves to `this.method()`.
+    let src = "\
+class Rect(val w: Int, val h: Int) {
+    fun area(): Int = w * h
+    fun describe(): String = \"area=\" + area()
+}
+fun main() { println(Rect(3, 4).describe()) }";
+    assert_eq!(prog(src), "area=12\n");
+}
+
+#[test]
+fn object_singleton_holds_state() {
+    // An `object` is a single instance with mutable state across calls.
+    let src = "\
+object Counter {
+    var n: Int = 0
+    fun inc(): Int { n = n + 1; return n }
+}
+fun main() {
+    println(Counter.inc())
+    println(Counter.inc())
+    println(Counter.n)
+}";
+    assert_eq!(prog(src), "1\n2\n2\n");
+}
+
+#[test]
+fn list_literal_indexing_and_size() {
+    let src = "\
+fun main() {
+    val xs = listOf(10, 20, 30)
+    println(xs)
+    println(xs.size)
+    println(xs[0])
+    println(xs[2])
+    println(xs.sum())
+    println(xs.contains(20))
+    println(xs.indexOf(30))
+}";
+    assert_eq!(prog(src), "[10, 20, 30]\n3\n10\n30\n60\ntrue\n2\n");
+}
+
+#[test]
+fn mutable_list_add_and_indexed_set() {
+    let src = "\
+fun main() {
+    val xs = mutableListOf(1, 2)
+    xs.add(3)
+    println(xs)
+    xs[0] = 99
+    println(xs)
+    println(xs.size)
+}";
+    assert_eq!(prog(src), "[1, 2, 3]\n[99, 2, 3]\n3\n");
+}
+
+#[test]
+fn map_literal_indexing_and_membership() {
+    let src = "\
+fun main() {
+    val m = mapOf(\"a\" to 1, \"b\" to 2)
+    println(m)
+    println(m[\"a\"])
+    println(m.size)
+    println(m.containsKey(\"b\"))
+    println(m[\"missing\"])
+}";
+    // `m["missing"]` is null for an absent key (Kotlin operator get is nullable).
+    assert_eq!(prog(src), "{a=1, b=2}\n1\n2\ntrue\nnull\n");
+}
+
+#[test]
+fn mutable_map_put_and_keys_values() {
+    let src = "\
+fun main() {
+    val m = mutableMapOf(\"a\" to 1)
+    m[\"b\"] = 2
+    println(m[\"b\"])
+    println(m.keys)
+    println(m.values)
+}";
+    assert_eq!(prog(src), "2\n[a, b]\n[1, 2]\n");
+}
+
+#[test]
+fn collection_map_filter_foreach_lambdas() {
+    // The closure-taking higher-order functions: `map` transforms, `filter`
+    // selects, `forEach` runs for effect. `it` is the implicit parameter.
+    let src = "\
+fun main() {
+    val xs = listOf(1, 2, 3, 4)
+    println(xs.map { it * 2 })
+    println(xs.filter { it % 2 == 0 })
+    xs.forEach { println(it) }
+}";
+    assert_eq!(prog(src), "[2, 4, 6, 8]\n[2, 4]\n1\n2\n3\n4\n");
+}
+
+#[test]
+fn chained_higher_order_calls() {
+    // `filter` returns a `List`, so it chains into `map`.
+    let src = "fun main() { println(listOf(1, 2, 3, 4, 5).filter { it > 2 }.map { it * 10 }) }";
+    assert_eq!(prog(src), "[30, 40, 50]\n");
+}
+
+#[test]
+fn lambda_named_parameter_and_multi_statement_body() {
+    // A named lambda parameter and a multi-statement body (last expression is
+    // the result).
+    let src = "\
+fun main() {
+    val r = listOf(1, 2, 3).map { n ->
+        val sq = n * n
+        sq + 1
+    }
+    println(r)
+}";
+    assert_eq!(prog(src), "[2, 5, 10]\n");
+}
+
+#[test]
+fn nested_collections_and_dynamic_field_read() {
+    // A map of lists, and a property read off an indexed instance (the receiver
+    // type is statically unknown, so this pins the host's dynamic field read).
+    let src = "\
+data class P(val n: String)
+fun main() {
+    val m = mapOf(1 to listOf(\"a\", \"b\"))
+    println(m[1])
+    val ps = listOf(P(\"x\"), P(\"y\"))
+    println(ps[0].n)
+    println(ps[1].n)
+}";
+    assert_eq!(prog(src), "[a, b]\nx\ny\n");
+}
+
+#[test]
+fn list_equality_is_structural() {
+    let src = "\
+fun main() {
+    println(listOf(1, 2, 3) == listOf(1, 2, 3))
+    println(listOf(1, 2) == listOf(1, 2, 3))
+}";
+    assert_eq!(prog(src), "true\nfalse\n");
+}
+
+#[test]
+fn pair_to_infix_and_destructuring() {
+    let src = "\
+fun main() {
+    val p = \"k\" to 42
+    println(p)
+    val (k, v) = p
+    println(k)
+    println(v)
+}";
+    assert_eq!(prog(src), "(k, 42)\nk\n42\n");
+}
+
+#[test]
+fn index_out_of_bounds_throws() {
+    let err = prog_err("fun main() { val xs = listOf(1, 2); println(xs[5]) }");
+    assert!(err.contains("IndexOutOfBounds"), "stderr was: {err}");
+}
+
+#[test]
+fn constructor_lowers_to_host_extension_op() {
+    // A construction lowers to the `KT_NEW` (Extended) host op over the object
+    // heap — not a native array/hash — confirming the heap-backed model.
+    let out = Command::new(env!("CARGO_BIN_EXE_kotlin"))
+        .arg("--dump-bytecode")
+        .arg("-e")
+        .arg("data class P(val x: Int)\nfun main() { println(P(1)) }")
+        .output()
+        .unwrap();
+    let asm = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        asm.contains("Extended"),
+        "expected a host Extended op in:\n{asm}"
+    );
+}

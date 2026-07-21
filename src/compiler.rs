@@ -21,8 +21,9 @@
 
 use crate::ast::*;
 use crate::host::{
-    KT_CHR_STRING, KT_DBG_LINE, KT_FFI_CALL, KT_FFI_COMPILE, KT_IDIV, KT_IMOD, KT_IS, KT_ISNULL,
-    KT_METHOD, KT_NOTNULL, KT_TO_STRING,
+    KT_CHR_STRING, KT_DBG_LINE, KT_FFI_CALL, KT_FFI_COMPILE, KT_GETFIELD, KT_IDIV, KT_IMOD,
+    KT_INDEX_GET, KT_INDEX_SET, KT_IS, KT_ISNULL, KT_LIST, KT_LISTPUSH, KT_MAP, KT_METHOD, KT_NEW,
+    KT_NEWLIST, KT_NOTNULL, KT_OBJEQ, KT_PAIR, KT_SETFIELD, KT_TO_STRING,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::collections::HashMap;
@@ -37,6 +38,9 @@ struct Binding {
     slot: u16,
     ty: Type,
     mutable: bool,
+    /// The class/container name when `ty == Type::Obj` (e.g. `Person`, `List`),
+    /// so member access on this binding can dispatch to the right method sub.
+    class: Option<String>,
 }
 
 /// A checkpoint of scope state, taken on block entry and restored on block exit
@@ -71,11 +75,21 @@ impl Scope {
     /// Declare (or shadow) `name`. `mutable` is `true` for `var`, `false` for
     /// `val`. Returns the assigned slot.
     fn declare(&mut self, name: &str, ty: Type, mutable: bool) -> u16 {
+        self.declare_obj(name, ty, mutable, None)
+    }
+    /// Declare a binding that may carry a class/container name (`Type::Obj`).
+    fn declare_obj(&mut self, name: &str, ty: Type, mutable: bool, class: Option<String>) -> u16 {
         let slot = self.next_slot;
         self.next_slot += 1;
-        let prev = self
-            .map
-            .insert(name.to_string(), Binding { slot, ty, mutable });
+        let prev = self.map.insert(
+            name.to_string(),
+            Binding {
+                slot,
+                ty,
+                mutable,
+                class,
+            },
+        );
         self.undo.push((name.to_string(), prev));
         slot
     }
@@ -116,16 +130,77 @@ impl Scope {
     fn ty(&self, name: &str) -> Type {
         self.map.get(name).map(|b| b.ty).unwrap_or(Type::Unknown)
     }
+    /// The class/container name bound to `name`, if any.
+    fn class_of(&self, name: &str) -> Option<String> {
+        self.map.get(name).and_then(|b| b.class.clone())
+    }
     /// Whether `name` is currently bound as a reassignable `var`.
     fn is_mutable(&self, name: &str) -> Option<bool> {
         self.map.get(name).map(|b| b.mutable)
     }
 }
 
+/// A stored property of a class (or `object`).
+#[derive(Clone)]
+struct PropMeta {
+    name: String,
+    ty: Type,
+    class: Option<String>,
+    mutable: bool,
+}
+
+/// Static signature of a user function or class method.
+#[derive(Clone)]
+struct FnSig {
+    ret: Type,
+    ret_class: Option<String>,
+    arity: usize,
+}
+
+/// Compile-time metadata for a `class` / `data class` / `object`, driving
+/// constructor lowering, field access, method dispatch, and (for `data`)
+/// synthesized-member routing.
+#[derive(Clone)]
+struct ClassMeta {
+    name: String,
+    is_data: bool,
+    is_object: bool,
+    props: Vec<PropMeta>,
+    /// method name → its signature; the sub is named `Class#method`.
+    methods: HashMap<String, FnSig>,
+}
+
+impl ClassMeta {
+    fn prop(&self, name: &str) -> Option<&PropMeta> {
+        self.props.iter().find(|p| p.name == name)
+    }
+    /// The `KT_NEW` metadata string: `"Name\x1f(d|c)\x1ffield0\x1f…"`.
+    fn meta_string(&self) -> String {
+        let mut s = self.name.clone();
+        s.push('\u{1f}');
+        s.push(if self.is_data { 'd' } else { 'c' });
+        for p in &self.props {
+            s.push('\u{1f}');
+            s.push_str(&p.name);
+        }
+        s
+    }
+}
+
+/// The mangled sub name for a class method (`Person#greet`).
+fn method_sub_name(class: &str, method: &str) -> String {
+    format!("{class}#{method}")
+}
+
 pub struct Compiler {
     b: ChunkBuilder,
-    /// name → (return type, arity) for user functions, filled before lowering.
-    fun_sig: HashMap<String, (Type, usize)>,
+    /// name → signature for user functions, filled before lowering.
+    fun_sig: HashMap<String, FnSig>,
+    /// class/object name → metadata, filled before lowering.
+    classes: HashMap<String, ClassMeta>,
+    /// The class whose method is currently being lowered (enables implicit
+    /// `this` for member/method access). `None` at top level and in free funcs.
+    cur_class: Option<String>,
     /// When true, emit a per-statement `Op::Extended(KT_DBG_LINE, 0)` marker
     /// (carrying the statement's source line) before each statement, so the
     /// `--dap` debugger can stop at breakpoints and step. Off for normal runs —
@@ -155,40 +230,113 @@ struct LoopCtx {
 }
 
 /// Compile a program to a runnable chunk. Requires a `fun main`.
-pub fn compile(program: &[FunDecl]) -> Result<Chunk, String> {
+pub fn compile(program: &Program) -> Result<Chunk, String> {
     compile_with(program, false)
 }
 
 /// Compile with per-statement DAP line markers enabled (`kotlin --dap`).
-pub fn compile_debug(program: &[FunDecl]) -> Result<Chunk, String> {
+pub fn compile_debug(program: &Program) -> Result<Chunk, String> {
     compile_with(program, true)
 }
 
 /// Compile a program to a runnable chunk, optionally instrumented with debug
 /// line markers. Requires a `fun main`.
-pub fn compile_with(program: &[FunDecl], debug: bool) -> Result<Chunk, String> {
+pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
     let mut fun_sig = HashMap::new();
-    for f in program {
-        fun_sig.insert(f.name.clone(), (f.ret, f.params.len()));
+    for f in &program.funs {
+        fun_sig.insert(
+            f.name.clone(),
+            FnSig {
+                ret: f.ret,
+                ret_class: f.ret_class.clone(),
+                arity: f.params.len(),
+            },
+        );
     }
+
+    // Build class/object metadata before lowering so calls, constructors, and
+    // member access can resolve against it regardless of declaration order.
+    let mut classes: HashMap<String, ClassMeta> = HashMap::new();
+    for cd in &program.classes {
+        let props: Vec<PropMeta> = if cd.is_object {
+            cd.obj_props
+                .iter()
+                .map(|(n, ty, class, _)| PropMeta {
+                    name: n.clone(),
+                    ty: *ty,
+                    class: class.clone(),
+                    mutable: true,
+                })
+                .collect()
+        } else {
+            cd.params
+                .iter()
+                .filter(|p| p.kind != PropKind::None)
+                .map(|p| PropMeta {
+                    name: p.name.clone(),
+                    ty: p.ty,
+                    class: p.class.clone(),
+                    mutable: p.kind == PropKind::Var,
+                })
+                .collect()
+        };
+        let methods = cd
+            .methods
+            .iter()
+            .map(|m| {
+                (
+                    m.name.clone(),
+                    FnSig {
+                        ret: m.ret,
+                        ret_class: m.ret_class.clone(),
+                        arity: m.params.len(),
+                    },
+                )
+            })
+            .collect();
+        if classes
+            .insert(
+                cd.name.clone(),
+                ClassMeta {
+                    name: cd.name.clone(),
+                    is_data: cd.is_data,
+                    is_object: cd.is_object,
+                    props,
+                    methods,
+                },
+            )
+            .is_some()
+        {
+            return Err(format!("conflicting declarations for class {}", cd.name));
+        }
+    }
+
     let main = program
+        .funs
         .iter()
         .find(|f| f.name == "main")
         .ok_or("no `fun main` found")?;
 
-    let has_ffi = program.iter().any(|f| body_has_ffi(&f.body));
+    let has_ffi = program.funs.iter().any(|f| body_has_ffi(&f.body));
 
     let mut c = Compiler {
         b: ChunkBuilder::new(),
         fun_sig,
+        classes,
+        cur_class: None,
         debug,
         has_ffi,
         loops: Vec::new(),
     };
 
-    // Preamble: bind main's args (an empty Array per declared parameter — the
-    // program-args wiring is an M0 stub), call main, discard its Unit, skip the
-    // function bodies.
+    // Preamble: build `object` singletons into globals, then bind main's args
+    // (an empty Array per declared parameter — the program-args wiring is an M0
+    // stub), call main, discard its Unit, skip the bodies.
+    for cd in &program.classes {
+        if cd.is_object {
+            c.build_object(cd)?;
+        }
+    }
     let main_idx = c.b.add_name("main");
     for _ in &main.params {
         c.b.emit(Op::MakeArray(0), main.line);
@@ -197,8 +345,15 @@ pub fn compile_with(program: &[FunDecl], debug: bool) -> Result<Chunk, String> {
     c.b.emit(Op::Pop, main.line);
     let end_jump = c.b.emit(Op::Jump(0), main.line);
 
-    for f in program {
-        c.compile_fun(f)?;
+    for f in &program.funs {
+        c.compile_fun(f, None)?;
+    }
+    // Class/object methods lower as subs named `Class#method`, with `this`
+    // (slot 0) as an implicit first parameter of the enclosing class type.
+    for cd in &program.classes {
+        for m in &cd.methods {
+            c.compile_fun(m, Some(&cd.name))?;
+        }
     }
 
     let end = c.b.current_pos();
@@ -207,25 +362,60 @@ pub fn compile_with(program: &[FunDecl], debug: bool) -> Result<Chunk, String> {
 }
 
 impl Compiler {
-    fn compile_fun(&mut self, f: &FunDecl) -> Result<(), String> {
+    /// Evaluate an `object`'s property initializers and construct its singleton
+    /// once, storing the handle in a global named after the object.
+    fn build_object(&mut self, cd: &ClassDecl) -> Result<(), String> {
+        let meta = self.classes[&cd.name].clone();
+        let meta_idx = self.b.add_constant(Value::str(meta.meta_string()));
+        self.b.emit(Op::LoadConst(meta_idx), cd.line);
+        let mut sc = Scope::new();
+        for (_, _, _, init) in &cd.obj_props {
+            self.compile_expr(&mut sc, init)?;
+        }
+        self.b
+            .emit(Op::Extended(KT_NEW, meta.props.len() as u8), cd.line);
+        let g = self.b.add_name(&cd.name);
+        self.b.emit(Op::SetVar(g), cd.line);
+        Ok(())
+    }
+
+    /// Lower a free function (`class` = `None`) or a class method (`class` =
+    /// `Some(name)`, adding an implicit `this` in slot 0).
+    fn compile_fun(&mut self, f: &FunDecl, class: Option<&str>) -> Result<(), String> {
         let entry = self.b.current_pos();
-        let name_idx = self.b.add_name(&f.name);
+        let sub_name = match class {
+            Some(cls) => method_sub_name(cls, &f.name),
+            None => f.name.clone(),
+        };
+        let name_idx = self.b.add_name(&sub_name);
         self.b.add_sub_entry(name_idx, entry);
 
         let mut sc = Scope::new();
-        // Parameters occupy slots 0..n in declaration order. Kotlin function
-        // parameters are read-only (`val`), so they are declared immutable.
-        for (pname, pty) in &f.params {
-            sc.declare(pname, *pty, false);
+        let mut nslots = f.params.len();
+        // A method receives `this` (the instance handle) as arg 0.
+        if let Some(cls) = class {
+            sc.declare_obj("this", Type::Obj, false, Some(cls.to_string()));
+            nslots += 1;
+        }
+        // Parameters occupy the following slots in declaration order. Kotlin
+        // function parameters are read-only (`val`), so declared immutable.
+        for p in &f.params {
+            sc.declare_obj(&p.name, p.ty, false, p.class.clone());
         }
         // Bind args (stack top = last arg) into slots, deepest last.
-        for i in (0..f.params.len()).rev() {
+        for i in (0..nslots).rev() {
             self.b.emit(Op::SetSlot(i as u16), f.line);
         }
 
-        for s in &f.body {
-            self.compile_stmt(&mut sc, s)?;
-        }
+        self.cur_class = class.map(|s| s.to_string());
+        let res: Result<(), String> = (|| {
+            for s in &f.body {
+                self.compile_stmt(&mut sc, s)?;
+            }
+            Ok(())
+        })();
+        self.cur_class = None;
+        res?;
         // Fallthrough Unit return for `Unit` functions / a missing `return`.
         self.b.emit(Op::LoadUndef, f.line);
         self.b.emit(Op::ReturnValue, f.line);
@@ -250,9 +440,14 @@ impl Compiler {
                 init,
                 mutable,
             } => {
+                let class = self.infer_class(sc, init);
                 let it = self.compile_expr(sc, init)?;
-                let vty = ty.unwrap_or(it);
-                let slot = sc.declare(name, vty, *mutable);
+                let mut vty = ty.unwrap_or(it);
+                // A binding with a known class/container is a heap object.
+                if class.is_some() {
+                    vty = Type::Obj;
+                }
+                let slot = sc.declare_obj(name, vty, *mutable, class);
                 self.b.emit(Op::SetSlot(slot), 0);
             }
             StmtKind::Assign { name, op, value } => {
@@ -260,6 +455,25 @@ impl Compiler {
                 // reports this at compile time.
                 if sc.is_mutable(name) == Some(false) {
                     return Err(format!("val cannot be reassigned: {name}"));
+                }
+                // A bare `name = …` that is not a local but is a property of the
+                // enclosing class is an implicit-`this` field write.
+                if sc.slot(name).is_none() {
+                    if let Some(cls) = self.cur_class.clone() {
+                        if self
+                            .classes
+                            .get(&cls)
+                            .is_some_and(|m| m.prop(name).is_some())
+                        {
+                            return self.compile_set_member(
+                                sc,
+                                &Expr::Var("this".into()),
+                                name,
+                                op,
+                                value,
+                            );
+                        }
+                    }
                 }
                 let slot = sc
                     .slot(name)
@@ -281,6 +495,19 @@ impl Compiler {
                 }
                 self.b.emit(Op::SetSlot(slot), 0);
             }
+            StmtKind::SetMember {
+                recv,
+                name,
+                op,
+                value,
+            } => self.compile_set_member(sc, recv, name, op, value)?,
+            StmtKind::SetIndex {
+                recv,
+                index,
+                op,
+                value,
+            } => self.compile_set_index(sc, recv, index, op, value)?,
+            StmtKind::Destructure { names, init } => self.compile_destructure(sc, names, init)?,
             StmtKind::Return(e) => {
                 match e {
                     Some(e) => {
@@ -496,11 +723,35 @@ impl Compiler {
                 Ok(Type::String)
             }
             Expr::Var(name) => {
-                let slot = sc
-                    .slot(name)
-                    .ok_or_else(|| format!("unresolved reference: {name}"))?;
-                self.b.emit(Op::GetSlot(slot), 0);
-                Ok(sc.ty(name))
+                if let Some(slot) = sc.slot(name) {
+                    self.b.emit(Op::GetSlot(slot), 0);
+                    return Ok(sc.ty(name));
+                }
+                // Implicit `this`: a bare name that is a property of the class
+                // whose method we're lowering resolves to `this.name`.
+                if let Some(cls) = self.cur_class.clone() {
+                    if self
+                        .classes
+                        .get(&cls)
+                        .is_some_and(|m| m.prop(name).is_some())
+                    {
+                        return self.compile_member(
+                            sc,
+                            &Expr::Var("this".into()),
+                            name,
+                            &[],
+                            false,
+                            0,
+                        );
+                    }
+                }
+                // A bare reference to an `object` singleton loads its global.
+                if self.classes.get(name).is_some_and(|m| m.is_object) {
+                    let g = self.b.add_name(name);
+                    self.b.emit(Op::GetVar(g), 0);
+                    return Ok(Type::Obj);
+                }
+                Err(format!("unresolved reference: {name}"))
             }
             Expr::Unary { op, expr } => {
                 let t = self.compile_expr(sc, expr)?;
@@ -539,6 +790,23 @@ impl Compiler {
                 let t = self.compile_expr(sc, inner)?;
                 self.b.emit(Op::Extended(KT_NOTNULL, 0), 0);
                 Ok(t)
+            }
+            Expr::Index { recv, index, line } => {
+                self.compile_expr(sc, recv)?;
+                self.compile_expr(sc, index)?;
+                self.b.emit(Op::Extended(KT_INDEX_GET, 0), *line);
+                Ok(Type::Unknown)
+            }
+            Expr::Pair { first, second } => {
+                self.compile_expr(sc, first)?;
+                self.compile_expr(sc, second)?;
+                self.b.emit(Op::Extended(KT_PAIR, 0), 0);
+                Ok(Type::Obj)
+            }
+            // A lambda is only meaningful inlined into a collection HOF (handled
+            // in `compile_member`); standalone it has no first-class value here.
+            Expr::Lambda { .. } => {
+                Err("a lambda is only supported as a map/filter/forEach argument".into())
             }
             Expr::If(ie) => self.compile_if(sc, ie),
             Expr::When(w) => self.compile_when(sc, w),
@@ -609,6 +877,66 @@ impl Compiler {
             self.b.emit(Op::Extended(KT_CHR_STRING, 0), line);
             return Ok(Type::String);
         }
+        // Collection higher-order functions — the compiler inlines the lambda.
+        if let ["map" | "filter" | "forEach"] = [name] {
+            if let [Expr::Lambda { params, body }] = args {
+                return self.compile_hof(sc, recv, name, params, body, line);
+            }
+        }
+        // A statically-known user class: dispatch a user method as a native
+        // `Op::Call`, read a property directly, or route a `data` member.
+        if let Some(cls) = self.infer_class(sc, recv) {
+            if let Some(meta) = self.classes.get(&cls).cloned() {
+                // A user-declared method → direct call on the `Class#method` sub,
+                // pushing `this` (the receiver) as arg 0.
+                if let Some(sig) = meta.methods.get(name) {
+                    if args.len() != sig.arity {
+                        return Err(format!(
+                            "method {name} on {cls} expects {} argument(s), got {}",
+                            sig.arity,
+                            args.len()
+                        ));
+                    }
+                    self.compile_expr(sc, recv)?;
+                    for a in args {
+                        self.compile_expr(sc, a)?;
+                    }
+                    let idx = self.b.add_name(&method_sub_name(&cls, name));
+                    self.b.emit(Op::Call(idx, (sig.arity + 1) as u8), line);
+                    return Ok(sig.ret);
+                }
+                // A stored property read.
+                if args.is_empty() {
+                    if let Some(p) = meta.prop(name) {
+                        self.compile_expr(sc, recv)?;
+                        let nidx = self.b.add_constant(Value::str(name.to_string()));
+                        self.b.emit(Op::LoadConst(nidx), line);
+                        self.b.emit(Op::Extended(KT_GETFIELD, 0), line);
+                        return Ok(p.ty);
+                    }
+                }
+                // `data class` synthesized `copy(...)` — clone with positional
+                // overrides applied in declaration order.
+                if meta.is_data && name == "copy" {
+                    return self.compile_copy(sc, recv, &meta, args, line);
+                }
+                // Other members (`toString`/`equals`/`hashCode`/`componentN`)
+                // fall through to the host dispatch below.
+            }
+        }
+        self.emit_kt_method(sc, recv, name, args, line)
+    }
+
+    /// Emit a generic `KT_METHOD` host dispatch: push the receiver, then the
+    /// arguments deepest-first, then the member name, and dispatch.
+    fn emit_kt_method(
+        &mut self,
+        sc: &mut Scope,
+        recv: &Expr,
+        name: &str,
+        args: &[Expr],
+        line: u32,
+    ) -> Result<Type, String> {
         self.compile_expr(sc, recv)?;
         for a in args {
             self.compile_expr(sc, a)?;
@@ -617,6 +945,257 @@ impl Compiler {
         self.b.emit(Op::LoadConst(nidx), line);
         self.b.emit(Op::Extended(KT_METHOD, args.len() as u8), line);
         Ok(method_ret_type(name))
+    }
+
+    /// Lower a `data class` `copy(...)`: build a fresh instance whose fields are
+    /// the receiver's, with the positional arguments overriding the leading
+    /// properties (`p.copy(newX)` overrides the first property only).
+    fn compile_copy(
+        &mut self,
+        sc: &mut Scope,
+        recv: &Expr,
+        meta: &ClassMeta,
+        args: &[Expr],
+        line: u32,
+    ) -> Result<Type, String> {
+        if args.len() > meta.props.len() {
+            return Err(format!(
+                "{}.copy takes at most {} argument(s)",
+                meta.name,
+                meta.props.len()
+            ));
+        }
+        let mark = sc.enter();
+        self.compile_expr(sc, recv)?; // [recv]
+        let rslot = sc.temp();
+        self.b.emit(Op::SetSlot(rslot), 0);
+        let meta_idx = self.b.add_constant(Value::str(meta.meta_string()));
+        self.b.emit(Op::LoadConst(meta_idx), line);
+        for (i, p) in meta.props.iter().enumerate() {
+            match args.get(i) {
+                Some(a) => {
+                    self.compile_expr(sc, a)?;
+                }
+                None => {
+                    // Keep the receiver's current value for this property.
+                    self.b.emit(Op::GetSlot(rslot), 0);
+                    let nidx = self.b.add_constant(Value::str(p.name.clone()));
+                    self.b.emit(Op::LoadConst(nidx), 0);
+                    self.b.emit(Op::Extended(KT_GETFIELD, 0), 0);
+                }
+            }
+        }
+        self.b
+            .emit(Op::Extended(KT_NEW, meta.props.len() as u8), line);
+        sc.exit(mark);
+        Ok(Type::Obj)
+    }
+
+    /// Inline a collection higher-order call (`map`/`filter`/`forEach`) over
+    /// `recv` with the given lambda. `map`/`filter` build a fresh accumulator
+    /// list; `forEach` runs the body for effect and yields Unit.
+    fn compile_hof(
+        &mut self,
+        sc: &mut Scope,
+        recv: &Expr,
+        kind: &str,
+        params: &[String],
+        body: &[Stmt],
+        _line: u32,
+    ) -> Result<Type, String> {
+        if params.len() > 1 {
+            return Err(format!("{kind} lambda takes a single parameter"));
+        }
+        let pname = params.first().map(String::as_str).unwrap_or("it");
+        let collects = kind != "forEach";
+        let mark = sc.enter();
+
+        // src, size, index (and accumulator for map/filter) in temp slots.
+        self.compile_expr(sc, recv)?;
+        let src = sc.temp();
+        self.b.emit(Op::SetSlot(src), 0);
+        self.b.emit(Op::GetSlot(src), 0);
+        let sz_name = self.b.add_constant(Value::str("size"));
+        self.b.emit(Op::LoadConst(sz_name), 0);
+        self.b.emit(Op::Extended(KT_METHOD, 0), 0);
+        let szslot = sc.temp();
+        self.b.emit(Op::SetSlot(szslot), 0);
+        let islot = sc.temp();
+        self.b.emit(Op::LoadInt(0), 0);
+        self.b.emit(Op::SetSlot(islot), 0);
+        let accslot = if collects {
+            let a = sc.temp();
+            self.b.emit(Op::Extended(KT_NEWLIST, 0), 0);
+            self.b.emit(Op::SetSlot(a), 0);
+            Some(a)
+        } else {
+            None
+        };
+        // The lambda parameter gets a fixed slot, reassigned each iteration.
+        let pslot = sc.declare(pname, Type::Unknown, false);
+
+        let top = self.b.current_pos();
+        self.b.emit(Op::GetSlot(islot), 0);
+        self.b.emit(Op::GetSlot(szslot), 0);
+        self.b.emit(Op::NumLt, 0);
+        let jf = self.b.emit(Op::JumpIfFalse(0), 0);
+
+        // it = src[i]
+        self.b.emit(Op::GetSlot(src), 0);
+        self.b.emit(Op::GetSlot(islot), 0);
+        self.b.emit(Op::Extended(KT_INDEX_GET, 0), 0);
+        self.b.emit(Op::SetSlot(pslot), 0);
+
+        // Run the lambda body, leaving its value on the stack.
+        self.compile_block_value(sc, body)?;
+        match kind {
+            "forEach" => {
+                self.b.emit(Op::Pop, 0);
+            }
+            "map" => {
+                // [v] → [acc, v] → append
+                self.b.emit(Op::GetSlot(accslot.unwrap()), 0);
+                self.b.emit(Op::Swap, 0);
+                self.b.emit(Op::Extended(KT_LISTPUSH, 0), 0);
+            }
+            "filter" => {
+                // [bool]: on true, append the current element to the accumulator.
+                let skip = self.b.emit(Op::JumpIfFalse(0), 0);
+                self.b.emit(Op::GetSlot(accslot.unwrap()), 0);
+                self.b.emit(Op::GetSlot(pslot), 0);
+                self.b.emit(Op::Extended(KT_LISTPUSH, 0), 0);
+                let after = self.b.current_pos();
+                self.b.patch_jump(skip, after);
+            }
+            _ => unreachable!(),
+        }
+
+        // i += 1
+        self.b.emit(Op::GetSlot(islot), 0);
+        self.b.emit(Op::LoadInt(1), 0);
+        self.b.emit(Op::Add, 0);
+        self.b.emit(Op::SetSlot(islot), 0);
+        self.b.emit(Op::Jump(top), 0);
+        let end = self.b.current_pos();
+        self.b.patch_jump(jf, end);
+
+        let ty = match accslot {
+            Some(a) => {
+                self.b.emit(Op::GetSlot(a), 0);
+                Type::Obj
+            }
+            None => {
+                self.b.emit(Op::LoadUndef, 0);
+                Type::Unit
+            }
+        };
+        sc.exit(mark);
+        Ok(ty)
+    }
+
+    /// `recv.field (op)= value` — an object property write.
+    fn compile_set_member(
+        &mut self,
+        sc: &mut Scope,
+        recv: &Expr,
+        name: &str,
+        op: &Option<BinOp>,
+        value: &Expr,
+    ) -> Result<(), String> {
+        // A `val` property cannot be reassigned (Kotlin compile-time error).
+        if let Some(cls) = self.infer_class(sc, recv) {
+            if let Some(p) = self.classes.get(&cls).and_then(|m| m.prop(name)) {
+                if !p.mutable {
+                    return Err(format!("val cannot be reassigned: {name}"));
+                }
+            }
+        }
+        self.compile_expr(sc, recv)?; // [obj]
+        let store = self.compound_value(recv, name, None, op, value);
+        self.compile_expr(sc, &store)?; // [obj, newval]
+        let nidx = self.b.add_constant(Value::str(name.to_string()));
+        self.b.emit(Op::LoadConst(nidx), 0);
+        self.b.emit(Op::Extended(KT_SETFIELD, 0), 0);
+        Ok(())
+    }
+
+    /// `recv[index] (op)= value` — an indexed write.
+    fn compile_set_index(
+        &mut self,
+        sc: &mut Scope,
+        recv: &Expr,
+        index: &Expr,
+        op: &Option<BinOp>,
+        value: &Expr,
+    ) -> Result<(), String> {
+        self.compile_expr(sc, recv)?; // [recv]
+        self.compile_expr(sc, index)?; // [recv, index]
+        let store = self.compound_value(recv, "", Some(index), op, value);
+        self.compile_expr(sc, &store)?; // [recv, index, value]
+        self.b.emit(Op::Extended(KT_INDEX_SET, 0), 0);
+        Ok(())
+    }
+
+    /// Build the value expression for a (possibly compound) assignment. For a
+    /// plain `=` it is just `value`; for `op=` it is `target op value`, where
+    /// `target` is the member (`index == None`) or the indexed access.
+    fn compound_value(
+        &self,
+        recv: &Expr,
+        name: &str,
+        index: Option<&Expr>,
+        op: &Option<BinOp>,
+        value: &Expr,
+    ) -> Expr {
+        match op {
+            None => value.clone(),
+            Some(binop) => {
+                let target = match index {
+                    Some(ix) => Expr::Index {
+                        recv: Box::new(recv.clone()),
+                        index: Box::new(ix.clone()),
+                        line: 0,
+                    },
+                    None => Expr::Member {
+                        recv: Box::new(recv.clone()),
+                        name: name.to_string(),
+                        safe: false,
+                        line: 0,
+                    },
+                };
+                Expr::Binary {
+                    op: *binop,
+                    l: Box::new(target),
+                    r: Box::new(value.clone()),
+                }
+            }
+        }
+    }
+
+    /// `val (a, b, …) = expr` — bind each name to `expr.componentN` (1-based).
+    fn compile_destructure(
+        &mut self,
+        sc: &mut Scope,
+        names: &[String],
+        init: &Expr,
+    ) -> Result<(), String> {
+        self.compile_expr(sc, init)?; // [val]
+        let tslot = sc.temp();
+        self.b.emit(Op::SetSlot(tslot), 0);
+        for (i, nm) in names.iter().enumerate() {
+            if nm == "_" {
+                continue; // `_` discards the component
+            }
+            self.b.emit(Op::GetSlot(tslot), 0);
+            let cidx = self
+                .b
+                .add_constant(Value::str(format!("component{}", i + 1)));
+            self.b.emit(Op::LoadConst(cidx), 0);
+            self.b.emit(Op::Extended(KT_METHOD, 0), 0);
+            let slot = sc.declare(nm, Type::Unknown, false);
+            self.b.emit(Op::SetSlot(slot), 0);
+        }
+        Ok(())
     }
 
     /// Lower a safe member/method access `recv?.member(args)`. Evaluates the
@@ -710,6 +1289,18 @@ impl Compiler {
 
         let lt = self.infer(sc, l);
         let rt = self.infer(sc, r);
+
+        // `==`/`!=` on a heap object is structural equality (data-class,
+        // List/Map/Pair), not the numeric/pointer compare of the native ops.
+        if matches!(op, BinOp::Eq | BinOp::Ne) && (lt == Type::Obj || rt == Type::Obj) {
+            self.compile_expr(sc, l)?;
+            self.compile_expr(sc, r)?;
+            self.b.emit(Op::Extended(KT_OBJEQ, 0), 0);
+            if op == BinOp::Ne {
+                self.b.emit(Op::LogNot, 0);
+            }
+            return Ok(Type::Boolean);
+        }
 
         // `+` is string concatenation when either side is a String.
         if op == BinOp::Add && (lt == Type::String || rt == Type::String) {
@@ -850,40 +1441,109 @@ impl Compiler {
                 self.b.emit(Op::LoadUndef, line); // println returns Unit
                 Ok(Type::Unit)
             }
-            _ => {
-                match self.fun_sig.get(name) {
-                    Some(&(ret, arity)) => {
-                        if args.len() != arity {
-                            return Err(format!(
-                                "function {name} expects {arity} argument(s), got {}",
-                                args.len()
-                            ));
-                        }
-                        for a in args {
-                            self.compile_expr(sc, a)?;
-                        }
-                        let idx = self.b.add_name(name);
-                        self.b.emit(Op::Call(idx, arity as u8), line);
-                        Ok(ret)
-                    }
-                    // Unknown name. With a `rust { ... }` block present it may be an
-                    // FFI export registered at runtime, so lower to a by-name FFI
-                    // dispatch; the args are pushed deepest-first, then the name.
-                    // Without any FFI block, it stays a compile-time error.
-                    None if self.has_ffi => {
-                        for a in args {
-                            self.compile_expr(sc, a)?;
-                        }
-                        let nidx = self.b.add_constant(Value::str(name.to_string()));
-                        self.b.emit(Op::LoadConst(nidx), line);
-                        self.b
-                            .emit(Op::Extended(KT_FFI_CALL, args.len() as u8), line);
-                        Ok(Type::Unknown)
-                    }
-                    None => Err(format!("unresolved reference: {name}")),
+            // Collection builders → heap objects.
+            "listOf" | "mutableListOf" | "arrayListOf" | "emptyList" => {
+                for a in args {
+                    self.compile_expr(sc, a)?;
                 }
+                self.b.emit(Op::Extended(KT_LIST, args.len() as u8), line);
+                Ok(Type::Obj)
+            }
+            "mapOf" | "mutableMapOf" | "hashMapOf" | "emptyMap" => {
+                // Each argument is a `k to v` Pair.
+                for a in args {
+                    self.compile_expr(sc, a)?;
+                }
+                self.b.emit(Op::Extended(KT_MAP, args.len() as u8), line);
+                Ok(Type::Obj)
+            }
+            _ => {
+                // A constructor call `Class(args)`.
+                if let Some(meta) = self.classes.get(name).cloned() {
+                    return self.compile_construct(sc, &meta, args, line);
+                }
+                // A free user function.
+                if let Some(sig) = self.fun_sig.get(name).cloned() {
+                    if args.len() != sig.arity {
+                        return Err(format!(
+                            "function {name} expects {} argument(s), got {}",
+                            sig.arity,
+                            args.len()
+                        ));
+                    }
+                    for a in args {
+                        self.compile_expr(sc, a)?;
+                    }
+                    let idx = self.b.add_name(name);
+                    self.b.emit(Op::Call(idx, sig.arity as u8), line);
+                    return Ok(sig.ret);
+                }
+                // Implicit `this.method(args)` inside a class method.
+                if let Some(cls) = self.cur_class.clone() {
+                    if self
+                        .classes
+                        .get(&cls)
+                        .is_some_and(|m| m.methods.contains_key(name))
+                    {
+                        return self.compile_member(
+                            sc,
+                            &Expr::Var("this".into()),
+                            name,
+                            args,
+                            false,
+                            line,
+                        );
+                    }
+                }
+                // Unknown name. With a `rust { ... }` block present it may be an
+                // FFI export registered at runtime, so lower to a by-name FFI
+                // dispatch; the args are pushed deepest-first, then the name.
+                // Without any FFI block, it stays a compile-time error.
+                if self.has_ffi {
+                    for a in args {
+                        self.compile_expr(sc, a)?;
+                    }
+                    let nidx = self.b.add_constant(Value::str(name.to_string()));
+                    self.b.emit(Op::LoadConst(nidx), line);
+                    self.b
+                        .emit(Op::Extended(KT_FFI_CALL, args.len() as u8), line);
+                    return Ok(Type::Unknown);
+                }
+                Err(format!("unresolved reference: {name}"))
             }
         }
+    }
+
+    /// Lower a constructor call `Class(args)`: push the class metadata string,
+    /// then each stored-property value in declaration order, then `KT_NEW`. Only
+    /// `val`/`var` primary-constructor params are stored; plain params are not
+    /// modeled (they carry no property).
+    fn compile_construct(
+        &mut self,
+        sc: &mut Scope,
+        meta: &ClassMeta,
+        args: &[Expr],
+        line: u32,
+    ) -> Result<Type, String> {
+        if meta.is_object {
+            return Err(format!("cannot construct object {}", meta.name));
+        }
+        if args.len() != meta.props.len() {
+            return Err(format!(
+                "constructor {} expects {} argument(s), got {}",
+                meta.name,
+                meta.props.len(),
+                args.len()
+            ));
+        }
+        let meta_idx = self.b.add_constant(Value::str(meta.meta_string()));
+        self.b.emit(Op::LoadConst(meta_idx), line);
+        for a in args {
+            self.compile_expr(sc, a)?;
+        }
+        self.b
+            .emit(Op::Extended(KT_NEW, meta.props.len() as u8), line);
+        Ok(Type::Obj)
     }
 
     fn compile_if(&mut self, sc: &mut Scope, ie: &IfExpr) -> Result<Type, String> {
@@ -1146,13 +1806,39 @@ impl Compiler {
             },
             Expr::Call { name, .. } => match name.as_str() {
                 "println" | "print" => Type::Unit,
+                "listOf" | "mutableListOf" | "arrayListOf" | "emptyList" | "mapOf"
+                | "mutableMapOf" | "hashMapOf" | "emptyMap" => Type::Obj,
+                _ if self.classes.contains_key(name) => Type::Obj, // constructor
                 _ => self
                     .fun_sig
                     .get(name)
-                    .map(|(t, _)| *t)
+                    .map(|s| s.ret)
                     .unwrap_or(Type::Unknown),
             },
-            Expr::Member { name, .. } | Expr::MethodCall { name, .. } => method_ret_type(name),
+            Expr::Index { .. } => Type::Unknown,
+            Expr::Pair { .. } => Type::Obj,
+            Expr::Lambda { .. } => Type::Unknown,
+            Expr::Member { recv, name, .. } => {
+                // A property read on a known class yields the property's type.
+                if let Some(cls) = self.infer_class(sc, recv) {
+                    if let Some(p) = self.classes.get(&cls).and_then(|m| m.prop(name)) {
+                        return p.ty;
+                    }
+                }
+                method_ret_type(name)
+            }
+            Expr::MethodCall { recv, name, .. } => {
+                // `map`/`filter` yield a `List` (heap object).
+                if matches!(name.as_str(), "map" | "filter") {
+                    return Type::Obj;
+                }
+                if let Some(cls) = self.infer_class(sc, recv) {
+                    if let Some(sig) = self.classes.get(&cls).and_then(|m| m.methods.get(name)) {
+                        return sig.ret;
+                    }
+                }
+                method_ret_type(name)
+            }
             Expr::Elvis { left, right } => {
                 let lt = self.infer(sc, left);
                 let rt = self.infer(sc, right);
@@ -1199,6 +1885,61 @@ impl Compiler {
             _ => Type::Unit,
         }
     }
+
+    /// The class/container name of an expression's value, when statically known:
+    /// a bound variable's class, a constructor call, `this`, a class-typed
+    /// function return, or a class-typed property/method result. Drives method
+    /// dispatch and property typing.
+    fn infer_class(&self, sc: &Scope, e: &Expr) -> Option<String> {
+        match e {
+            Expr::Var(n) => {
+                if n == "this" {
+                    return self.cur_class.clone().or_else(|| sc.class_of(n));
+                }
+                if let Some(c) = sc.class_of(n) {
+                    return Some(c);
+                }
+                // Unbound but a property of the enclosing class → implicit this.
+                if let Some(cls) = &self.cur_class {
+                    if let Some(p) = self.classes.get(cls).and_then(|m| m.prop(n)) {
+                        return p.class.clone();
+                    }
+                }
+                // An `object` singleton referenced by name.
+                if self.classes.get(n).is_some_and(|m| m.is_object) {
+                    return Some(n.clone());
+                }
+                None
+            }
+            Expr::Call { name, .. } => {
+                if self.classes.contains_key(name) {
+                    return Some(name.clone()); // constructor
+                }
+                self.fun_sig.get(name).and_then(|s| s.ret_class.clone())
+            }
+            Expr::Member { recv, name, .. } => {
+                let cls = self.infer_class(sc, recv)?;
+                self.classes
+                    .get(&cls)
+                    .and_then(|m| m.prop(name))
+                    .and_then(|p| p.class.clone())
+            }
+            Expr::MethodCall { recv, name, .. } => {
+                if matches!(name.as_str(), "map" | "filter") {
+                    return Some("List".to_string());
+                }
+                let cls = self.infer_class(sc, recv)?;
+                self.classes
+                    .get(&cls)
+                    .and_then(|m| m.methods.get(name))
+                    .and_then(|s| s.ret_class.clone())
+            }
+            Expr::NotNull(inner) => self.infer_class(sc, inner),
+            Expr::Elvis { left, .. } => self.infer_class(sc, left),
+            Expr::Pair { .. } => Some("Pair".to_string()),
+            _ => None,
+        }
+    }
 }
 
 /// Join two coarse branch types: identical types collapse to that type, an
@@ -1234,6 +1975,11 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
     body.iter().any(|s| match &s.kind {
         StmtKind::Let { init, .. } => expr_has_ffi(init),
         StmtKind::Assign { value, .. } => expr_has_ffi(value),
+        StmtKind::SetMember { recv, value, .. } => expr_has_ffi(recv) || expr_has_ffi(value),
+        StmtKind::SetIndex {
+            recv, index, value, ..
+        } => expr_has_ffi(recv) || expr_has_ffi(index) || expr_has_ffi(value),
+        StmtKind::Destructure { init, .. } => expr_has_ffi(init),
         StmtKind::Return(Some(e)) => expr_has_ffi(e),
         StmtKind::Return(None) => false,
         StmtKind::While { cond, body, .. } => expr_has_ffi(cond) || body_has_ffi(body),
@@ -1277,6 +2023,9 @@ fn expr_has_ffi(e: &Expr) -> bool {
         Expr::Binary { l, r, .. } => expr_has_ffi(l) || expr_has_ffi(r),
         Expr::Elvis { left, right } => expr_has_ffi(left) || expr_has_ffi(right),
         Expr::NotNull(inner) => expr_has_ffi(inner),
+        Expr::Index { recv, index, .. } => expr_has_ffi(recv) || expr_has_ffi(index),
+        Expr::Pair { first, second } => expr_has_ffi(first) || expr_has_ffi(second),
+        Expr::Lambda { body, .. } => body_has_ffi(body),
         Expr::If(ie) => if_has_ffi(ie),
         Expr::When(w) => when_has_ffi(w),
         Expr::Str(parts) => parts.iter().any(|p| match p {

@@ -16,6 +16,11 @@ pub enum Type {
     Char,
     String,
     Unit,
+    /// A heap object — a class instance, `List`, `Map`, or `Pair`. Carries no
+    /// class identity in the coarse type (that rides in the compiler's binding
+    /// table, [`crate::compiler`]); it exists so `==` routes to structural
+    /// equality and display routes through the object stringifier.
+    Obj,
     Unknown,
 }
 
@@ -47,13 +52,76 @@ impl Type {
     }
 }
 
+/// A whole compilation unit: the top-level `class`/`object` declarations and
+/// free `fun`s. Execution still enters `fun main`.
+#[derive(Debug, Clone, Default)]
+pub struct Program {
+    pub classes: Vec<ClassDecl>,
+    pub funs: Vec<FunDecl>,
+}
+
+/// A function parameter, or a primary-constructor property parameter. `class`
+/// carries the referenced class name when the annotation names a user class
+/// (the coarse [`Type`] can't hold it), so the compiler can dispatch methods on
+/// a parameter of class type.
+#[derive(Debug, Clone)]
+pub struct Param {
+    pub name: String,
+    pub ty: Type,
+    /// The class name when `ty == Type::Obj` and the annotation named a user
+    /// class (e.g. `p: Person`).
+    pub class: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct FunDecl {
     pub name: String,
-    pub params: Vec<(String, Type)>,
+    pub params: Vec<Param>,
     pub ret: Type,
+    /// The return class name when `ret == Type::Obj` and it named a user class.
+    pub ret_class: Option<String>,
     pub body: Vec<Stmt>,
     pub line: u32,
+}
+
+/// Whether a primary-constructor parameter also declares a stored property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropKind {
+    /// `val x` — a read-only stored property.
+    Val,
+    /// `var x` — a mutable stored property.
+    Var,
+    /// A plain constructor parameter (`x`) — not stored as a property.
+    None,
+}
+
+/// A `class` / `data class` / `object` declaration.
+///
+/// A regular class's primary constructor lists [`Param`]s; those marked
+/// `val`/`var` ([`PropKind`]) become stored properties. `data` classes
+/// additionally get synthesized `equals`/`hashCode`/`toString`/`copy`/
+/// `componentN`. An `object` has no constructor — its `props` carry
+/// initializer expressions and are built once into a singleton.
+#[derive(Debug, Clone)]
+pub struct ClassDecl {
+    pub name: String,
+    /// Primary-constructor parameters (empty for an `object`).
+    pub params: Vec<CtorProp>,
+    /// `object` singleton properties with initializer expressions.
+    pub obj_props: Vec<(String, Type, Option<String>, Expr)>,
+    pub methods: Vec<FunDecl>,
+    pub is_data: bool,
+    pub is_object: bool,
+    pub line: u32,
+}
+
+/// A primary-constructor parameter with its property kind.
+#[derive(Debug, Clone)]
+pub struct CtorProp {
+    pub name: String,
+    pub ty: Type,
+    pub class: Option<String>,
+    pub kind: PropKind,
 }
 
 /// A statement plus the 1-based source line it started on. The line drives
@@ -85,6 +153,25 @@ pub enum StmtKind {
         name: String,
         op: Option<BinOp>,
         value: Expr,
+    },
+    /// `receiver.field (op)= value` — a property write on an object.
+    SetMember {
+        recv: Expr,
+        name: String,
+        op: Option<BinOp>,
+        value: Expr,
+    },
+    /// `receiver[index] (op)= value` — an indexed write on a list/map.
+    SetIndex {
+        recv: Expr,
+        index: Expr,
+        op: Option<BinOp>,
+        value: Expr,
+    },
+    /// `val (a, b, …) = expr` — destructuring via `componentN`.
+    Destructure {
+        names: Vec<String>,
+        init: Expr,
     },
     Return(Option<Expr>),
     While {
@@ -251,6 +338,24 @@ pub enum Expr {
     },
     /// Not-null assertion `expr!!` — throws NPE when `expr` is null.
     NotNull(Box<Expr>),
+    /// Indexed access `receiver[index]` — list element or map value.
+    Index {
+        recv: Box<Expr>,
+        index: Box<Expr>,
+        line: u32,
+    },
+    /// `first to second` — a `Pair`.
+    Pair {
+        first: Box<Expr>,
+        second: Box<Expr>,
+    },
+    /// A lambda `{ params -> body }`. First-class only inside the collection
+    /// higher-order calls (`map`/`filter`/`forEach`), where the compiler inlines
+    /// the body; used elsewhere it is a compile error.
+    Lambda {
+        params: Vec<String>,
+        body: Vec<Stmt>,
+    },
     /// `if` used as an expression (each branch's last statement is its value).
     If(IfExpr),
     /// `when` used as an expression (the matched arm's value).
