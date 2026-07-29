@@ -3,7 +3,7 @@
 //!
 //! fusevm's ops are language-agnostic, so the Kotlin behaviors the universal
 //! ops can't express are handled here — the value coercions below, the
-//! frontend-owned object heap ([`HeapObj`]), and the in-flight exception a VM
+//! frontend-owned object heap (`HeapObj`), and the in-flight exception a VM
 //! with no unwind opcode cannot carry itself (see “Exception unwinding”):
 //!
 //! - **`KT_TO_STRING`** — Kotlin display form. fusevm's `Value::to_str` is
@@ -489,7 +489,7 @@ fn reset_heap() {
 //
 //   * **Runtime half (here).** A raise parks the throwable in [`PENDING`]
 //     instead of halting, provided the program contains a `try` at all
-//     ([`EXC_ENABLED`]). Every builtin with an observable side effect (printing,
+//     (`EXC_ENABLED`). Every builtin with an observable side effect (printing,
 //     closure invocation) short-circuits while [`unwinding`] holds, so nothing
 //     escapes between the raise and its handler.
 //   * **Compile-time half (`crate::compiler`).** In a program that contains a
@@ -518,7 +518,7 @@ thread_local! {
 }
 
 /// Declare whether the program about to run contains a `try` (see
-/// [`EXC_ENABLED`]). Called by the runner after compiling and before `VM::run`.
+/// `EXC_ENABLED`). Called by the runner after compiling and before `VM::run`.
 pub fn set_catchable(on: bool) {
     EXC_ENABLED.with(|e| e.set(on));
 }
@@ -1563,7 +1563,7 @@ pub fn install(vm: &mut VM) {
 }
 
 /// Switch `vm` to fusevm's *strict* numeric policy, routing every arithmetic or
-/// comparison op it cannot compute natively through [`num_hook`].
+/// comparison op it cannot compute natively through `num_hook`.
 ///
 /// This is what makes a real `Char` possible. A char is a `Value::Obj`, so
 /// `'a' + 1` and `c < 'z'` — which lower to *native* `Op::Add`/`Op::NumLt` even
@@ -1578,7 +1578,7 @@ pub fn install(vm: &mut VM) {
 /// to be a `String`, so a syntactic test would have to be so broad it would
 /// cover nearly every program anyway — and being wrong about it would be silent.
 /// Int/Int arithmetic stays on fusevm's native fast path either way; only an
-/// operand fusevm cannot compute on at all reaches [`num_hook`].
+/// operand fusevm cannot compute on at all reaches `num_hook`.
 pub fn install_numeric(vm: &mut VM) {
     vm.set_numeric_hook(std::sync::Arc::new(num_hook));
 }
