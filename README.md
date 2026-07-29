@@ -54,10 +54,12 @@ the loop. kotlinrs carries no VM or JIT of its own. Highlights:
   `pythonrs`, and `node-js`.
 - **Native locals & calls** — `val`/`var` bindings compile to frame slots and
   `fun` calls to fusevm's native `Op::Call` sub-dispatch, with real recursion.
-- **Kotlin-faithful boundaries** — a small extension handler supplies the three
+- **Kotlin-faithful boundaries** — a small extension handler supplies the
   behaviors the language-agnostic VM can't: Kotlin `toString()` for
-  `Boolean`/`Double`, and truncating integer `/` and `%` with an
-  `ArithmeticException` on a zero divisor.
+  `Boolean`/`Double`, truncating integer `/` and `%` with an
+  `ArithmeticException` on a zero divisor, the object heap behind classes /
+  collections / lambdas, and the in-flight exception a VM with no unwind opcode
+  cannot carry itself.
 
 `kotlinrs` is an **M0 scaffold**: a genuinely running Kotlin subset (below), not
 a stub. See the roadmap for what is next.
@@ -147,8 +149,10 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   *reachable* element), aggregated (`(1..3).sum()`), mapped/filtered, and
   iterated. `x in r` / `x !in r` is step-aligned membership; `in` also works over
   a `List`, a `Map`'s keys, and a `String`'s substrings.
-- **Arrays** — `arrayOf`/`intArrayOf`/`doubleArrayOf`/`booleanArrayOf` and the
-  zero-filled `IntArray(n)`/`DoubleArray(n)`/`BooleanArray(n)`, with `[i]` read
+- **Arrays** — `arrayOf`/`intArrayOf`/`doubleArrayOf`/`booleanArrayOf`, the
+  zero-filled `IntArray(n)`/`DoubleArray(n)`/`BooleanArray(n)`, and the
+  index-lambda initializers `IntArray(n) { it * 2 }` / `DoubleArray(n) { … }` /
+  `Array(n) { … }`, with `[i]` read
   and write, `.size`, the shared sequence members, and `for (x in a)`. An array
   keeps JVM semantics: `==` is reference identity (`arrayOf(1) == arrayOf(1)` is
   `false`) and `toString()` is `[I@…`-style (the identity-hash digits are ours,
@@ -175,15 +179,31 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   forms, with literal, comma-grouped, `in`/`!in` range, `is`/`!is` type, and
   `else` arms; `while`, and `for` — over a literal range (`a..b`, `a until b`,
   `a downTo b`, with optional `step`), which lowers to a counted native-op loop,
-  or over any iterable value (a `List`, an array, a range held in a variable).
+  or over any iterable value (a `List`, an array, a range held in a variable, or
+  a `String` — `for (c in "abc")` walks its `Char`s).
   A loop body may be a block or a single statement;
   `break`/`continue`, including labeled `outer@ for (…)` with
   `break@outer` / `continue@outer`. Blocks are lexically scoped: bindings
   declared in a nested block (and the `for` variable) drop at the block's end;
   shadowing is restored.
 - **Null safety** — `null` literal and nullable types `T?`; safe call `?.`
-  (short-circuits to null), Elvis `?:`, and the not-null assertion `!!` (throws
-  `NullPointerException` on null).
+  (short-circuits to null, and chains: `a?.b?.c`), Elvis `?:`, and the not-null
+  assertion `!!` (throws `NullPointerException` on null). `x == null` / `x != null`
+  are null tests, not value comparisons, and a null `String?` renders as the four
+  characters `null` in a template or a `+` — so `"v=$n"` reads `v=null`.
+- **Exceptions** — `try` / `catch` / `finally` / `throw`, with `try` as an
+  **expression** (`val n = try { f() } catch (e: Exception) { -1 }`). `catch`
+  arms are tested in source order against the JVM throwable hierarchy, so
+  `catch (e: RuntimeException)` claims an `IllegalArgumentException`; `finally`
+  runs on both the normal and the exceptional path, and an exception raised *by*
+  a finalizer replaces the one it interrupted. The modeled throwables construct
+  and print like the JVM's (`RuntimeException("boom")` →
+  `java.lang.RuntimeException: boom`, `.message` → `boom` or `null`), and the
+  runtime faults kotlinrs already reported are the *same* catchable exceptions:
+  `1 / 0` is an `ArithmeticException`, `!!` on null a `NullPointerException`, an
+  out-of-range index an `IndexOutOfBoundsException`. An uncaught exception
+  reports `Exception in thread "main" <class>: <message>` on stderr and exits
+  non-zero.
 - **Functions** — user calls, recursion, `return`, `Unit` functions.
 - **Increment / decrement** — `x++`, `x--`, `++x`, `--x` on a variable, a
   property, or an indexed element, in statement **and** expression position
@@ -192,14 +212,29 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 - **Built-ins** — `println(...)` / `print(...)`.
 - **Imports** — `package` and `import` declarations, including `a.b.*` and
   `a.b.c as d`, parsed and used for name resolution.
+- **Type arguments** — explicit call type arguments (`listOf<Int>()`,
+  `emptyMap<String, Int>()`) are parsed and ignored; typing stays coarse, and
+  `a < b` still parses as a comparison (a type-argument list may hold only names
+  and must be followed by `(`, which is how Kotlin resolves the same ambiguity).
 - **Comments** — `//` and nested `/* … */`.
 
-Not yet (see roadmap): generics beyond parse-and-ignore, the `this`-receiver
+Not yet (see roadmap): generic *declarations* (type parameters on a `fun`/`class`
+are not accepted; only type arguments at a call site are), the `this`-receiver
 scope functions (`.apply`/`.run`), directly invoking a call result (`f()()`;
 bind it first), lambda element-type inference (an unannotated `it` is coarsely
 typed, so `/` and `%` on it default to float — annotate the parameter `Int` for
-integer semantics), interfaces/inheritance, class body property initializers,
-named / default arguments, and the rest of the standard-library surface.
+integer semantics), interfaces/inheritance (so a user class cannot extend
+`Exception` — `throw`/`catch` cover the built-in throwables), class body property
+initializers, named / default arguments, the lambda-taking collection functions
+on a `String` receiver (`"abc".map { … }`; `for (c in s)` works), and the rest of
+the standard-library surface.
+
+A `return` out of a `try` that owns a `finally` is honoured — the finalizer runs
+first, nesting outward — but a `break`/`continue` out of one is refused at
+compile time, because kotlinrs would run the jump without the finalizer and
+silently skipping a cleanup block is worse than not accepting the program. A
+`try` with neither a `catch` nor a `finally` is refused too (Kotlin rejects it
+as well).
 
 ## [0x04] COMMAND-LINE FLAGS
 
@@ -248,6 +283,19 @@ fusevm::VM  ──►  three-tier Cranelift JIT (linear · block · tracing)
   host ops work inside a lambda body. fusevm just carries the handle
   (identity-comparable); the frontend owns the pointed-to object — the same model
   the other mature fusevm frontends use. Everything else is a universal fusevm op.
+- **Exceptions without an unwind opcode.** fusevm has none, and kotlinrs lowers
+  `fun`s to *native* `Op::Call` frames, so a `throw` cannot longjmp out of a
+  frame. It is instead the two-part protocol the sibling frontends (`javars`,
+  `scalars`) converged on: the host parks the throwable in a pending slot and
+  suppresses every side-effecting builtin while it is in flight (so nothing
+  prints between the raise and its handler), while the compiler emits a pending
+  check after each statement that jumps to the innermost enclosing handler — out
+  of a loop, out of a frame, into a `catch` dispatch, or into the terminal report
+  at the end of `main`. Unwinding is therefore statement-granular: the abandoned
+  statement finishes evaluating on garbage operands, which the handler discards
+  by truncating the value stack to the depth recorded at `try` entry. A program
+  with no `try`/`throw` emits **zero** extra ops and keeps the native print op,
+  so it pays nothing for the feature.
 
 ## [0x06] STATUS & ROADMAP
 
@@ -263,15 +311,19 @@ syntax) as heap closures; the lambda-taking higher-order collection functions
 functions (`let`/`also`/`takeIf`); ranges as values (`1..5`, `until`, `downTo`,
 `step`, `in`/`!in`) with the `IntRange`/`IntProgression` display split; arrays
 (`arrayOf`, `IntArray(n)`, indexing, `.size`) with JVM reference equality;
-`kotlin.math`/`java.lang.Math` under Kotlin's own import rules; and `++`/`--` in
-expression position.
+`kotlin.math`/`java.lang.Math` under Kotlin's own import rules; `++`/`--` in
+expression position; `try`/`catch`/`finally`/`throw` with `try` as an expression
+and host faults raised as catchable JVM exceptions; the array index-lambda
+initializers (`IntArray(n) { it * 2 }`, `Array(n) { … }`); `String` iteration
+(`for (c in "abc")`); and the null-safety corners — `x == null` as a null test,
+`String?` display, and the operator methods (`n?.plus(1)`).
 
 Next: generics, `Set`, the `this`-receiver scope functions (`apply`/`run`),
-lambda element-type inference, interfaces/inheritance, named/default arguments,
-the array lambda-initializer form (`IntArray(n) { it * 2 }`), `String` iteration,
-and a growing standard-library surface — alongside the sibling parity tooling
-(LSP/DAP,
-reference generator, differential harness).
+lambda element-type inference, interfaces/inheritance (including user classes
+extending `Exception`), named/default arguments, the lambda-taking collection
+functions on a `String` receiver, and a growing standard-library surface —
+alongside the sibling parity tooling (LSP/DAP, reference generator, differential
+harness).
 
 ## [0xFF] LICENSE
 

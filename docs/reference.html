@@ -151,7 +151,27 @@ println(r.sum())   // 15</code></pre>
           <pre><code class="lang-kotlin">for (i in 1..9) { if (i % 2 == 0) continue; println(i) }</code></pre>
         </article>
         <article class="doc-entry" id="doc-keyword-20">
-          <h3><a class="doc-anchor" href="#doc-keyword-20">#</a> <code>null</code></h3>
+          <h3><a class="doc-anchor" href="#doc-keyword-20">#</a> <code>try</code></h3>
+          <p>guarded block; an EXPRESSION whose value is the body's or the matching handler's</p>
+          <pre><code class="lang-kotlin">val n = try { "x".length } catch (e: Exception) { -1 }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-21">
+          <h3><a class="doc-anchor" href="#doc-keyword-21">#</a> <code>catch</code></h3>
+          <p>handler arm: `catch (e: T) { … }`; the first arm whose type matches wins</p>
+          <pre><code class="lang-kotlin">try { 1 / 0 } catch (e: ArithmeticException) { println(e.message) }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-22">
+          <h3><a class="doc-anchor" href="#doc-keyword-22">#</a> <code>finally</code></h3>
+          <p>cleanup block; runs on the normal and the exceptional path alike</p>
+          <pre><code class="lang-kotlin">try { work() } finally { println("done") }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-23">
+          <h3><a class="doc-anchor" href="#doc-keyword-23">#</a> <code>throw</code></h3>
+          <p>raise a throwable; typed `Nothing`, so it is usable as an expression</p>
+          <pre><code class="lang-kotlin">val v = x ?: throw IllegalStateException("missing")</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-24">
+          <h3><a class="doc-anchor" href="#doc-keyword-24">#</a> <code>null</code></h3>
           <p>the null reference; used with `T?`, `?.`, `?:`, and `!!`</p>
           <pre><code class="lang-kotlin">val x: Int? = null
 println(x ?: 0)   // 0</code></pre>

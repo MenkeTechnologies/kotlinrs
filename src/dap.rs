@@ -291,6 +291,9 @@ fn run_debug(src: &str) -> Result<(), String> {
     let program = crate::parser::parse_program(&prepared)?;
     let chunk = crate::compiler::compile_debug(&program)?;
     let _ = crate::host::take_error();
+    // Same contract as the normal run: a JVM-throwable fault is catchable only
+    // in a program whose bytecode carries the unwind checks.
+    crate::host::set_catchable(crate::compiler::uses_exceptions(&program));
     let mut vm = VM::new(chunk);
     crate::host::install_debug(&mut vm);
     match vm.run() {

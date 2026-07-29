@@ -146,6 +146,30 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "for (i in 1..9) { if (i % 2 == 0) continue; println(i) }",
     ),
     (
+        "try",
+        "Keyword",
+        "guarded block; an EXPRESSION whose value is the body's or the matching handler's",
+        "val n = try { \"x\".length } catch (e: Exception) { -1 }",
+    ),
+    (
+        "catch",
+        "Keyword",
+        "handler arm: `catch (e: T) { … }`; the first arm whose type matches wins",
+        "try { 1 / 0 } catch (e: ArithmeticException) { println(e.message) }",
+    ),
+    (
+        "finally",
+        "Keyword",
+        "cleanup block; runs on the normal and the exceptional path alike",
+        "try { work() } finally { println(\"done\") }",
+    ),
+    (
+        "throw",
+        "Keyword",
+        "raise a throwable; typed `Nothing`, so it is usable as an expression",
+        "val v = x ?: throw IllegalStateException(\"missing\")",
+    ),
+    (
         "null",
         "Keyword",
         "the null reference; used with `T?`, `?.`, `?:`, and `!!`",

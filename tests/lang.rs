@@ -1239,3 +1239,221 @@ fun main() {
         "stderr was: {err}"
     );
 }
+
+// ─── Exceptions: `try` / `catch` / `finally` / `throw` ────────────────────
+//
+// fusevm has no unwind opcode, so an in-flight exception is a host-side pending
+// value plus compiler-emitted per-statement checks (see the “Exception
+// unwinding” sections in `src/host.rs` / `src/compiler.rs`). These tests pin the
+// observable contract that protocol has to deliver: values, ordering, and the
+// exit status. Every expectation below was captured from the reference
+// `kotlinc` + `kotlin` toolchain.
+
+#[test]
+fn try_is_an_expression_and_catch_supplies_the_value() {
+    let src = "\
+fun main() {
+    val a = try { 1 / 0 } catch (e: ArithmeticException) { -1 }
+    println(a)
+    println(try { 6 * 7 } catch (e: Exception) { 0 })
+    println(try { throw RuntimeException(\"x\") } catch (e: Exception) { e.message })
+}";
+    assert_eq!(prog(src), "-1\n42\nx\n");
+}
+
+#[test]
+fn catch_matches_the_throwable_hierarchy_in_source_order() {
+    // A subclass is caught by a supertype arm, and the FIRST matching arm wins.
+    let src = "\
+fun main() {
+    try { throw IllegalArgumentException(\"bad\") } catch (e: RuntimeException) { println(e) }
+    try { throw RuntimeException(\"x\") } catch (e: IllegalStateException) { println(\"wrong\") } catch (e: RuntimeException) { println(\"right\") }
+    try { throw Error(\"fatal\") } catch (e: Throwable) { println(e.message) }
+}";
+    assert_eq!(
+        prog(src),
+        "java.lang.IllegalArgumentException: bad\nright\nfatal\n"
+    );
+}
+
+#[test]
+fn finally_runs_on_both_paths_and_a_finally_throw_wins() {
+    let src = "\
+fun main() {
+    try { println(\"body\") } finally { println(\"fin1\") }
+    try { throw RuntimeException(\"a\") } catch (e: Exception) { println(\"c\") } finally { println(\"fin2\") }
+    try { try { throw RuntimeException(\"a\") } finally { throw IllegalStateException(\"b\") } } catch (e: Exception) { println(e.message) }
+}";
+    assert_eq!(prog(src), "body\nfin1\nc\nfin2\nb\n");
+}
+
+#[test]
+fn a_raise_suppresses_the_rest_of_the_abandoned_statement() {
+    // `println` must NOT run once the argument's evaluation threw, and a
+    // compound assignment must leave its target's previous value intact.
+    let src = "\
+fun boom(): Int = throw RuntimeException(\"no\")
+fun main() {
+    var acc = 7
+    try { println(\"v=\" + boom()) } catch (e: Exception) { println(\"caught\") }
+    try { acc += 10 / 0 } catch (e: Exception) { println(acc) }
+}";
+    assert_eq!(prog(src), "caught\n7\n");
+}
+
+#[test]
+fn an_exception_unwinds_out_of_call_frames_loops_and_lambdas() {
+    let src = "\
+fun deep(n: Int): Int { if (n == 0) throw IllegalStateException(\"bottom\") ; return deep(n - 1) }
+fun main() {
+    println(try { deep(3) } catch (e: IllegalStateException) { -9 })
+    var sum = 0
+    for (i in 1..4) { try { if (i == 3) throw RuntimeException(\"skip\") ; sum += i } catch (e: Exception) { sum += 10 } }
+    println(sum)
+    try { listOf(1, 2, 3).forEach { if (it == 2) throw RuntimeException(\"stop\") else println(it) } } catch (e: Exception) { println(e.message) }
+}";
+    assert_eq!(prog(src), "-9\n17\n1\nstop\n");
+}
+
+#[test]
+fn host_faults_are_catchable_as_their_jvm_exceptions() {
+    // The runtime errors kotlinrs already reported become ordinary catchable
+    // exceptions once the program has a handler for them.
+    let src = "\
+fun main() {
+    println(try { 1 % 0 } catch (e: ArithmeticException) { -1 })
+    val n: String? = null
+    println(try { n!!.length } catch (e: NullPointerException) { -2 })
+    println(try { listOf(1, 2)[7] } catch (e: IndexOutOfBoundsException) { -3 })
+}";
+    assert_eq!(prog(src), "-1\n-2\n-3\n");
+}
+
+#[test]
+fn an_uncaught_exception_reports_like_the_jvm_and_exits_nonzero() {
+    let out = eval("fun main() {\n    println(\"before\")\n    throw IllegalStateException(\"dead\")\n}");
+    assert!(!out.status.success(), "expected a non-zero exit");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "before\n");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("Exception in thread \"main\" java.lang.IllegalStateException: dead"),
+        "stderr was: {err}"
+    );
+}
+
+#[test]
+fn a_return_out_of_a_try_runs_the_finally_first() {
+    // The resource-cleanup idiom: the finalizer runs before the frame is left,
+    // on the value path and the exceptional one alike — and nests.
+    let src = "\
+fun f(n: Int): Int { try { if (n < 0) throw IllegalStateException(\"neg\") ; return n * 2 } finally { println(\"close \" + n) } }
+fun g(): String { try { try { return \"deep\" } finally { println(\"inner\") } } finally { println(\"outer\") } }
+fun main() {
+    println(f(3))
+    println(try { f(-1) } catch (e: Exception) { -1 })
+    println(g())
+}";
+    assert_eq!(
+        prog(src),
+        "close 3\n6\nclose -1\n-1\ninner\nouter\ndeep\n"
+    );
+}
+
+#[test]
+fn a_break_out_of_a_try_with_a_finally_is_rejected() {
+    // Unlike `return`, a `break` has no path that could run the finalizer here;
+    // refusing the program beats silently skipping a cleanup block.
+    let err = prog_err(
+        "fun main() { for (i in 1..3) { try { break } finally { println(\"fin\") } } }",
+    );
+    assert!(
+        err.contains("out of a `try` with a `finally` is not supported"),
+        "stderr was: {err}"
+    );
+}
+
+#[test]
+fn a_try_needs_a_catch_or_a_finally() {
+    let err = prog_err("fun main() { try { println(1) } }");
+    assert!(
+        err.contains("at least one `catch` or a `finally`"),
+        "stderr was: {err}"
+    );
+}
+
+#[test]
+fn throwables_render_and_carry_their_message() {
+    let src = "\
+fun main() {
+    println(RuntimeException(\"m\"))
+    println(RuntimeException(\"m\").message)
+    println(IllegalStateException().message)
+    val any: Any = IllegalArgumentException(\"z\")
+    println(when (any) { is IllegalStateException -> \"ise\" ; is RuntimeException -> \"rte\" ; else -> \"?\" })
+}";
+    assert_eq!(
+        prog(src),
+        "java.lang.RuntimeException: m\nm\nnull\nrte\n"
+    );
+}
+
+// ─── Array lambda initializers and String iteration ───────────────────────
+
+#[test]
+fn array_constructors_take_an_index_lambda() {
+    let src = "\
+fun main() {
+    val a = IntArray(4) { it * 2 }
+    println(a.joinToString())
+    println(a.sum())
+    println(DoubleArray(3) { it * 1.5 }.joinToString())
+    println(Array(3) { it * it }.toList())
+    println(IntArray(2).joinToString())
+}";
+    assert_eq!(prog(src), "0, 2, 4, 6\n12\n0.0, 1.5, 3.0\n[0, 1, 4]\n0, 0\n");
+}
+
+#[test]
+fn for_in_walks_a_strings_characters() {
+    // The element is a `Char`, so it displays as a character (not its code) and
+    // `+` on it appends to a String.
+    let src = "\
+fun main() {
+    for (c in \"abc\") println(c)
+    var t = 0
+    for (c in \"Hello\") t += c.code
+    println(t)
+    var s = \"\"
+    val src = \"kot\"
+    for (c in src) s += c
+    println(s + \"|\" + s.length)
+}";
+    assert_eq!(prog(src), "a\nb\nc\n500\nkot|3\n");
+}
+
+// ─── Null safety end to end ───────────────────────────────────────────────
+
+#[test]
+fn nullable_values_compare_and_display_like_kotlin() {
+    // `x == null` is a null test (not a coerced value compare), and a null
+    // `String?` renders as the four characters `null` in a template or a `+`.
+    let src = "\
+fun main() {
+    val n: String? = null
+    val s: String? = \"hey\"
+    println(n == null)
+    println(s != null)
+    println(n?.length)
+    println(s?.length)
+    println(n ?: \"dflt\")
+    println(\"v=$n\")
+    println(\"c\" + n)
+    println(s?.uppercase() ?: \"none\")
+    val k: Int? = null
+    println(k?.plus(1) ?: 0)
+}";
+    assert_eq!(
+        prog(src),
+        "true\ntrue\nnull\n3\ndflt\nv=null\ncnull\nHEY\n0\n"
+    );
+}

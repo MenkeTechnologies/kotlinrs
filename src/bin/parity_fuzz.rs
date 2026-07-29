@@ -16,7 +16,10 @@
 //! The generator is biased toward where a from-scratch Kotlin frontend goes
 //! wrong: `Int`-vs-`Double` division dispatch (`7/2==3`, `7/2.0==3.5`), IEEE
 //! division by zero, `Double.toString` notation (the decimal/scientific
-//! threshold), string templates, and `String` member dispatch.
+//! threshold), string templates, `String` member dispatch, and — since a VM with
+//! no unwind opcode has to fake one — exception control flow: which handler
+//! claims a throw, what a `finally` runs, what a partially-evaluated statement
+//! is allowed to print, and what a `try` evaluates to.
 //!
 //! Scope + determinism invariants (mirroring the javars/scalars harnesses):
 //!   * Only constructs kotlinrs actually implements are emitted — an unsupported
@@ -31,6 +34,9 @@
 //!     (Kotlin throws there; that is a fault-path test, not a value test).
 //!     Likewise ranges are never empty where a probe calls `max()`/`min()`,
 //!     which throw on an empty sequence.
+//!   * Every exception a probe raises is caught by that same probe. The probes
+//!     share one `main`, so an escaping throw would truncate the whole program
+//!     and test the harness instead of the frontend.
 //!
 //! Subprocess-only: this binary never links the kotlinrs library.
 //!
@@ -316,6 +322,170 @@ fn g_incdec(r: &mut Rng, idx: usize) -> String {
     }
 }
 
+/// `try`/`catch`/`finally`/`throw`. Every probe catches what it throws — the
+/// probes share one `main`, so an escaping exception would truncate the run and
+/// test the harness rather than the frontend. Both throw sources are covered:
+/// an explicit `throw` and a *runtime* fault the host raises (integer `/ 0`, `!!`
+/// on null, an out-of-range index), which Kotlin reports as the same catchable
+/// JVM exceptions.
+fn g_exc(r: &mut Rng, idx: usize) -> String {
+    let a = pick(r, INTS);
+    let d = pick(r, DIVS);
+    let msg = pick(r, &["boom", "bad input", "x"]);
+    match r.below(15) {
+        0 => p(format!(
+            "try {{ {a} / 0 }} catch (e: ArithmeticException) {{ -1 }}"
+        )),
+        1 => format!(
+            "try {{ throw RuntimeException(\"{msg}\") }} catch (e: Exception) {{ println(e.message) }}"
+        ),
+        2 => format!(
+            "var v{idx} = {a}; try {{ v{idx} += {a} / 0 }} catch (e: Exception) {{ v{idx} += 100 }}; println(v{idx})"
+        ),
+        3 => format!("try {{ println({a}) }} finally {{ println(\"fin{idx}\") }}"),
+        4 => format!(
+            "try {{ throw IllegalStateException(\"{msg}\") }} catch (e: IllegalStateException) {{ println(\"c\" + e.message) }} finally {{ println(\"f{idx}\") }}"
+        ),
+        // A subclass thrown, a supertype caught — the hierarchy walk.
+        5 => format!(
+            "try {{ throw IllegalArgumentException(\"{msg}\") }} catch (e: RuntimeException) {{ println(e) }}"
+        ),
+        6 => p(format!(
+            "try {{ listOf({a}, {d})[{}] }} catch (e: IndexOutOfBoundsException) {{ -2 }}",
+            2 + r.below(3)
+        )),
+        7 => format!(
+            "val n{idx}: String? = null; println(try {{ n{idx}!!.length }} catch (e: NullPointerException) {{ -3 }})"
+        ),
+        // An exception raised inside a lambda, unwinding out of the nested run.
+        8 => format!(
+            "try {{ listOf(1, 2, 3).forEach {{ if (it == 2) throw RuntimeException(\"{msg}\") else println(it) }} }} catch (e: Exception) {{ println(\"L\" + e.message) }}"
+        ),
+        // Nested `try`: the inner one has no matching arm, so the outer takes it.
+        9 => format!(
+            "try {{ try {{ throw IllegalStateException(\"{msg}\") }} catch (e: ArithmeticException) {{ println(\"never\") }} }} catch (e: Exception) {{ println(\"outer \" + e.message) }}"
+        ),
+        // A `throw` crossing a call frame, and a `return` that has to run a
+        // `finally` before leaving one.
+        10 => format!(
+            "try {{ println(boom{idx}({a})) }} catch (e: Exception) {{ println(\"fn \" + e.message) }}"
+        ),
+        14 => format!(
+            "println(try {{ guard{idx}({a}) }} catch (e: Exception) {{ -1 }})"
+        ),
+        // Unwinding out of a loop, and continuing from a handler.
+        11 => format!(
+            "var s{idx} = 0; for (i in 1..4) {{ try {{ if (i == 3) throw RuntimeException(\"skip\") ; s{idx} += i }} catch (e: Exception) {{ s{idx} += 10 }} }}; println(s{idx})"
+        ),
+        // `try` as an expression, with a `finally` that runs on the value path.
+        12 => format!(
+            "val t{idx} = try {{ {a} * 2 }} finally {{ println(\"tf{idx}\") }}; println(t{idx})"
+        ),
+        _ => format!(
+            "println(try {{ if ({a} > 0) {a} else throw IllegalArgumentException(\"{msg}\") }} catch (e: Exception) {{ e.message }})"
+        ),
+    }
+}
+
+/// A helper `fun` for the [`g_exc`] cross-frame probe: throws for a
+/// non-positive argument so the caller's `catch` sees an exception raised one
+/// frame down.
+fn exc_helper(idx: usize) -> String {
+    format!(
+        "fun boom{idx}(n: Int): Int {{ if (n <= 0) throw IllegalStateException(\"neg\") ; return n * 2 }}"
+    )
+}
+
+/// A helper `fun` whose `return` sits inside a `try` that owns a `finally`: the
+/// finalizer has to run before the frame is left, on the value path and the
+/// throwing one alike.
+fn guard_helper(idx: usize) -> String {
+    format!(
+        "fun guard{idx}(n: Int): Int {{ try {{ if (n < 0) throw IllegalStateException(\"neg\") ; return n + 1 }} finally {{ println(\"g{idx}\") }} }}"
+    )
+}
+
+/// The array lambda-initializer constructors. Arrays are never printed directly
+/// (identity hash), so every probe reads a deterministic projection.
+fn g_arrayinit(r: &mut Rng, idx: usize) -> String {
+    let n = 1 + r.below(4);
+    let k = pick(r, &["1", "2", "3"]);
+    match r.below(6) {
+        0 => format!("val q{idx} = IntArray({n}) {{ it * {k} }}; println(q{idx}.joinToString())"),
+        1 => format!("val q{idx} = IntArray({n}) {{ it + {k} }}; println(q{idx}.sum())"),
+        2 => format!("val q{idx} = IntArray({n}) {{ it }}; println(q{idx}.size)"),
+        3 => format!(
+            "val q{idx} = DoubleArray({n}) {{ it * 1.5 }}; println(q{idx}.joinToString())"
+        ),
+        4 => format!("val q{idx} = Array({n}) {{ it * it }}; println(q{idx}.toList())"),
+        _ => format!(
+            "val q{idx} = IntArray({n}) {{ it * {k} }}; println(q{idx}[{}])",
+            r.below(n)
+        ),
+    }
+}
+
+/// `for (c in "…")` over a String's characters.
+fn g_strchars(r: &mut Rng, idx: usize) -> String {
+    let s = pick(r, &["\"abc\"", "\"Hello\"", "\"x\"", "\"AbC\""]);
+    match r.below(5) {
+        0 => format!("for (c{idx} in {s}) println(c{idx})"),
+        1 => format!("var t{idx} = 0; for (c{idx} in {s}) t{idx} += c{idx}.code; println(t{idx})"),
+        2 => format!("var u{idx} = \"\"; for (c{idx} in {s}) u{idx} += c{idx}; println(u{idx})"),
+        3 => format!("for (c{idx} in {s}) print(c{idx}); println()"),
+        _ => format!(
+            "var w{idx} = 0; val z{idx} = {s}; for (c{idx} in z{idx}) w{idx}++; println(w{idx})"
+        ),
+    }
+}
+
+/// Null safety: `?.`, `?:`, `!!`, `== null`, and a nullable value's display.
+fn g_nullsafe(r: &mut Rng, idx: usize) -> String {
+    let s = pick(r, &["null", "\"abc\"", "\"\"", "\"Hi\""]);
+    match r.below(9) {
+        0 => format!("val n{idx}: String? = {s}; println(n{idx}?.length)"),
+        1 => format!("val n{idx}: String? = {s}; println(n{idx}?.length ?: -1)"),
+        2 => format!("val n{idx}: String? = {s}; println(n{idx} ?: \"dflt\")"),
+        3 => format!("val n{idx}: String? = {s}; println(n{idx} == null)"),
+        4 => format!("val n{idx}: String? = {s}; println(n{idx} != null)"),
+        5 => format!("val n{idx}: String? = {s}; println(\"v=$n{idx}\")"),
+        6 => format!("val n{idx}: String? = {s}; println(\"c\" + n{idx})"),
+        7 => format!("val n{idx}: String? = {s}; println(n{idx}?.uppercase() ?: \"none\")"),
+        _ => format!(
+            "val n{idx}: Int? = {}; println(n{idx}?.plus(1) ?: 0)",
+            pick(r, &["null", "1", "7", "-2"])
+        ),
+    }
+}
+
+/// `data class` members and `when` as an expression, over the `Pt` declaration
+/// [`build_program`] always emits.
+fn g_datawhen(r: &mut Rng, idx: usize) -> String {
+    let a = pick(r, INTS);
+    let b = pick(r, STRS);
+    match r.below(10) {
+        0 => p(format!("Pt({a}, {b})")),
+        1 => p(format!("Pt({a}, {b}) == Pt({a}, {b})")),
+        2 => p(format!("Pt({a}, {b}).copy({})", pick(r, INTS))),
+        3 => format!("val (dx{idx}, dy{idx}) = Pt({a}, {b}); println(\"$dx{idx}|$dy{idx}\")"),
+        4 => p(format!("Pt({a}, {b}).x")),
+        5 => p(format!("listOf(Pt({a}, {b}))")),
+        6 => p(format!(
+            "when ({a}) {{ 0, 1 -> \"lo\"; in 2..9 -> \"mid\"; !in -99..99 -> \"far\"; else -> \"hi\" }}"
+        )),
+        7 => p(format!(
+            "when {{ {a} > 0 -> \"pos\"; {a} < 0 -> \"neg\"; else -> \"zero\" }}"
+        )),
+        8 => format!(
+            "val any{idx}: Any = {}; println(when (any{idx}) {{ is Int -> \"i\"; is String -> \"s\"; else -> \"?\" }})",
+            if r.below(2) == 0 { a } else { b }
+        ),
+        _ => format!(
+            "val k{idx} = when ({a} % 3) {{ 0 -> 10; 1 -> 20; else -> 30 }}; println(k{idx} + 1)"
+        ),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     All,
@@ -337,6 +507,11 @@ enum Mode {
     Array,
     Math,
     IncDec,
+    Exc,
+    ArrayInit,
+    StrChars,
+    NullSafe,
+    DataWhen,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -358,6 +533,11 @@ const CONCRETE: &[Mode] = &[
     Mode::Array,
     Mode::Math,
     Mode::IncDec,
+    Mode::Exc,
+    Mode::ArrayInit,
+    Mode::StrChars,
+    Mode::NullSafe,
+    Mode::DataWhen,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -381,6 +561,11 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Array => "array",
         Mode::Math => "math",
         Mode::IncDec => "incdec",
+        Mode::Exc => "exc",
+        Mode::ArrayInit => "arrayinit",
+        Mode::StrChars => "strchars",
+        Mode::NullSafe => "nullsafe",
+        Mode::DataWhen => "datawhen",
     }
 }
 
@@ -416,6 +601,11 @@ fn gen_probe(r: &mut Rng, mode: Mode, idx: usize) -> String {
         Mode::Array => g_array(r, idx),
         Mode::Math => g_math(r),
         Mode::IncDec => g_incdec(r, idx),
+        Mode::Exc => g_exc(r, idx),
+        Mode::ArrayInit => g_arrayinit(r, idx),
+        Mode::StrChars => g_strchars(r, idx),
+        Mode::NullSafe => g_nullsafe(r, idx),
+        Mode::DataWhen => g_datawhen(r, idx),
         Mode::All => unreachable!("resolved above"),
     }
 }
@@ -434,8 +624,47 @@ fn gen_probes(seed: u64, mode: Mode, n: usize) -> Vec<String> {
 /// The `kotlin.math` import is unconditional: Kotlin does not auto-import that
 /// package, so the math probes need it, and an unused import is only a warning
 /// (never a compile failure) for the programs that contain no math probe.
+/// Top-level declarations a probe may reference are emitted only when some probe
+/// actually names them, so an unrelated program stays minimal and [`minimize`]
+/// keeps producing compilable reductions: the `Pt` `data class`, and one
+/// `boom<i>` helper per cross-frame `throw` probe. The helper id is read back
+/// out of the probe text rather than from its position, because `minimize` drops
+/// probes and would otherwise renumber them.
+fn declarations(probes: &[String]) -> String {
+    let mut out = String::new();
+    if probes.iter().any(|p| p.contains("Pt(")) {
+        out.push_str("data class Pt(val x: Int, val y: String)\n");
+    }
+    for (marker, decl) in [
+        ("boom", exc_helper as fn(usize) -> String),
+        ("guard", guard_helper as fn(usize) -> String),
+    ] {
+        let mut ids: Vec<usize> = Vec::new();
+        for probe in probes {
+            let mut rest = probe.as_str();
+            while let Some(at) = rest.find(marker) {
+                rest = &rest[at + marker.len()..];
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(id) = digits.parse::<usize>() {
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+            }
+        }
+        ids.sort_unstable();
+        for id in ids {
+            out.push_str(&decl(id));
+            out.push('\n');
+        }
+    }
+    out
+}
+
 fn build_program(probes: &[String]) -> String {
-    let mut s = String::from("import kotlin.math.*\n\nfun main() {\n");
+    let mut s = String::from("import kotlin.math.*\n\n");
+    s.push_str(&declarations(probes));
+    s.push_str("\nfun main() {\n");
     for probe in probes {
         s.push_str("    ");
         s.push_str(probe);

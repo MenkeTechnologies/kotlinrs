@@ -50,3 +50,35 @@ fun main() {\n    println(Math.abs(-3))\n    println(Math.round(2.5))\n    print
 fun main() {\n    var i = 0\n    println(i++)\n    println(i)\n    println(++i)\n}	0\n1\n2\n
 fun main() {\n    var j = 5\n    println(j++ + j++)\n    println(j)\n}	11\n7\n
 fun main() {\n    val a = intArrayOf(1, 2)\n    println(a[0]++)\n    println(a.joinToString())\n}	1\n2, 2\n
+fun main() {\n    val a = try { 1 / 0 } catch (e: ArithmeticException) { -1 }\n    println(a)\n}	-1\n
+fun main() {\n    try { throw RuntimeException("boom") } catch (e: Exception) { println(e.message) }\n}	boom\n
+fun main() {\n    try { throw IllegalArgumentException("bad") } catch (e: RuntimeException) { println(e) }\n}	java.lang.IllegalArgumentException: bad\n
+fun main() {\n    try { println("body") } catch (e: Exception) { println("skip") } finally { println("fin") }\n}	body\nfin\n
+fun main() {\n    var acc = 0\n    try { acc += 10 / 0 } catch (e: Exception) { acc += 100 }\n    println(acc)\n}	100\n
+fun risky(n: Int): Int { if (n < 0) throw IllegalStateException("neg") ; return n * 2 }\nfun main() {\n    println(try { risky(4) } catch (e: Exception) { -1 })\n    println(try { risky(-4) } catch (e: IllegalStateException) { -1 })\n}	8\n-1\n
+fun main() {\n    try { try { throw RuntimeException("in") } finally { println("f1") } } catch (e: Exception) { println("out " + e.message) }\n}	f1\nout in\n
+fun main() {\n    try { try { throw RuntimeException("a") } finally { throw IllegalStateException("b") } } catch (e: Exception) { println(e.message) }\n}	b\n
+fun main() {\n    for (i in 1..4) {\n        try { if (i % 2 == 0) throw RuntimeException("even") ; println(i) } catch (e: Exception) { println("c" + i) }\n    }\n}	1\nc2\n3\nc4\n
+fun main() {\n    try { listOf(1, 2, 3).forEach { if (it == 2) throw RuntimeException("stop") else println(it) } } catch (e: Exception) { println("caught " + e.message) }\n}	1\ncaught stop\n
+fun main() {\n    val v = try { 5 } finally { println("cleanup") }\n    println(v)\n}	cleanup\n5\n
+fun main() {\n    val n: String? = null\n    println(try { n!!.length } catch (e: NullPointerException) { -3 })\n}	-3\n
+fun main() {\n    println(try { listOf(1, 2)[7] } catch (e: IndexOutOfBoundsException) { -4 })\n}	-4\n
+fun main() {\n    println(RuntimeException("m"))\n    println(RuntimeException("m").message)\n    println(IllegalStateException().message)\n}	java.lang.RuntimeException: m\nm\nnull\n
+fun main() {\n    val m: String? = null\n    println(try { m ?: throw IllegalStateException("none") } catch (e: Exception) { "E:" + e.message })\n}	E:none\n
+fun main() {\n    var out = ""\n    outer@ for (i in 1..3) {\n        for (j in 1..3) {\n            try { if (j == 2) throw RuntimeException("j") ; out += "" + i + j + " " } catch (e: Exception) { continue@outer }\n        }\n    }\n    println(out)\n}	11 21 31 \n
+fun main() {\n    try { throw Error("fatal") } catch (e: Throwable) { println("t:" + e.message) }\n}	t:fatal\n
+fun main() {\n    try { throw RuntimeException("x") } catch (e: IllegalStateException) { println("wrong") } catch (e: RuntimeException) { println("right") }\n}	right\n
+fun main() {\n    val a = IntArray(4) { it * 2 }\n    println(a.joinToString())\n    println(a.sum())\n    println(a.size)\n}	0, 2, 4, 6\n12\n4\n
+fun main() {\n    val d = DoubleArray(3) { it * 1.5 }\n    println(d.joinToString())\n}	0.0, 1.5, 3.0\n
+fun main() {\n    val g = Array(3) { it * it }\n    println(g.toList())\n}	[0, 1, 4]\n
+fun main() {\n    for (c in "abc") println(c)\n}	a\nb\nc\n
+fun main() {\n    var t = 0\n    for (c in "Hello") t += c.code\n    println(t)\n}	500\n
+fun main() {\n    var s = ""\n    val src = "kot"\n    for (c in src) s += c\n    println(s)\n    println(s.length)\n}	kot\n3\n
+fun main() {\n    val n: String? = null\n    val s: String? = "hey"\n    println(n?.length)\n    println(s?.length)\n    println(n ?: "dflt")\n    println(n == null)\n    println(s != null)\n    println("v=$n")\n    println("c" + n)\n}	null\n3\ndflt\ntrue\ntrue\nv=null\ncnull\n
+fun main() {\n    val k: Int? = null\n    println(k?.plus(1) ?: 0)\n    val j: Int? = 7\n    println(j?.plus(1) ?: 0)\n}	0\n8\n
+data class Pt(val x: Int, val y: String)\nfun main() {\n    val p = Pt(1, "a")\n    println(p)\n    println(p == Pt(1, "a"))\n    println(p.copy(5))\n    val (a, b) = p\n    println("$a|$b")\n    println(when (p) { Pt(1, "a") -> "eq" ; else -> "ne" })\n}	Pt(x=1, y=a)\ntrue\nPt(x=5, y=a)\n1|a\neq\n
+fun main() {\n    val x = 7\n    println(when (x) { 0, 1 -> "lo" ; in 2..6 -> "mid" ; !in -99..99 -> "far" ; else -> "hi" })\n    val any: Any = "s"\n    println(when (any) { is Int -> "i" ; is String -> "str" ; else -> "?" })\n}	hi\nstr\n
+fun f(n: Int): Int { try { if (n < 0) throw IllegalStateException("neg") ; return n * 2 } finally { println("close " + n) } }\nfun g(): String { try { try { return "deep" } finally { println("inner") } } finally { println("outer") } }\nfun main() {\n    println(f(3))\n    println(try { f(-1) } catch (e: Exception) { -1 })\n    println(g())\n}	close 3\n6\nclose -1\n-1\ninner\nouter\ndeep\n
+fun main() {\n    val t = try { try { 1 } finally { } } catch (e: Exception) { 2 }\n    println(t)\n    println(listOf<Int>().size)\n    println(try { listOf<Int>().first() } catch (e: NoSuchElementException) { -5 })\n}	1\n0\n-5\n
+class Res(val name: String) { fun use(n: Int): Int { try { if (n < 0) throw IllegalArgumentException(name) ; return n } finally { println("close " + name) } } }\nfun main() {\n    val r = Res("db")\n    println(try { r.use(3) } catch (e: Exception) { -1 })\n    println(try { r.use(-3) } catch (e: Exception) { "E" + e.message })\n}	close db\n3\nclose db\nEdb\n
+fun main() {\n    var acc = 0\n    for (a in 1..3) { try { acc += a; if (a == 2) throw RuntimeException("x") } catch (e: Exception) { acc *= 2 } finally { acc += 100 } }\n    println(acc)\n    var s = 0\n    for (c in "abc") { try { if (c == 'b') throw RuntimeException("b") ; s += c.code } catch (e: Exception) { s += 1000 } }\n    println(s)\n    val f = { x: Int -> try { 10 / x } catch (e: ArithmeticException) { -1 } }\n    println(f(2))\n    println(f(0))\n}	409\n1196\n5\n-1\n

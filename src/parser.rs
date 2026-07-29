@@ -367,10 +367,21 @@ impl Parser {
                 }
             }
         }
-        if self.at(&Tok::Question) {
+        let nullable = if self.at(&Tok::Question) {
             self.bump(); // nullable marker `T?`
-        }
+            true
+        } else {
+            false
+        };
         let ty = Type::from_name(&name);
+        // `String?` is tracked apart from `String` so a null one still displays
+        // as `null`; every other nullable annotation already displays through the
+        // Kotlin stringifier, so the coarse type carries no other nullability.
+        let ty = if nullable && ty == Type::String {
+            Type::NullableString
+        } else {
+            ty
+        };
         // A non-primitive annotation names a heap object (a user class or a
         // container like `List`/`Map`); keep its name for dispatch.
         if ty == Type::Unknown {
@@ -1070,6 +1081,46 @@ impl Parser {
         }
     }
 
+    /// Consume `<T, U>` after a call name when what follows really is a type
+    /// argument list — a balanced run of names (with `.`/`?`/nested `<…>`) ending
+    /// in `>` immediately followed by `(`. Anything else rolls back, so
+    /// `a < b` stays a comparison. Kotlin resolves the same ambiguity the same
+    /// way: `a<b>(c)` is a generic call.
+    fn skip_call_type_args(&mut self) {
+        if !self.at(&Tok::Lt) {
+            return;
+        }
+        let save = self.pos;
+        self.bump(); // `<`
+        let mut depth = 1i32;
+        loop {
+            match self.peek() {
+                Tok::Lt => {
+                    depth += 1;
+                    self.bump();
+                }
+                Tok::Gt => {
+                    depth -= 1;
+                    self.bump();
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Tok::Ident(_) | Tok::Comma | Tok::Dot | Tok::Question => {
+                    self.bump();
+                }
+                // Not a type-argument list after all.
+                _ => {
+                    self.pos = save;
+                    return;
+                }
+            }
+        }
+        if !self.at(&Tok::LParen) {
+            self.pos = save;
+        }
+    }
+
     fn primary(&mut self) -> Result<Expr, String> {
         let line = self.line();
         match self.peek().clone() {
@@ -1099,6 +1150,13 @@ impl Parser {
             }
             Tok::If => Ok(Expr::If(self.if_expr()?)),
             Tok::When => Ok(Expr::When(self.when_expr()?)),
+            Tok::Try => Ok(Expr::Try(self.try_expr()?)),
+            // `throw e` — an expression (Kotlin types it `Nothing`), so it is
+            // usable as a statement and on the right of `?:`.
+            Tok::Throw => {
+                self.bump();
+                Ok(Expr::Throw(Box::new(self.expr()?)))
+            }
             // A brace in expression position is a lambda literal (`val f = { … }`,
             // `f({ … })`). Trailing-lambda braces are consumed by `postfix` /
             // `primary`'s call arms before reaching here.
@@ -1111,6 +1169,12 @@ impl Parser {
             }
             Tok::Ident(name) => {
                 self.bump();
+                // Explicit type arguments on a call — `listOf<Int>()`,
+                // `emptyMap<String, Int>()`. Consumed and ignored (typing here is
+                // coarse); the speculative scan below is what keeps `a < b` a
+                // comparison, since a type-argument list may only hold names and
+                // must be followed by `(`.
+                self.skip_call_type_args();
                 if self.at(&Tok::LParen) {
                     self.bump();
                     let mut args = Vec::new();
@@ -1169,6 +1233,52 @@ impl Parser {
             cond: Box::new(cond),
             then,
             els,
+            line,
+        })
+    }
+
+    /// `try { … } catch (e: T) { … }* [finally { … }]`. Kotlin requires braces on
+    /// every part and at least one `catch` or a `finally`.
+    fn try_expr(&mut self) -> Result<TryExpr, String> {
+        let line = self.line();
+        self.eat(&Tok::Try)?;
+        let body = self.block()?;
+        let mut catches = Vec::new();
+        while self.at(&Tok::Catch) {
+            self.bump();
+            self.eat(&Tok::LParen)?;
+            let name = self.ident()?;
+            self.eat(&Tok::Colon)?;
+            // The caught type is a plain name; a nullable/generic spelling is not
+            // valid on a `catch` parameter in Kotlin, so no `type_ref` here.
+            let ty = self.ident()?;
+            self.eat(&Tok::RParen)?;
+            let cbody = self.block()?;
+            catches.push(CatchArm {
+                name,
+                ty,
+                body: cbody,
+            });
+        }
+        // An empty `finally { }` is still a `finally` for the purposes of the
+        // “a try needs one or the other” rule, even though it lowers to nothing.
+        let mut saw_finally = false;
+        let finally_body = if self.at(&Tok::Finally) {
+            self.bump();
+            saw_finally = true;
+            self.block()?
+        } else {
+            Vec::new()
+        };
+        if catches.is_empty() && !saw_finally {
+            return Err(format!(
+                "a `try` needs at least one `catch` or a `finally` (line {line})"
+            ));
+        }
+        Ok(TryExpr {
+            body,
+            catches,
+            finally_body,
             line,
         })
     }

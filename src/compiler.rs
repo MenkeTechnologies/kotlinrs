@@ -21,11 +21,13 @@
 
 use crate::ast::*;
 use crate::host::{
-    KT_ARRAY, KT_ARRAY_NEW, KT_CHR_STRING, KT_CLOSURE_CALL, KT_COLL_HOF, KT_DBG_LINE, KT_DDIV,
-    KT_FFI_CALL, KT_FFI_COMPILE, KT_GETFIELD, KT_IDIV, KT_IMOD, KT_IN, KT_INDEX_GET, KT_INDEX_SET,
-    KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_LIST, KT_MAKE_CLOSURE, KT_MAP, KT_MATH,
-    KT_METHOD, KT_NEW, KT_NOTNULL, KT_OBJEQ, KT_PAIR, KT_RANGE, KT_RANGE_STEP, KT_SCOPE_FN,
-    KT_SETFIELD, KT_TO_STRING,
+    KT_ARRAY, KT_ARRAY_INIT, KT_ARRAY_NEW, KT_CHR_STRING, KT_CLOSURE_CALL, KT_COLL_HOF,
+    KT_DBG_LINE, KT_DDIV, KT_EXC_ABORT, KT_EXC_CUT, KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW,
+    KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW, KT_EXC_UNSTASH, KT_FFI_CALL,
+    KT_FFI_COMPILE, KT_GETFIELD, KT_IDIV, KT_IMOD, KT_IN, KT_INDEX_GET, KT_INDEX_SET, KT_IS,
+    KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_LIST, KT_MAKE_CLOSURE, KT_MAP, KT_MATH, KT_METHOD,
+    KT_NEW, KT_NOTNULL, KT_OBJEQ, KT_PAIR, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP,
+    KT_SCOPE_FN, KT_SETFIELD, KT_TO_STRING,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::collections::HashMap;
@@ -246,6 +248,52 @@ pub struct Compiler {
     math_scope: HashMap<String, String>,
     /// Set by `import kotlin.math.*`, which puts every math name in scope.
     math_star: bool,
+    /// True when the program contains a `try`/`throw` anywhere. Only then are the
+    /// per-statement unwind checks (and the suppressible print builtins) emitted,
+    /// so an exception-free program keeps byte-identical bytecode — and its
+    /// speed. See the “Exception unwinding” section in [`crate::host`].
+    has_try: bool,
+    /// Where a pending exception unwinds to from the statement being compiled —
+    /// innermost last. Empty means “leave this frame”.
+    unwind: Vec<UnwindFrame>,
+    /// The enclosing `try`s that own a `finally`, innermost last. A `return`
+    /// inside one cannot jump straight out — the finalizer has to run first — so
+    /// it parks its value here and jumps to that `try`'s return path instead.
+    /// Cleared on entry to a `fun`/lambda body: a `return` belongs to its own
+    /// frame.
+    finally_returns: Vec<FinallyReturn>,
+}
+
+/// One enclosing `try`-with-`finally`'s return path: the slot a pending return
+/// value waits in, and the jumps from each `return` statement inside it.
+struct FinallyReturn {
+    slot: u16,
+    jumps: Vec<usize>,
+}
+
+/// Where the unwind check emitted after a statement jumps when an exception is
+/// in flight. The variants compose: a `throw` inside a loop inside a `fun`
+/// inside a `try` breaks the loop, returns from the frame, then lands in the
+/// `catch` dispatch.
+#[derive(Clone, Copy, PartialEq)]
+enum UnwindKind {
+    /// Into the enclosing `try`'s `catch` dispatch (or, from a handler body,
+    /// past the handlers into its `finally`).
+    Try,
+    /// Out of the enclosing loop; the check after the loop statement continues
+    /// the walk outward.
+    Loop,
+    /// Out of the enclosing `fun`/method/lambda frame, returning a placeholder;
+    /// the caller's own check resumes the walk there.
+    Frame,
+}
+
+/// One entry of [`Compiler::unwind`]: the target kind plus the forward jumps
+/// awaiting patching to it. `Frame` needs no jump list (it returns inline), but
+/// carrying one uniformly keeps the push/pop protocol simple.
+struct UnwindFrame {
+    kind: UnwindKind,
+    jumps: Vec<usize>,
 }
 
 /// Build the visible-name → runtime-name table for the `kotlin.math` imports.
@@ -392,6 +440,9 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
         lambdas_seen: 0,
         math_scope: HashMap::new(),
         math_star: false,
+        has_try: uses_exceptions(program),
+        unwind: Vec::new(),
+        finally_returns: Vec::new(),
     };
     (c.math_scope, c.math_star) = math_scope(&program.imports);
 
@@ -409,6 +460,16 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
     }
     c.b.emit(Op::Call(main_idx, main.params.len() as u8), main.line);
     c.b.emit(Op::Pop, main.line);
+    // An exception that walked out of `main` reached the top: report it the way
+    // the JVM does and stop with a non-zero status.
+    if c.has_try {
+        c.b.emit(Op::CallBuiltin(KT_EXC_PENDING, 0), main.line);
+        let ok = c.b.emit(Op::JumpIfFalse(0), main.line);
+        c.b.emit(Op::CallBuiltin(KT_EXC_ABORT, 0), main.line);
+        c.b.emit(Op::Pop, main.line);
+        let after = c.b.current_pos();
+        c.b.patch_jump(ok, after);
+    }
     let end_jump = c.b.emit(Op::Jump(0), main.line);
 
     for f in &program.funs {
@@ -479,6 +540,12 @@ impl Compiler {
         }
 
         self.cur_class = class.map(|s| s.to_string());
+        // The frame is its own unwind boundary: an exception with no handler
+        // inside it leaves the frame, and the caller's check resumes the walk.
+        // A `return` likewise belongs to this frame, so an enclosing `try`'s
+        // return path (from a lambda's definition site) must not capture it.
+        self.push_unwind(UnwindKind::Frame);
+        let outer_returns = std::mem::take(&mut self.finally_returns);
         let res: Result<(), String> = (|| {
             for s in &f.body {
                 self.compile_stmt(&mut sc, s)?;
@@ -486,6 +553,9 @@ impl Compiler {
             Ok(())
         })();
         self.cur_class = None;
+        self.finally_returns = outer_returns;
+        let here = self.b.current_pos();
+        self.pop_unwind_to(here);
         res?;
         // Fallthrough Unit return for `Unit` functions / a missing `return`.
         self.b.emit(Op::LoadUndef, f.line);
@@ -493,9 +563,87 @@ impl Compiler {
         Ok(())
     }
 
+    // ── Exception unwinding (compile-time half) ────────────────────
+    //
+    // See the “Exception unwinding” section in [`crate::host`] for the protocol.
+    // A statement boundary is the only point where the operand stack is known to
+    // be balanced, so that is where the check goes; the handler's `KT_EXC_CUT`
+    // mops up anything a *nested* abandoned expression left behind.
+
+    /// Emit the post-statement pending test and the jump the innermost enclosing
+    /// construct wants for it. A no-op in a program without a `try`.
+    fn unwind_check(&mut self) {
+        self.unwind_check_dropping(0);
+    }
+
+    /// [`Compiler::unwind_check`] at a point where `drop` values sit on the
+    /// operand stack: they are popped on the unwind path so the jump leaves the
+    /// stack balanced.
+    ///
+    /// The `drop == 1` form guards a binding store. Without it a raise while
+    /// computing an initializer would still commit the resulting garbage to the
+    /// `val`/`var` before control reached the handler, so a handler reading that
+    /// binding would see `null` instead of its previous value.
+    fn unwind_check_dropping(&mut self, drop: usize) {
+        if !self.has_try {
+            return;
+        }
+        self.b.emit(Op::CallBuiltin(KT_EXC_PENDING, 0), 0);
+        let ok = self.b.emit(Op::JumpIfFalse(0), 0);
+        for _ in 0..drop {
+            self.b.emit(Op::Pop, 0);
+        }
+        match self.unwind.last().map(|f| f.kind) {
+            // A `try` body or a loop body: jump forward to the construct's
+            // exceptional exit, patched by whoever pushed the frame.
+            Some(UnwindKind::Try) | Some(UnwindKind::Loop) => {
+                let j = self.b.emit(Op::Jump(0), 0);
+                self.unwind
+                    .last_mut()
+                    .expect("just matched a frame")
+                    .jumps
+                    .push(j);
+            }
+            // A `fun`/method/lambda body: return a placeholder immediately so the
+            // frame is popped (`Op::ReturnValue` truncates the value stack to the
+            // frame base, so the abandoned operands cost nothing). The caller's
+            // own check resumes the walk.
+            Some(UnwindKind::Frame) | None => {
+                self.b.emit(Op::LoadUndef, 0);
+                self.b.emit(Op::ReturnValue, 0);
+            }
+        }
+        let at = self.b.current_pos();
+        self.b.patch_jump(ok, at);
+    }
+
+    fn push_unwind(&mut self, kind: UnwindKind) {
+        self.unwind.push(UnwindFrame {
+            kind,
+            jumps: Vec::new(),
+        });
+    }
+
+    /// Pop the innermost unwind frame and patch its collected jumps to `target`.
+    fn pop_unwind_to(&mut self, target: usize) {
+        if let Some(f) = self.unwind.pop() {
+            for j in f.jumps {
+                self.b.patch_jump(j, target);
+            }
+        }
+    }
+
     // ── Statements (stack-neutral) ─────────────────────────────────
 
+    /// Compile one statement, then — in a program that contains a `try` — the
+    /// unwind check that carries an in-flight exception outward.
     fn compile_stmt(&mut self, sc: &mut Scope, s: &Stmt) -> Result<(), String> {
+        self.compile_stmt_inner(sc, s)?;
+        self.unwind_check();
+        Ok(())
+    }
+
+    fn compile_stmt_inner(&mut self, sc: &mut Scope, s: &Stmt) -> Result<(), String> {
         // In debug mode, a stack-neutral marker carrying this statement's source
         // line precedes the statement — the `--dap` hook reads it to decide
         // whether to stop here. `Op::Extended(KT_DBG_LINE, 0)` pushes nothing (the
@@ -519,6 +667,9 @@ impl Compiler {
                     vty = Type::Obj;
                 }
                 let slot = sc.declare_obj(name, vty, *mutable, class);
+                // A raise inside the initializer must not commit its garbage
+                // result to the new binding.
+                self.unwind_check_dropping(1);
                 self.b.emit(Op::SetSlot(slot), 0);
             }
             StmtKind::Assign { name, op, value } => {
@@ -564,6 +715,9 @@ impl Compiler {
                         self.compile_expr(sc, &expr)?;
                     }
                 }
+                // As with a `val` initializer: a raise mid-value must leave the
+                // variable's previous value intact (`acc += 10 / 0`).
+                self.unwind_check_dropping(1);
                 self.b.emit(Op::SetSlot(slot), 0);
             }
             StmtKind::SetMember {
@@ -588,7 +742,24 @@ impl Compiler {
                         self.b.emit(Op::LoadUndef, 0);
                     }
                 }
-                self.b.emit(Op::ReturnValue, 0);
+                // Inside a `try` that owns a `finally`, the finalizer must run
+                // before the frame is left: park the value and jump to that
+                // `try`'s return path, which runs the `finally` (and any outer
+                // one) and then returns.
+                match self.finally_returns.last().map(|f| f.slot) {
+                    Some(slot) => {
+                        self.b.emit(Op::SetSlot(slot), 0);
+                        let j = self.b.emit(Op::Jump(0), 0);
+                        self.finally_returns
+                            .last_mut()
+                            .expect("just matched a frame")
+                            .jumps
+                            .push(j);
+                    }
+                    None => {
+                        self.b.emit(Op::ReturnValue, 0);
+                    }
+                }
             }
             StmtKind::While { cond, body, label } => {
                 let start = self.b.current_pos();
@@ -599,6 +770,11 @@ impl Compiler {
                     breaks: Vec::new(),
                     continues: Vec::new(),
                 });
+                // A raise inside the body (or in the condition just evaluated)
+                // leaves the loop; the check after the loop statement carries it
+                // further out.
+                self.push_unwind(UnwindKind::Loop);
+                self.unwind_check();
                 let mark = sc.enter();
                 for s in body {
                     self.compile_stmt(sc, s)?;
@@ -612,6 +788,7 @@ impl Compiler {
                 self.b.emit(Op::Jump(start), 0);
                 let end = self.b.current_pos();
                 self.b.patch_jump(jf, end);
+                self.pop_unwind_to(end);
                 for j in &ctx.breaks {
                     self.b.patch_jump(*j, end);
                 }
@@ -733,6 +910,8 @@ impl Compiler {
             breaks: Vec::new(),
             continues: Vec::new(),
         });
+        self.push_unwind(UnwindKind::Loop);
+        self.unwind_check();
         for s in body {
             self.compile_stmt(sc, s)?;
         }
@@ -762,6 +941,7 @@ impl Compiler {
         self.b.emit(Op::Jump(top), 0);
         let done = self.b.current_pos();
         self.b.patch_jump(jf, done);
+        self.pop_unwind_to(done);
         for j in &ctx.breaks {
             self.b.patch_jump(*j, done);
         }
@@ -784,6 +964,15 @@ impl Compiler {
         label: &Option<String>,
     ) -> Result<(), String> {
         let mark = sc.enter();
+        // Iterating a `String` yields `Char`s. The runtime element is an integer
+        // code unit like every other kotlinrs `Char`, so the element type has to
+        // be decided here — otherwise `println(c)` would print the code, not the
+        // character.
+        let elem_ty = if self.infer(sc, iter).is_str() {
+            Type::Char
+        } else {
+            Type::Unknown
+        };
         // The iterable and the loop's index/length temporaries.
         let cslot = sc.temp();
         self.compile_expr(sc, iter)?;
@@ -796,7 +985,7 @@ impl Compiler {
         self.b.emit(Op::LoadInt(0), 0);
         self.b.emit(Op::SetSlot(islot), 0);
         // The element binding is a `val` (Kotlin's `for` variable is read-only).
-        let vslot = sc.declare(var, Type::Unknown, false);
+        let vslot = sc.declare(var, elem_ty, false);
 
         let top = self.b.current_pos();
         self.b.emit(Op::GetSlot(islot), 0);
@@ -813,6 +1002,8 @@ impl Compiler {
             breaks: Vec::new(),
             continues: Vec::new(),
         });
+        self.push_unwind(UnwindKind::Loop);
+        self.unwind_check();
         for s in body {
             self.compile_stmt(sc, s)?;
         }
@@ -828,6 +1019,7 @@ impl Compiler {
         self.b.emit(Op::Jump(top), 0);
         let done = self.b.current_pos();
         self.b.patch_jump(jf, done);
+        self.pop_unwind_to(done);
         for j in &ctx.breaks {
             self.b.patch_jump(*j, done);
         }
@@ -985,7 +1177,186 @@ impl Compiler {
             Expr::Lambda { params, body } => self.compile_lambda(sc, params, body),
             Expr::If(ie) => self.compile_if(sc, ie),
             Expr::When(w) => self.compile_when(sc, w),
+            Expr::Try(t) => self.compile_try(sc, t),
+            Expr::Throw(e) => {
+                self.compile_expr(sc, e)?;
+                self.b.emit(Op::CallBuiltin(KT_EXC_THROW, 1), 0);
+                // The builtin leaves a placeholder so the expression is stack-
+                // balanced; nothing observes it, because the enclosing
+                // statement's unwind check jumps before the value is used.
+                Ok(Type::Unknown)
+            }
         }
+    }
+
+    /// Lower `try { … } catch (e: T) { … }* [finally { … }]` as a value.
+    ///
+    /// The shape, in order:
+    ///
+    /// ```text
+    ///   depth = KT_EXC_DEPTH        ; operand-stack depth at entry
+    ///   <body>              -> res  ; unwind checks inside jump to `dispatch`
+    ///   Jump fin
+    /// dispatch:                     ; exceptional exit — `res` is null
+    ///   KT_EXC_CUT(depth)           ; drop what the abandoned statement pushed
+    ///   <catch arms>        -> res  ; each arm: KT_EXC_MATCH, then KT_EXC_TAKE
+    /// fin:
+    ///   KT_EXC_STASH                ; park any still-in-flight exception …
+    ///   <finally>                   ; … so the finalizer runs to completion …
+    ///   KT_EXC_UNSTASH              ; … then resume unwinding it
+    ///   load res
+    /// ```
+    ///
+    /// The result travels in a synthetic local rather than on the operand stack
+    /// because the exceptional path enters at `dispatch` from an arbitrary
+    /// statement boundary inside the body, where nothing has been pushed.
+    ///
+    /// The handler arms run under their own unwind frame targeting `fin`, so an
+    /// exception thrown *by* a handler still runs the `finally` before
+    /// propagating — the JVM's ordering. The `finally` body is emitted once, on
+    /// the single path both exits converge to.
+    fn compile_try(&mut self, sc: &mut Scope, t: &TryExpr) -> Result<Type, String> {
+        // A `return` out of a `try` that owns a `finally` is honoured (it routes
+        // through the return path below), but a `break`/`continue` is not: it
+        // would leave the loop without running the finalizer, and silently
+        // skipping a cleanup block is worse than not accepting the program.
+        let has_finally = !t.finally_body.is_empty();
+        if has_finally
+            && (body_breaks(&t.body) || t.catches.iter().any(|c| body_breaks(&c.body)))
+        {
+            return Err(format!(
+                "`break`/`continue` out of a `try` with a `finally` is not supported (line {})",
+                t.line
+            ));
+        }
+        let mark = sc.enter();
+        let res = sc.temp();
+        let depth = sc.temp();
+        if has_finally {
+            let slot = sc.temp();
+            self.finally_returns.push(FinallyReturn {
+                slot,
+                jumps: Vec::new(),
+            });
+        }
+        self.b.emit(Op::CallBuiltin(KT_EXC_DEPTH, 0), t.line);
+        self.b.emit(Op::SetSlot(depth), t.line);
+
+        // ── guarded body ──
+        self.push_unwind(UnwindKind::Try);
+        let body_ty = self.compile_block_value(sc, &t.body)?;
+        self.b.emit(Op::SetSlot(res), 0);
+        // The body's tail expression has no statement after it, so its own check
+        // goes here — a raise in the last expression must still dispatch.
+        self.unwind_check_dropping(0);
+        let to_fin = self.b.emit(Op::Jump(0), 0);
+
+        // ── handler dispatch ──
+        let dispatch = self.b.current_pos();
+        self.pop_unwind_to(dispatch);
+        self.b.emit(Op::GetSlot(depth), 0);
+        self.b.emit(Op::CallBuiltin(KT_EXC_CUT, 1), 0);
+        self.b.emit(Op::Pop, 0);
+        self.b.emit(Op::LoadUndef, 0);
+        self.b.emit(Op::SetSlot(res), 0);
+
+        self.push_unwind(UnwindKind::Try);
+        let mut arm_ty: Option<Type> = None;
+        let mut handled = Vec::new();
+        for arm in &t.catches {
+            let tidx = self.b.add_constant(Value::str(arm.ty.clone()));
+            self.b.emit(Op::LoadConst(tidx), 0);
+            self.b.emit(Op::CallBuiltin(KT_EXC_MATCH, 1), 0);
+            let next_arm = self.b.emit(Op::JumpIfFalse(0), 0);
+            // Matched: claim the exception (so the handler body runs with
+            // side-effecting builtins live again) and bind it.
+            let amark = sc.enter();
+            let slot = sc.declare_obj(&arm.name, Type::Obj, false, Some(arm.ty.clone()));
+            self.b.emit(Op::CallBuiltin(KT_EXC_TAKE, 0), 0);
+            self.b.emit(Op::SetSlot(slot), 0);
+            let t_arm = self.compile_block_value(sc, &arm.body)?;
+            arm_ty = Some(join_ty(arm_ty, t_arm));
+            self.b.emit(Op::SetSlot(res), 0);
+            self.unwind_check_dropping(0);
+            sc.exit(amark);
+            handled.push(self.b.emit(Op::Jump(0), 0));
+            let next = self.b.current_pos();
+            self.b.patch_jump(next_arm, next);
+        }
+        // Falling off the last arm leaves the exception in flight: unhandled
+        // here, it keeps unwinding once the `finally` has run.
+
+        // ── finally (both paths converge here) ──
+        let fin = self.b.current_pos();
+        self.pop_unwind_to(fin);
+        self.b.patch_jump(to_fin, fin);
+        for j in handled {
+            self.b.patch_jump(j, fin);
+        }
+        let pending_ret = if has_finally {
+            self.emit_finally(sc, &t.finally_body)?;
+            self.finally_returns.pop()
+        } else {
+            None
+        };
+        self.b.emit(Op::GetSlot(res), 0);
+
+        // ── return path ──
+        // A `return` inside the body or a handler parked its value and jumped
+        // here, so the finalizer runs on that path too. The `finally` body is
+        // emitted a second time rather than shared through a subroutine: fusevm's
+        // frames are for calls, not for local jumps, so a shared copy would need
+        // a return address. Duplication is what `javac` itself does since `jsr`
+        // was dropped.
+        if let Some(ret) = pending_ret.filter(|r| !r.jumps.is_empty()) {
+            let over = self.b.emit(Op::Jump(0), 0);
+            let ret_path = self.b.current_pos();
+            for j in ret.jumps {
+                self.b.patch_jump(j, ret_path);
+            }
+            self.emit_finally(sc, &t.finally_body)?;
+            self.b.emit(Op::GetSlot(ret.slot), 0);
+            // An enclosing `try` with its own `finally` must run that one too, so
+            // the value hops to its return path instead of leaving the frame.
+            match self.finally_returns.last().map(|f| f.slot) {
+                Some(outer) => {
+                    self.b.emit(Op::SetSlot(outer), 0);
+                    let j = self.b.emit(Op::Jump(0), 0);
+                    self.finally_returns
+                        .last_mut()
+                        .expect("just matched a frame")
+                        .jumps
+                        .push(j);
+                }
+                None => {
+                    self.b.emit(Op::ReturnValue, 0);
+                }
+            }
+            let after = self.b.current_pos();
+            self.b.patch_jump(over, after);
+        }
+        sc.exit(mark);
+        Ok(join_ty(arm_ty, body_ty))
+    }
+
+    /// Emit one copy of a `finally` body, bracketed by the stash/unstash pair
+    /// that parks any in-flight exception across it — otherwise the finalizer's
+    /// own statements would be suppressed (and immediately unwound) by the very
+    /// exception it is cleaning up after. A raise inside the finalizer jumps
+    /// straight to the unstash, which keeps the NEW exception and discards the
+    /// parked one: the JVM's rule.
+    fn emit_finally(&mut self, sc: &mut Scope, body: &[Stmt]) -> Result<(), String> {
+        self.b.emit(Op::CallBuiltin(KT_EXC_STASH, 0), 0);
+        self.b.emit(Op::Pop, 0);
+        self.push_unwind(UnwindKind::Try);
+        for s in body {
+            self.compile_stmt(sc, s)?;
+        }
+        let unstash = self.b.current_pos();
+        self.pop_unwind_to(unstash);
+        self.b.emit(Op::CallBuiltin(KT_EXC_UNSTASH, 0), 0);
+        self.b.emit(Op::Pop, 0);
+        Ok(())
     }
 
     /// `x++` / `x--` / `++x` / `--x` in either statement or expression position.
@@ -1042,7 +1413,11 @@ impl Compiler {
                 return Err("the operand of ++/-- must be a variable, property, or element".into())
             }
         };
-        self.compile_stmt(sc, &Stmt::new(0, update))?;
+        // `compile_stmt_inner`, not `compile_stmt`: this synthetic statement sits
+        // mid-expression, where an unwind jump would strand the operands the
+        // enclosing expression has already pushed. The enclosing statement's own
+        // check picks up any exception the update raised.
+        self.compile_stmt_inner(sc, &Stmt::new(0, update))?;
         match saved {
             Some(slot) => {
                 self.b.emit(Op::GetSlot(slot), 0);
@@ -1328,8 +1703,16 @@ impl Compiler {
 
         let saved = self.cur_class.take();
         self.cur_class = pl.class.clone();
+        // A lambda body is invoked through a nested `vm.run()`, so it is its own
+        // frame for unwinding too: a raise inside it returns out, and the host
+        // suppresses any further invocation while the exception is in flight.
+        self.push_unwind(UnwindKind::Frame);
+        let outer_returns = std::mem::take(&mut self.finally_returns);
         let res = self.compile_block_value(&mut sc, &pl.body);
         self.cur_class = saved;
+        self.finally_returns = outer_returns;
+        let here = self.b.current_pos();
+        self.pop_unwind_to(here);
         res?;
         self.b.emit(Op::ReturnValue, 0);
         Ok(())
@@ -1571,8 +1954,23 @@ impl Compiler {
             return Ok(Type::Boolean);
         }
 
+        // `x == null` / `x != null` is a null test, not a value comparison: the
+        // native numeric/string ops would compare an absent value's coerced form
+        // (`0` / `""`) and answer `true` for a non-null `0`/`""` receiver.
+        if matches!(op, BinOp::Eq | BinOp::Ne)
+            && (matches!(l, Expr::Null) || matches!(r, Expr::Null))
+        {
+            let value = if matches!(l, Expr::Null) { r } else { l };
+            self.compile_expr(sc, value)?;
+            self.b.emit(Op::Extended(KT_ISNULL, 0), 0);
+            if op == BinOp::Ne {
+                self.b.emit(Op::LogNot, 0);
+            }
+            return Ok(Type::Boolean);
+        }
+
         // `+` is string concatenation when either side is a String.
-        if op == BinOp::Add && (lt == Type::String || rt == Type::String) {
+        if op == BinOp::Add && (lt.is_str() || rt.is_str()) {
             self.compile_expr(sc, l)?;
             self.emit_display(lt);
             self.compile_expr(sc, r)?;
@@ -1585,7 +1983,7 @@ impl Compiler {
         self.compile_expr(sc, r)?;
 
         let both_int = lt.is_int() && rt.is_int();
-        let both_str = lt == Type::String && rt == Type::String;
+        let both_str = lt.is_str() && rt.is_str();
         let num_ty = if lt == Type::Double || rt == Type::Double {
             Type::Double
         } else {
@@ -1701,28 +2099,35 @@ impl Compiler {
                 if args.len() > 1 {
                     return Err(format!("{name} takes at most one argument in M0"));
                 }
+                let argc = args.len() as u8;
                 if let Some(a) = args.first() {
                     let t = self.compile_expr(sc, a)?;
                     self.emit_display(t);
-                    self.b.emit(
-                        if name == "println" {
-                            Op::PrintLn(1)
-                        } else {
-                            Op::Print(1)
-                        },
-                        line,
-                    );
+                }
+                // In a program that uses exceptions the print goes through a
+                // host builtin that is suppressed while an exception unwinds, so
+                // nothing is emitted between a `throw` and its handler. Without a
+                // `try` the native op stays (and the builtin's Unit result stands
+                // in for the `LoadUndef` the native form needs).
+                if self.has_try {
+                    let id = if name == "println" {
+                        KT_PRINTLN
+                    } else {
+                        KT_PRINT
+                    };
+                    self.b.emit(Op::CallBuiltin(id, argc), line);
                 } else {
                     self.b.emit(
-                        if name == "println" {
-                            Op::PrintLn(0)
-                        } else {
-                            Op::Print(0)
+                        match (name, argc) {
+                            ("println", 0) => Op::PrintLn(0),
+                            ("println", _) => Op::PrintLn(1),
+                            (_, 0) => Op::Print(0),
+                            _ => Op::Print(1),
                         },
                         line,
                     );
+                    self.b.emit(Op::LoadUndef, line); // println returns Unit
                 }
-                self.b.emit(Op::LoadUndef, line); // println returns Unit
                 Ok(Type::Unit)
             }
             // Collection builders → heap objects.
@@ -1744,25 +2149,60 @@ impl Compiler {
                 Ok(Type::Obj)
             }
             // `IntArray(n)` / `DoubleArray(n)` / `BooleanArray(n)` — a zero-filled
-            // primitive array. The lambda-initializer form `IntArray(n) { … }` is
-            // not supported; it arrives here with two arguments and is rejected
-            // rather than silently dropping the initializer.
-            "IntArray" | "DoubleArray" | "BooleanArray" => {
-                if args.len() != 1 {
-                    return Err(format!(
-                        "{name} takes a single size argument (the `{name}(n) {{ … }}` \
-                         initializer form is not supported)"
-                    ));
-                }
-                self.compile_expr(sc, &args[0])?;
+            // primitive array — and the initializer form `IntArray(n) { it * 2 }`,
+            // which fills each slot with the lambda applied to its index. The
+            // generic `Array(n) { … }` exists only in the initializer form
+            // (Kotlin has no zero-filled `Array(n)`), so its descriptor is
+            // inferred from the elements the lambda produced.
+            "IntArray" | "DoubleArray" | "BooleanArray" | "CharArray" | "Array" => {
                 let desc = match name {
                     "DoubleArray" => "[D",
                     "BooleanArray" => "[Z",
+                    "CharArray" => "[C",
+                    "Array" => "",
                     _ => "[I",
                 };
-                let didx = self.b.add_constant(Value::str(desc));
-                self.b.emit(Op::LoadConst(didx), line);
-                self.b.emit(Op::Extended(KT_ARRAY_NEW, 0), line);
+                match args.len() {
+                    2 => {
+                        self.compile_expr(sc, &args[0])?; // size
+                        let didx = self.b.add_constant(Value::str(desc));
+                        self.b.emit(Op::LoadConst(didx), line);
+                        self.compile_expr(sc, &args[1])?; // the init lambda
+                        self.b.emit(Op::CallBuiltin(KT_ARRAY_INIT, 0), line);
+                    }
+                    1 if name != "Array" => {
+                        self.compile_expr(sc, &args[0])?;
+                        let didx = self.b.add_constant(Value::str(desc));
+                        self.b.emit(Op::LoadConst(didx), line);
+                        self.b.emit(Op::Extended(KT_ARRAY_NEW, 0), line);
+                    }
+                    _ => {
+                        return Err(format!(
+                            "{name} takes a size and (for `Array`, requires) an \
+                             `{name}(n) {{ … }}` initializer lambda"
+                        ))
+                    }
+                }
+                Ok(Type::Obj)
+            }
+            // A built-in throwable constructor: `RuntimeException("boom")`,
+            // `IllegalStateException()`. Only reached when no user class or local
+            // shadows the name (the constructor/user-function arms run first).
+            _ if self.is_throwable_ctor(name) && args.len() <= 1 => {
+                let fqn = crate::host::throwable_fqn(name).unwrap();
+                let fidx = self.b.add_constant(Value::str(fqn));
+                self.b.emit(Op::LoadConst(fidx), line);
+                match args.first() {
+                    Some(a) => {
+                        let t = self.compile_expr(sc, a)?;
+                        self.emit_display(t);
+                    }
+                    // No message: `Throwable.message` is null.
+                    None => {
+                        self.b.emit(Op::LoadUndef, line);
+                    }
+                }
+                self.b.emit(Op::CallBuiltin(KT_EXC_NEW, 0), line);
                 Ok(Type::Obj)
             }
             // `kotlin.math` — resolvable only under `import kotlin.math.…`, which
@@ -1835,6 +2275,15 @@ impl Compiler {
                 Err(format!("unresolved reference: {name}"))
             }
         }
+    }
+
+    /// Whether `name` is a built-in throwable constructor (`RuntimeException`,
+    /// `IllegalStateException`, …). A user `class`/`fun` of the same name
+    /// shadows it, exactly as a user declaration shadows the imported JDK type.
+    fn is_throwable_ctor(&self, name: &str) -> bool {
+        crate::host::throwable_fqn(name).is_some()
+            && !self.classes.contains_key(name)
+            && !self.fun_sig.contains_key(name)
     }
 
     /// Resolve a bare name to the math function it dispatches to, honouring the
@@ -2037,7 +2486,7 @@ impl Compiler {
                 Some((slot, sty)) => {
                     self.b.emit(Op::GetSlot(slot), 0);
                     let et = self.compile_expr(sc, e)?;
-                    let str_eq = sty == Type::String || et == Type::String;
+                    let str_eq = sty.is_str() || et.is_str();
                     self.b.emit(if str_eq { Op::StrEq } else { Op::NumEq }, 0);
                 }
                 None => {
@@ -2171,7 +2620,7 @@ impl Compiler {
                 BinOp::Add => {
                     let lt = self.infer(sc, l);
                     let rt = self.infer(sc, r);
-                    if lt == Type::String || rt == Type::String {
+                    if lt.is_str() || rt.is_str() {
                         Type::String
                     } else if lt == Type::Char || rt == Type::Char {
                         Type::Char // Char + Int → Char
@@ -2300,6 +2749,28 @@ impl Compiler {
             // heterogeneous); leave it `Unknown` so display routes through the
             // generic coercion, which is correct for the common Int/String cases.
             Expr::When(_) => Type::Unknown,
+            // A `try`'s value is the body's or a handler's; joining them keeps
+            // `val n = try { f() } catch (e: Exception) { 0 }` integral, which is
+            // what decides whether a later `/` truncates.
+            Expr::Try(t) => {
+                let bt = t
+                    .body
+                    .last()
+                    .map(|s| self.infer_stmt(sc, s))
+                    .unwrap_or(Type::Unit);
+                let mut joined = Some(bt);
+                for arm in &t.catches {
+                    let at = arm
+                        .body
+                        .last()
+                        .map(|s| self.infer_stmt(sc, s))
+                        .unwrap_or(Type::Unit);
+                    joined = Some(join_ty(joined, at));
+                }
+                joined.unwrap_or(Type::Unit)
+            }
+            // `throw` is Kotlin's `Nothing`: it has no value to type.
+            Expr::Throw(_) => Type::Unknown,
         }
     }
 
@@ -2482,47 +2953,62 @@ fn hof_ret_type(name: &str) -> Type {
     }
 }
 
-// ── FFI detection (does the program contain a `rust { ... }` block?) ────────
+// ── Whole-body predicates (FFI detection, exception detection) ─────────────
+//
+// Both questions the compiler asks up front — “does this program contain a
+// `rust { … }` block?” and “does it contain a `try`/`throw`?” — are the same
+// recursive walk over every expression a body can reach, so they share one
+// visitor. Adding an AST node therefore only has to teach [`expr_any`] about it.
 
-/// True if any statement in `body` (recursively) evaluates a `__rust_compile`
-/// call — the desugar target of a `rust { ... }` block.
-fn body_has_ffi(body: &[Stmt]) -> bool {
+/// True when any expression reachable from `body` satisfies `f`.
+fn body_any(body: &[Stmt], f: &dyn Fn(&Expr) -> bool) -> bool {
     body.iter().any(|s| match &s.kind {
-        StmtKind::Let { init, .. } => expr_has_ffi(init),
-        StmtKind::Assign { value, .. } => expr_has_ffi(value),
-        StmtKind::SetMember { recv, value, .. } => expr_has_ffi(recv) || expr_has_ffi(value),
+        StmtKind::Let { init, .. } => expr_any(init, f),
+        StmtKind::Assign { value, .. } => expr_any(value, f),
+        StmtKind::SetMember { recv, value, .. } => expr_any(recv, f) || expr_any(value, f),
         StmtKind::SetIndex {
             recv, index, value, ..
-        } => expr_has_ffi(recv) || expr_has_ffi(index) || expr_has_ffi(value),
-        StmtKind::Destructure { init, .. } => expr_has_ffi(init),
-        StmtKind::Return(Some(e)) => expr_has_ffi(e),
+        } => expr_any(recv, f) || expr_any(index, f) || expr_any(value, f),
+        StmtKind::Destructure { init, .. } => expr_any(init, f),
+        StmtKind::Return(Some(e)) => expr_any(e, f),
         StmtKind::Return(None) => false,
-        StmtKind::While { cond, body, .. } => expr_has_ffi(cond) || body_has_ffi(body),
+        StmtKind::While { cond, body, .. } => expr_any(cond, f) || body_any(body, f),
         StmtKind::For {
-            start, end, body, ..
-        } => expr_has_ffi(start) || expr_has_ffi(end) || body_has_ffi(body),
-        StmtKind::ForIn { iter, body, .. } => expr_has_ffi(iter) || body_has_ffi(body),
+            start,
+            end,
+            step,
+            body,
+            ..
+        } => {
+            expr_any(start, f)
+                || expr_any(end, f)
+                || step.as_ref().is_some_and(|e| expr_any(e, f))
+                || body_any(body, f)
+        }
+        StmtKind::ForIn { iter, body, .. } => expr_any(iter, f) || body_any(body, f),
         StmtKind::Break(_) | StmtKind::Continue(_) => false,
-        StmtKind::If(ie) => if_has_ffi(ie),
-        StmtKind::When(w) => when_has_ffi(w),
-        StmtKind::Expr(e) => expr_has_ffi(e),
+        StmtKind::If(ie) => if_any(ie, f),
+        StmtKind::When(w) => when_any(w, f),
+        StmtKind::Expr(e) => expr_any(e, f),
     })
 }
 
-fn if_has_ffi(ie: &IfExpr) -> bool {
-    expr_has_ffi(&ie.cond) || body_has_ffi(&ie.then) || ie.els.as_deref().is_some_and(body_has_ffi)
+fn if_any(ie: &IfExpr, f: &dyn Fn(&Expr) -> bool) -> bool {
+    expr_any(&ie.cond, f)
+        || body_any(&ie.then, f)
+        || ie.els.as_deref().is_some_and(|b| body_any(b, f))
 }
 
-fn when_has_ffi(w: &WhenExpr) -> bool {
-    w.subject.as_deref().is_some_and(expr_has_ffi)
+fn when_any(w: &WhenExpr, f: &dyn Fn(&Expr) -> bool) -> bool {
+    w.subject.as_deref().is_some_and(|e| expr_any(e, f))
         || w.arms.iter().any(|arm| {
-            body_has_ffi(&arm.body)
+            body_any(&arm.body, f)
                 || match &arm.guard {
                     WhenGuard::Else => false,
                     WhenGuard::Conds(conds) => conds.iter().any(|c| match c {
-                        WhenCond::Expr(e) => expr_has_ffi(e),
+                        WhenCond::Expr(e) => expr_any(e, f),
                         WhenCond::InRange { start, end, .. } => {
-                            expr_has_ffi(start) || expr_has_ffi(end)
+                            expr_any(start, f) || expr_any(end, f)
                         }
                         WhenCond::Is { .. } => false,
                     }),
@@ -2530,28 +3016,39 @@ fn when_has_ffi(w: &WhenExpr) -> bool {
         })
 }
 
-fn expr_has_ffi(e: &Expr) -> bool {
+fn expr_any(e: &Expr, f: &dyn Fn(&Expr) -> bool) -> bool {
+    if f(e) {
+        return true;
+    }
     match e {
-        Expr::Call { name, args, .. } => name == RUST_COMPILE || args.iter().any(expr_has_ffi),
-        Expr::Member { recv, .. } => expr_has_ffi(recv),
-        Expr::MethodCall { recv, args, .. } => expr_has_ffi(recv) || args.iter().any(expr_has_ffi),
-        Expr::Unary { expr, .. } => expr_has_ffi(expr),
-        Expr::Binary { l, r, .. } => expr_has_ffi(l) || expr_has_ffi(r),
-        Expr::Elvis { left, right } => expr_has_ffi(left) || expr_has_ffi(right),
-        Expr::NotNull(inner) => expr_has_ffi(inner),
-        Expr::Index { recv, index, .. } => expr_has_ffi(recv) || expr_has_ffi(index),
-        Expr::Pair { first, second } => expr_has_ffi(first) || expr_has_ffi(second),
-        Expr::Range { start, end, .. } => expr_has_ffi(start) || expr_has_ffi(end),
-        Expr::Step { recv, by } => expr_has_ffi(recv) || expr_has_ffi(by),
+        Expr::Call { args, .. } => args.iter().any(|a| expr_any(a, f)),
+        Expr::Member { recv, .. } => expr_any(recv, f),
+        Expr::MethodCall { recv, args, .. } => {
+            expr_any(recv, f) || args.iter().any(|a| expr_any(a, f))
+        }
+        Expr::Unary { expr, .. } => expr_any(expr, f),
+        Expr::Binary { l, r, .. } => expr_any(l, f) || expr_any(r, f),
+        Expr::Elvis { left, right } => expr_any(left, f) || expr_any(right, f),
+        Expr::NotNull(inner) => expr_any(inner, f),
+        Expr::Index { recv, index, .. } => expr_any(recv, f) || expr_any(index, f),
+        Expr::Pair { first, second } => expr_any(first, f) || expr_any(second, f),
+        Expr::Range { start, end, .. } => expr_any(start, f) || expr_any(end, f),
+        Expr::Step { recv, by } => expr_any(recv, f) || expr_any(by, f),
         Expr::In {
             value, container, ..
-        } => expr_has_ffi(value) || expr_has_ffi(container),
-        Expr::IncDec { target, .. } => expr_has_ffi(target),
-        Expr::Lambda { body, .. } => body_has_ffi(body),
-        Expr::If(ie) => if_has_ffi(ie),
-        Expr::When(w) => when_has_ffi(w),
+        } => expr_any(value, f) || expr_any(container, f),
+        Expr::IncDec { target, .. } => expr_any(target, f),
+        Expr::Lambda { body, .. } => body_any(body, f),
+        Expr::If(ie) => if_any(ie, f),
+        Expr::When(w) => when_any(w, f),
+        Expr::Try(t) => {
+            body_any(&t.body, f)
+                || t.catches.iter().any(|c| body_any(&c.body, f))
+                || body_any(&t.finally_body, f)
+        }
+        Expr::Throw(inner) => expr_any(inner, f),
         Expr::Str(parts) => parts.iter().any(|p| match p {
-            StrExpr::Expr(e) => expr_has_ffi(e),
+            StrExpr::Expr(e) => expr_any(e, f),
             StrExpr::Text(_) => false,
         }),
         Expr::Int(_)
@@ -2560,5 +3057,51 @@ fn expr_has_ffi(e: &Expr) -> bool {
         | Expr::Char(_)
         | Expr::Null
         | Expr::Var(_) => false,
+    }
+}
+
+/// True if any statement in `body` (recursively) evaluates a `__rust_compile`
+/// call — the desugar target of a `rust { ... }` block.
+fn body_has_ffi(body: &[Stmt]) -> bool {
+    body_any(body, &|e| {
+        matches!(e, Expr::Call { name, .. } if name == RUST_COMPILE)
+    })
+}
+
+/// True when the program contains a `try` or a `throw` anywhere — in `main`, a
+/// free `fun`, a method, or a lambda body. Only such a program pays for the
+/// per-statement unwind checks and the suppressible print builtins.
+pub fn uses_exceptions(program: &Program) -> bool {
+    let has = |body: &[Stmt]| body_any(body, &|e| matches!(e, Expr::Try(_) | Expr::Throw(_)));
+    program.funs.iter().any(|f| has(&f.body))
+        || program
+            .classes
+            .iter()
+            .any(|c| c.methods.iter().any(|m| has(&m.body)))
+}
+
+/// True when `body` can leave its enclosing loop by a `break`/`continue` — the
+/// one shape a `try` with a `finally` cannot honour, because the jump would
+/// bypass the finalizer. A `break`/`continue` inside a *nested* loop is absorbed
+/// by that loop and does not count. (A `return` is honoured: it routes through
+/// the `try`'s return path, which runs the finalizer first.)
+fn body_breaks(body: &[Stmt]) -> bool {
+    body.iter().any(|s| match &s.kind {
+        StmtKind::Break(_) | StmtKind::Continue(_) => true,
+        StmtKind::If(ie) => body_breaks(&ie.then) || ie.els.as_deref().is_some_and(body_breaks),
+        StmtKind::When(w) => w.arms.iter().any(|a| body_breaks(&a.body)),
+        StmtKind::Expr(e) => expr_breaks(e),
+        // A nested loop absorbs its own `break`/`continue`.
+        _ => false,
+    })
+}
+
+/// An `if`/`when` used as an *expression* can still hold a `break` in a branch
+/// (`val x = if (c) break else 1`), so the scan follows those too.
+fn expr_breaks(e: &Expr) -> bool {
+    match e {
+        Expr::If(ie) => body_breaks(&ie.then) || ie.els.as_deref().is_some_and(body_breaks),
+        Expr::When(w) => w.arms.iter().any(|a| body_breaks(&a.body)),
+        _ => false,
     }
 }

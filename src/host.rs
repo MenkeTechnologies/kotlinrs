@@ -1,8 +1,10 @@
 //! Kotlin-specific runtime hooks reached through fusevm's extension-op
 //! dispatch.
 //!
-//! fusevm's ops are language-agnostic, so three Kotlin behaviors the universal
-//! ops can't express are handled here:
+//! fusevm's ops are language-agnostic, so the Kotlin behaviors the universal
+//! ops can't express are handled here — the value coercions below, the
+//! frontend-owned object heap ([`HeapObj`]), and the in-flight exception a VM
+//! with no unwind opcode cannot carry itself (see “Exception unwinding”):
 //!
 //! - **`KT_TO_STRING`** — Kotlin display form. fusevm's `Value::to_str` is
 //!   Perl-flavored (`Bool` → `"1"`/`""`, whole `Double` → `"1"`); Kotlin needs
@@ -151,6 +153,54 @@ pub const KT_COLL_HOF: u16 = 102;
 /// lambda with the receiver bound to `it` and pushes the scope function's result.
 pub const KT_SCOPE_FN: u16 = 103;
 
+/// Builtin id for `IntArray(n) { … }` / `Array(n) { … }` — the lambda-initializer
+/// array constructors. Stack: `[n, descStr, closure]` with the closure on top;
+/// the closure is invoked once per index and its result becomes that element.
+pub const KT_ARRAY_INIT: u16 = 104;
+
+/// Builtin id for `println(x)` (`argc` = 0 or 1). Only emitted in a program that
+/// uses exceptions: unlike fusevm's native `Op::PrintLn`, it is *suppressed*
+/// while an exception is unwinding, so nothing is printed between a `throw` and
+/// its handler. An exception-free program keeps the native op.
+pub const KT_PRINTLN: u16 = 105;
+/// Builtin id for `print(x)` — see [`KT_PRINTLN`].
+pub const KT_PRINT: u16 = 106;
+
+// ── Exception builtins (`try` / `catch` / `finally` / `throw`) ──────────────
+//
+// See the “Exception unwinding” section below for the protocol these implement.
+
+/// Builtin id for constructing a throwable (`RuntimeException("boom")`). Stack:
+/// `[fqnStr, message]` with the message on top (`Undef` for the no-arg form).
+pub const KT_EXC_NEW: u16 = 110;
+/// Builtin id for `throw e`: pops the throwable and makes it the in-flight
+/// exception. Returns `Undef` (a `throw` expression's value is never observed).
+pub const KT_EXC_THROW: u16 = 111;
+/// Builtin id for the unwind check the compiler emits after each statement:
+/// takes nothing and pushes a `Bool` — `true` while an exception is in flight.
+pub const KT_EXC_PENDING: u16 = 112;
+/// Builtin id for a `catch` type test. Pops the caught type's simple name and
+/// pushes whether the in-flight exception is an instance of it (walking the JVM
+/// throwable hierarchy). Does not consume the exception.
+pub const KT_EXC_MATCH: u16 = 113;
+/// Builtin id for consuming the in-flight exception once an arm matched: pushes
+/// it and clears the in-flight slot so the handler body runs normally.
+pub const KT_EXC_TAKE: u16 = 114;
+/// Builtin id for the value-stack depth at `try` entry (pushes an `Int`).
+pub const KT_EXC_DEPTH: u16 = 115;
+/// Builtin id for truncating the value stack back to a depth recorded by
+/// [`KT_EXC_DEPTH`]. Stack: `[depth]`. Discards whatever operands the statement
+/// the exception abandoned had already pushed.
+pub const KT_EXC_CUT: u16 = 116;
+/// Builtin id for parking the in-flight exception across a `finally` body, so
+/// the finalizer's own statements are not immediately unwound.
+pub const KT_EXC_STASH: u16 = 117;
+/// Builtin id for restoring the exception parked by [`KT_EXC_STASH`]. An
+/// exception raised *by* the finalizer wins over the parked one — the JVM rule.
+pub const KT_EXC_UNSTASH: u16 = 118;
+/// Builtin id for reporting an exception no handler claimed: formats the JVM's
+/// `Exception in thread "main" …` line and halts, so the process exits non-zero.
+pub const KT_EXC_ABORT: u16 = 119;
 
 thread_local! {
     /// Set by a runtime fault (e.g. integer divide-by-zero) so the CLI can
@@ -190,6 +240,11 @@ enum HeapObj {
     },
     /// An `IntRange` / `IntProgression`. See [`RangeObj`].
     Range(RangeObj),
+    /// A throwable: its fully-qualified JVM class name (`java.lang.RuntimeException`)
+    /// and the constructor message (`None` for the no-arg form, whose `message`
+    /// is Kotlin `null`). Kept apart from [`HeapObj::Instance`] because a
+    /// throwable has no ordered field record and renders as `fqn` / `fqn: message`.
+    Exc { class: String, msg: Option<String> },
     /// A JVM array. `desc` is its JVM type descriptor (`"[I"`,
     /// `"[Ljava.lang.Integer;"`, …), which only exists to reproduce the
     /// `toString` form — arrays inherit `Object.toString`, so Kotlin prints them
@@ -324,6 +379,378 @@ fn difference_modulo(a: i64, b: i64, c: i64) -> i64 {
 /// no residual objects (handles are per-run identities).
 fn reset_heap() {
     HEAP.with(|h| h.borrow_mut().clear());
+    PENDING.with(|p| *p.borrow_mut() = None);
+    STASH.with(|s| s.borrow_mut().clear());
+}
+
+// ── Exception unwinding ────────────────────────────────────────────────────
+//
+// fusevm has no unwind opcode and kotlinrs lowers `fun`s to fusevm's *native*
+// `Op::Call` frames, so a thrown exception cannot longjmp out of a frame. `try`
+// is therefore a cooperative two-part protocol, the same one the sibling
+// frontends (javars, scalars) converged on:
+//
+//   * **Runtime half (here).** A raise parks the throwable in [`PENDING`]
+//     instead of halting, provided the program contains a `try` at all
+//     ([`EXC_ENABLED`]). Every builtin with an observable side effect (printing,
+//     closure invocation) short-circuits while [`unwinding`] holds, so nothing
+//     escapes between the raise and its handler.
+//   * **Compile-time half (`crate::compiler`).** In a program that contains a
+//     `try`, the compiler emits a [`KT_EXC_PENDING`] test after every statement;
+//     the innermost enclosing construct decides where a `true` answer jumps —
+//     out of a loop, out of a `fun` frame, into a `catch` dispatch, or into the
+//     terminal abort at the end of `main`.
+//
+// Unwinding is therefore *statement-granular*: a raise mid-way through a
+// statement finishes evaluating that statement's remaining operands (on garbage
+// values, with side-effecting builtins suppressed) before control reaches the
+// handler; the handler's [`KT_EXC_CUT`] then discards those stranded operands.
+// A program with no `try` pays nothing — no check is emitted and a fault halts
+// exactly as it did before.
+
+thread_local! {
+    /// The exception currently unwinding, if any.
+    static PENDING: RefCell<Option<Value>> = const { RefCell::new(None) };
+    /// Exceptions parked across `finally` bodies (one entry per nested `finally`
+    /// currently running).
+    static STASH: RefCell<Vec<Option<Value>>> = const { RefCell::new(Vec::new()) };
+    /// True when the running program contains a `try`, so a runtime fault that
+    /// names a JVM throwable is catchable rather than immediately fatal. Set by
+    /// [`set_catchable`] before the run.
+    static EXC_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Declare whether the program about to run contains a `try` (see
+/// [`EXC_ENABLED`]). Called by the runner after compiling and before `VM::run`.
+pub fn set_catchable(on: bool) {
+    EXC_ENABLED.with(|e| e.set(on));
+}
+
+/// True while an exception is in flight and has not yet reached its handler.
+/// Side-effecting builtins test this and become no-ops, so no output is produced
+/// (and nothing further faults) during the walk out to the `catch`.
+fn unwinding() -> bool {
+    PENDING.with(|p| p.borrow().is_some())
+}
+
+/// Make `exc` the in-flight exception. In a program with a `try` this parks it
+/// for the compiler-emitted unwind checks; without one it is uncatchable and
+/// halts the run with the JVM's `Exception in thread "main" …` text.
+///
+/// A raise *while already unwinding* is dropped: the first exception wins, which
+/// is also the JVM's rule (a second throw cannot occur there, since the
+/// suppressed builtins never run).
+fn raise(vm: &mut VM, exc: Value) {
+    if unwinding() {
+        return;
+    }
+    if EXC_ENABLED.with(|e| e.get()) {
+        PENDING.with(|p| *p.borrow_mut() = Some(exc));
+        return;
+    }
+    KT_ERROR.with(|e| {
+        *e.borrow_mut() = Some(format!(
+            "Exception in thread \"main\" {}",
+            throwable_str(&exc)
+        ))
+    });
+    vm.request_halt();
+}
+
+/// Parse a `java.lang.Xxx: message` fault string into a throwable, or `None`
+/// when the message is a frontend-internal error rather than a Kotlin exception.
+///
+/// The recognizer is deliberately narrow — a fully-qualified `java.`/`kotlin.`
+/// name whose last segment ends in `Exception` or `Error` — so a kotlinrs bug
+/// ("unresolved reference: …") can never be silently swallowed by a user's
+/// `catch`.
+fn throwable_from_message(s: &str) -> Option<Value> {
+    let (fqn, msg) = match s.split_once(": ") {
+        Some((f, m)) => (f, Some(m)),
+        None => (s, None),
+    };
+    let last = fqn.rsplit('.').next()?;
+    let qualified = fqn.starts_with("java.") || fqn.starts_with("kotlin.");
+    if !qualified || !(last.ends_with("Exception") || last.ends_with("Error")) {
+        return None;
+    }
+    Some(new_throwable(fqn, msg))
+}
+
+/// Allocate a throwable with the fully-qualified class name `fqn`.
+fn new_throwable(fqn: &str, msg: Option<&str>) -> Value {
+    alloc(HeapObj::Exc {
+        class: fqn.to_string(),
+        msg: msg.map(|m| m.to_string()),
+    })
+}
+
+/// The throwables kotlinrs can construct or raise, each mapped to its
+/// fully-qualified JVM name. A table rather than a `java.lang.` prefix rule
+/// because the package differs per class (`java.util.NoSuchElementException`)
+/// and the package is observable through `toString`.
+pub const BUILTIN_THROWABLES: &[(&str, &str)] = &[
+    ("Throwable", "java.lang.Throwable"),
+    ("Exception", "java.lang.Exception"),
+    ("Error", "java.lang.Error"),
+    ("RuntimeException", "java.lang.RuntimeException"),
+    ("ArithmeticException", "java.lang.ArithmeticException"),
+    (
+        "IllegalArgumentException",
+        "java.lang.IllegalArgumentException",
+    ),
+    ("IllegalStateException", "java.lang.IllegalStateException"),
+    ("NumberFormatException", "java.lang.NumberFormatException"),
+    (
+        "IndexOutOfBoundsException",
+        "java.lang.IndexOutOfBoundsException",
+    ),
+    (
+        "StringIndexOutOfBoundsException",
+        "java.lang.StringIndexOutOfBoundsException",
+    ),
+    (
+        "ArrayIndexOutOfBoundsException",
+        "java.lang.ArrayIndexOutOfBoundsException",
+    ),
+    ("NullPointerException", "java.lang.NullPointerException"),
+    ("ClassCastException", "java.lang.ClassCastException"),
+    (
+        "UnsupportedOperationException",
+        "java.lang.UnsupportedOperationException",
+    ),
+    (
+        "NegativeArraySizeException",
+        "java.lang.NegativeArraySizeException",
+    ),
+    ("NoSuchElementException", "java.util.NoSuchElementException"),
+];
+
+/// The JVM throwable hierarchy kotlinrs models, as `(class, superclass)` simple
+/// names. `catch (e: T)` matches when the thrown class is `T` or reaches `T` by
+/// walking this chain — that is what makes `catch (e: Exception)` catch an
+/// `IllegalArgumentException`.
+const THROWABLE_PARENTS: &[(&str, &str)] = &[
+    ("Error", "Throwable"),
+    ("Exception", "Throwable"),
+    ("RuntimeException", "Exception"),
+    ("ArithmeticException", "RuntimeException"),
+    ("IllegalArgumentException", "RuntimeException"),
+    ("IllegalStateException", "RuntimeException"),
+    ("NumberFormatException", "IllegalArgumentException"),
+    ("IndexOutOfBoundsException", "RuntimeException"),
+    (
+        "StringIndexOutOfBoundsException",
+        "IndexOutOfBoundsException",
+    ),
+    (
+        "ArrayIndexOutOfBoundsException",
+        "IndexOutOfBoundsException",
+    ),
+    ("NullPointerException", "RuntimeException"),
+    ("ClassCastException", "RuntimeException"),
+    ("UnsupportedOperationException", "RuntimeException"),
+    ("NegativeArraySizeException", "RuntimeException"),
+    ("NoSuchElementException", "RuntimeException"),
+];
+
+/// The fully-qualified name of a throwable's simple name, or `None` when the
+/// name is not one kotlinrs models.
+pub fn throwable_fqn(simple: &str) -> Option<&'static str> {
+    BUILTIN_THROWABLES
+        .iter()
+        .find(|(s, _)| *s == simple)
+        .map(|(_, f)| *f)
+}
+
+/// Whether a thrown class (simple name) is an instance of the caught type
+/// `want`, by walking [`THROWABLE_PARENTS`]. The chain is short and fixed, so a
+/// linear walk beats any index.
+fn throwable_is_a(thrown: &str, want: &str) -> bool {
+    let mut cur = thrown;
+    loop {
+        if cur == want {
+            return true;
+        }
+        match THROWABLE_PARENTS.iter().find(|(c, _)| *c == cur) {
+            Some((_, parent)) => cur = parent,
+            None => return false,
+        }
+    }
+}
+
+/// The simple class name used for `catch` matching.
+fn thrown_class(v: &Value) -> Option<String> {
+    with_obj(v, |o| match o {
+        HeapObj::Exc { class, .. } => Some(
+            class
+                .rsplit('.')
+                .next()
+                .unwrap_or(class.as_str())
+                .to_string(),
+        ),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// A throwable's `toString()`: `fqn` alone when the message is null, else
+/// `fqn: message` (`java.lang.Throwable.toString`). A non-throwable value falls
+/// back to its ordinary Kotlin display form.
+fn throwable_str(v: &Value) -> String {
+    with_obj(v, |o| match o {
+        HeapObj::Exc { class, msg } => Some(match msg {
+            Some(m) => format!("{class}: {m}"),
+            None => class.clone(),
+        }),
+        _ => None,
+    })
+    .flatten()
+    .unwrap_or_else(|| kotlin_string(v))
+}
+
+/// `KT_EXC_NEW` — see [`KT_EXC_NEW`].
+fn b_exc_new(vm: &mut VM, _argc: u8) -> Value {
+    let msg = vm.pop();
+    let class = vm.pop().to_str();
+    let msg = match msg {
+        Value::Undef => None,
+        other => Some(kotlin_string(&other)),
+    };
+    new_throwable(&class, msg.as_deref())
+}
+
+/// `KT_EXC_THROW` — see [`KT_EXC_THROW`].
+fn b_exc_throw(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.pop();
+    raise(vm, v);
+    Value::Undef
+}
+
+/// `KT_EXC_PENDING` — see [`KT_EXC_PENDING`].
+fn b_exc_pending(_vm: &mut VM, _argc: u8) -> Value {
+    Value::Bool(unwinding())
+}
+
+/// `KT_EXC_MATCH` — see [`KT_EXC_MATCH`].
+fn b_exc_match(vm: &mut VM, _argc: u8) -> Value {
+    let want = vm.pop().to_str();
+    let thrown = PENDING.with(|p| p.borrow().as_ref().and_then(thrown_class));
+    Value::Bool(match thrown {
+        // `catch (e: Throwable)` catches everything, including a value outside
+        // the modeled hierarchy.
+        Some(_) if want == "Throwable" => true,
+        Some(c) => throwable_is_a(&c, &want),
+        None => false,
+    })
+}
+
+/// `KT_EXC_TAKE` — see [`KT_EXC_TAKE`].
+fn b_exc_take(_vm: &mut VM, _argc: u8) -> Value {
+    PENDING
+        .with(|p| p.borrow_mut().take())
+        .unwrap_or(Value::Undef)
+}
+
+/// `KT_EXC_DEPTH` — see [`KT_EXC_DEPTH`].
+fn b_exc_depth(vm: &mut VM, _argc: u8) -> Value {
+    Value::Int(vm.stack.len() as i64)
+}
+
+/// `KT_EXC_CUT` — see [`KT_EXC_CUT`].
+fn b_exc_cut(vm: &mut VM, _argc: u8) -> Value {
+    let depth = vm.pop().to_int().max(0) as usize;
+    if depth <= vm.stack.len() {
+        vm.stack.truncate(depth);
+    }
+    Value::Undef
+}
+
+/// `KT_EXC_STASH` — see [`KT_EXC_STASH`].
+fn b_exc_stash(_vm: &mut VM, _argc: u8) -> Value {
+    let held = PENDING.with(|p| p.borrow_mut().take());
+    STASH.with(|s| s.borrow_mut().push(held));
+    Value::Undef
+}
+
+/// `KT_EXC_UNSTASH` — see [`KT_EXC_UNSTASH`].
+fn b_exc_unstash(_vm: &mut VM, _argc: u8) -> Value {
+    let parked = STASH.with(|s| s.borrow_mut().pop()).flatten();
+    // An exception raised by the finalizer itself replaces the parked one.
+    PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.is_none() {
+            *p = parked;
+        }
+    });
+    Value::Undef
+}
+
+/// `KT_EXC_ABORT` — see [`KT_EXC_ABORT`].
+fn b_exc_abort(vm: &mut VM, _argc: u8) -> Value {
+    let exc = PENDING
+        .with(|p| p.borrow_mut().take())
+        .unwrap_or(Value::Undef);
+    KT_ERROR.with(|e| {
+        *e.borrow_mut() = Some(format!(
+            "Exception in thread \"main\" {}",
+            throwable_str(&exc)
+        ))
+    });
+    vm.request_halt();
+    Value::Undef
+}
+
+/// `KT_PRINTLN` / `KT_PRINT` — the suppressible print builtins (see
+/// [`KT_PRINTLN`]). The compiler has already coerced the argument to its Kotlin
+/// display form, so the value is printed verbatim.
+fn b_println(vm: &mut VM, argc: u8) -> Value {
+    let arg = if argc > 0 { Some(vm.pop()) } else { None };
+    if !unwinding() {
+        match arg {
+            Some(v) => println!("{}", v.to_str()),
+            None => println!(),
+        }
+    }
+    Value::Undef
+}
+
+fn b_print(vm: &mut VM, argc: u8) -> Value {
+    let arg = if argc > 0 { Some(vm.pop()) } else { None };
+    if !unwinding() {
+        if let Some(v) = arg {
+            print!("{}", v.to_str());
+        }
+    }
+    Value::Undef
+}
+
+/// `KT_ARRAY_INIT` — see [`KT_ARRAY_INIT`]. An empty `desc` means the generic
+/// `Array(n) { … }`, whose descriptor comes from the produced elements.
+fn b_array_init(vm: &mut VM, _argc: u8) -> Value {
+    let clo = vm.pop();
+    let desc = vm.pop().to_str();
+    let n = vm.pop().to_int();
+    if n < 0 {
+        fault(vm, "java.lang.NegativeArraySizeException");
+        return Value::Undef;
+    }
+    let mut items = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        match invoke_closure(vm, &clo, &[Value::Int(i)]) {
+            Ok(v) => items.push(v),
+            Err(e) => {
+                fault(vm, e);
+                return Value::Undef;
+            }
+        }
+    }
+    let desc = if desc.is_empty() {
+        array_desc(&items)
+    } else {
+        desc
+    };
+    alloc(HeapObj::Array { items, desc })
 }
 
 /// Allocate `obj` on the heap and return its handle.
@@ -353,8 +780,38 @@ pub fn take_error() -> Option<String> {
     KT_ERROR.with(|e| e.borrow_mut().take())
 }
 
+/// Stop the run with `msg` — or, when the message names a JVM throwable and the
+/// program contains a `try`, raise it as a catchable exception instead.
+///
+/// Every runtime error the host can report flows through here, so routing the
+/// throwable ones into [`raise`] is what makes `1 / 0`, `!!` on null, and an
+/// out-of-range index catchable without touching each call site. A
+/// *frontend-internal* fault (one whose message is not a `java.…`/`kotlin.…`
+/// throwable) always halts: it is a kotlinrs gap, not a Kotlin exception, and
+/// swallowing it in a `catch` would hide it. A fault raised while an exception
+/// is already unwinding is dropped — it is computed on garbage operands the
+/// abandoned statement left behind.
 fn fault(vm: &mut VM, msg: impl Into<String>) {
-    KT_ERROR.with(|e| *e.borrow_mut() = Some(msg.into()));
+    if unwinding() {
+        return;
+    }
+    let msg = msg.into();
+    let throwable = throwable_from_message(&msg).is_some();
+    if throwable && EXC_ENABLED.with(|e| e.get()) {
+        if let Some(exc) = throwable_from_message(&msg) {
+            raise(vm, exc);
+            return;
+        }
+    }
+    // Uncatchable here (no `try` in the program, or a frontend-internal fault):
+    // stop the run. A JVM throwable gets the report line `java` prints for one
+    // that reached the top of `main`; a kotlinrs-internal message stays bare.
+    let msg = if throwable {
+        format!("Exception in thread \"main\" {msg}")
+    } else {
+        msg
+    };
+    KT_ERROR.with(|e| *e.borrow_mut() = Some(msg));
     vm.request_halt();
 }
 
@@ -557,7 +1014,13 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             vm.push(Value::Bool(value_is_type(&v, &ty)));
         }
         KT_CHR_STRING => {
-            let code = vm.pop().to_int();
+            let v = vm.pop();
+            // A `Char?` holding null renders as `null`, not as code point 0.
+            if matches!(v, Value::Undef) {
+                vm.push(Value::str("null"));
+                return;
+            }
+            let code = v.to_int();
             let s = char::from_u32(code as u32)
                 .map(|c| c.to_string())
                 .unwrap_or_default();
@@ -747,6 +1210,19 @@ fn register_builtins(vm: &mut VM) {
     vm.register_builtin(KT_CLOSURE_CALL, b_closure_call);
     vm.register_builtin(KT_COLL_HOF, b_coll_hof);
     vm.register_builtin(KT_SCOPE_FN, b_scope_fn);
+    vm.register_builtin(KT_ARRAY_INIT, b_array_init);
+    vm.register_builtin(KT_PRINTLN, b_println);
+    vm.register_builtin(KT_PRINT, b_print);
+    vm.register_builtin(KT_EXC_NEW, b_exc_new);
+    vm.register_builtin(KT_EXC_THROW, b_exc_throw);
+    vm.register_builtin(KT_EXC_PENDING, b_exc_pending);
+    vm.register_builtin(KT_EXC_MATCH, b_exc_match);
+    vm.register_builtin(KT_EXC_TAKE, b_exc_take);
+    vm.register_builtin(KT_EXC_DEPTH, b_exc_depth);
+    vm.register_builtin(KT_EXC_CUT, b_exc_cut);
+    vm.register_builtin(KT_EXC_STASH, b_exc_stash);
+    vm.register_builtin(KT_EXC_UNSTASH, b_exc_unstash);
+    vm.register_builtin(KT_EXC_ABORT, b_exc_abort);
 }
 
 /// Register the debug extension handler on a fresh VM (`kotlin --dap`). Identical
@@ -792,6 +1268,11 @@ fn contains_value(container: &Value, value: &Value) -> bool {
 /// which the general `for (v in …)` lowering reports as a fault rather than
 /// silently looping zero times.
 fn iter_len(recv: &Value) -> Option<i64> {
+    // `for (c in "abc")` walks a String's UTF-16 code units — the same basis
+    // `String.length` and `indexOf` use.
+    if let Value::Str(s) = recv {
+        return Some(s.encode_utf16().count() as i64);
+    }
     with_obj(recv, |o| match o {
         HeapObj::List(items) | HeapObj::Array { items, .. } => Some(items.len() as i64),
         HeapObj::Range(r) => Some(r.count()),
@@ -804,6 +1285,16 @@ fn iter_len(recv: &Value) -> Option<i64> {
 /// by [`iter_len`], so an out-of-range index can only mean the collection was
 /// mutated mid-loop; that yields `null` rather than faulting.
 fn iter_at(recv: &Value, i: i64) -> Value {
+    // A String yields `Char`s, carried (as everywhere in kotlinrs) as their
+    // integer code unit; the compiler types the loop variable `Char` so it
+    // displays as a character.
+    if let Value::Str(s) = recv {
+        return usize::try_from(i)
+            .ok()
+            .and_then(|i| s.encode_utf16().nth(i))
+            .map(|u| Value::Int(u as i64))
+            .unwrap_or(Value::Undef);
+    }
     with_obj(recv, |o| match o {
         HeapObj::List(items) | HeapObj::Array { items, .. } => {
             usize::try_from(i).ok().and_then(|i| items.get(i).cloned())
@@ -914,6 +1405,12 @@ fn closure_meta(v: &Value) -> Option<(u16, u8, Vec<Value>)> {
 /// parameter count followed by the captures, so missing args are padded with
 /// `null` and extras dropped. See [`run_sub`] for the frame mechanics.
 fn invoke_closure(vm: &mut VM, clo: &Value, args: &[Value]) -> Result<Value, String> {
+    // Suppressed while unwinding: the lambda body's own unwind check already
+    // returned out of it once, and a higher-order call site would otherwise keep
+    // invoking it (with side effects) for every remaining element.
+    if unwinding() {
+        return Ok(Value::Undef);
+    }
     let (name_idx, params, captures) =
         closure_meta(clo).ok_or_else(|| "kotlin: value is not a function".to_string())?;
     let entry = vm
@@ -1265,7 +1762,9 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
         (Value::Str(s), "repeat") => {
             let n = args.first().map(|v| v.to_int()).unwrap_or(0);
             if n < 0 {
-                Err("Count 'n' must be non-negative".to_string())
+                Err(format!(
+                    "java.lang.IllegalArgumentException: Count 'n' must be non-negative, but was {n}."
+                ))
             } else {
                 Ok(Value::str(s.repeat(n as usize)))
             }
@@ -1278,7 +1777,8 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
             let end = args.get(1).map(|v| v.to_int()).unwrap_or(units.len() as i64);
             if start < 0 || end > units.len() as i64 || start > end {
                 Err(format!(
-                    "begin {start}, end {end}, length {}",
+                    "java.lang.StringIndexOutOfBoundsException: \
+                     Range [{start}, {end}) out of bounds for length {}",
                     units.len()
                 ))
             } else {
@@ -1294,6 +1794,40 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
         // static type (Char vs Int) drives display, not the runtime tag.
         (Value::Int(n), "code") => Ok(Value::Int(*n)),
         (Value::Int(n), "toChar") => Ok(Value::Int(*n & 0xFFFF)),
+
+        // ── the arithmetic operators in their method spelling ──
+        // `a.plus(b)` is what `a + b` compiles to on the JVM, and the method
+        // form is how the operators are reached through a safe call
+        // (`count?.plus(1)`). Integer `div`/`rem` truncate and take the
+        // dividend's sign, exactly as the operator forms do.
+        (Value::Int(_) | Value::Float(_), "plus" | "minus" | "times" | "div" | "rem") => {
+            let b = args.first().cloned().unwrap_or(Value::Int(0));
+            let int_op = matches!(recv, Value::Int(_)) && matches!(b, Value::Int(_));
+            if int_op {
+                let (x, y) = (recv.to_int(), b.to_int());
+                match name {
+                    "plus" => Ok(Value::Int(x.wrapping_add(y))),
+                    "minus" => Ok(Value::Int(x.wrapping_sub(y))),
+                    "times" => Ok(Value::Int(x.wrapping_mul(y))),
+                    _ if y == 0 => Err("java.lang.ArithmeticException: / by zero".to_string()),
+                    "div" => Ok(Value::Int(x.wrapping_div(y))),
+                    _ => Ok(Value::Int(x.wrapping_rem(y))),
+                }
+            } else {
+                let (x, y) = (recv.to_float(), b.to_float());
+                Ok(Value::Float(match name {
+                    "plus" => x + y,
+                    "minus" => x - y,
+                    "times" => x * y,
+                    "div" => x / y,
+                    _ => x % y,
+                }))
+            }
+        }
+        (Value::Int(n), "toDouble") => Ok(Value::Float(*n as f64)),
+        (Value::Int(n), "toInt" | "toLong") => Ok(Value::Int(*n)),
+        (Value::Float(f), "toDouble") => Ok(Value::Float(*f)),
+        (Value::Float(f), "toInt" | "toLong") => Ok(Value::Int(*f as i64)),
 
         // ── kotlin.Any.toString() — defined on every type ──
         (_, "toString") => Ok(Value::str(kotlin_string(recv))),
@@ -1317,6 +1851,20 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         .and_then(|d| d.parse::<usize>().ok())
     {
         return component(recv, idx);
+    }
+    // `Throwable.message` — the constructor message, or Kotlin `null`.
+    if name == "message" {
+        if let Some(m) = with_obj(recv, |o| match o {
+            HeapObj::Exc { msg, .. } => Some(match msg {
+                Some(m) => Value::str(m.clone()),
+                None => Value::Undef,
+            }),
+            _ => None,
+        })
+        .flatten()
+        {
+            return Ok(m);
+        }
     }
     match name {
         "toString" => return Ok(Value::str(kotlin_string(recv))),
@@ -1476,7 +2024,7 @@ fn sequence_member(
     /// Kotlin throws on `first()`/`last()`/`max()`/`min()` over an empty
     /// sequence rather than returning null.
     fn need(v: Option<Value>) -> Result<Value, String> {
-        v.ok_or_else(|| "java.util.NoSuchElementException".to_string())
+        v.ok_or_else(|| "java.util.NoSuchElementException: List is empty.".to_string())
     }
     let v = match name {
         "size" | "count" => Value::Int(items.len() as i64),
@@ -1568,7 +2116,10 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
             2 => Some(b.clone()),
             _ => None,
         },
-        HeapObj::Map(_) | HeapObj::Closure { .. } | HeapObj::Range(_) => None,
+        HeapObj::Map(_)
+        | HeapObj::Closure { .. }
+        | HeapObj::Range(_)
+        | HeapObj::Exc { .. } => None,
     })
     .flatten()
     .ok_or_else(|| format!("no component{n} on {}", obj_label(recv)))
@@ -1591,7 +2142,7 @@ fn index_get(recv: &Value, index: &Value) -> Result<Value, String> {
             let i = index.to_int();
             if i < 0 || i as usize >= items.len() {
                 Err(format!(
-                    "java.lang.IndexOutOfBoundsException: Index {i} out of bounds for length {}",
+                    "java.lang.ArrayIndexOutOfBoundsException: Index {i} out of bounds for length {}",
                     items.len()
                 ))
             } else {
@@ -1747,6 +2298,10 @@ fn obj_hash(recv: &Value) -> i64 {
                 }
             }
             HeapObj::Closure { name_idx, .. } => name_idx.hash(&mut h),
+            HeapObj::Exc { class, msg } => {
+                class.hash(&mut h);
+                msg.hash(&mut h);
+            }
         }
         h.finish() as i64
     })
@@ -1755,6 +2310,9 @@ fn obj_hash(recv: &Value) -> i64 {
 
 /// A coarse label for a heap object, for `unresolved reference` diagnostics.
 fn obj_label(recv: &Value) -> String {
+    if matches!(recv, Value::Str(_)) {
+        return "String".to_string();
+    }
     with_obj(recv, |o| match o {
         HeapObj::Instance { class, .. } => class.clone(),
         HeapObj::List(_) => "List".to_string(),
@@ -1768,6 +2326,7 @@ fn obj_label(recv: &Value) -> String {
         }
         .to_string(),
         HeapObj::Array { .. } => "Array".to_string(),
+        HeapObj::Exc { class, .. } => class.rsplit('.').next().unwrap_or(class).to_string(),
     })
     .unwrap_or_else(|| "value".to_string())
 }
@@ -1837,6 +2396,12 @@ fn display_obj(id: u32) -> String {
             // no reimplementation can reproduce — the heap handle stands in, so
             // the SHAPE matches (`[I@1b6d3586`) but the digits do not.
             HeapObj::Array { desc, .. } => format!("{desc}@{id:x}"),
+            // `Throwable.toString()`: the qualified class name, plus `": " +
+            // message` when the constructor was given one.
+            HeapObj::Exc { class, msg } => match msg {
+                Some(m) => format!("{class}: {m}"),
+                None => class.clone(),
+            },
         }
     })
 }
@@ -1852,7 +2417,12 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         "String" | "CharSequence" => matches!(v, Value::Str(_)),
         // `Any` matches any non-null value; unknown names never match.
         "Any" => !matches!(v, Value::Undef),
-        _ => false,
+        // A throwable matches its own class and every supertype it reaches, so
+        // `when (e) { is RuntimeException -> … }` behaves like a `catch` arm.
+        other => match thrown_class(v) {
+            Some(c) => other == "Throwable" || throwable_is_a(&c, other),
+            None => false,
+        },
     }
 }
 

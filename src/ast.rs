@@ -15,6 +15,12 @@ pub enum Type {
     Boolean,
     Char,
     String,
+    /// `String?` — a String that may hold Kotlin `null`. Distinguished from
+    /// [`Type::String`] purely for *display*: a non-null String needs no
+    /// coercion before `+`/interpolation, but a null one has to render as the
+    /// four characters `null` (fusevm's native `Concat` renders an absent value
+    /// as the empty string), so this type routes through the Kotlin stringifier.
+    NullableString,
     Unit,
     /// A heap object — a class instance, `List`, `Map`, or `Pair`. Carries no
     /// class identity in the coarse type (that rides in the compiler's binding
@@ -30,6 +36,11 @@ impl Type {
     /// numeric ops; only its *display* and add/sub result type differ.
     pub fn is_int(self) -> bool {
         matches!(self, Type::Int | Type::Long | Type::Char)
+    }
+    /// The `String` kinds — both drive `+`-as-concatenation and the string
+    /// comparison ops; only their display coercion differs.
+    pub fn is_str(self) -> bool {
+        matches!(self, Type::String | Type::NullableString)
     }
     pub fn is_num(self) -> bool {
         matches!(
@@ -434,6 +445,35 @@ pub enum Expr {
     If(IfExpr),
     /// `when` used as an expression (the matched arm's value).
     When(WhenExpr),
+    /// `try { … } catch (e: T) { … }* [finally { … }]`. Kotlin's `try` is an
+    /// expression: its value is the body's (or the matching handler's) last
+    /// statement value, so it appears here rather than as a statement kind — a
+    /// statement-position `try` is an [`StmtKind::Expr`] whose value is dropped.
+    Try(TryExpr),
+    /// `throw e`. Kotlin types a `throw` as `Nothing`, so it is an expression
+    /// (`val x = y ?: throw IllegalStateException("…")`); the value it leaves is
+    /// never observed, because the enclosing statement unwinds.
+    Throw(Box<Expr>),
+}
+
+/// A `try` expression: the guarded body, the `catch` arms in source order, and
+/// the (possibly empty) `finally` body.
+#[derive(Debug, Clone)]
+pub struct TryExpr {
+    pub body: Vec<Stmt>,
+    pub catches: Vec<CatchArm>,
+    pub finally_body: Vec<Stmt>,
+    pub line: u32,
+}
+
+/// One `catch (name: Type) { … }` arm. `ty` is the caught throwable's simple
+/// name (`Exception`, `ArithmeticException`, …) — the first arm whose type the
+/// in-flight exception is an instance of wins.
+#[derive(Debug, Clone)]
+pub struct CatchArm {
+    pub name: String,
+    pub ty: String,
+    pub body: Vec<Stmt>,
 }
 
 #[derive(Debug, Clone)]

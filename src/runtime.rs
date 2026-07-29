@@ -12,6 +12,10 @@ pub fn run_source(src: &str) -> Result<i32, String> {
     let program = parser::parse_program(&src)?;
     let chunk = compiler::compile(&program)?;
     let _ = host::take_error(); // clear any stale fault from a prior run
+    // A runtime fault that names a JVM throwable is catchable only in a program
+    // that has a `try` — the only program whose bytecode carries the unwind
+    // checks that would deliver it to a handler.
+    host::set_catchable(compiler::uses_exceptions(&program));
     let mut vm = VM::new(chunk);
     host::install(&mut vm);
     match vm.run() {

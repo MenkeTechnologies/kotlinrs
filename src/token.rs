@@ -45,6 +45,10 @@ pub enum Tok {
     Class,
     Object,
     Data,
+    Try,
+    Catch,
+    Finally,
+    Throw,
 
     // Punctuation
     LParen,
