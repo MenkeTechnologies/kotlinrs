@@ -384,7 +384,10 @@ fn char_ranges() {
     assert_eq!(stdout("println(('a'..'e').toList())"), "[a, b, c, d, e]\n");
     assert_eq!(stdout("println('a'..'e')"), "a..e\n");
     assert_eq!(stdout("println('a'..'z' step 5)"), "a..z step 5\n");
-    assert_eq!(stdout("println(('a'..'e').reversed())"), "e downTo a step 1\n");
+    assert_eq!(
+        stdout("println(('a'..'e').reversed())"),
+        "e downTo a step 1\n"
+    );
     assert_eq!(stdout("println('c' in 'a'..'z')"), "true\n");
     assert_eq!(stdout("println('C' in 'a'..'z')"), "false\n");
     assert_eq!(stdout("for (c in 'a'..'d') print(c)"), "abcd");
@@ -640,7 +643,10 @@ fn inheritance_modifiers_are_enforced() {
     ];
     for (src, want) in cases {
         let err = prog_err(src);
-        assert!(err.contains(want), "expected {want:?} for {src:?}, got {err}");
+        assert!(
+            err.contains(want),
+            "expected {want:?} for {src:?}, got {err}"
+        );
     }
 }
 
@@ -1563,7 +1569,8 @@ fun main() {
 
 #[test]
 fn an_uncaught_exception_reports_like_the_jvm_and_exits_nonzero() {
-    let out = eval("fun main() {\n    println(\"before\")\n    throw IllegalStateException(\"dead\")\n}");
+    let out =
+        eval("fun main() {\n    println(\"before\")\n    throw IllegalStateException(\"dead\")\n}");
     assert!(!out.status.success(), "expected a non-zero exit");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "before\n");
     let err = String::from_utf8_lossy(&out.stderr);
@@ -1585,19 +1592,15 @@ fun main() {
     println(try { f(-1) } catch (e: Exception) { -1 })
     println(g())
 }";
-    assert_eq!(
-        prog(src),
-        "close 3\n6\nclose -1\n-1\ninner\nouter\ndeep\n"
-    );
+    assert_eq!(prog(src), "close 3\n6\nclose -1\n-1\ninner\nouter\ndeep\n");
 }
 
 #[test]
 fn a_break_out_of_a_try_with_a_finally_is_rejected() {
     // Unlike `return`, a `break` has no path that could run the finalizer here;
     // refusing the program beats silently skipping a cleanup block.
-    let err = prog_err(
-        "fun main() { for (i in 1..3) { try { break } finally { println(\"fin\") } } }",
-    );
+    let err =
+        prog_err("fun main() { for (i in 1..3) { try { break } finally { println(\"fin\") } } }");
     assert!(
         err.contains("out of a `try` with a `finally` is not supported"),
         "stderr was: {err}"
@@ -1623,10 +1626,7 @@ fun main() {
     val any: Any = IllegalArgumentException(\"z\")
     println(when (any) { is IllegalStateException -> \"ise\" ; is RuntimeException -> \"rte\" ; else -> \"?\" })
 }";
-    assert_eq!(
-        prog(src),
-        "java.lang.RuntimeException: m\nm\nnull\nrte\n"
-    );
+    assert_eq!(prog(src), "java.lang.RuntimeException: m\nm\nnull\nrte\n");
 }
 
 // ─── Array lambda initializers and String iteration ───────────────────────
@@ -1642,7 +1642,10 @@ fun main() {
     println(Array(3) { it * it }.toList())
     println(IntArray(2).joinToString())
 }";
-    assert_eq!(prog(src), "0, 2, 4, 6\n12\n0.0, 1.5, 3.0\n[0, 1, 4]\n0, 0\n");
+    assert_eq!(
+        prog(src),
+        "0, 2, 4, 6\n12\n0.0, 1.5, 3.0\n[0, 1, 4]\n0, 0\n"
+    );
 }
 
 #[test]
@@ -1829,18 +1832,18 @@ fun main() {
 
 #[test]
 fn an_abstract_or_sealed_type_cannot_be_constructed() {
-    assert!(prog_err("abstract class S(val n: Int)\nfun main() { println(S(1)) }")
-        .contains("cannot construct abstract class S"));
+    assert!(
+        prog_err("abstract class S(val n: Int)\nfun main() { println(S(1)) }")
+            .contains("cannot construct abstract class S")
+    );
     assert!(prog_err("sealed class S\nfun main() { println(S()) }")
         .contains("cannot construct abstract class S"));
     assert!(
         prog_err("interface I { fun f(): Int }\nfun main() { println(I()) }")
             .contains("cannot construct interface I")
     );
-    assert!(
-        prog_err("class D : Missing()\nfun main() { println(1) }")
-            .contains("unresolved supertype Missing")
-    );
+    assert!(prog_err("class D : Missing()\nfun main() { println(1) }")
+        .contains("unresolved supertype Missing"));
 }
 
 #[test]

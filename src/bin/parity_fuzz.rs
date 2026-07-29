@@ -72,14 +72,36 @@ fn pick<'a, T>(rng: &mut Rng, xs: &'a [T]) -> &'a T {
     &xs[rng.below(xs.len())]
 }
 
-const INTS: &[&str] = &["0", "1", "2", "3", "7", "10", "42", "100", "-1", "-7", "-42"];
+const INTS: &[&str] = &[
+    "0", "1", "2", "3", "7", "10", "42", "100", "-1", "-7", "-42",
+];
 const DIVS: &[&str] = &["1", "2", "3", "4", "5", "7", "-2", "-3"];
 const DBLS: &[&str] = &[
-    "0.0", "1.0", "0.5", "2.5", "3.14", "-1.5", "100.0", "1e3", "1e-3", "0.1", "1234567.0",
-    "1.0e7", "1.0e-7", "123456789.0", "9.999e-4",
+    "0.0",
+    "1.0",
+    "0.5",
+    "2.5",
+    "3.14",
+    "-1.5",
+    "100.0",
+    "1e3",
+    "1e-3",
+    "0.1",
+    "1234567.0",
+    "1.0e7",
+    "1.0e-7",
+    "123456789.0",
+    "9.999e-4",
 ];
 const ZDIVS: &[&str] = &["0.0", "-0.0"];
-const STRS: &[&str] = &["\"\"", "\"a\"", "\"abc\"", "\"Hello\"", "\" x \"", "\"AbC\""];
+const STRS: &[&str] = &[
+    "\"\"",
+    "\"a\"",
+    "\"abc\"",
+    "\"Hello\"",
+    "\" x \"",
+    "\"AbC\"",
+];
 const BOOLS: &[&str] = &["true", "false"];
 const AOPS: &[&str] = &["+", "-", "*"];
 const CMPOPS: &[&str] = &["==", "!=", "<", ">", "<=", ">="];
@@ -414,9 +436,9 @@ fn g_arrayinit(r: &mut Rng, idx: usize) -> String {
         0 => format!("val q{idx} = IntArray({n}) {{ it * {k} }}; println(q{idx}.joinToString())"),
         1 => format!("val q{idx} = IntArray({n}) {{ it + {k} }}; println(q{idx}.sum())"),
         2 => format!("val q{idx} = IntArray({n}) {{ it }}; println(q{idx}.size)"),
-        3 => format!(
-            "val q{idx} = DoubleArray({n}) {{ it * 1.5 }}; println(q{idx}.joinToString())"
-        ),
+        3 => {
+            format!("val q{idx} = DoubleArray({n}) {{ it * 1.5 }}; println(q{idx}.joinToString())")
+        }
         4 => format!("val q{idx} = Array({n}) {{ it * it }}; println(q{idx}.toList())"),
         _ => format!(
             "val q{idx} = IntArray({n}) {{ it * {k} }}; println(q{idx}[{}])",
@@ -882,10 +904,7 @@ fn declarations(probes: &[String]) -> String {
              \x20   override fun f(): Int = m * 2\n\
              }\n",
         ),
-        (
-            "KtErr(",
-            "class KtErr(msg: String) : Exception(msg)\n",
-        ),
+        ("KtErr(", "class KtErr(msg: String) : Exception(msg)\n"),
         // `super<T>.m()`. `Both` implements two interfaces that both supply
         // `pick`, which is exactly when Kotlin *requires* the qualifier — so the
         // oracle accepts only the qualified spelling, and the two arms it can

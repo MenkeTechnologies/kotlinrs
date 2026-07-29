@@ -328,7 +328,10 @@ enum HeapObj {
     /// and the constructor message (`None` for the no-arg form, whose `message`
     /// is Kotlin `null`). Kept apart from [`HeapObj::Instance`] because a
     /// throwable has no ordered field record and renders as `fqn` / `fqn: message`.
-    Exc { class: String, msg: Option<String> },
+    Exc {
+        class: String,
+        msg: Option<String>,
+    },
     /// A JVM array. `desc` is its JVM type descriptor (`"[I"`,
     /// `"[Ljava.lang.Integer;"`, …), which only exists to reproduce the
     /// `toString` form — arrays inherit `Object.toString`, so Kotlin prints them
@@ -2363,9 +2366,9 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
         (Value::Str(s), "startsWith") => Ok(Value::Bool(s.starts_with(&arg_str(args, 0)))),
         (Value::Str(s), "endsWith") => Ok(Value::Bool(s.ends_with(&arg_str(args, 0)))),
         (Value::Str(s), "plus") => Ok(Value::str(format!("{s}{}", arg_str(args, 0)))),
-        (Value::Str(s), "replace") => Ok(Value::str(
-            s.replace(&arg_str(args, 0), &arg_str(args, 1)),
-        )),
+        (Value::Str(s), "replace") => {
+            Ok(Value::str(s.replace(&arg_str(args, 0), &arg_str(args, 1))))
+        }
         (Value::Str(s), "repeat") => {
             let n = args.first().map(|v| v.to_int()).unwrap_or(0);
             if n < 0 {
@@ -2381,7 +2384,10 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
         (Value::Str(s), "substring") => {
             let units: Vec<u16> = s.encode_utf16().collect();
             let start = args.first().map(|v| v.to_int()).unwrap_or(0);
-            let end = args.get(1).map(|v| v.to_int()).unwrap_or(units.len() as i64);
+            let end = args
+                .get(1)
+                .map(|v| v.to_int())
+                .unwrap_or(units.len() as i64);
             if start < 0 || end > units.len() as i64 || start > end {
                 Err(format!(
                     "java.lang.StringIndexOutOfBoundsException: \
@@ -2435,12 +2441,10 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
         // ── kotlin.Any.toString() — defined on every type ──
         (_, "toString") => Ok(Value::str(kotlin_string(recv))),
 
-        _ => {
-            Err(format!(
-                "unresolved reference: {name} on {}",
-                type_label(recv)
-            ))
-        }
+        _ => Err(format!(
+            "unresolved reference: {name} on {}",
+            type_label(recv)
+        )),
     }
 }
 
@@ -2872,10 +2876,7 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
             2 => Some(b.clone()),
             _ => None,
         },
-        HeapObj::Map(_)
-        | HeapObj::Closure { .. }
-        | HeapObj::Range(_)
-        | HeapObj::Exc { .. } => None,
+        HeapObj::Map(_) | HeapObj::Closure { .. } | HeapObj::Range(_) | HeapObj::Exc { .. } => None,
     })
     .flatten()
     .ok_or_else(|| format!("no component{n} on {}", obj_label(recv)))
@@ -2898,7 +2899,10 @@ fn index_get(recv: &Value, index: &Value) -> Result<Value, String> {
     if let Value::Str(s) = recv {
         let i = index.to_int();
         let len = s.encode_utf16().count();
-        return match usize::try_from(i).ok().and_then(|i| s.encode_utf16().nth(i)) {
+        return match usize::try_from(i)
+            .ok()
+            .and_then(|i| s.encode_utf16().nth(i))
+        {
             Some(u) => Ok(char_of(u as i64)),
             None => Err(format!(
                 "java.lang.StringIndexOutOfBoundsException: index {i}, length {len}"

@@ -22,11 +22,11 @@
 use crate::ast::*;
 use crate::host::{
     KT_ARRAY, KT_ARRAY_INIT, KT_ARRAY_NEW, KT_CHR_STRING, KT_CLASSOF, KT_CLOSURE_CALL, KT_COLL_HOF,
-    KT_DBG_LINE, KT_DDIV, KT_EXC_ABORT, KT_EXC_CUT, KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW,
-    KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND,
+    KT_DBG_LINE, KT_DDIV, KT_DISPLAY, KT_EXC_ABORT, KT_EXC_CUT, KT_EXC_DEPTH, KT_EXC_MATCH,
+    KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND,
     KT_FFI_CALL, KT_FFI_COMPILE, KT_GETFIELD, KT_IDIV, KT_IMOD, KT_IN, KT_INDEX_GET, KT_INDEX_SET,
-    KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_LIST, KT_MAKE_CLOSURE, KT_MAP, KT_MATH,
-    KT_DISPLAY, KT_JOIN, KT_METHOD, KT_NEW, KT_NOTNULL, KT_OBJEQ, KT_PAIR, KT_PRINT, KT_PRINTLN, KT_RANGE,
+    KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_JOIN, KT_LIST, KT_MAKE_CLOSURE, KT_MAP,
+    KT_MATH, KT_METHOD, KT_NEW, KT_NOTNULL, KT_OBJEQ, KT_PAIR, KT_PRINT, KT_PRINTLN, KT_RANGE,
     KT_RANGE_STEP, KT_SCOPE_FN, KT_SET, KT_SETFIELD, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
@@ -558,7 +558,11 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
         // A throwable subclass stores its `Exception(message)` argument in a
         // synthetic leading field, which is what `e.message` reads and what the
         // `Class: message` display form prints.
-        if throwable_base.is_some() && cd.parents.iter().any(|p| Some(p) == throwable_base.as_ref())
+        if throwable_base.is_some()
+            && cd
+                .parents
+                .iter()
+                .any(|p| Some(p) == throwable_base.as_ref())
         {
             own_props.push(PropMeta {
                 name: MESSAGE_FIELD.to_string(),
@@ -662,8 +666,11 @@ fn build_method_index(
     program: &Program,
     classes: &HashMap<String, ClassMeta>,
 ) -> HashMap<String, Vec<(String, String)>> {
-    let by_name: HashMap<&str, &ClassDecl> =
-        program.classes.iter().map(|c| (c.name.as_str(), c)).collect();
+    let by_name: HashMap<&str, &ClassDecl> = program
+        .classes
+        .iter()
+        .map(|c| (c.name.as_str(), c))
+        .collect();
     let mut index: HashMap<String, Vec<(String, String)>> = HashMap::new();
     for (tag, meta) in classes {
         // Only a type that can exist at runtime is a dispatch tag: an interface
@@ -1693,9 +1700,7 @@ impl Compiler {
         // would leave the loop without running the finalizer, and silently
         // skipping a cleanup block is worse than not accepting the program.
         let has_finally = !t.finally_body.is_empty();
-        if has_finally
-            && (body_breaks(&t.body) || t.catches.iter().any(|c| body_breaks(&c.body)))
-        {
+        if has_finally && (body_breaks(&t.body) || t.catches.iter().any(|c| body_breaks(&c.body))) {
             return Err(format!(
                 "`break`/`continue` out of a `try` with a `finally` is not supported (line {})",
                 t.line
@@ -1999,9 +2004,11 @@ impl Compiler {
         // recurse; a receiver whose static class implements the override is
         // dispatched directly below.
         if self.has_tostring_override() {
-            let own_override = self
-                .infer_class(sc, recv)
-                .is_some_and(|c| self.classes.get(&c).is_some_and(|m| m.methods.contains_key("toString")));
+            let own_override = self.infer_class(sc, recv).is_some_and(|c| {
+                self.classes
+                    .get(&c)
+                    .is_some_and(|m| m.methods.contains_key("toString"))
+            });
             if name == "toString" && args.is_empty() && !own_override {
                 self.compile_expr(sc, recv)?;
                 self.b.emit(Op::CallBuiltin(KT_DISPLAY, 1), line);
@@ -2013,7 +2020,8 @@ impl Compiler {
                     let t = self.compile_expr(sc, a)?;
                     self.emit_display(t);
                 }
-                self.b.emit(Op::CallBuiltin(KT_JOIN, args.len() as u8), line);
+                self.b
+                    .emit(Op::CallBuiltin(KT_JOIN, args.len() as u8), line);
                 return Ok(Type::String);
             }
         }
@@ -2097,7 +2105,10 @@ impl Compiler {
         };
         all.iter()
             .filter(|(tag, _)| match cls {
-                Some(c) => self.classes.get(tag).is_some_and(|m| m.mro.iter().any(|a| a == c)),
+                Some(c) => self
+                    .classes
+                    .get(tag)
+                    .is_some_and(|m| m.mro.iter().any(|a| a == c)),
                 None => true,
             })
             .filter(|(tag, _)| {
@@ -2907,8 +2918,7 @@ impl Compiler {
             }
             // `Set` builders → an insertion-ordered distinct heap collection,
             // which is what Kotlin's `LinkedHashSet`-backed `setOf` is.
-            "setOf" | "mutableSetOf" | "hashSetOf" | "linkedSetOf" | "sortedSetOf"
-            | "emptySet" => {
+            "setOf" | "mutableSetOf" | "hashSetOf" | "linkedSetOf" | "sortedSetOf" | "emptySet" => {
                 for a in args {
                     self.compile_expr(sc, a)?;
                 }
@@ -3812,9 +3822,10 @@ fn expr_any(e: &Expr, f: &dyn Fn(&Expr) -> bool) -> bool {
 /// True if any statement in `body` (recursively) evaluates a `__rust_compile`
 /// call — the desugar target of a `rust { ... }` block.
 fn body_has_ffi(body: &[Stmt]) -> bool {
-    body_any(body, &|e| {
-        matches!(e, Expr::Call { name, .. } if name == RUST_COMPILE)
-    })
+    body_any(
+        body,
+        &|e| matches!(e, Expr::Call { name, .. } if name == RUST_COMPILE),
+    )
 }
 
 /// True when the program contains a `try` or a `throw` anywhere — in `main`, a

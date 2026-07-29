@@ -235,10 +235,8 @@ impl Parser {
     /// True when the parser is positioned on a declaration keyword — `fun`,
     /// `class`, `data`, `object`, or the soft keyword `interface`.
     fn at_decl_kw(&self) -> bool {
-        matches!(
-            self.peek(),
-            Tok::Fun | Tok::Class | Tok::Data | Tok::Object
-        ) || matches!(self.peek(), Tok::Ident(w) if w == "interface")
+        matches!(self.peek(), Tok::Fun | Tok::Class | Tok::Data | Tok::Object)
+            || matches!(self.peek(), Tok::Ident(w) if w == "interface")
     }
 
     fn fun_decl(&mut self) -> Result<FunDecl, String> {

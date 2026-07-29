@@ -72,16 +72,16 @@ pub enum Tok {
     Star,
     Slash,
     Percent,
-    Assign,    // =
-    PlusPlus,  // ++
-    MinusMinus,// --
-    PlusEq,    // +=
-    MinusEq,   // -=
-    StarEq,    // *=
-    SlashEq,   // /=
-    PercentEq, // %=
-    EqEq,      // ==
-    NotEq,     // !=
+    Assign,     // =
+    PlusPlus,   // ++
+    MinusMinus, // --
+    PlusEq,     // +=
+    MinusEq,    // -=
+    StarEq,     // *=
+    SlashEq,    // /=
+    PercentEq,  // %=
+    EqEq,       // ==
+    NotEq,      // !=
     Lt,
     Gt,
     Le,
