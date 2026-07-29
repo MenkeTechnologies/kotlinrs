@@ -17,7 +17,7 @@
 //! the runtime surfaces it as `kotlin: <reason>` on stderr (an uncaught
 //! `ArithmeticException`).
 
-use fusevm::{Frame, VMResult, Value, VM};
+use fusevm::{Frame, NumOp, VMResult, Value, VM};
 use std::cell::RefCell;
 
 /// Coerce the top of stack to its Kotlin `toString()` form.
@@ -357,16 +357,21 @@ struct RangeObj {
     end: i64,
     step: i64,
     progression: bool,
+    /// `'a'..'z'` — a `CharRange`/`CharProgression`. The endpoints are kept as
+    /// code units (so the arithmetic below is shared verbatim); this only
+    /// decides that its elements and its printed form are characters.
+    is_char: bool,
 }
 
 impl RangeObj {
-    fn new(first: i64, end: i64, form: RangeForm) -> RangeObj {
+    fn new(first: i64, end: i64, form: RangeForm, is_char: bool) -> RangeObj {
         match form {
             RangeForm::Inclusive => RangeObj {
                 first,
                 end,
                 step: 1,
                 progression: false,
+                is_char,
             },
             // `until` is exclusive: it builds the `IntRange` `first..(end-1)`.
             // Kotlin guards the underflow by yielding an empty range instead of
@@ -376,12 +381,14 @@ impl RangeObj {
                 end: end.wrapping_sub(1),
                 step: 1,
                 progression: false,
+                is_char,
             },
             RangeForm::DownTo => RangeObj {
                 first,
                 end,
                 step: -1,
                 progression: true,
+                is_char,
             },
         }
     }
@@ -424,6 +431,20 @@ impl RangeObj {
         self.first + i * self.step
     }
 
+    /// Element `i` as the Kotlin value it is — a `Char` for a `CharRange`.
+    fn value_at(&self, i: i64) -> Value {
+        self.wrap(self.at(i))
+    }
+
+    /// Wrap a code point drawn from this range in its element type.
+    fn wrap(&self, n: i64) -> Value {
+        if self.is_char {
+            char_of(n)
+        } else {
+            Value::Int(n)
+        }
+    }
+
     /// Membership: within the bounds AND on a step boundary. Kotlin's
     /// `IntRange.contains` is a plain bounds test, and an `IntProgression`'s is
     /// an iteration — both agree with this formulation.
@@ -438,7 +459,7 @@ impl RangeObj {
     }
 
     fn to_vec(self) -> Vec<Value> {
-        (0..self.count()).map(|i| Value::Int(self.at(i))).collect()
+        (0..self.count()).map(|i| self.value_at(i)).collect()
     }
 }
 
@@ -871,16 +892,26 @@ fn b_array_init(vm: &mut VM, _argc: u8) -> Value {
 }
 
 /// Allocate `obj` on the heap and return its handle.
+///
+/// Handles are dealt out from `0` upward and the top 64 K of the space is
+/// reserved for [`CHAR_TAG`], so the allocator stops before it would mint a
+/// handle that reads back as a `Char`.
 fn alloc(obj: HeapObj) -> Value {
     HEAP.with(|h| {
         let mut h = h.borrow_mut();
         let id = h.len() as u32;
+        if id >= CHAR_TAG {
+            return Value::Undef;
+        }
         h.push(obj);
         Value::Obj(id)
     })
 }
 
 /// Run `f` with a shared borrow of heap object `id` (if the handle is live).
+/// A `Char` handle is never live — it points into the reserved [`CHAR_TAG`]
+/// region above the heap's length — so char-carrying values fall through to
+/// each caller's non-object branch unless that caller handles them first.
 fn with_obj<T>(v: &Value, f: impl FnOnce(&HeapObj) -> T) -> Option<T> {
     let Value::Obj(id) = v else { return None };
     HEAP.with(|h| h.borrow().get(*id as usize).map(f))
@@ -890,6 +921,158 @@ fn with_obj<T>(v: &Value, f: impl FnOnce(&HeapObj) -> T) -> Option<T> {
 fn with_obj_mut<T>(v: &Value, f: impl FnOnce(&mut HeapObj) -> T) -> Option<T> {
     let Value::Obj(id) = v else { return None };
     HEAP.with(|h| h.borrow_mut().get_mut(*id as usize).map(f))
+}
+
+// ── kotlin.Char ─────────────────────────────────────────────────────────────
+//
+// A Kotlin `Char` is a UTF-16 code unit — exactly 65 536 values — and it is a
+// type of its own: `'a'` is not `97`, `'a' + 1` is `'b'` (not `98`), and
+// `println(listOf('a'))` prints `[a]`. `fusevm::Value` has no `Char` variant, so
+// the representation has to come out of a variant that already exists without
+// colliding with the values Kotlin puts there.
+//
+// It is the top 64 K of the `Value::Obj` handle space: `Value::Obj(CHAR_TAG |
+// code)`. Three properties fall out of that choice, and together they are what
+// make a real `Char` affordable:
+//
+// - **No allocation and no interning.** The handle *is* the character, so
+//   `'a'` built in two places is the same handle — `Op::NumEq` on two chars is
+//   still a native integer compare, and a char works as a `Map`/`Set` key
+//   through the existing handle-identity path.
+// - **Disjoint from `Int`.** A `Char` is not a `Value::Int`, so no integer
+//   value can be mistaken for one; `is Char` and `is Int` answer differently,
+//   and a `Long` holding 97 never prints as `a`.
+// - **Rejected, not coerced, by native arithmetic.** `Op::Add`/`Op::NumLt` on a
+//   non-numeric operand delegate to the VM's [`fusevm::NumericHook`] (see
+//   [`num_hook`]) instead of silently coercing it, which is what lets `it + 1`
+//   inside a lambda — a statically untyped position, lowered to a *native* op —
+//   do `Char` arithmetic. The same gate stops the JIT from compiling a block
+//   whose slots hold a char, so a char never reaches native code as a 0.
+
+/// The base of the reserved `Value::Obj` handle range that carries a `Char`.
+pub const CHAR_TAG: u32 = 0xFFFF_0000;
+
+/// The `Value` for code unit `code` (truncated to 16 bits, as the JVM does).
+pub fn char_of(code: i64) -> Value {
+    Value::Obj(CHAR_TAG | (code as u32 & 0xFFFF))
+}
+
+/// `Some(code unit)` when `v` is a `Char`.
+pub fn char_code(v: &Value) -> Option<i64> {
+    match v {
+        Value::Obj(id) if *id >= CHAR_TAG => Some((*id & 0xFFFF) as i64),
+        _ => None,
+    }
+}
+
+/// Whether `v` is a `Char`.
+fn is_char(v: &Value) -> bool {
+    char_code(v).is_some()
+}
+
+/// The integral value of a number-like operand: a `Char`'s code unit, or the
+/// value's own integer form.
+fn num_of(v: &Value) -> i64 {
+    char_code(v).unwrap_or_else(|| v.to_int())
+}
+
+/// The one-character string a `Char` displays as. An unpaired surrogate has no
+/// `char` of its own; the JVM prints it as a lone code unit, which no Rust
+/// `String` can hold, so it renders as the replacement character.
+fn char_string(code: i64) -> String {
+    char::from_u32(code as u32)
+        .unwrap_or(char::REPLACEMENT_CHARACTER)
+        .to_string()
+}
+
+/// The Kotlin result of a native arithmetic or comparison op fusevm refused to
+/// compute itself. Installed by [`install_numeric`] on a program that can build
+/// a `Char`; see the module note above for why that is the seam.
+///
+/// Two cases reach here:
+///
+/// - a `Char` operand, which fusevm cannot add or order — the Kotlin rules are
+///   `Char + Int`/`Char - Int` → `Char` (truncated to 16 bits, as `(char)` does
+///   on the JVM), `Char - Char` → `Int`, and comparison by code unit;
+/// - anything else fusevm's *strict* policy hands over — an `i64` overflow, or
+///   a non-numeric operand. Both reproduce the non-strict result exactly
+///   (wrapping arithmetic, `to_float` coercion), so installing the hook changes
+///   nothing but `Char`.
+fn num_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
+    use NumOp::*;
+    // Kotlin's `String.plus(Any?)`: `+` with a String operand concatenates, in
+    // every position. The compiler emits `Op::Concat` where it can see a String
+    // statically; this is the case where it cannot — `xs.fold("") { acc, c ->
+    // acc + c }`, whose operands are both untyped.
+    if op == Add && (matches!(a, Value::Str(_)) || matches!(b, Value::Str(_))) {
+        return Ok(Value::str(format!(
+            "{}{}",
+            kotlin_string(a),
+            kotlin_string(b)
+        )));
+    }
+    if is_char(a) || is_char(b) {
+        let (x, y) = (num_of(a), num_of(b));
+        return Ok(match op {
+            // `Char - Char` is the distance between two characters; every other
+            // additive form keeps the Char side's type.
+            Sub if is_char(a) && is_char(b) => Value::Int(x - y),
+            Add | Sub => {
+                let n = if op == Add { x + y } else { x - y };
+                char_of(n)
+            }
+            Lt => Value::Bool(x < y),
+            Gt => Value::Bool(x > y),
+            Le => Value::Bool(x <= y),
+            Ge => Value::Bool(x >= y),
+            Eq => Value::Bool(x == y),
+            Ne => Value::Bool(x != y),
+            // Kotlin defines no `*`, `/`, `%`, `pow`, or unary `-` on `Char`, so
+            // these are unreachable from a program `kotlinc` accepts; operating
+            // on the code unit keeps them total rather than faulting.
+            Mul => Value::Int(x * y),
+            Div if y == 0 => return Err("java.lang.ArithmeticException: / by zero".to_string()),
+            Div => Value::Int(x / y),
+            Mod if y == 0 => return Err("java.lang.ArithmeticException: / by zero".to_string()),
+            Mod => Value::Int(x % y),
+            Pow => Value::Float((x as f64).powf(y as f64)),
+            Neg => Value::Int(-x),
+        });
+    }
+    // No Char in sight: reproduce fusevm's own non-strict result, so a program
+    // that merely *could* build a char is not otherwise perturbed by the hook.
+    let (fa, fb) = (a.to_float(), b.to_float());
+    let ints = match (a, b) {
+        (Value::Int(x), Value::Int(y)) => Some((*x, *y)),
+        _ => None,
+    };
+    Ok(match op {
+        Add => match ints {
+            Some((x, y)) => Value::Int(x.wrapping_add(y)),
+            None => Value::Float(fa + fb),
+        },
+        Sub => match ints {
+            Some((x, y)) => Value::Int(x.wrapping_sub(y)),
+            None => Value::Float(fa - fb),
+        },
+        Mul => match ints {
+            Some((x, y)) => Value::Int(x.wrapping_mul(y)),
+            None => Value::Float(fa * fb),
+        },
+        Div => Value::Float(fa / fb),
+        Mod => Value::Float(fa % fb),
+        Pow => Value::Float(fa.powf(fb)),
+        Neg => match a {
+            Value::Int(x) => Value::Int(x.wrapping_neg()),
+            _ => Value::Float(-fa),
+        },
+        Lt => Value::Bool(fa < fb),
+        Gt => Value::Bool(fa > fb),
+        Le => Value::Bool(fa <= fb),
+        Ge => Value::Bool(fa >= fb),
+        Eq => Value::Bool(fa == fb),
+        Ne => Value::Bool(fa != fb),
+    })
 }
 
 /// Take and clear any pending runtime-fault message.
@@ -1195,11 +1378,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
                 vm.push(Value::str("null"));
                 return;
             }
-            let code = v.to_int();
-            let s = char::from_u32(code as u32)
-                .map(|c| c.to_string())
-                .unwrap_or_default();
-            vm.push(Value::str(s));
+            vm.push(Value::str(char_string(num_of(&v))));
         }
         KT_ISNULL => {
             let v = vm.pop();
@@ -1215,14 +1394,22 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             }
         }
         KT_RANGE => {
-            let end = vm.pop().to_int();
-            let start = vm.pop().to_int();
+            let end = vm.pop();
+            let start = vm.pop();
             let form = match arg {
                 1 => RangeForm::Until,
                 2 => RangeForm::DownTo,
                 _ => RangeForm::Inclusive,
             };
-            vm.push(alloc(HeapObj::Range(RangeObj::new(start, end, form))));
+            // `'a'..'z'` is a `CharRange`, whose elements and printed form are
+            // characters; the endpoints ride as code units either way.
+            let is_char = is_char(&start) || is_char(&end);
+            vm.push(alloc(HeapObj::Range(RangeObj::new(
+                num_of(&start),
+                num_of(&end),
+                form,
+                is_char,
+            ))));
         }
         KT_RANGE_STEP => {
             let n = vm.pop().to_int();
@@ -1245,10 +1432,9 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
                     vm.push(Value::Undef);
                 }
                 Some(r) => vm.push(alloc(HeapObj::Range(RangeObj {
-                    first: r.first,
-                    end: r.end,
                     step: if r.step < 0 { -n } else { n },
                     progression: true,
+                    ..r
                 }))),
                 None => {
                     fault(
@@ -1376,6 +1562,27 @@ pub fn install(vm: &mut VM) {
     vm.set_extension_handler(Box::new(handle_coercion));
 }
 
+/// Switch `vm` to fusevm's *strict* numeric policy, routing every arithmetic or
+/// comparison op it cannot compute natively through [`num_hook`].
+///
+/// This is what makes a real `Char` possible. A char is a `Value::Obj`, so
+/// `'a' + 1` and `c < 'z'` — which lower to *native* `Op::Add`/`Op::NumLt` even
+/// where the compiler cannot see a type, as with a lambda's `it` — would
+/// otherwise be coerced to a number by fusevm's default awk-flavoured policy.
+/// Under the strict policy they are handed back to Kotlin instead. The same
+/// switch stops the JIT from compiling a block whose slots hold a non-number,
+/// which is what keeps a char from reaching native code as a `0`.
+///
+/// It is installed unconditionally rather than only on a program that mentions a
+/// char: a char can arrive from indexing or iterating *any* value that turns out
+/// to be a `String`, so a syntactic test would have to be so broad it would
+/// cover nearly every program anyway — and being wrong about it would be silent.
+/// Int/Int arithmetic stays on fusevm's native fast path either way; only an
+/// operand fusevm cannot compute on at all reaches [`num_hook`].
+pub fn install_numeric(vm: &mut VM) {
+    vm.set_numeric_hook(std::sync::Arc::new(num_hook));
+}
+
 /// Register the lambda builtins (`Op::CallBuiltin` dispatch). Shared by the
 /// normal and debug installs. These live in the VM's `builtin_table`, which
 /// survives the re-entrant `vm.run()` a lambda invocation drives — see the
@@ -1408,6 +1615,7 @@ fn register_builtins(vm: &mut VM) {
 pub fn install_debug(vm: &mut VM) {
     reset_heap();
     register_builtins(vm);
+    install_numeric(vm);
     vm.set_extension_handler(Box::new(|vm, id, arg| {
         if id == KT_DBG_LINE {
             crate::dap::on_debug_line(vm);
@@ -1431,7 +1639,8 @@ fn contains_value(container: &Value, value: &Value) -> bool {
         return s.contains(&kotlin_string(value));
     }
     with_obj(container, |o| match o {
-        HeapObj::Range(r) => r.contains(value.to_int()),
+        // `'x' in 'a'..'z'` compares code units, like every other range test.
+        HeapObj::Range(r) => r.is_char == is_char(value) && r.contains(num_of(value)),
         HeapObj::List(items) | HeapObj::Set(items) | HeapObj::Array { items, .. } => {
             items.iter().any(|v| value_eq(v, value))
         }
@@ -1464,21 +1673,19 @@ fn iter_len(recv: &Value) -> Option<i64> {
 /// by [`iter_len`], so an out-of-range index can only mean the collection was
 /// mutated mid-loop; that yields `null` rather than faulting.
 fn iter_at(recv: &Value, i: i64) -> Value {
-    // A String yields `Char`s, carried (as everywhere in kotlinrs) as their
-    // integer code unit; the compiler types the loop variable `Char` so it
-    // displays as a character.
+    // A String yields `Char`s.
     if let Value::Str(s) = recv {
         return usize::try_from(i)
             .ok()
             .and_then(|i| s.encode_utf16().nth(i))
-            .map(|u| Value::Int(u as i64))
+            .map(|u| char_of(u as i64))
             .unwrap_or(Value::Undef);
     }
     with_obj(recv, |o| match o {
         HeapObj::List(items) | HeapObj::Set(items) | HeapObj::Array { items, .. } => {
             usize::try_from(i).ok().and_then(|i| items.get(i).cloned())
         }
-        HeapObj::Range(r) => Some(Value::Int(r.at(i))),
+        HeapObj::Range(r) => Some(r.value_at(i)),
         _ => None,
     })
     .flatten()
@@ -1491,6 +1698,7 @@ fn iter_at(recv: &Value, i: i64) -> Value {
 /// only to reproduce the printed form (`[Ljava.lang.Integer;@1b6d3586`).
 fn array_desc(items: &[Value]) -> String {
     let elem = match items.first() {
+        Some(v) if is_char(v) => "java.lang.Character",
         Some(Value::Int(_)) => "java.lang.Integer",
         Some(Value::Float(_)) => "java.lang.Double",
         Some(Value::Str(_)) => "java.lang.String",
@@ -1498,13 +1706,14 @@ fn array_desc(items: &[Value]) -> String {
         _ => "java.lang.Object",
     };
     let uniform = items.iter().all(|v| {
-        matches!(
-            (v, elem),
-            (Value::Int(_), "java.lang.Integer")
-                | (Value::Float(_), "java.lang.Double")
-                | (Value::Str(_), "java.lang.String")
-                | (Value::Bool(_), "java.lang.Boolean")
-        )
+        elem == "java.lang.Character" && is_char(v)
+            || matches!(
+                (v, elem),
+                (Value::Int(_), "java.lang.Integer")
+                    | (Value::Float(_), "java.lang.Double")
+                    | (Value::Str(_), "java.lang.String")
+                    | (Value::Bool(_), "java.lang.Boolean")
+            )
     });
     if uniform {
         format!("[L{elem};")
@@ -1842,6 +2051,9 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
+        // `Char` is `Comparable<Char>` by code unit, so a `List<Char>` sorts and
+        // reduces (`max`/`min`) like any other comparable element.
+        _ if is_char(a) || is_char(b) => num_of(a).cmp(&num_of(b)),
         _ => a
             .to_float()
             .partial_cmp(&b.to_float())
@@ -2110,6 +2322,11 @@ fn utf16_index_of(hay: &str, needle: &str) -> i64 {
 }
 
 fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    // A `Char` shares the `Value::Obj` variant with the heap but is not a heap
+    // object, so its members resolve first.
+    if let Some(code) = char_code(recv) {
+        return char_method(code, name, args);
+    }
     // Heap objects (List/Map/Pair/data-class members) dispatch through the heap.
     if let Value::Obj(_) = recv {
         return obj_method(recv, name, args);
@@ -2164,12 +2381,8 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
             }
         }
 
-        // ── kotlin.Char (carried as its integer code unit) ──
-        // `Char.code` → the code unit as `Int`; `Int.toChar()` → a `Char` (the
-        // low 16 bits). Both keep the same underlying integer value; the coarse
-        // static type (Char vs Int) drives display, not the runtime tag.
-        (Value::Int(n), "code") => Ok(Value::Int(*n)),
-        (Value::Int(n), "toChar") => Ok(Value::Int(*n & 0xFFFF)),
+        // `Int.toChar()` → the `Char` for the low 16 bits of the receiver.
+        (Value::Int(n), "toChar") => Ok(char_of(*n)),
 
         // ── the arithmetic operators in their method spelling ──
         // `a.plus(b)` is what `a + b` compiles to on the JVM, and the method
@@ -2217,6 +2430,55 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
     }
 }
 
+/// The `kotlin.Char` members, on the code unit `code`.
+///
+/// The classification predicates delegate to Rust's Unicode tables, which agree
+/// with the JVM's `Character` over ASCII; a supplementary-plane character has no
+/// single `Char` on either platform, so the surrogate halves classify as neither
+/// letter nor digit in both.
+fn char_method(code: i64, name: &str, args: &[Value]) -> Result<Value, String> {
+    let c = char::from_u32(code as u32).unwrap_or(char::REPLACEMENT_CHARACTER);
+    let other = || args.first().map(num_of).unwrap_or(0);
+    // `uppercaseChar`/`lowercaseChar` map to a single Char, so a mapping that
+    // expands (`'ß'.uppercase()` is `"SS"`) keeps the original — the JVM's
+    // `Character.toUpperCase(char)` contract.
+    fn single(c: char, mut mapped: impl Iterator<Item = char>) -> char {
+        match (mapped.next(), mapped.next()) {
+            (Some(m), None) => m,
+            _ => c,
+        }
+    }
+    Ok(match name {
+        "code" => Value::Int(code),
+        "toString" => Value::str(char_string(code)),
+        "hashCode" => Value::Int(code),
+        "equals" => Value::Bool(args.first().is_some_and(|o| value_eq(&char_of(code), o))),
+        "compareTo" => Value::Int((code - other()).signum()),
+        "plus" => char_of(code + other()),
+        "minus" if args.first().is_some_and(is_char) => Value::Int(code - other()),
+        "minus" => char_of(code - other()),
+        "isDigit" => Value::Bool(c.is_numeric()),
+        "isLetter" => Value::Bool(c.is_alphabetic()),
+        "isLetterOrDigit" => Value::Bool(c.is_alphanumeric()),
+        "isWhitespace" => Value::Bool(c.is_whitespace()),
+        "isUpperCase" => Value::Bool(c.is_uppercase()),
+        "isLowerCase" => Value::Bool(c.is_lowercase()),
+        "uppercaseChar" => char_of(single(c, c.to_uppercase()) as i64),
+        "lowercaseChar" => char_of(single(c, c.to_lowercase()) as i64),
+        "uppercase" => Value::str(c.to_uppercase().to_string()),
+        "lowercase" => Value::str(c.to_lowercase().to_string()),
+        "digitToInt" => match c.to_digit(10) {
+            Some(d) => Value::Int(d as i64),
+            None => {
+                return Err(format!(
+                    "java.lang.IllegalArgumentException: Char {c} is not a decimal digit"
+                ))
+            }
+        },
+        _ => return Err(format!("unresolved reference: {name} on Char")),
+    })
+}
+
 /// Dispatch a member/method on a heap object (`List`/`Map`/`Pair`, or a `data`
 /// class's synthesized members). User-defined class methods never reach here —
 /// the compiler lowers those to direct `Op::Call`s on method subs.
@@ -2256,13 +2518,14 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         // the reason the two share one arm but not one result.
         "add" => {
             let v = args.first().cloned().unwrap_or(Value::Undef);
+            let seen = key_position(recv, &v).is_some();
             let added = with_obj_mut(recv, |o| match o {
                 HeapObj::List(items) => {
                     items.push(v);
                     Some(true)
                 }
                 HeapObj::Set(items) => {
-                    if items.iter().any(|x| value_eq(x, &v)) {
+                    if seen {
                         Some(false)
                     } else {
                         items.push(v);
@@ -2281,26 +2544,23 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         // by-position form and stays separate.
         "remove" => {
             let v = args.first().cloned().unwrap_or(Value::Undef);
+            let at = key_position(recv, &v);
             let removed = with_obj_mut(recv, |o| match o {
-                HeapObj::List(items) | HeapObj::Set(items) => {
-                    match items.iter().position(|x| value_eq(x, &v)) {
-                        Some(i) => {
-                            items.remove(i);
-                            Some(true)
-                        }
-                        None => Some(false),
+                HeapObj::List(items) | HeapObj::Set(items) => Some(match at {
+                    Some(i) => {
+                        items.remove(i);
+                        true
                     }
-                }
+                    None => false,
+                }),
                 // `MutableMap.remove(key)` answers the previous value, or null.
-                HeapObj::Map(entries) => {
-                    match entries.iter().position(|(k, _)| value_eq(k, &v)) {
-                        Some(i) => {
-                            entries.remove(i);
-                            Some(true)
-                        }
-                        None => Some(false),
+                HeapObj::Map(entries) => Some(match at {
+                    Some(i) => {
+                        entries.remove(i);
+                        true
                     }
-                }
+                    None => false,
+                }),
                 _ => None,
             })
             .flatten();
@@ -2350,15 +2610,15 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             // Map.put(k, v) → previous value or null.
             let k = args.first().cloned().unwrap_or(Value::Undef);
             let v = args.get(1).cloned().unwrap_or(Value::Undef);
+            let at = key_position(recv, &k);
             let prev = with_obj_mut(recv, |o| match o {
-                HeapObj::Map(entries) => {
-                    if let Some(slot) = entries.iter_mut().find(|(ek, _)| value_eq(ek, &k)) {
-                        Some(std::mem::replace(&mut slot.1, v))
-                    } else {
+                HeapObj::Map(entries) => match at.and_then(|i| entries.get_mut(i)) {
+                    Some(slot) => Some(std::mem::replace(&mut slot.1, v)),
+                    None => {
                         entries.push((k, v));
                         None
                     }
-                }
+                },
                 _ => None,
             })
             .flatten();
@@ -2386,7 +2646,12 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         })
         .flatten();
         let items = list_snapshot(recv).unwrap_or_default();
-        if let Some(v) = sequence_member(&items, range.map(|r| (r.first, r.last())), name, args) {
+        if let Some(v) = sequence_member(
+            &items,
+            range.map(|r| (r.wrap(r.first), r.wrap(r.last()))),
+            name,
+            args,
+        ) {
             return v;
         }
     }
@@ -2438,7 +2703,7 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
 /// diagnostic).
 fn sequence_member(
     items: &[Value],
-    range: Option<(i64, i64)>,
+    range: Option<(Value, Value)>,
     name: &str,
     args: &[Value],
 ) -> Option<Result<Value, String>> {
@@ -2452,11 +2717,11 @@ fn sequence_member(
         "isEmpty" => Value::Bool(items.is_empty()),
         "isNotEmpty" => Value::Bool(!items.is_empty()),
         "first" => match range {
-            Some((first, _)) => Value::Int(first),
+            Some((first, _)) => first,
             None => return Some(need(items.first().cloned())),
         },
         "last" => match range {
-            Some((_, last)) => Value::Int(last),
+            Some((_, last)) => last,
             None => return Some(need(items.last().cloned())),
         },
         "get" => {
@@ -2562,10 +2827,11 @@ fn sequence_member(
             // list's is a plain reversed list.
             return Some(Ok(match range {
                 Some((first, last)) => alloc(HeapObj::Range(RangeObj {
-                    first: last,
-                    end: first,
+                    first: num_of(&last),
+                    end: num_of(&first),
                     step: -1,
                     progression: true,
+                    is_char: is_char(&first),
                 })),
                 None => alloc(HeapObj::List(items.iter().rev().cloned().collect())),
             }));
@@ -2610,13 +2876,12 @@ fn sum_values(items: &[Value]) -> Value {
 /// `recv[index]` — list element (bounds-checked) or map value (null if absent).
 fn index_get(recv: &Value, index: &Value) -> Result<Value, String> {
     // `s[i]` is a `Char`, indexed by UTF-16 code unit — the same basis
-    // `String.length` uses. The compiler types the result `Char` when the
-    // receiver is statically a String, so it displays as a character.
+    // `String.length` uses.
     if let Value::Str(s) = recv {
         let i = index.to_int();
         let len = s.encode_utf16().count();
         return match usize::try_from(i).ok().and_then(|i| s.encode_utf16().nth(i)) {
-            Some(u) => Ok(Value::Int(u as i64)),
+            Some(u) => Ok(char_of(u as i64)),
             None => Err(format!(
                 "java.lang.StringIndexOutOfBoundsException: index {i}, length {len}"
             )),
@@ -2645,8 +2910,34 @@ fn index_get(recv: &Value, index: &Value) -> Result<Value, String> {
     out.unwrap_or_else(|| Err("indexing a non-object value".to_string()))
 }
 
+/// The index of the element (or map key) of `recv` that equals `v`.
+///
+/// Kept apart from the mutating members that need it because structural equality
+/// re-enters the heap — comparing two lists compares their elements — so the
+/// search must run under a *shared* borrow. Nesting it inside the `borrow_mut`
+/// the mutation takes would panic, which is why every mutator below locates
+/// first and mutates second.
+fn key_position(recv: &Value, v: &Value) -> Option<usize> {
+    with_obj(recv, |o| match o {
+        HeapObj::List(items) | HeapObj::Set(items) | HeapObj::Array { items, .. } => {
+            items.iter().position(|x| value_eq(x, v))
+        }
+        HeapObj::Map(entries) => entries.iter().position(|(k, _)| value_eq(k, v)),
+        _ => None,
+    })
+    .flatten()
+}
+
 /// `recv[index] = value` — list set (bounds-checked) or map put.
 fn index_set(recv: &Value, index: &Value, value: Value) -> Result<(), String> {
+    // Only a `Map` looks its slot up by equality; a list/array indexes by
+    // position, so it must not pay for the scan.
+    let is_map = with_obj(recv, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false);
+    let at = if is_map {
+        key_position(recv, index)
+    } else {
+        None
+    };
     let out = with_obj_mut(recv, |o| match o {
         HeapObj::List(items) | HeapObj::Array { items, .. } => {
             let i = index.to_int();
@@ -2658,10 +2949,9 @@ fn index_set(recv: &Value, index: &Value, value: Value) -> Result<(), String> {
             }
         }
         HeapObj::Map(entries) => {
-            if let Some(slot) = entries.iter_mut().find(|(k, _)| value_eq(k, index)) {
-                slot.1 = value;
-            } else {
-                entries.push((index.clone(), value));
+            match at.and_then(|i| entries.get_mut(i)) {
+                Some(slot) => slot.1 = value,
+                None => entries.push((index.clone(), value)),
             }
             Ok(())
         }
@@ -2677,17 +2967,14 @@ fn index_set(recv: &Value, index: &Value, value: Value) -> Result<(), String> {
 /// equality over primitives. Ints and Doubles compare by numeric value.
 pub fn value_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Obj(_), Value::Obj(_)) => HEAP.with(|h| {
+        // The same handle is the same object — this is what makes the identity
+        // equality an array inherits from `Object` come out `true` for `a == a`
+        // while `arrayOf(1) == arrayOf(1)` stays `false`. It is also all a
+        // `Char` needs, its handle being its value, and it is checked before the
+        // heap is touched so neither answer takes a borrow it does not need.
+        (Value::Obj(ia), Value::Obj(ib)) if ia == ib => true,
+        (Value::Obj(ia), Value::Obj(ib)) => HEAP.with(|h| {
             let h = h.borrow();
-            let (Value::Obj(ia), Value::Obj(ib)) = (a, b) else {
-                return false;
-            };
-            // The same handle is the same object — this is what makes the
-            // identity equality an array inherits from `Object` come out `true`
-            // for `a == a` while `arrayOf(1) == arrayOf(1)` stays `false`.
-            if ia == ib {
-                return true;
-            }
             match (h.get(*ia as usize), h.get(*ib as usize)) {
                 (Some(oa), Some(ob)) => heap_eq(oa, ob),
                 _ => false,
@@ -2814,6 +3101,9 @@ fn obj_label(recv: &Value) -> String {
     if matches!(recv, Value::Str(_)) {
         return "String".to_string();
     }
+    if is_char(recv) {
+        return "Char".to_string();
+    }
     with_obj(recv, |o| match o {
         HeapObj::Instance { class, .. } => class.clone(),
         HeapObj::List(_) => "List".to_string(),
@@ -2821,10 +3111,11 @@ fn obj_label(recv: &Value) -> String {
         HeapObj::Map(_) => "Map".to_string(),
         HeapObj::Pair(_, _) => "Pair".to_string(),
         HeapObj::Closure { .. } => "Function".to_string(),
-        HeapObj::Range(r) => if r.progression {
-            "IntProgression"
-        } else {
-            "IntRange"
+        HeapObj::Range(r) => match (r.is_char, r.progression) {
+            (true, true) => "CharProgression",
+            (true, false) => "CharRange",
+            (false, true) => "IntProgression",
+            (false, false) => "IntRange",
         }
         .to_string(),
         HeapObj::Array { .. } => "Array".to_string(),
@@ -2894,12 +3185,19 @@ fn display_obj(id: u32) -> String {
             // descending, where `last` is the last element actually reached
             // (`1..10 step 2` prints `1..9 step 2`).
             HeapObj::Range(r) => {
+                // A `CharRange` prints its endpoints as characters (`a..e`);
+                // the `step` count stays a number in both.
+                let (first, last, end) = (
+                    kotlin_string(&r.wrap(r.first)),
+                    kotlin_string(&r.wrap(r.last())),
+                    kotlin_string(&r.wrap(r.end)),
+                );
                 if !r.progression {
-                    format!("{}..{}", r.first, r.end)
+                    format!("{first}..{end}")
                 } else if r.step > 0 {
-                    format!("{}..{} step {}", r.first, r.last(), r.step)
+                    format!("{first}..{last} step {}", r.step)
                 } else {
-                    format!("{} downTo {} step {}", r.first, r.last(), -r.step)
+                    format!("{first} downTo {last} step {}", -r.step)
                 }
             }
             // An array inherits `Object.toString`: its JVM type descriptor and
@@ -2918,11 +3216,13 @@ fn display_obj(id: u32) -> String {
 }
 
 /// Whether `v`'s runtime kind matches the Kotlin type name `ty` — backs
-/// `when`'s `is Type` check. `Char` is carried as an `Int` at runtime and is
-/// not distinguishable here, so `is Char` is treated as `is Int`.
+/// `when`'s `is Type` check.
 fn value_is_type(v: &Value, ty: &str) -> bool {
     match ty {
-        "Int" | "Long" | "Char" | "Byte" | "Short" => matches!(v, Value::Int(_)),
+        // A `Char` has its own runtime representation, so `is Char` and `is Int`
+        // answer for exactly one value kind each.
+        "Char" => is_char(v),
+        "Int" | "Long" | "Byte" | "Short" => matches!(v, Value::Int(_)),
         "Double" | "Float" => matches!(v, Value::Float(_)),
         "Boolean" => matches!(v, Value::Bool(_)),
         "String" | "CharSequence" => matches!(v, Value::Str(_)),
@@ -2958,6 +3258,7 @@ fn type_label(v: &Value) -> &'static str {
         Value::Int(_) => "Int",
         Value::Float(_) => "Double",
         Value::Str(_) => "String",
+        _ if is_char(v) => "Char",
         _ => "value",
     }
 }
@@ -2974,7 +3275,14 @@ pub fn kotlin_string(v: &Value) -> String {
         // compiler (it emits the literal `kotlin.Unit`), so it never reaches
         // here as an `Undef`.
         Value::Undef => "null".to_string(),
-        Value::Obj(id) => display_obj(*id),
+        // A `Char` is a handle in the reserved region, not a heap object, so it
+        // renders as its character wherever a value is displayed — including
+        // inside a printed `List`/`Set`/`Map`, which is what `Char`-as-an-`Int`
+        // could not do.
+        Value::Obj(id) => match char_code(v) {
+            Some(code) => char_string(code),
+            None => display_obj(*id),
+        },
         other => other.to_str(),
     }
 }

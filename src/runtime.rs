@@ -18,6 +18,10 @@ pub fn run_source(src: &str) -> Result<i32, String> {
     host::set_catchable(compiler::uses_exceptions(&program));
     let mut vm = VM::new(chunk);
     host::install(&mut vm);
+    // A `Char` is not a number to fusevm, so the VM runs under the strict
+    // numeric policy: `'a' + 1` and `c < 'z'` — native ops even where the
+    // compiler cannot see a type — reach Kotlin instead of being coerced.
+    host::install_numeric(&mut vm);
     // Arm the tracing tier: a hot loop whose body is native fusevm ops gets
     // recorded and compiled to native code instead of dispatched forever.
     // `kotlin --tiers` reports whether a given script actually reaches it.

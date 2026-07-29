@@ -259,9 +259,10 @@ println(x ?: 0)   // 0</code></pre>
         </article>
         <article class="doc-entry" id="doc-type-6">
           <h3><a class="doc-anchor" href="#doc-type-6">#</a> <code>Char</code></h3>
-          <p>a single character (code unit); integral — `'A' + 1`, `.code`, `.toChar()`</p>
+          <p>a single UTF-16 code unit, distinct from `Int` — `'A' + 1`, `.code`, `.toChar()`, `'a'..'z'`</p>
           <pre><code class="lang-kotlin">val c: Char = 'A'
-println(c + 1)   // B</code></pre>
+println(c + 1)        // B
+println(listOf(c))    // [A]</code></pre>
         </article>
         <article class="doc-entry" id="doc-type-7">
           <h3><a class="doc-anchor" href="#doc-type-7">#</a> <code>String</code></h3>

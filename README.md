@@ -109,8 +109,8 @@ fun main() {
 The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 
 - **Types** — `Int`/`Long` (`i64`), `Double`/`Float` (`f64`), `Boolean`,
-  `Char` (integral code unit), `String`, `Unit`; annotations optional (including
-  nullable `T?`), coarsely inferred otherwise.
+  `Char` (a distinct runtime type — see below), `String`, `Unit`; annotations
+  optional (including nullable `T?`), coarsely inferred otherwise.
 - **Declarations** — top-level `fun` with typed parameters and return type,
   block bodies **and** single-expression bodies (`fun f(...) = expr`);
   `val`/`var` locals (`val` reassignment is a compile error, matching Kotlin);
@@ -120,15 +120,20 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `Double` division is IEEE.
 - **Strings** — literals with `\n`/`\t`/`\\`/`\"`/`\$` escapes and `$name` /
   `${expr}` templates; `+` concatenates when either side is a `String`.
-- **Char** — `'A'` literals (with `\n`/`\t`/`\uXXXX`/… escapes); integral
-  arithmetic (`'A' + 1` → `Char`, `'D' - 'A'` → `Int`), `.code` (→ `Int`) and
-  `Int.toChar()` (→ `Char`), ordering by code unit, and `s[i]` (indexed by
-  UTF-16 code unit, out of range a `StringIndexOutOfBoundsException`).
-  A `Char` is carried as its integer code unit and its Char-ness lives in the
-  *static* type, so it displays as a character wherever the compiler can see the
-  type — a local, a `for (c in s)` variable, `s[i]`, a `+`, a template — but not
-  once it enters an untyped position: `println(listOf('a'))` prints `[97]` where
-  Kotlin prints `[a]`. See the gap note below.
+- **`Char`** — a runtime type of its own, not an `Int` in disguise, so it stays
+  a character in *every* position, including the ones where the compiler can see
+  no type: `println(listOf('a'))` is `[a]`, a `Map` key prints as `{a=1}`, and
+  `x is Char` and `x is Int` answer differently. `'A'` literals (with
+  `\n`/`\t`/`\uXXXX`/… escapes); Kotlin's `Char` operators — `'A' + 1` → `Char`,
+  `'D' - 'A'` → `Int`, ordering and `==` by code unit — which hold inside a
+  lambda (`listOf('a').map { it + 1 }` is `[b]`) as well as in typed code;
+  `.code` (→ `Int`) and `Int.toChar()` (→ `Char`); `s[i]` and `for (c in s)`
+  (both indexed by UTF-16 code unit, an out-of-range index a
+  `StringIndexOutOfBoundsException`); `CharRange` (`'a'..'e'`, `step`, `downTo`,
+  `reversed()`, `in`, iteration, and the `a..e` printed form); and the members
+  `isDigit`/`isLetter`/`isLetterOrDigit`/`isWhitespace`/`isUpperCase`/
+  `isLowerCase`/`uppercaseChar`/`lowercaseChar`/`uppercase`/`lowercase`/
+  `digitToInt`/`compareTo`/`equals`/`hashCode`/`toString`.
 - **Member access** — chainable postfix `.`: `String.length`,
   `.uppercase()`/`.lowercase()`, `.trim()`, `.isEmpty()`/`.isNotEmpty()`,
   `Char.code`, `Int.toChar()`, and `Any.toString()`.
@@ -267,20 +272,9 @@ bind it first), lambda element-type inference (an unannotated `it` is coarsely
 typed, so `/` and `%` on it default to float — annotate the parameter `Int` for
 integer semantics), class body property initializers (stored properties go in the
 primary constructor), secondary constructors, `as`/`as?` casts, named / default
-arguments, the lambda-taking collection functions on a `String` receiver
-(`"abc".map { … }`; `for (c in s)` works), and the rest of the standard-library
-surface.
-
-The `String`-receiver gap and the `listOf('a')` display above have one shared
-cause: a `Char` is carried as its integer code unit, not as a distinct runtime
-type, so a lambda over a `String`'s characters would receive an `Int` and
-`println(it)` would print `97` where Kotlin prints `a`. Passing a one-character `String` instead trades that for a different
-divergence (`it + 1` would concatenate where Kotlin does `Char` arithmetic), so
-neither shortcut is correct. A faithful fix needs a distinct runtime `Char`
-representation AND every statically-untyped `+`/`-`/comparison routed through a
-host op that dispatches on it — today those lower to native fusevm ops, which
-cannot see a non-numeric `Char`. That is a change to the arithmetic hot path,
-not a stdlib addition, and it is not started rather than half-done.
+arguments, the collection functions on a `String` receiver (`"abc".map { … }`,
+`"abc".toCharArray()`, `"abc".first()`; `for (c in s)` and `s[i]` work), and the
+rest of the standard-library surface.
 
 Inheritance carries three deliberate simplifications. The modifiers are recorded
 but not **enforced** — kotlinrs accepts an `override` of a member the base did not
@@ -348,6 +342,21 @@ fusevm::VM  ──►  three-tier Cranelift JIT (linear · block · tracing)
   host ops work inside a lambda body. fusevm just carries the handle
   (identity-comparable); the frontend owns the pointed-to object — the same model
   the other mature fusevm frontends use. Everything else is a universal fusevm op.
+- **A `Char` that survives an untyped position.** `fusevm::Value` has no `Char`
+  variant, and the obvious substitutes both fail: an `Int` code unit cannot be
+  told apart from the number `97`, and a one-character `String` would make
+  `it + 1` concatenate where Kotlin does `Char` arithmetic. A `Char` is instead
+  the top 64 K of the `Value::Obj` handle space (`0xFFFF0000 | code`) — the
+  handle *is* the character, so it allocates nothing, interns for free (two
+  `'a'`s are the same handle, which keeps `==` a native integer compare and lets
+  a char be a `Map`/`Set` key), and is disjoint from every `Int`. Because it is
+  not a number, the native `Op::Add`/`Op::NumLt` that `'a' + 1` and `c < 'z'`
+  lower to — even inside a lambda, where no static type is available — would
+  coerce it. So the VM runs under fusevm's **strict numeric policy**: an operand
+  fusevm cannot compute on is handed to a Kotlin `NumericHook` rather than
+  guessed at, and the same switch keeps the JIT from compiling a block whose
+  slots hold a char (which would reach native code as a `0`). Int/Int arithmetic
+  stays on the native fast path throughout.
 - **Exceptions without an unwind opcode.** fusevm has none, and kotlinrs lowers
   `fun`s to *native* `Op::Call` frames, so a `throw` cannot longjmp out of a
   frame. It is instead the two-part protocol the sibling frontends (`javars`,
@@ -397,12 +406,19 @@ and a wider `Iterable` surface — `sorted`/`sortedDescending`/`take`/`drop` plu
 the `associate`/`associateBy`/`minByOrNull`/`none`/`filterNot`/`flatMap`/
 `mapIndexed`/`sortedByDescending` higher-order members.
 
-Next: a real runtime `Char` (see the note above — it gates the `String`-receiver
-collection functions), generics, the `this`-receiver scope functions
-(`apply`/`run`), lambda element-type inference, named/default arguments, `as`
-casts, class body property initializers, and a growing standard-library surface —
-alongside the sibling parity tooling (LSP/DAP, reference generator, differential
-harness).
+Also landed: a **real runtime `Char`** — its own value representation rather than
+an `Int` code unit, so it prints as a character inside a `List`/`Set`/`Map`,
+answers `is Char`, and keeps Kotlin's `Char` arithmetic and ordering inside a
+lambda; plus `CharRange` (`'a'..'e'`, `step`/`downTo`/`reversed`/`in`) and the
+`Char` classification and case members. The strict-numeric switch it needed also
+fixed `+` with a `String` operand in an untyped position (`xs.fold("") { a, b ->
+a + b }` concatenates instead of summing).
+
+Next: the collection functions on a `String` receiver (`"abc".map { … }`,
+`toCharArray`), generics, the `this`-receiver scope functions (`apply`/`run`),
+lambda element-type inference, named/default arguments, `as` casts, class body
+property initializers, and a growing standard-library surface — alongside the
+sibling parity tooling (LSP/DAP, reference generator, differential harness).
 
 ## [0xFF] LICENSE
 

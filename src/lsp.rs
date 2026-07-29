@@ -263,8 +263,8 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
     (
         "Char",
         "Type",
-        "a single character (code unit); integral — `'A' + 1`, `.code`, `.toChar()`",
-        "val c: Char = 'A'\nprintln(c + 1)   // B",
+        "a single UTF-16 code unit, distinct from `Int` — `'A' + 1`, `.code`, `.toChar()`, `'a'..'z'`",
+        "val c: Char = 'A'\nprintln(c + 1)        // B\nprintln(listOf(c))    // [A]",
     ),
     (
         "String",

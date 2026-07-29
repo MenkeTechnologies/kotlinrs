@@ -1418,10 +1418,12 @@ impl Compiler {
                     .emit(if *b { Op::LoadTrue } else { Op::LoadFalse }, 0);
                 Ok(Type::Boolean)
             }
-            // A `Char` lowers to its integer code unit; the static `Char` type
-            // carries display and Char-arithmetic semantics.
+            // A `Char` is a runtime type of its own (`crate::host::CHAR_TAG`),
+            // not an `Int` the static type happens to call a character, so the
+            // literal loads the char value itself.
             Expr::Char(c) => {
-                self.b.emit(Op::LoadInt(*c), 0);
+                let idx = self.b.add_constant(crate::host::char_of(*c));
+                self.b.emit(Op::LoadConst(idx), 0);
                 Ok(Type::Char)
             }
             // Kotlin `null` is fusevm `Undef`.

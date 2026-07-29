@@ -447,6 +447,64 @@ fn g_strchars(r: &mut Rng, idx: usize) -> String {
     }
 }
 
+/// `Char` as a runtime type of its own: its display in every position (bare, in
+/// a collection, in a template), `Char` arithmetic and ordering — including in
+/// the statically untyped positions a lambda creates — the `Char` members, `is
+/// Char` vs `is Int`, and `CharRange`.
+fn g_char(r: &mut Rng, idx: usize) -> String {
+    let c = pick(r, &["'a'", "'z'", "'A'", "'0'", "'m'", "' '", "'~'"]);
+    let d = pick(r, &["'a'", "'q'", "'B'", "'9'"]);
+    let n = pick(r, &["0", "1", "2", "5", "-1"]);
+    match r.below(24) {
+        0 => format!("println({c})"),
+        1 => format!("println(listOf({c}, {d}))"),
+        2 => format!("println(setOf({c}, {d}, {c}))"),
+        3 => format!("println(mapOf({c} to 1, {d} to 2))"),
+        4 => format!("println({c} to {d})"),
+        5 => format!("println({c} + {n})"),
+        6 => format!("println({c} - {d})"),
+        7 => format!("println({c}.code)"),
+        8 => format!("println({}.toChar())", pick(r, &["65", "97", "48", "122"])),
+        9 => format!("println(\"[${c}]\")"),
+        10 => format!("println({c} == {d})"),
+        11 => format!(
+            "println({c} {} {d})",
+            pick(r, &["<", ">", "<=", ">=", "!="])
+        ),
+        12 => format!("println(listOf({c}, {d}).map {{ it + 1 }})"),
+        13 => format!("println(listOf({c}, {d}).filter {{ it > {d} }})"),
+        14 => format!("println(listOf({c}, {d}).sorted())"),
+        15 => format!("println(listOf({c}, {d}).joinToString(\"\"))"),
+        16 => format!("println(listOf({c}, {d}).fold(\"\") {{ a, b -> a + b }})"),
+        17 => format!("val a{idx}: Any = {c}; println(a{idx} is Char); println(a{idx} is Int)"),
+        18 => format!(
+            "println({c}.{})",
+            pick(
+                r,
+                &[
+                    "isDigit()",
+                    "isLetter()",
+                    "isLetterOrDigit()",
+                    "isWhitespace()",
+                    "isUpperCase()",
+                    "isLowerCase()",
+                    "uppercaseChar()",
+                    "lowercaseChar()",
+                    "uppercase()",
+                    "lowercase()",
+                    "toString()",
+                    "hashCode()",
+                ]
+            )
+        ),
+        19 => format!("println({c}.compareTo({d}))"),
+        20 => "println(('a'..'e').toList())".to_string(),
+        21 => format!("println({c} in 'a'..'z')"),
+        22 => format!("for (k{idx} in 'a'..'d') print(k{idx}); println()"),
+        _ => format!("var m{idx} = {c}; m{idx}++; println(m{idx})"),
+    }
+}
+
 /// Null safety: `?.`, `?:`, `!!`, `== null`, and a nullable value's display.
 fn g_nullsafe(r: &mut Rng, idx: usize) -> String {
     let s = pick(r, &["null", "\"abc\"", "\"\"", "\"Hi\""]);
@@ -605,6 +663,7 @@ enum Mode {
     Exc,
     ArrayInit,
     StrChars,
+    Char,
     NullSafe,
     DataWhen,
     Class,
@@ -633,6 +692,7 @@ const CONCRETE: &[Mode] = &[
     Mode::Exc,
     Mode::ArrayInit,
     Mode::StrChars,
+    Mode::Char,
     Mode::NullSafe,
     Mode::DataWhen,
     Mode::Class,
@@ -663,6 +723,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Exc => "exc",
         Mode::ArrayInit => "arrayinit",
         Mode::StrChars => "strchars",
+        Mode::Char => "char",
         Mode::NullSafe => "nullsafe",
         Mode::DataWhen => "datawhen",
         Mode::Class => "class",
@@ -705,6 +766,7 @@ fn gen_probe(r: &mut Rng, mode: Mode, idx: usize) -> String {
         Mode::Exc => g_exc(r, idx),
         Mode::ArrayInit => g_arrayinit(r, idx),
         Mode::StrChars => g_strchars(r, idx),
+        Mode::Char => g_char(r, idx),
         Mode::NullSafe => g_nullsafe(r, idx),
         Mode::DataWhen => g_datawhen(r, idx),
         Mode::Class => g_class(r, idx),

@@ -342,6 +342,71 @@ fn char_literals_and_arithmetic() {
 }
 
 #[test]
+fn char_is_a_runtime_type_not_an_int() {
+    // The point of a real `Char`: it stays a character in an *untyped* position,
+    // where the compiler cannot annotate the display. A collection element is
+    // the sharpest case — it used to print as the code unit.
+    assert_eq!(stdout("println(listOf('a', 'b'))"), "[a, b]\n");
+    assert_eq!(stdout("println(setOf('b', 'a'))"), "[b, a]\n");
+    assert_eq!(stdout("println(mapOf('a' to 1))"), "{a=1}\n");
+    assert_eq!(stdout("println('a' to 'b')"), "(a, b)\n");
+    assert_eq!(stdout("val x: Any = 'q'; println(x)"), "q\n");
+    // `is` tells `Char` and `Int` apart, which an Int-carried char could not.
+    assert_eq!(stdout("val x: Any = 'q'; println(x is Char)"), "true\n");
+    assert_eq!(stdout("val x: Any = 'q'; println(x is Int)"), "false\n");
+    assert_eq!(stdout("val x: Any = 3; println(x is Char)"), "false\n");
+    // Arithmetic and ordering inside a lambda — the operands are statically
+    // untyped there, so these lower to native fusevm ops and only reach Kotlin
+    // through the numeric hook.
+    assert_eq!(stdout("println(listOf('a').map { it + 1 })"), "[b]\n");
+    assert_eq!(
+        stdout("println(listOf('a', 'z').filter { it < 'm' })"),
+        "[a]\n"
+    );
+    assert_eq!(stdout("println(listOf('c', 'a').sorted())"), "[a, c]\n");
+    // `String + Char` in an untyped position concatenates rather than adding.
+    assert_eq!(
+        stdout(r#"println(listOf('h', 'i').fold("") { a, b -> a + b })"#),
+        "hi\n"
+    );
+    // Iterating and indexing a String yield real Chars, so they display as
+    // characters after passing through a collection.
+    assert_eq!(
+        stdout("val v = mutableListOf<Char>(); for (c in \"hi\") v.add(c); println(v)"),
+        "[h, i]\n"
+    );
+    assert_eq!(stdout(r#"println(listOf("hi"[0]))"#), "[h]\n");
+}
+
+#[test]
+fn char_ranges() {
+    // `'a'..'e'` is a `CharRange`: its elements and its printed form are chars.
+    assert_eq!(stdout("println(('a'..'e').toList())"), "[a, b, c, d, e]\n");
+    assert_eq!(stdout("println('a'..'e')"), "a..e\n");
+    assert_eq!(stdout("println('a'..'z' step 5)"), "a..z step 5\n");
+    assert_eq!(stdout("println(('a'..'e').reversed())"), "e downTo a step 1\n");
+    assert_eq!(stdout("println('c' in 'a'..'z')"), "true\n");
+    assert_eq!(stdout("println('C' in 'a'..'z')"), "false\n");
+    assert_eq!(stdout("for (c in 'a'..'d') print(c)"), "abcd");
+    assert_eq!(stdout("for (c in 'd' downTo 'a') print(c)"), "dcba");
+}
+
+#[test]
+fn char_members() {
+    assert_eq!(stdout("println('7'.isDigit())"), "true\n");
+    assert_eq!(stdout("println('x'.isDigit())"), "false\n");
+    assert_eq!(stdout("println('x'.isLetter())"), "true\n");
+    assert_eq!(stdout("println(' '.isWhitespace())"), "true\n");
+    assert_eq!(stdout("println('Z'.isUpperCase())"), "true\n");
+    assert_eq!(stdout("println('Z'.isLowerCase())"), "false\n");
+    assert_eq!(stdout("println('a'.uppercaseChar())"), "A\n");
+    assert_eq!(stdout("println('A'.lowercase())"), "a\n");
+    assert_eq!(stdout("println('7'.digitToInt())"), "7\n");
+    assert_eq!(stdout("println('a'.hashCode())"), "97\n");
+    assert_eq!(stdout("println('a'.compareTo('b'))"), "-1\n");
+}
+
+#[test]
 fn null_safety_operators() {
     // `null` literal and a nullable-typed binding both display as `null`.
     assert_eq!(stdout("println(null)"), "null\n");
