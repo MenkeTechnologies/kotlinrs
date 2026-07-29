@@ -838,6 +838,22 @@ fn coll_hof(
 /// Only the members faithfully backed here are handled — extend this table as
 /// stdlib coverage grows. `String.length` counts UTF-16 code units, matching
 /// the JVM `kotlin.String.length` contract (not Unicode scalar count).
+/// Render argument `i` as Kotlin would display it, for the arg-taking `String`
+/// members. Missing arguments read as the empty string rather than faulting;
+/// arity is a compile-time concern, not this table.
+fn arg_str(args: &[Value], i: usize) -> String {
+    args.get(i).map(kotlin_string).unwrap_or_default()
+}
+
+/// UTF-16 offset of `needle` in `hay`, or -1 — matching `String.indexOf` and
+/// the UTF-16 basis `length` already uses.
+fn utf16_index_of(hay: &str, needle: &str) -> i64 {
+    match hay.find(needle) {
+        Some(byte_off) => hay[..byte_off].encode_utf16().count() as i64,
+        None => -1,
+    }
+}
+
 fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     // Heap objects (List/Map/Pair/data-class members) dispatch through the heap.
     if let Value::Obj(_) = recv {
@@ -851,6 +867,44 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
         (Value::Str(s), "trim") => Ok(Value::str(s.trim().to_string())),
         (Value::Str(s), "isEmpty") => Ok(Value::Bool(s.is_empty())),
         (Value::Str(s), "isNotEmpty") => Ok(Value::Bool(!s.is_empty())),
+        (Value::Str(s), "isBlank") => Ok(Value::Bool(s.trim().is_empty())),
+        (Value::Str(s), "isNotBlank") => Ok(Value::Bool(!s.trim().is_empty())),
+
+        // Arg-taking `String` members. The argument is rendered through
+        // `kotlin_string` so a `Char` (carried as an integer code unit) or a
+        // number reads the way Kotlin would print it.
+        (Value::Str(s), "contains") => Ok(Value::Bool(s.contains(&arg_str(args, 0)))),
+        (Value::Str(s), "startsWith") => Ok(Value::Bool(s.starts_with(&arg_str(args, 0)))),
+        (Value::Str(s), "endsWith") => Ok(Value::Bool(s.ends_with(&arg_str(args, 0)))),
+        (Value::Str(s), "plus") => Ok(Value::str(format!("{s}{}", arg_str(args, 0)))),
+        (Value::Str(s), "replace") => Ok(Value::str(
+            s.replace(&arg_str(args, 0), &arg_str(args, 1)),
+        )),
+        (Value::Str(s), "repeat") => {
+            let n = args.first().map(|v| v.to_int()).unwrap_or(0);
+            if n < 0 {
+                Err("Count 'n' must be non-negative".to_string())
+            } else {
+                Ok(Value::str(s.repeat(n as usize)))
+            }
+        }
+        // Index and slice positions are UTF-16 offsets, matching `length` above.
+        (Value::Str(s), "indexOf") => Ok(Value::Int(utf16_index_of(s, &arg_str(args, 0)))),
+        (Value::Str(s), "substring") => {
+            let units: Vec<u16> = s.encode_utf16().collect();
+            let start = args.first().map(|v| v.to_int()).unwrap_or(0);
+            let end = args.get(1).map(|v| v.to_int()).unwrap_or(units.len() as i64);
+            if start < 0 || end > units.len() as i64 || start > end {
+                Err(format!(
+                    "begin {start}, end {end}, length {}",
+                    units.len()
+                ))
+            } else {
+                Ok(Value::str(String::from_utf16_lossy(
+                    &units[start as usize..end as usize],
+                )))
+            }
+        }
 
         // ── kotlin.Char (carried as its integer code unit) ──
         // `Char.code` → the code unit as `Int`; `Int.toChar()` → a `Char` (the
@@ -863,7 +917,6 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
         (_, "toString") => Ok(Value::str(kotlin_string(recv))),
 
         _ => {
-            let _ = args; // reserved for arg-taking members
             Err(format!(
                 "unresolved reference: {name} on {}",
                 type_label(recv)

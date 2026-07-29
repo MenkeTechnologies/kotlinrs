@@ -178,18 +178,18 @@ fn g_ifexpr(r: &mut Rng) -> String {
 }
 
 /// `String` members kotlinrs dispatches (ASCII receivers only).
-///
-/// `contains` is deliberately absent: it is not registered on `String` yet
-/// (`unresolved reference: contains on String`), so generating it would report a
-/// known gap rather than find a divergence. Add it here when it lands.
 fn g_strmember(r: &mut Rng) -> String {
     let s = pick(r, STRS);
-    match r.below(5) {
+    match r.below(9) {
         0 => p(format!("{s}.length")),
         1 => p(format!("{s}.uppercase()")),
         2 => p(format!("{s}.lowercase()")),
         3 => p(format!("{s}.trim()")),
-        _ => p(format!("{s}.isEmpty()")),
+        4 => p(format!("{s}.isEmpty()")),
+        5 => p(format!("{s}.contains(\"b\")")),
+        6 => p(format!("{s}.startsWith(\"a\")")),
+        7 => p(format!("{s}.indexOf(\"b\")")),
+        _ => p(format!("{s}.replace(\"b\", \"-\")")),
     }
 }
 
