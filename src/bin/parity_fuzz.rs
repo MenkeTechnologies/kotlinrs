@@ -428,13 +428,21 @@ fn g_arrayinit(r: &mut Rng, idx: usize) -> String {
 /// `for (c in "…")` over a String's characters.
 fn g_strchars(r: &mut Rng, idx: usize) -> String {
     let s = pick(r, &["\"abc\"", "\"Hello\"", "\"x\"", "\"AbC\""]);
-    match r.below(5) {
+    match r.below(9) {
         0 => format!("for (c{idx} in {s}) println(c{idx})"),
         1 => format!("var t{idx} = 0; for (c{idx} in {s}) t{idx} += c{idx}.code; println(t{idx})"),
         2 => format!("var u{idx} = \"\"; for (c{idx} in {s}) u{idx} += c{idx}; println(u{idx})"),
         3 => format!("for (c{idx} in {s}) print(c{idx}); println()"),
-        _ => format!(
+        4 => format!(
             "var w{idx} = 0; val z{idx} = {s}; for (c{idx} in z{idx}) w{idx}++; println(w{idx})"
+        ),
+        // `s[i]` — indexed by UTF-16 code unit; the index stays in range because
+        // an out-of-range one throws (a fault-path test, not a value test).
+        5 => format!("println({s}[0])"),
+        6 => format!("val q{idx} = {s}; println(q{idx}[q{idx}.length - 1])"),
+        7 => format!("val q{idx} = {s}; println(q{idx}[0].code)"),
+        _ => format!(
+            "var v{idx} = \"\"; val q{idx} = {s};              for (i{idx} in 0 until q{idx}.length) v{idx} += q{idx}[i{idx}]; println(v{idx})"
         ),
     }
 }

@@ -2609,8 +2609,21 @@ fn sum_values(items: &[Value]) -> Value {
 
 /// `recv[index]` — list element (bounds-checked) or map value (null if absent).
 fn index_get(recv: &Value, index: &Value) -> Result<Value, String> {
+    // `s[i]` is a `Char`, indexed by UTF-16 code unit — the same basis
+    // `String.length` uses. The compiler types the result `Char` when the
+    // receiver is statically a String, so it displays as a character.
+    if let Value::Str(s) = recv {
+        let i = index.to_int();
+        let len = s.encode_utf16().count();
+        return match usize::try_from(i).ok().and_then(|i| s.encode_utf16().nth(i)) {
+            Some(u) => Ok(Value::Int(u as i64)),
+            None => Err(format!(
+                "java.lang.StringIndexOutOfBoundsException: index {i}, length {len}"
+            )),
+        };
+    }
     let out = with_obj(recv, |o| match o {
-        HeapObj::List(items) | HeapObj::Array { items, .. } => {
+        HeapObj::List(items) | HeapObj::Set(items) | HeapObj::Array { items, .. } => {
             let i = index.to_int();
             if i < 0 || i as usize >= items.len() {
                 Err(format!(

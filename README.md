@@ -122,7 +122,13 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `${expr}` templates; `+` concatenates when either side is a `String`.
 - **Char** — `'A'` literals (with `\n`/`\t`/`\uXXXX`/… escapes); integral
   arithmetic (`'A' + 1` → `Char`, `'D' - 'A'` → `Int`), `.code` (→ `Int`) and
-  `Int.toChar()` (→ `Char`), ordering by code unit.
+  `Int.toChar()` (→ `Char`), ordering by code unit, and `s[i]` (indexed by
+  UTF-16 code unit, out of range a `StringIndexOutOfBoundsException`).
+  A `Char` is carried as its integer code unit and its Char-ness lives in the
+  *static* type, so it displays as a character wherever the compiler can see the
+  type — a local, a `for (c in s)` variable, `s[i]`, a `+`, a template — but not
+  once it enters an untyped position: `println(listOf('a'))` prints `[97]` where
+  Kotlin prints `[a]`. See the gap note below.
 - **Member access** — chainable postfix `.`: `String.length`,
   `.uppercase()`/`.lowercase()`, `.trim()`, `.isEmpty()`/`.isNotEmpty()`,
   `Char.code`, `Int.toChar()`, and `Any.toString()`.
@@ -265,10 +271,10 @@ arguments, the lambda-taking collection functions on a `String` receiver
 (`"abc".map { … }`; `for (c in s)` works), and the rest of the standard-library
 surface.
 
-The `String`-receiver gap has one cause: a `Char` is carried as its integer code
-unit, not as a distinct runtime type, so a lambda over a `String`'s characters
-would receive an `Int` and `println(it)` would print `97` where Kotlin prints
-`a`. Passing a one-character `String` instead trades that for a different
+The `String`-receiver gap and the `listOf('a')` display above have one shared
+cause: a `Char` is carried as its integer code unit, not as a distinct runtime
+type, so a lambda over a `String`'s characters would receive an `Int` and
+`println(it)` would print `97` where Kotlin prints `a`. Passing a one-character `String` instead trades that for a different
 divergence (`it + 1` would concatenate where Kotlin does `Char` arithmetic), so
 neither shortcut is correct. A faithful fix needs a distinct runtime `Char`
 representation AND every statically-untyped `+`/`-`/comparison routed through a

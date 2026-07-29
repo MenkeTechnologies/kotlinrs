@@ -1736,3 +1736,26 @@ fun main() {
          [0:ann, 1:bob, 2:cid]\n"
     );
 }
+
+#[test]
+fn string_indexing_yields_a_char() {
+    // `s[i]` indexes by UTF-16 code unit, the same basis as `length`, and its
+    // static type is `Char` — so it displays as a character, takes part in Char
+    // arithmetic, and appends as one. Out of range is a
+    // StringIndexOutOfBoundsException, catchable like any other.
+    let src = "\
+fun main() {
+    val s = \"hello\"
+    println(s[0])
+    println(s[4])
+    println(s[1] == 'e')
+    println(s[0] + 1)
+    println(s[1].code)
+    var t = \"\"
+    for (i in 0 until s.length) t += s[i]
+    println(t)
+    println(try { s[9] } catch (e: StringIndexOutOfBoundsException) { 'X' })
+    println(try { s[-1].toString() } catch (e: Exception) { \"oob\" })
+}";
+    assert_eq!(prog(src), "h\no\ntrue\ni\n101\nhello\nX\noob\n");
+}

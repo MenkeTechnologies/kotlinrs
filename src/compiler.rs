@@ -1507,10 +1507,17 @@ impl Compiler {
                 Ok(t)
             }
             Expr::Index { recv, index, line } => {
+                let rt = self.infer(sc, recv);
                 self.compile_expr(sc, recv)?;
                 self.compile_expr(sc, index)?;
                 self.b.emit(Op::Extended(KT_INDEX_GET, 0), *line);
-                Ok(Type::Unknown)
+                // `s[i]` on a String is a `Char`; every other receiver's element
+                // type is beyond the coarse inference.
+                Ok(if rt.is_str() {
+                    Type::Char
+                } else {
+                    Type::Unknown
+                })
             }
             Expr::Pair { first, second } => {
                 self.compile_expr(sc, first)?;
@@ -3266,7 +3273,15 @@ impl Compiler {
                     .map(|s| s.ret)
                     .unwrap_or(Type::Unknown),
             },
-            Expr::Index { .. } => Type::Unknown,
+            // `s[i]` yields a `Char`; other element types are past the coarse
+            // inference and stay `Unknown`.
+            Expr::Index { recv, .. } => {
+                if self.infer(sc, recv).is_str() {
+                    Type::Char
+                } else {
+                    Type::Unknown
+                }
+            }
             Expr::Pair { .. } => Type::Obj,
             // A range and an array are heap objects; `in` is a predicate.
             Expr::Range { .. } | Expr::Step { .. } => Type::Obj,
