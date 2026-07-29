@@ -344,6 +344,8 @@ impl<'a> Lexer<'a> {
             t
         };
         Ok(match (c, d) {
+            (b'+', b'+') => two(self, Tok::PlusPlus),
+            (b'-', b'-') => two(self, Tok::MinusMinus),
             (b'+', b'=') => two(self, Tok::PlusEq),
             (b'-', b'=') => two(self, Tok::MinusEq),
             (b'*', b'=') => two(self, Tok::StarEq),

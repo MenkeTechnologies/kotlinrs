@@ -69,6 +69,8 @@ pub enum Tok {
     Slash,
     Percent,
     Assign,    // =
+    PlusPlus,  // ++
+    MinusMinus,// --
     PlusEq,    // +=
     MinusEq,   // -=
     StarEq,    // *=

@@ -507,6 +507,22 @@ impl Parser {
         // operator. This uniformly covers `x = …`, `obj.field = …`, and
         // `coll[i] = …` (plus their `op=` forms) without special-casing.
         let lhs = self.expr()?;
+
+        // `x++` / `x--` desugar to `x += 1` / `x -= 1`. Handled here, alongside
+        // the `op=` forms, so they inherit the same lvalue coverage: the
+        // increment works on a variable, a field, and an indexed element without
+        // any of them being special-cased. Statement position only — the value
+        // of a postfix increment is not yet an expression.
+        if matches!(self.peek(), Tok::PlusPlus | Tok::MinusMinus) {
+            let binop = if matches!(self.peek(), Tok::PlusPlus) {
+                BinOp::Add
+            } else {
+                BinOp::Sub
+            };
+            self.bump();
+            return self.assign_to(lhs, Some(binop), Expr::Int(1));
+        }
+
         let op = match self.peek() {
             Tok::Assign => Some(None),
             Tok::PlusEq => Some(Some(BinOp::Add)),
@@ -521,6 +537,17 @@ impl Parser {
         };
         self.bump(); // the assign token
         let value = self.expr()?;
+        self.assign_to(lhs, binop, value)
+    }
+
+    /// Build the assignment statement for an already-parsed lvalue, shared by
+    /// the `=`/`op=` forms and the `++`/`--` desugar.
+    fn assign_to(
+        &mut self,
+        lhs: Expr,
+        binop: Option<BinOp>,
+        value: Expr,
+    ) -> Result<StmtKind, String> {
         match lhs {
             Expr::Var(name) => Ok(StmtKind::Assign {
                 name,

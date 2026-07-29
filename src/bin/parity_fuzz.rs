@@ -195,15 +195,11 @@ fn g_strmember(r: &mut Rng) -> String {
 
 /// A counted loop with an accumulator, exercising the loop lowering.
 ///
-/// Steps with `+= 1` rather than `i++`: the postfix increment/decrement
-/// operators are a known gap (the parser rejects them), so generating them would
-/// report a gap instead of finding a divergence. Restore `i++` here once they
-/// land — this probe is the natural place to cover them.
 fn g_loop(r: &mut Rng, idx: usize) -> String {
     let n = 2 + r.below(5);
     let step = pick(r, &["1", "2", "3"]);
     format!(
-        "var a{idx} = 0; var i{idx} = 0; while (i{idx} < {n}) {{ a{idx} += i{idx} * {step}; i{idx} += 1 }}; println(a{idx})"
+        "var a{idx} = 0; var i{idx} = 0; while (i{idx} < {n}) {{ a{idx} += i{idx} * {step}; i{idx}++ }}; println(a{idx})"
     )
 }
 
