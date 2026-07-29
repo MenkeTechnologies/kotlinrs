@@ -26,3 +26,27 @@ fun main() {\n    println(listOf(1, 2, 3))\n}	[1, 2, 3]\n
 fun main() {\n    println(listOf(1, 2).size)\n}	2\n
 fun main() {\n    println(true && false)\n}	false\n
 fun main() {\n    println(3.5 >= 3.5)\n}	true\n
+fun main() {\n    println(1..5)\n}	1..5\n
+fun main() {\n    println(1 until 5)\n}	1..4\n
+fun main() {\n    println(5 downTo 1)\n}	5 downTo 1 step 1\n
+fun main() {\n    println(1..10 step 2)\n}	1..9 step 2\n
+fun main() {\n    println(10 downTo 1 step 3)\n}	10 downTo 1 step 3\n
+fun main() {\n    println((1..3).sum())\n}	6\n
+fun main() {\n    println((1..5).toList())\n}	[1, 2, 3, 4, 5]\n
+fun main() {\n    println((1..5 step 2).sum())\n}	9\n
+fun main() {\n    println(3 in 1..5)\n}	true\n
+fun main() {\n    println(7 !in 1..5)\n}	true\n
+fun main() {\n    println(4 in (1..10 step 2))\n}	false\n
+fun main() {\n    var s = 0\n    for (i in 1..4) s += i\n    println(s)\n}	10\n
+fun main() {\n    val r = 1 until 4\n    var s = 0\n    for (i in r) s += i\n    println(s)\n}	6\n
+fun main() {\n    println((1..3).map { it * 2 })\n}	[2, 4, 6]\n
+fun main() {\n    val a = arrayOf(1, 2, 3)\n    a[1] = 9\n    println(a.size)\n    println(a[1])\n    println(a.sum())\n    println(a.joinToString())\n}	3\n9\n13\n1, 9, 3\n
+fun main() {\n    val a = IntArray(3)\n    a[0] = 5\n    println(a.joinToString())\n    println(a.sum())\n}	5, 0, 0\n5\n
+fun main() {\n    var t = 0\n    for (x in intArrayOf(1, 2, 3)) t += x\n    println(t)\n}	6\n
+fun main() {\n    println(arrayOf(1) == arrayOf(1))\n}	false\n
+import kotlin.math.*\nfun main() {\n    println(abs(-3))\n    println(abs(-3.5))\n    println(max(2, 9))\n    println(sqrt(9.0))\n}	3\n3.5\n9\n3.0\n
+import kotlin.math.*\nfun main() {\n    println(round(2.5))\n    println(round(3.5))\n    println(floor(2.7))\n    println(ceil(2.1))\n    println(PI)\n}	2.0\n4.0\n2.0\n3.0\n3.141592653589793\n
+fun main() {\n    println(Math.abs(-3))\n    println(Math.round(2.5))\n    println(Math.round(-2.5))\n}	3\n3\n-2\n
+fun main() {\n    var i = 0\n    println(i++)\n    println(i)\n    println(++i)\n}	0\n1\n2\n
+fun main() {\n    var j = 5\n    println(j++ + j++)\n    println(j)\n}	11\n7\n
+fun main() {\n    val a = intArrayOf(1, 2)\n    println(a[0]++)\n    println(a.joinToString())\n}	1\n2, 2\n

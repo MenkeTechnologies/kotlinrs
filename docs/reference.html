@@ -90,8 +90,9 @@ while (i &lt; 3) { i += 1 }</code></pre>
         </article>
         <article class="doc-entry" id="doc-keyword-8">
           <h3><a class="doc-anchor" href="#doc-keyword-8">#</a> <code>in</code></h3>
-          <p>the `for (x in range)` separator</p>
-          <pre><code class="lang-kotlin">for (c in 0 until 3) println(c)</code></pre>
+          <p>the `for (x in iterable)` separator, and the membership operator</p>
+          <pre><code class="lang-kotlin">for (c in 0 until 3) println(c)
+println(2 in 1..3)   // true</code></pre>
         </article>
         <article class="doc-entry" id="doc-keyword-9">
           <h3><a class="doc-anchor" href="#doc-keyword-9">#</a> <code>return</code></h3>
@@ -104,47 +105,53 @@ while (i &lt; 3) { i += 1 }</code></pre>
           <pre><code class="lang-kotlin">for (i in 0 until 3) println(i)   // 0 1 2</code></pre>
         </article>
         <article class="doc-entry" id="doc-keyword-11">
-          <h3><a class="doc-anchor" href="#doc-keyword-11">#</a> <code>downTo</code></h3>
+          <h3><a class="doc-anchor" href="#doc-keyword-11">#</a> <code>..</code></h3>
+          <p>inclusive range: `a..b` builds an IntRange value</p>
+          <pre><code class="lang-kotlin">val r = 1..5
+println(r.sum())   // 15</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-12">
+          <h3><a class="doc-anchor" href="#doc-keyword-12">#</a> <code>downTo</code></h3>
           <p>descending inclusive range: `a downTo b`</p>
           <pre><code class="lang-kotlin">for (i in 3 downTo 1) println(i)   // 3 2 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-12">
-          <h3><a class="doc-anchor" href="#doc-keyword-12">#</a> <code>step</code></h3>
+        <article class="doc-entry" id="doc-keyword-13">
+          <h3><a class="doc-anchor" href="#doc-keyword-13">#</a> <code>step</code></h3>
           <p>stride for a range: `a..b step n`</p>
           <pre><code class="lang-kotlin">for (i in 0..10 step 2) println(i)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-13">
-          <h3><a class="doc-anchor" href="#doc-keyword-13">#</a> <code>true</code></h3>
+        <article class="doc-entry" id="doc-keyword-14">
+          <h3><a class="doc-anchor" href="#doc-keyword-14">#</a> <code>true</code></h3>
           <p>the Boolean true literal</p>
           <pre><code class="lang-kotlin">val ok: Boolean = true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-14">
-          <h3><a class="doc-anchor" href="#doc-keyword-14">#</a> <code>false</code></h3>
+        <article class="doc-entry" id="doc-keyword-15">
+          <h3><a class="doc-anchor" href="#doc-keyword-15">#</a> <code>false</code></h3>
           <p>the Boolean false literal</p>
           <pre><code class="lang-kotlin">val done: Boolean = false</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-15">
-          <h3><a class="doc-anchor" href="#doc-keyword-15">#</a> <code>when</code></h3>
+        <article class="doc-entry" id="doc-keyword-16">
+          <h3><a class="doc-anchor" href="#doc-keyword-16">#</a> <code>when</code></h3>
           <p>multi-way branch (statement or expression); subject or subjectless</p>
           <pre><code class="lang-kotlin">when (n) { 1 -&gt; "one"; in 2..9 -&gt; "few"; else -&gt; "many" }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-16">
-          <h3><a class="doc-anchor" href="#doc-keyword-16">#</a> <code>is</code></h3>
+        <article class="doc-entry" id="doc-keyword-17">
+          <h3><a class="doc-anchor" href="#doc-keyword-17">#</a> <code>is</code></h3>
           <p>runtime type check in a `when` arm: `is String`, `!is Int`</p>
           <pre><code class="lang-kotlin">when (x) { is String -&gt; "str"; is Int -&gt; "int"; else -&gt; "?" }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-17">
-          <h3><a class="doc-anchor" href="#doc-keyword-17">#</a> <code>break</code></h3>
+        <article class="doc-entry" id="doc-keyword-18">
+          <h3><a class="doc-anchor" href="#doc-keyword-18">#</a> <code>break</code></h3>
           <p>exit the enclosing loop; `break@label` targets a labeled loop</p>
           <pre><code class="lang-kotlin">for (i in 1..9) { if (i == 5) break }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-18">
-          <h3><a class="doc-anchor" href="#doc-keyword-18">#</a> <code>continue</code></h3>
+        <article class="doc-entry" id="doc-keyword-19">
+          <h3><a class="doc-anchor" href="#doc-keyword-19">#</a> <code>continue</code></h3>
           <p>skip to the loop's next iteration; `continue@label` for a labeled loop</p>
           <pre><code class="lang-kotlin">for (i in 1..9) { if (i % 2 == 0) continue; println(i) }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-19">
-          <h3><a class="doc-anchor" href="#doc-keyword-19">#</a> <code>null</code></h3>
+        <article class="doc-entry" id="doc-keyword-20">
+          <h3><a class="doc-anchor" href="#doc-keyword-20">#</a> <code>null</code></h3>
           <p>the null reference; used with `T?`, `?.`, `?:`, and `!!`</p>
           <pre><code class="lang-kotlin">val x: Int? = null
 println(x ?: 0)   // 0</code></pre>
@@ -207,6 +214,57 @@ println(c + 1)   // B</code></pre>
           <h3><a class="doc-anchor" href="#doc-builtin-2">#</a> <code>print</code></h3>
           <p>write a value to stdout with no trailing newline</p>
           <pre><code class="lang-kotlin">print("a"); print("b")   // ab</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-3">
+          <h3><a class="doc-anchor" href="#doc-builtin-3">#</a> <code>listOf</code></h3>
+          <p>build a read-only List; `mutableListOf` builds a mutable one</p>
+          <pre><code class="lang-kotlin">val xs = listOf(1, 2, 3)
+println(xs.size)   // 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-4">
+          <h3><a class="doc-anchor" href="#doc-builtin-4">#</a> <code>mapOf</code></h3>
+          <p>build a Map from `k to v` pairs; `mutableMapOf` builds a mutable one</p>
+          <pre><code class="lang-kotlin">val m = mapOf("a" to 1)
+println(m["a"])   // 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-5">
+          <h3><a class="doc-anchor" href="#doc-builtin-5">#</a> <code>arrayOf</code></h3>
+          <p>build an array; `intArrayOf`/`doubleArrayOf`/`booleanArrayOf` are typed</p>
+          <pre><code class="lang-kotlin">val a = arrayOf(1, 2, 3)
+println(a[1])   // 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-6">
+          <h3><a class="doc-anchor" href="#doc-builtin-6">#</a> <code>IntArray</code></h3>
+          <p>a zero-filled primitive array; also `DoubleArray`/`BooleanArray`</p>
+          <pre><code class="lang-kotlin">val a = IntArray(3)
+println(a.sum())   // 0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-7">
+          <h3><a class="doc-anchor" href="#doc-builtin-7">#</a> <code>abs</code></h3>
+          <p>absolute value (kotlin.math; needs `import kotlin.math.*`)</p>
+          <pre><code class="lang-kotlin">import kotlin.math.*
+println(abs(-3))   // 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-8">
+          <h3><a class="doc-anchor" href="#doc-builtin-8">#</a> <code>sqrt</code></h3>
+          <p>square root of a Double (kotlin.math; needs the import)</p>
+          <pre><code class="lang-kotlin">import kotlin.math.*
+println(sqrt(9.0))   // 3.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-9">
+          <h3><a class="doc-anchor" href="#doc-builtin-9">#</a> <code>max</code></h3>
+          <p>larger of two values (kotlin.math); `maxOf` needs no import</p>
+          <pre><code class="lang-kotlin">println(maxOf(2, 9))   // 9</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-10">
+          <h3><a class="doc-anchor" href="#doc-builtin-10">#</a> <code>min</code></h3>
+          <p>smaller of two values (kotlin.math); `minOf` needs no import</p>
+          <pre><code class="lang-kotlin">println(minOf(2, 9))   // 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-11">
+          <h3><a class="doc-anchor" href="#doc-builtin-11">#</a> <code>Math</code></h3>
+          <p>the java.lang.Math statics, auto-imported (abs/max/min/sqrt/round/…)</p>
+          <pre><code class="lang-kotlin">println(Math.abs(-3))   // 3</code></pre>
         </article>
       </section>
 

@@ -11,13 +11,22 @@
 //! or       := and ('||' and)*
 //! and      := eq  ('&&' eq)*
 //! eq       := cmp (('=='|'!=') cmp)*
-//! cmp      := add (('<'|'>'|'<='|'>=') add)*
+//! cmp      := inOp (('<'|'>'|'<='|'>=') inOp)*
+//! inOp     := elvis (('in'|'!in') elvis)*
+//! elvis    := infix ('?:' elvis)?
+//! infix    := range (('to'|'until'|'downTo'|'step') range)*
+//! range    := add ('..' add)*
 //! add      := mul (('+'|'-') mul)*
 //! mul      := unary (('*'|'/'|'%') unary)*
-//! unary    := ('-'|'!') unary | postfix
-//! postfix  := primary ('.' IDENT ('(' args? ')')?)*
+//! unary    := ('-'|'!'|'++'|'--') unary | postfix
+//! postfix  := primary ('.' IDENT ('(' args? ')')?)* ('++'|'--')?
 //! primary  := INT | FLOAT | STRING | BOOL | ifExpr | call | IDENT | '(' expr ')'
 //! ```
+//!
+//! The `inOp`/`elvis`/`infix`/`range` levels mirror Kotlin's own precedence
+//! table: `..` binds tighter than the named infix functions (`1..10 step 2` is
+//! `(1..10) step 2`), which bind tighter than `?:`, which binds tighter than
+//! `in`, which binds tighter than the comparisons.
 
 use crate::ast::*;
 use crate::lexer::Lexer;
@@ -38,6 +47,19 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
         match p.peek() {
             Tok::Fun => prog.funs.push(p.fun_decl()?),
             Tok::Class | Tok::Data | Tok::Object => prog.classes.push(p.class_decl()?),
+            // `package a.b` / `import a.b.*` — a dotted path, optionally ending
+            // in `.*`. The package declaration is accepted and discarded (a
+            // single-file program has no package-level name resolution here);
+            // imports are recorded because Kotlin gates `kotlin.math` names on
+            // them (see [`Program::imports`]).
+            Tok::Ident(kw) if kw == "import" || kw == "package" => {
+                let is_import = kw == "import";
+                p.bump();
+                let decl = p.dotted_path()?;
+                if is_import {
+                    prog.imports.push(decl);
+                }
+            }
             other => {
                 return Err(format!(
                     "expected a top-level `fun`, `class`, or `object`, found {other:?} (line {})",
@@ -91,6 +113,30 @@ impl Parser {
             Tok::Ident(s) => Ok(s),
             other => Err(format!("expected identifier, found {:?}", other)),
         }
+    }
+
+    /// A dotted name path after `import`/`package`: `a.b.c`, `a.b.*`, or a
+    /// renaming `a.b as c`. The lexer discards newlines, so the path ends where
+    /// the dots stop.
+    fn dotted_path(&mut self) -> Result<ImportDecl, String> {
+        let mut path = self.ident()?;
+        while self.at(&Tok::Dot) {
+            self.bump();
+            if self.at(&Tok::Star) {
+                self.bump();
+                path.push_str(".*");
+                return Ok(ImportDecl { path, alias: None });
+            }
+            path.push('.');
+            path.push_str(&self.ident()?);
+        }
+        let alias = if matches!(self.peek(), Tok::Ident(a) if a == "as") {
+            self.bump();
+            Some(self.ident()?)
+        } else {
+            None
+        };
+        Ok(ImportDecl { path, alias })
     }
 
     // ── Declarations ───────────────────────────────────────────────
@@ -447,53 +493,66 @@ impl Parser {
         self.eat(&Tok::LParen)?;
         let cond = self.expr()?;
         self.eat(&Tok::RParen)?;
-        let body = self.block()?;
+        let body = self.loop_body()?;
         Ok(StmtKind::While { cond, body, label })
     }
 
+    /// A loop body: a `{ … }` block or, as Kotlin also allows, a single
+    /// statement (`for (i in 1..3) println(i)`).
+    fn loop_body(&mut self) -> Result<Vec<Stmt>, String> {
+        if self.at(&Tok::LBrace) {
+            self.block()
+        } else {
+            Ok(vec![self.stmt()?])
+        }
+    }
+
+    /// `for (v in iterable) { … }`. The header is parsed as an ordinary
+    /// expression, then split two ways: a *syntactic* range (`a..b`, `a until b`,
+    /// `a downTo b`, each optionally `step n`) keeps the counted lowering, which
+    /// runs on native fusevm ops; anything else (a `List`, an array, a range held
+    /// in a variable) becomes a [`StmtKind::ForIn`] driven by host indexing.
     fn for_stmt(&mut self, label: Option<String>) -> Result<StmtKind, String> {
         self.eat(&Tok::For)?;
         self.eat(&Tok::LParen)?;
         let var = self.ident()?;
         self.eat(&Tok::In)?;
-        let start = self.range_bound()?;
-        let (kind, end) = match self.peek() {
-            Tok::DotDot => {
-                self.bump();
-                (RangeKind::Inclusive, self.range_bound()?)
-            }
-            Tok::Until => {
-                self.bump();
-                (RangeKind::Until, self.range_bound()?)
-            }
-            Tok::DownTo => {
-                self.bump();
-                (RangeKind::DownTo, self.range_bound()?)
-            }
-            other => {
-                return Err(format!(
-                    "for-loop needs a range (`a..b`, `a until b`, `a downTo b`), found {:?}",
-                    other
-                ))
-            }
-        };
-        let step = if self.at(&Tok::Step) {
-            self.bump();
-            Some(self.range_bound()?)
-        } else {
-            None
-        };
+        let iter = self.expr()?;
         self.eat(&Tok::RParen)?;
-        let body = self.block()?;
-        Ok(StmtKind::For {
-            var,
-            start,
-            end,
-            kind,
-            step,
-            body,
-            label,
-        })
+        let body = self.loop_body()?;
+        // Peel an optional `step n` off a literal range header.
+        let (range, step) = match iter {
+            Expr::Step { recv, by } => (*recv, Some(*by)),
+            other => (other, None),
+        };
+        match range {
+            Expr::Range { start, end, kind } => Ok(StmtKind::For {
+                var,
+                start: *start,
+                end: *end,
+                kind,
+                step,
+                body,
+                label,
+            }),
+            // `step` on a non-range header has no counted form; rebuild the value
+            // expression and iterate it.
+            other => {
+                let iter = match step {
+                    Some(by) => Expr::Step {
+                        recv: Box::new(other),
+                        by: Box::new(by),
+                    },
+                    None => other,
+                };
+                Ok(StmtKind::ForIn {
+                    var,
+                    iter,
+                    body,
+                    label,
+                })
+            }
+        }
     }
 
     /// A range endpoint — additive precedence, so `1..n-1` parses `n-1` as the
@@ -506,22 +565,10 @@ impl Parser {
         // Parse a (potential) lvalue expression, then look for an assignment
         // operator. This uniformly covers `x = …`, `obj.field = …`, and
         // `coll[i] = …` (plus their `op=` forms) without special-casing.
+        // `x++` / `++x` are consumed by the expression grammar (see
+        // [`Parser::postfix`]), so a bare increment arrives here as an `IncDec`
+        // expression statement whose value the compiler discards.
         let lhs = self.expr()?;
-
-        // `x++` / `x--` desugar to `x += 1` / `x -= 1`. Handled here, alongside
-        // the `op=` forms, so they inherit the same lvalue coverage: the
-        // increment works on a variable, a field, and an indexed element without
-        // any of them being special-cased. Statement position only — the value
-        // of a postfix increment is not yet an expression.
-        if matches!(self.peek(), Tok::PlusPlus | Tok::MinusMinus) {
-            let binop = if matches!(self.peek(), Tok::PlusPlus) {
-                BinOp::Add
-            } else {
-                BinOp::Sub
-            };
-            self.bump();
-            return self.assign_to(lhs, Some(binop), Expr::Int(1));
-        }
 
         let op = match self.peek() {
             Tok::Assign => Some(None),
@@ -596,29 +643,14 @@ impl Parser {
     }
 
     fn and_expr(&mut self) -> Result<Expr, String> {
-        let mut l = self.pair_expr()?;
+        let mut l = self.eq_expr()?;
         while self.at(&Tok::AndAnd) {
             self.bump();
-            let r = self.pair_expr()?;
+            let r = self.eq_expr()?;
             l = Expr::Binary {
                 op: BinOp::And,
                 l: Box::new(l),
                 r: Box::new(r),
-            };
-        }
-        Ok(l)
-    }
-
-    /// The `to` infix operator, building a `Pair` — `k to v` (used by
-    /// `mapOf(k to v, …)`). `to` is a soft keyword lexed as an identifier.
-    fn pair_expr(&mut self) -> Result<Expr, String> {
-        let mut l = self.eq_expr()?;
-        while matches!(self.peek(), Tok::Ident(n) if n == "to") {
-            self.bump();
-            let r = self.eq_expr()?;
-            l = Expr::Pair {
-                first: Box::new(l),
-                second: Box::new(r),
             };
         }
         Ok(l)
@@ -644,7 +676,7 @@ impl Parser {
     }
 
     fn cmp_expr(&mut self) -> Result<Expr, String> {
-        let mut l = self.elvis_expr()?;
+        let mut l = self.in_expr()?;
         loop {
             let op = match self.peek() {
                 Tok::Lt => BinOp::Lt,
@@ -654,11 +686,39 @@ impl Parser {
                 _ => break,
             };
             self.bump();
-            let r = self.elvis_expr()?;
+            let r = self.in_expr()?;
             l = Expr::Binary {
                 op,
                 l: Box::new(l),
                 r: Box::new(r),
+            };
+        }
+        Ok(l)
+    }
+
+    /// Membership `a in b` / `a !in b`. Kotlin puts these at their own precedence
+    /// level, looser than `?:` and tighter than the comparisons, so
+    /// `x in 1..5` groups as `x in (1..5)` and `a in b == c` as `(a in b) == c`.
+    /// A `for` header consumes its own `in` before reaching an expression, so the
+    /// two uses never collide.
+    fn in_expr(&mut self) -> Result<Expr, String> {
+        let mut l = self.elvis_expr()?;
+        loop {
+            let negated = if self.at(&Tok::In) {
+                self.bump();
+                false
+            } else if self.at(&Tok::Not) && matches!(self.peek_at(1), Tok::In) {
+                self.bump();
+                self.bump();
+                true
+            } else {
+                break;
+            };
+            let r = self.elvis_expr()?;
+            l = Expr::In {
+                value: Box::new(l),
+                container: Box::new(r),
+                negated,
             };
         }
         Ok(l)
@@ -669,7 +729,7 @@ impl Parser {
     /// checks and comparisons). `?:` is `Question` immediately followed by
     /// `Colon`; a `?` followed by `.` is a safe call and stays in `postfix`.
     fn elvis_expr(&mut self) -> Result<Expr, String> {
-        let l = self.additive()?;
+        let l = self.infix_expr()?;
         if self.at(&Tok::Question) && matches!(self.peek_at(1), Tok::Colon) {
             self.bump(); // ?
             self.bump(); // :
@@ -681,6 +741,62 @@ impl Parser {
         } else {
             Ok(l)
         }
+    }
+
+    /// The named infix functions, left-associative and all at one precedence
+    /// level (Kotlin's `infixFunctionCall`): `to` (a `Pair`), `until` / `downTo`
+    /// (ranges), and `step` (re-stepping a range). They are ordinary functions in
+    /// Kotlin, not operators, which is why `1..10 step 2` parses as
+    /// `(1..10) step 2` — `..` is a tighter level.
+    fn infix_expr(&mut self) -> Result<Expr, String> {
+        let mut l = self.range_expr()?;
+        loop {
+            let kind = match self.peek() {
+                Tok::Ident(n) if n == "to" => None,
+                Tok::Until => Some(RangeKind::Until),
+                Tok::DownTo => Some(RangeKind::DownTo),
+                Tok::Step => {
+                    self.bump();
+                    let by = self.range_expr()?;
+                    l = Expr::Step {
+                        recv: Box::new(l),
+                        by: Box::new(by),
+                    };
+                    continue;
+                }
+                _ => break,
+            };
+            self.bump();
+            let r = self.range_expr()?;
+            l = match kind {
+                None => Expr::Pair {
+                    first: Box::new(l),
+                    second: Box::new(r),
+                },
+                Some(k) => Expr::Range {
+                    start: Box::new(l),
+                    end: Box::new(r),
+                    kind: k,
+                },
+            };
+        }
+        Ok(l)
+    }
+
+    /// The range operator `a..b`, binding tighter than the named infix functions
+    /// and looser than `+`/`-` — so `1..n-1` is `1..(n-1)`, matching Kotlin.
+    fn range_expr(&mut self) -> Result<Expr, String> {
+        let mut l = self.additive()?;
+        while self.at(&Tok::DotDot) {
+            self.bump();
+            let r = self.additive()?;
+            l = Expr::Range {
+                start: Box::new(l),
+                end: Box::new(r),
+                kind: RangeKind::Inclusive,
+            };
+        }
+        Ok(l)
     }
 
     fn additive(&mut self) -> Result<Expr, String> {
@@ -736,6 +852,16 @@ impl Parser {
                 Ok(Expr::Unary {
                     op: UnOp::Not,
                     expr: Box::new(self.unary()?),
+                })
+            }
+            // Prefix `++x` / `--x` — the value is the target AFTER the update.
+            Tok::PlusPlus | Tok::MinusMinus => {
+                let inc = matches!(self.peek(), Tok::PlusPlus);
+                self.bump();
+                Ok(Expr::IncDec {
+                    target: Box::new(self.unary()?),
+                    inc,
+                    prefix: true,
                 })
             }
             _ => self.postfix(),
@@ -817,6 +943,18 @@ impl Parser {
                     line,
                 };
             }
+        }
+        // Postfix `x++` / `x--` — the value is the target BEFORE the update.
+        // Parsed here rather than desugared at statement level so it works in
+        // expression position (`println(i++)`) as well as as a statement.
+        if matches!(self.peek(), Tok::PlusPlus | Tok::MinusMinus) {
+            let inc = matches!(self.peek(), Tok::PlusPlus);
+            self.bump();
+            e = Expr::IncDec {
+                target: Box::new(e),
+                inc,
+                prefix: false,
+            };
         }
         Ok(e)
     }

@@ -91,6 +91,34 @@ pub const KT_OBJEQ: u16 = 22;
 /// either: it branches on the *runtime* representation, so a `Double`-typed
 /// value still holding an `Int` would take the integer path and truncate.
 pub const KT_DDIV: u16 = 23;
+/// Build a range value. Stack: `[start, end]`; the `arg` payload is the
+/// [`RangeForm`] discriminant (`0` = `a..b`, `1` = `a until b`, `2` = `a downTo
+/// b`). Pushes the range's handle.
+pub const KT_RANGE: u16 = 24;
+/// `range step n` — re-step a range into an `IntProgression`. Stack:
+/// `[range, n]`; pushes a new handle. A non-positive `n` is an
+/// `IllegalArgumentException`, as in Kotlin.
+pub const KT_RANGE_STEP: u16 = 25;
+/// `value in container`. Stack: `[value, container]`; pushes a `Bool`.
+pub const KT_IN: u16 = 26;
+/// Element count of an iterable (range / `List` / array), for the general
+/// `for (v in iterable)` lowering. Stack: `[iterable]`; pushes an `Int`.
+pub const KT_ITER_SIZE: u16 = 27;
+/// Element `i` of an iterable, for the general `for` lowering. Stack:
+/// `[iterable, i]`; pushes the element. `i` is always in range — the loop
+/// bounds it with [`KT_ITER_SIZE`].
+pub const KT_ITER_GET: u16 = 28;
+/// Build an array from `arg` stack values `[v0 .. v{n-1}]`; pushes its handle.
+/// The JVM element descriptor (which drives the `[I@…` / `[Ljava.lang.Integer;@…`
+/// display form) is inferred from the values.
+pub const KT_ARRAY: u16 = 29;
+/// Allocate a zero-filled primitive array. Stack: `[n, descStr]` with the JVM
+/// descriptor (`"[I"`, `"[D"`, `"[Z"`) on top; pushes its handle.
+pub const KT_ARRAY_NEW: u16 = 30;
+/// Dispatch a `kotlin.math` / `java.lang.Math` function. The `arg` payload is
+/// the argument count. Stack: `[arg0 .. arg{n-1}, nameStr]` with the function
+/// name on top; pushes the result.
+pub const KT_MATH: u16 = 31;
 
 // ── Builtin ids (`Op::CallBuiltin`) ─────────────────────────────────────────
 //
@@ -160,6 +188,136 @@ enum HeapObj {
         params: u8,
         captures: Vec<Value>,
     },
+    /// An `IntRange` / `IntProgression`. See [`RangeObj`].
+    Range(RangeObj),
+    /// A JVM array. `desc` is its JVM type descriptor (`"[I"`,
+    /// `"[Ljava.lang.Integer;"`, …), which only exists to reproduce the
+    /// `toString` form — arrays inherit `Object.toString`, so Kotlin prints them
+    /// as `<descriptor>@<identity hash>`.
+    Array {
+        items: Vec<Value>,
+        desc: String,
+    },
+}
+
+/// Which syntactic form produced a range. This is not cosmetic: `a..b` and
+/// `a until b` build an `IntRange`, whose `toString` is `first..last`, while
+/// `a downTo b` and any `step` build an `IntProgression`, whose `toString` is
+/// `first..last step n` (or `first downTo last step n`). Reproducing Kotlin's
+/// printed form therefore needs the distinction kept at runtime.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RangeForm {
+    /// `a..b` — an `IntRange`.
+    Inclusive = 0,
+    /// `a until b` — an `IntRange` over `a..(b-1)`.
+    Until = 1,
+    /// `a downTo b` — an `IntProgression` with step `-1`.
+    DownTo = 2,
+}
+
+/// A range value: `first`, the *raw* endpoint `end` the source named, and the
+/// signed `step`. `progression` marks the `IntProgression` display form.
+///
+/// `end` is kept raw rather than normalized because the two Kotlin types differ
+/// in what they print: an `IntRange` prints the endpoint it was built with,
+/// while an `IntProgression` prints its last *reachable* element
+/// (`1..10 step 2` prints `1..9 step 2`). [`RangeObj::last`] derives the latter.
+#[derive(Clone, Copy)]
+struct RangeObj {
+    first: i64,
+    end: i64,
+    step: i64,
+    progression: bool,
+}
+
+impl RangeObj {
+    fn new(first: i64, end: i64, form: RangeForm) -> RangeObj {
+        match form {
+            RangeForm::Inclusive => RangeObj {
+                first,
+                end,
+                step: 1,
+                progression: false,
+            },
+            // `until` is exclusive: it builds the `IntRange` `first..(end-1)`.
+            // Kotlin guards the underflow by yielding an empty range instead of
+            // wrapping past `Int.MIN_VALUE`.
+            RangeForm::Until => RangeObj {
+                first,
+                end: end.wrapping_sub(1),
+                step: 1,
+                progression: false,
+            },
+            RangeForm::DownTo => RangeObj {
+                first,
+                end,
+                step: -1,
+                progression: true,
+            },
+        }
+    }
+
+    /// The last element the progression actually reaches — Kotlin's
+    /// `getProgressionLastElement`. An empty progression reports the raw
+    /// endpoint (which is what Kotlin prints for, e.g., `1..0 step 2`).
+    fn last(&self) -> i64 {
+        if self.step > 0 {
+            if self.first >= self.end {
+                self.end
+            } else {
+                self.end - difference_modulo(self.end, self.first, self.step)
+            }
+        } else if self.first <= self.end {
+            self.end
+        } else {
+            self.end + difference_modulo(self.first, self.end, -self.step)
+        }
+    }
+
+    /// How many elements the range yields (0 when empty).
+    fn count(&self) -> i64 {
+        let last = self.last();
+        if self.step > 0 {
+            if self.first > last {
+                0
+            } else {
+                (last - self.first) / self.step + 1
+            }
+        } else if self.first < last {
+            0
+        } else {
+            (self.first - last) / -self.step + 1
+        }
+    }
+
+    /// Element `i` (0-based), unchecked — callers bound `i` by [`RangeObj::count`].
+    fn at(&self, i: i64) -> i64 {
+        self.first + i * self.step
+    }
+
+    /// Membership: within the bounds AND on a step boundary. Kotlin's
+    /// `IntRange.contains` is a plain bounds test, and an `IntProgression`'s is
+    /// an iteration — both agree with this formulation.
+    fn contains(&self, v: i64) -> bool {
+        let last = self.last();
+        let (lo, hi) = if self.step > 0 {
+            (self.first, last)
+        } else {
+            (last, self.first)
+        };
+        v >= lo && v <= hi && (v - self.first) % self.step == 0
+    }
+
+    fn to_vec(self) -> Vec<Value> {
+        (0..self.count()).map(|i| Value::Int(self.at(i))).collect()
+    }
+}
+
+/// Kotlin's `differenceModulo(a, b, c)` — `(a mod c) - (b mod c)` reduced into
+/// `[0, c)`. Used to snap a progression's endpoint onto a step boundary.
+fn difference_modulo(a: i64, b: i64, c: i64) -> i64 {
+    let m = a.rem_euclid(c) - b.rem_euclid(c);
+    m.rem_euclid(c)
 }
 
 /// Clear the object heap. Called on every VM install so a fresh run starts with
@@ -418,6 +576,120 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
                 vm.push(v);
             }
         }
+        KT_RANGE => {
+            let end = vm.pop().to_int();
+            let start = vm.pop().to_int();
+            let form = match arg {
+                1 => RangeForm::Until,
+                2 => RangeForm::DownTo,
+                _ => RangeForm::Inclusive,
+            };
+            vm.push(alloc(HeapObj::Range(RangeObj::new(start, end, form))));
+        }
+        KT_RANGE_STEP => {
+            let n = vm.pop().to_int();
+            let recv = vm.pop();
+            let base = with_obj(&recv, |o| match o {
+                HeapObj::Range(r) => Some(*r),
+                _ => None,
+            })
+            .flatten();
+            match base {
+                // Kotlin rejects a non-positive step at runtime; the sign of the
+                // progression comes from the receiver, not from the argument.
+                _ if n <= 0 => {
+                    fault(
+                        vm,
+                        format!(
+                            "java.lang.IllegalArgumentException: Step must be positive, was: {n}."
+                        ),
+                    );
+                    vm.push(Value::Undef);
+                }
+                Some(r) => vm.push(alloc(HeapObj::Range(RangeObj {
+                    first: r.first,
+                    end: r.end,
+                    step: if r.step < 0 { -n } else { n },
+                    progression: true,
+                }))),
+                None => {
+                    fault(
+                        vm,
+                        format!("unresolved reference: step on {}", obj_label(&recv)),
+                    );
+                    vm.push(Value::Undef);
+                }
+            }
+        }
+        KT_IN => {
+            let container = vm.pop();
+            let value = vm.pop();
+            vm.push(Value::Bool(contains_value(&container, &value)));
+        }
+        KT_ITER_SIZE => {
+            let recv = vm.pop();
+            match iter_len(&recv) {
+                Some(n) => vm.push(Value::Int(n)),
+                None => {
+                    fault(
+                        vm,
+                        format!("for-in over a non-iterable value ({})", obj_label(&recv)),
+                    );
+                    vm.push(Value::Int(0));
+                }
+            }
+        }
+        KT_ITER_GET => {
+            let i = vm.pop().to_int();
+            let recv = vm.pop();
+            vm.push(iter_at(&recv, i));
+        }
+        KT_ARRAY => {
+            let n = arg as usize;
+            let mut items = Vec::with_capacity(n);
+            for _ in 0..n {
+                items.push(vm.pop());
+            }
+            items.reverse();
+            let desc = array_desc(&items);
+            vm.push(alloc(HeapObj::Array { items, desc }));
+        }
+        KT_ARRAY_NEW => {
+            let desc = vm.pop().to_str();
+            let n = vm.pop().to_int();
+            if n < 0 {
+                fault(vm, "java.lang.NegativeArraySizeException");
+                vm.push(Value::Undef);
+            } else {
+                // A primitive array is zero-filled: `0` for `[I`, `0.0` for `[D`,
+                // `false` for `[Z` — matching JVM default initialization.
+                let zero = match desc.as_str() {
+                    "[D" => Value::Float(0.0),
+                    "[Z" => Value::Bool(false),
+                    _ => Value::Int(0),
+                };
+                vm.push(alloc(HeapObj::Array {
+                    items: vec![zero; n as usize],
+                    desc,
+                }));
+            }
+        }
+        KT_MATH => {
+            let name = vm.pop().to_str();
+            let n = arg as usize;
+            let mut args = Vec::with_capacity(n);
+            for _ in 0..n {
+                args.push(vm.pop());
+            }
+            args.reverse();
+            match math_call(&name, &args) {
+                Ok(v) => vm.push(v),
+                Err(e) => {
+                    fault(vm, e);
+                    vm.push(Value::Undef);
+                }
+            }
+        }
         KT_DDIV => {
             let b = vm.pop();
             let a = vm.pop();
@@ -494,6 +766,113 @@ pub fn install_debug(vm: &mut VM) {
 
 fn is_int(v: &Value) -> bool {
     matches!(v, Value::Int(_))
+}
+
+// ── Ranges, arrays, iteration, and kotlin.math ──────────────────────────────
+
+/// `value in container` for every container kind `in` accepts: numeric
+/// membership in a range, element membership in a `List` or array, key
+/// membership in a `Map`, and substring containment in a `String`.
+fn contains_value(container: &Value, value: &Value) -> bool {
+    if let Value::Str(s) = container {
+        return s.contains(&kotlin_string(value));
+    }
+    with_obj(container, |o| match o {
+        HeapObj::Range(r) => r.contains(value.to_int()),
+        HeapObj::List(items) | HeapObj::Array { items, .. } => {
+            items.iter().any(|v| value_eq(v, value))
+        }
+        HeapObj::Map(entries) => entries.iter().any(|(k, _)| value_eq(k, value)),
+        _ => false,
+    })
+    .unwrap_or(false)
+}
+
+/// Element count of an iterable, or `None` when the value cannot be iterated —
+/// which the general `for (v in …)` lowering reports as a fault rather than
+/// silently looping zero times.
+fn iter_len(recv: &Value) -> Option<i64> {
+    with_obj(recv, |o| match o {
+        HeapObj::List(items) | HeapObj::Array { items, .. } => Some(items.len() as i64),
+        HeapObj::Range(r) => Some(r.count()),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// Element `i` of an iterable. Only called with an `i` the loop already bounded
+/// by [`iter_len`], so an out-of-range index can only mean the collection was
+/// mutated mid-loop; that yields `null` rather than faulting.
+fn iter_at(recv: &Value, i: i64) -> Value {
+    with_obj(recv, |o| match o {
+        HeapObj::List(items) | HeapObj::Array { items, .. } => {
+            usize::try_from(i).ok().and_then(|i| items.get(i).cloned())
+        }
+        HeapObj::Range(r) => Some(Value::Int(r.at(i))),
+        _ => None,
+    })
+    .flatten()
+    .unwrap_or(Value::Undef)
+}
+
+/// The JVM type descriptor an `arrayOf(...)` call would produce, inferred from
+/// the elements. `arrayOf` builds a boxed `Array<T>`, so the descriptor names
+/// the boxed class; a mixed or empty literal widens to `Object`. This exists
+/// only to reproduce the printed form (`[Ljava.lang.Integer;@1b6d3586`).
+fn array_desc(items: &[Value]) -> String {
+    let elem = match items.first() {
+        Some(Value::Int(_)) => "java.lang.Integer",
+        Some(Value::Float(_)) => "java.lang.Double",
+        Some(Value::Str(_)) => "java.lang.String",
+        Some(Value::Bool(_)) => "java.lang.Boolean",
+        _ => "java.lang.Object",
+    };
+    let uniform = items.iter().all(|v| {
+        matches!(
+            (v, elem),
+            (Value::Int(_), "java.lang.Integer")
+                | (Value::Float(_), "java.lang.Double")
+                | (Value::Str(_), "java.lang.String")
+                | (Value::Bool(_), "java.lang.Boolean")
+        )
+    });
+    if uniform {
+        format!("[L{elem};")
+    } else {
+        "[Ljava.lang.Object;".to_string()
+    }
+}
+
+/// The `kotlin.math` / `java.lang.Math` functions the compiler routes here.
+///
+/// Overload selection is by runtime value kind, mirroring Kotlin's static
+/// overload set: `abs`/`max`/`min` keep an `Int` result when every operand is
+/// integral and widen to `Double` otherwise, while `sqrt`/`floor`/`ceil`/`round`
+/// are `Double`-only.
+///
+/// `round` and `Math.round` deliberately differ, because they do in Kotlin:
+/// `kotlin.math.round` is IEEE round-half-to-even and returns a `Double`
+/// (`round(2.5) == 2.0`), whereas `java.lang.Math.round` is round-half-up and
+/// returns a `Long` (`Math.round(2.5) == 3`).
+fn math_call(name: &str, args: &[Value]) -> Result<Value, String> {
+    let a = args.first().cloned().unwrap_or(Value::Int(0));
+    let b = args.get(1).cloned().unwrap_or(Value::Int(0));
+    let both_int = is_int(&a) && args.get(1).map(is_int).unwrap_or(true);
+    match name {
+        "abs" if is_int(&a) => Ok(Value::Int(a.to_int().wrapping_abs())),
+        "abs" => Ok(Value::Float(a.to_float().abs())),
+        "max" if both_int => Ok(Value::Int(a.to_int().max(b.to_int()))),
+        "max" => Ok(Value::Float(a.to_float().max(b.to_float()))),
+        "min" if both_int => Ok(Value::Int(a.to_int().min(b.to_int()))),
+        "min" => Ok(Value::Float(a.to_float().min(b.to_float()))),
+        "sqrt" => Ok(Value::Float(a.to_float().sqrt())),
+        "floor" => Ok(Value::Float(a.to_float().floor())),
+        "ceil" => Ok(Value::Float(a.to_float().ceil())),
+        "round" => Ok(Value::Float(a.to_float().round_ties_even())),
+        // `Math.round(Double)` → `Long`, half-up (i.e. `floor(x + 0.5)`).
+        "jround" => Ok(Value::Int((a.to_float() + 0.5).floor() as i64)),
+        _ => Err(format!("unresolved reference: {name}")),
+    }
 }
 
 // ── First-class lambdas ─────────────────────────────────────────────────────
@@ -652,12 +1031,15 @@ fn b_scope_fn(vm: &mut VM, _argc: u8) -> Value {
     }
 }
 
-/// Snapshot a `List` receiver's elements (a clone taken under a shared borrow, so
-/// the borrow is released before any closure runs — a closure body may re-enter
-/// the heap). `Map`/`Pair` receivers aren't iterable by these methods here.
+/// Snapshot an iterable receiver's elements (a clone taken under a shared borrow,
+/// so the borrow is released before any closure runs — a closure body may
+/// re-enter the heap). Ranges materialize here, which is what makes
+/// `(1..3).map { … }` work. `Map`/`Pair` receivers aren't iterable by these
+/// methods here.
 fn list_snapshot(recv: &Value) -> Option<Vec<Value>> {
     with_obj(recv, |o| match o {
-        HeapObj::List(items) => Some(items.clone()),
+        HeapObj::List(items) | HeapObj::Array { items, .. } => Some(items.clone()),
+        HeapObj::Range(r) => Some(r.to_vec()),
         _ => None,
     })
     .flatten()
@@ -1016,29 +1398,32 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         _ => {}
     }
 
+    // Members shared by every ordered sequence — `List`, arrays, and ranges.
+    // Handled once here, on a snapshot taken before any allocation, so the three
+    // kinds can't drift apart member by member. A range is flagged because its
+    // `first`/`last` are *properties* of the progression (defined even when it is
+    // empty), where a list's are element accessors.
+    let kind = with_obj(recv, |o| match o {
+        HeapObj::List(_) => 1u8,
+        HeapObj::Array { .. } => 2,
+        HeapObj::Range(_) => 3,
+        _ => 0,
+    })
+    .unwrap_or(0);
+    if kind != 0 {
+        let range = with_obj(recv, |o| match o {
+            HeapObj::Range(r) => Some(*r),
+            _ => None,
+        })
+        .flatten();
+        let items = list_snapshot(recv).unwrap_or_default();
+        if let Some(v) = sequence_member(&items, range.map(|r| (r.first, r.last())), name, args) {
+            return v;
+        }
+    }
+
     // Read-only members.
     let res = with_obj(recv, |o| match (o, name) {
-        // ── List ──
-        (HeapObj::List(items), "size") => Some(Value::Int(items.len() as i64)),
-        (HeapObj::List(items), "isEmpty") => Some(Value::Bool(items.is_empty())),
-        (HeapObj::List(items), "isNotEmpty") => Some(Value::Bool(!items.is_empty())),
-        (HeapObj::List(items), "first") => items.first().cloned(),
-        (HeapObj::List(items), "last") => items.last().cloned(),
-        (HeapObj::List(items), "get") => {
-            let i = args.first().map(|v| v.to_int()).unwrap_or(0);
-            usize::try_from(i).ok().and_then(|i| items.get(i).cloned())
-        }
-        (HeapObj::List(items), "contains") => Some(Value::Bool(
-            args.first()
-                .is_some_and(|a| items.iter().any(|v| value_eq(v, a))),
-        )),
-        (HeapObj::List(items), "indexOf") => Some(Value::Int(
-            args.first()
-                .and_then(|a| items.iter().position(|v| value_eq(v, a)))
-                .map(|p| p as i64)
-                .unwrap_or(-1),
-        )),
-        (HeapObj::List(items), "sum") => Some(sum_values(items)),
         // ── Map ──
         (HeapObj::Map(entries), "size") => Some(Value::Int(entries.len() as i64)),
         (HeapObj::Map(entries), "isEmpty") => Some(Value::Bool(entries.is_empty())),
@@ -1074,18 +1459,116 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
     }
 }
 
+/// The read-only members every ordered sequence shares — `List`, arrays, and
+/// ranges. `range` carries `(first, last)` when the receiver is a range, whose
+/// `first`/`last` are progression *properties* (defined even for an empty range)
+/// rather than element accessors.
+///
+/// Returns `None` when `name` is not a sequence member at all, so the caller can
+/// keep looking (a `Map`/`Pair`/instance member, or the unresolved-reference
+/// diagnostic).
+fn sequence_member(
+    items: &[Value],
+    range: Option<(i64, i64)>,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    /// Kotlin throws on `first()`/`last()`/`max()`/`min()` over an empty
+    /// sequence rather than returning null.
+    fn need(v: Option<Value>) -> Result<Value, String> {
+        v.ok_or_else(|| "java.util.NoSuchElementException".to_string())
+    }
+    let v = match name {
+        "size" | "count" => Value::Int(items.len() as i64),
+        "isEmpty" => Value::Bool(items.is_empty()),
+        "isNotEmpty" => Value::Bool(!items.is_empty()),
+        "first" => match range {
+            Some((first, _)) => Value::Int(first),
+            None => return Some(need(items.first().cloned())),
+        },
+        "last" => match range {
+            Some((_, last)) => Value::Int(last),
+            None => return Some(need(items.last().cloned())),
+        },
+        "get" => {
+            let i = args.first().map(|v| v.to_int()).unwrap_or(0);
+            return Some(need(
+                usize::try_from(i).ok().and_then(|i| items.get(i).cloned()),
+            ));
+        }
+        "contains" => Value::Bool(
+            args.first()
+                .is_some_and(|a| items.iter().any(|v| value_eq(v, a))),
+        ),
+        "indexOf" => Value::Int(
+            args.first()
+                .and_then(|a| items.iter().position(|v| value_eq(v, a)))
+                .map(|p| p as i64)
+                .unwrap_or(-1),
+        ),
+        "sum" => sum_values(items),
+        // An empty average is NaN in Kotlin, not an error.
+        "average" => {
+            Value::Float(items.iter().map(|v| v.to_float()).sum::<f64>() / items.len() as f64)
+        }
+        "max" | "min" => {
+            let want_max = name == "max";
+            return Some(need(items.iter().cloned().reduce(|a, b| {
+                let take_b = (value_cmp(&b, &a) == std::cmp::Ordering::Greater) == want_max;
+                if take_b {
+                    b
+                } else {
+                    a
+                }
+            })));
+        }
+        "toList" | "toMutableList" | "toTypedArray" | "asList" => {
+            return Some(Ok(alloc(HeapObj::List(items.to_vec()))))
+        }
+        // `joinToString(separator)` — the separator defaults to `", "`.
+        "joinToString" => {
+            let sep = match args.first() {
+                Some(v) => kotlin_string(v),
+                None => ", ".to_string(),
+            };
+            Value::str(
+                items
+                    .iter()
+                    .map(kotlin_string)
+                    .collect::<Vec<_>>()
+                    .join(&sep),
+            )
+        }
+        "reversed" => {
+            // `IntRange.reversed()` is an `IntProgression` counting down; a
+            // list's is a plain reversed list.
+            return Some(Ok(match range {
+                Some((first, last)) => alloc(HeapObj::Range(RangeObj {
+                    first: last,
+                    end: first,
+                    step: -1,
+                    progression: true,
+                })),
+                None => alloc(HeapObj::List(items.iter().rev().cloned().collect())),
+            }));
+        }
+        _ => return None,
+    };
+    Some(Ok(v))
+}
+
 /// `componentN` for the ordered heap kinds (data-class field / list element /
 /// pair half) — 1-based, as Kotlin destructuring uses.
 fn component(recv: &Value, n: usize) -> Result<Value, String> {
     with_obj(recv, |o| match o {
         HeapObj::Instance { fields, .. } => fields.get(n - 1).map(|(_, v)| v.clone()),
-        HeapObj::List(items) => items.get(n - 1).cloned(),
+        HeapObj::List(items) | HeapObj::Array { items, .. } => items.get(n - 1).cloned(),
         HeapObj::Pair(a, b) => match n {
             1 => Some(a.clone()),
             2 => Some(b.clone()),
             _ => None,
         },
-        HeapObj::Map(_) | HeapObj::Closure { .. } => None,
+        HeapObj::Map(_) | HeapObj::Closure { .. } | HeapObj::Range(_) => None,
     })
     .flatten()
     .ok_or_else(|| format!("no component{n} on {}", obj_label(recv)))
@@ -1104,7 +1587,7 @@ fn sum_values(items: &[Value]) -> Value {
 /// `recv[index]` — list element (bounds-checked) or map value (null if absent).
 fn index_get(recv: &Value, index: &Value) -> Result<Value, String> {
     let out = with_obj(recv, |o| match o {
-        HeapObj::List(items) => {
+        HeapObj::List(items) | HeapObj::Array { items, .. } => {
             let i = index.to_int();
             if i < 0 || i as usize >= items.len() {
                 Err(format!(
@@ -1129,7 +1612,7 @@ fn index_get(recv: &Value, index: &Value) -> Result<Value, String> {
 /// `recv[index] = value` — list set (bounds-checked) or map put.
 fn index_set(recv: &Value, index: &Value, value: Value) -> Result<(), String> {
     let out = with_obj_mut(recv, |o| match o {
-        HeapObj::List(items) => {
+        HeapObj::List(items) | HeapObj::Array { items, .. } => {
             let i = index.to_int();
             if i < 0 || i as usize >= items.len() {
                 Err("java.lang.IndexOutOfBoundsException".to_string())
@@ -1163,6 +1646,12 @@ pub fn value_eq(a: &Value, b: &Value) -> bool {
             let (Value::Obj(ia), Value::Obj(ib)) = (a, b) else {
                 return false;
             };
+            // The same handle is the same object — this is what makes the
+            // identity equality an array inherits from `Object` come out `true`
+            // for `a == a` while `arrayOf(1) == arrayOf(1)` stays `false`.
+            if ia == ib {
+                return true;
+            }
             match (h.get(*ia as usize), h.get(*ib as usize)) {
                 (Some(oa), Some(ob)) => heap_eq(oa, ob),
                 _ => false,
@@ -1208,6 +1697,17 @@ fn heap_eq(a: &HeapObj, b: &HeapObj) -> bool {
                     .iter()
                     .all(|(k, v)| eb.iter().any(|(k2, v2)| value_eq(k, k2) && value_eq(v, v2)))
         }
+        // `IntRange`/`IntProgression` define structural `equals`; two empty
+        // ranges are equal regardless of their endpoints, as in Kotlin.
+        (HeapObj::Range(a), HeapObj::Range(b)) => {
+            let (ea, eb) = (a.count() == 0, b.count() == 0);
+            (ea && eb)
+                || (!ea && !eb && a.first == b.first && a.last() == b.last() && a.step == b.step)
+        }
+        // A JVM array inherits `Object.equals`, i.e. reference identity —
+        // `arrayOf(1) == arrayOf(1)` is `false`. Two handles reaching here are
+        // distinct objects by construction, so this is always false.
+        (HeapObj::Array { .. }, HeapObj::Array { .. }) => false,
         _ => false,
     }
 }
@@ -1226,10 +1726,15 @@ fn obj_hash(recv: &Value) -> i64 {
                     kotlin_string(v).hash(&mut h);
                 }
             }
-            HeapObj::List(items) => {
+            HeapObj::List(items) | HeapObj::Array { items, .. } => {
                 for v in items {
                     kotlin_string(v).hash(&mut h);
                 }
+            }
+            HeapObj::Range(r) => {
+                r.first.hash(&mut h);
+                r.last().hash(&mut h);
+                r.step.hash(&mut h);
             }
             HeapObj::Pair(a, b) => {
                 kotlin_string(a).hash(&mut h);
@@ -1256,6 +1761,13 @@ fn obj_label(recv: &Value) -> String {
         HeapObj::Map(_) => "Map".to_string(),
         HeapObj::Pair(_, _) => "Pair".to_string(),
         HeapObj::Closure { .. } => "Function".to_string(),
+        HeapObj::Range(r) => if r.progression {
+            "IntProgression"
+        } else {
+            "IntRange"
+        }
+        .to_string(),
+        HeapObj::Array { .. } => "Array".to_string(),
     })
     .unwrap_or_else(|| "value".to_string())
 }
@@ -1307,6 +1819,24 @@ fn display_obj(id: u32) -> String {
             // reproduce — a stable placeholder is enough (lambdas are rarely
             // printed, only invoked).
             HeapObj::Closure { params, .. } => format!("(lambda arity={params})"),
+            // `IntRange.toString` is `first..last`; `IntProgression.toString` is
+            // `first..last step n` ascending and `first downTo last step n`
+            // descending, where `last` is the last element actually reached
+            // (`1..10 step 2` prints `1..9 step 2`).
+            HeapObj::Range(r) => {
+                if !r.progression {
+                    format!("{}..{}", r.first, r.end)
+                } else if r.step > 0 {
+                    format!("{}..{} step {}", r.first, r.last(), r.step)
+                } else {
+                    format!("{} downTo {} step {}", r.first, r.last(), -r.step)
+                }
+            }
+            // An array inherits `Object.toString`: its JVM type descriptor and
+            // identity hash. The hash is the JVM's per-run object address, which
+            // no reimplementation can reproduce — the heap handle stands in, so
+            // the SHAPE matches (`[I@1b6d3586`) but the digits do not.
+            HeapObj::Array { desc, .. } => format!("{desc}@{id:x}"),
         }
     })
 }

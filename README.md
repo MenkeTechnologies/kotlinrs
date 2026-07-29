@@ -138,7 +138,27 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 - **Collections** — `listOf`/`mutableListOf` and `mapOf`/`mutableMapOf` (with
   `k to v` `Pair`s), indexing `xs[i]` / `m[k]` (and indexed assignment), `.size`,
   `.add`/`.get`/`.contains`/`.indexOf`/`.sum` on lists, `.containsKey`/`.keys`/
-  `.values`/`.put` on maps.
+  `.values`/`.put` on maps. `List`s, arrays, and ranges share one sequence-member
+  table: `.count()`, `.first()`/`.last()`, `.max()`/`.min()`, `.average()`,
+  `.toList()`, `.joinToString(sep)`, `.reversed()`.
+- **Ranges** — first-class values, not just `for` headers: `1..5`,
+  `1 until 5`, `5 downTo 1`, `… step n`, bound to names, printed
+  (`IntRange` shows `1..5`, `IntProgression` shows `1..9 step 2` — its last
+  *reachable* element), aggregated (`(1..3).sum()`), mapped/filtered, and
+  iterated. `x in r` / `x !in r` is step-aligned membership; `in` also works over
+  a `List`, a `Map`'s keys, and a `String`'s substrings.
+- **Arrays** — `arrayOf`/`intArrayOf`/`doubleArrayOf`/`booleanArrayOf` and the
+  zero-filled `IntArray(n)`/`DoubleArray(n)`/`BooleanArray(n)`, with `[i]` read
+  and write, `.size`, the shared sequence members, and `for (x in a)`. An array
+  keeps JVM semantics: `==` is reference identity (`arrayOf(1) == arrayOf(1)` is
+  `false`) and `toString()` is `[I@…`-style (the identity-hash digits are ours,
+  the shape is Kotlin's).
+- **Math** — `kotlin.math` `abs`/`max`/`min`/`sqrt`/`floor`/`ceil`/`round` and
+  `PI`/`E`, gated on `import kotlin.math.*` (or a single-name import, honouring
+  `as` renames) exactly as Kotlin gates them; the auto-imported `maxOf`/`minOf`;
+  and the `java.lang.Math` statics, which need no import. `round` and
+  `Math.round` differ as they do in Kotlin — half-to-even returning `Double`
+  versus half-up returning `Long`.
 - **First-class lambdas** — `{ it * 2 }`, `{ a, b -> a + b }`, function-type
   values (`val f: (Int) -> Int = …`) and parameters (`fun apply(f: (Int) -> Int, x: Int) = f(x)`);
   store, pass, return, and invoke (`f(3)`); trailing-lambda call syntax; captures
@@ -153,8 +173,11 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 - **Control flow** — `if`/`else` (statement **and** expression, incl.
   `else if`); `when` (statement **and** expression) in subject and subjectless
   forms, with literal, comma-grouped, `in`/`!in` range, `is`/`!is` type, and
-  `else` arms; `while`, and `for` over `a..b`, `a until b`, `a downTo b`, with
-  optional `step`; `break`/`continue`, including labeled `outer@ for (…)` with
+  `else` arms; `while`, and `for` — over a literal range (`a..b`, `a until b`,
+  `a downTo b`, with optional `step`), which lowers to a counted native-op loop,
+  or over any iterable value (a `List`, an array, a range held in a variable).
+  A loop body may be a block or a single statement;
+  `break`/`continue`, including labeled `outer@ for (…)` with
   `break@outer` / `continue@outer`. Blocks are lexically scoped: bindings
   declared in a nested block (and the `for` variable) drop at the block's end;
   shadowing is restored.
@@ -162,7 +185,13 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   (short-circuits to null), Elvis `?:`, and the not-null assertion `!!` (throws
   `NullPointerException` on null).
 - **Functions** — user calls, recursion, `return`, `Unit` functions.
+- **Increment / decrement** — `x++`, `x--`, `++x`, `--x` on a variable, a
+  property, or an indexed element, in statement **and** expression position
+  (`println(i++)` yields the pre-update value, `println(++i)` the post-update
+  one).
 - **Built-ins** — `println(...)` / `print(...)`.
+- **Imports** — `package` and `import` declarations, including `a.b.*` and
+  `a.b.c as d`, parsed and used for name resolution.
 - **Comments** — `//` and nested `/* … */`.
 
 Not yet (see roadmap): generics beyond parse-and-ignore, the `this`-receiver
@@ -230,11 +259,16 @@ Landed since M0: a host-side object heap backing classes, `data class`es,
 first-class lambda values (capture, store/pass/return/invoke, trailing-lambda
 syntax) as heap closures; the lambda-taking higher-order collection functions
 (`map`/`filter`/`forEach`/`fold`/`reduce`/`any`/`all`/`count`/`sumOf`/
-`maxByOrNull`/`sortedBy`/`associateWith`/`groupBy`); and the `it`-form scope
-functions (`let`/`also`/`takeIf`).
+`maxByOrNull`/`sortedBy`/`associateWith`/`groupBy`); the `it`-form scope
+functions (`let`/`also`/`takeIf`); ranges as values (`1..5`, `until`, `downTo`,
+`step`, `in`/`!in`) with the `IntRange`/`IntProgression` display split; arrays
+(`arrayOf`, `IntArray(n)`, indexing, `.size`) with JVM reference equality;
+`kotlin.math`/`java.lang.Math` under Kotlin's own import rules; and `++`/`--` in
+expression position.
 
 Next: generics, `Set`, the `this`-receiver scope functions (`apply`/`run`),
 lambda element-type inference, interfaces/inheritance, named/default arguments,
+the array lambda-initializer form (`IntArray(n) { it * 2 }`), `String` iteration,
 and a growing standard-library surface — alongside the sibling parity tooling
 (LSP/DAP,
 reference generator, differential harness).

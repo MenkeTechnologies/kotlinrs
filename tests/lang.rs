@@ -1036,3 +1036,206 @@ fn scope_function_take_if() {
     assert_eq!(stdout("println(10.takeIf { it > 5 })"), "10\n");
     assert_eq!(stdout("println(3.takeIf { it > 5 })"), "null\n");
 }
+
+// ── Ranges ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn range_tostring_distinguishes_intrange_from_intprogression() {
+    // The two Kotlin range types print differently: an `IntRange` shows its
+    // endpoints, an `IntProgression` shows its step AND its last *reachable*
+    // element (`1..10 step 3` reaches 10, `1..10 step 2` stops at 9).
+    assert_eq!(stdout("println(1..5)"), "1..5\n");
+    assert_eq!(stdout("println(1 until 5)"), "1..4\n");
+    assert_eq!(stdout("println(5 downTo 1)"), "5 downTo 1 step 1\n");
+    assert_eq!(stdout("println(1..10 step 2)"), "1..9 step 2\n");
+    assert_eq!(stdout("println(1..10 step 3)"), "1..10 step 3\n");
+    assert_eq!(
+        stdout("println(10 downTo 1 step 3)"),
+        "10 downTo 1 step 3\n"
+    );
+    assert_eq!(stdout("println(1..0)"), "1..0\n"); // empty ranges still print
+}
+
+#[test]
+fn range_aggregates_and_membership() {
+    assert_eq!(stdout("println((1..3).sum())"), "6\n");
+    assert_eq!(stdout("println((1 until 5).sum())"), "10\n");
+    assert_eq!(stdout("println((5 downTo 1).sum())"), "15\n");
+    assert_eq!(stdout("println((1..5 step 2).sum())"), "9\n");
+    assert_eq!(stdout("println((1..0).sum())"), "0\n");
+    assert_eq!(stdout("println((1..5).count())"), "5\n");
+    assert_eq!(stdout("println((1..4).toList())"), "[1, 2, 3, 4]\n");
+    assert_eq!(stdout("println((1..3).map { it * 2 })"), "[2, 4, 6]\n");
+    // Membership on a progression is step-aligned, not just a bounds test.
+    assert_eq!(stdout("println(3 in 1..5)"), "true\n");
+    assert_eq!(stdout("println(7 !in 1..5)"), "true\n");
+    assert_eq!(stdout("println(4 in (1..10 step 2))"), "false\n");
+    assert_eq!(stdout("println(3 in (1..10 step 2))"), "true\n");
+}
+
+#[test]
+fn range_is_a_value_usable_in_a_for_header() {
+    // A range bound to a name still drives a `for`, through the general
+    // iterate-a-value lowering rather than the counted one.
+    let src = "\
+fun main() {
+    val r = 1..3
+    var s = 0
+    for (i in r) s += i
+    println(s)
+    println(r.first + r.last)
+}";
+    assert_eq!(prog(src), "6\n4\n");
+}
+
+#[test]
+fn range_precedence_matches_kotlin() {
+    // `..` binds tighter than `step`, looser than `+`/`-`, and `in` is looser
+    // than both — so none of these needs parentheses.
+    assert_eq!(stdout("val n = 4\nprintln(1..n-1)"), "1..3\n");
+    assert_eq!(stdout("println(1..2+3 step 2)"), "1..5 step 2\n");
+    assert_eq!(stdout("println(2 in 1..3 == true)"), "true\n");
+}
+
+// ── Arrays ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn array_indexing_size_and_mutation() {
+    let src = "\
+fun main() {
+    val a = arrayOf(1, 2, 3)
+    println(a.size)
+    println(a[1])
+    a[1] = 9
+    println(a[1])
+    println(a.sum())
+    println(a.joinToString())
+    println(a.joinToString(\"-\"))
+    println(a.toList())
+    println(9 in a)
+}";
+    assert_eq!(prog(src), "3\n2\n9\n13\n1, 9, 3\n1-9-3\n[1, 9, 3]\ntrue\n");
+}
+
+#[test]
+fn primitive_arrays_are_zero_filled() {
+    let src = "\
+fun main() {
+    val a = IntArray(3)
+    println(a.size)
+    println(a.sum())
+    a[0] = 5
+    println(a.joinToString())
+    println(DoubleArray(2).joinToString())
+    println(BooleanArray(2).joinToString())
+}";
+    assert_eq!(prog(src), "3\n0\n5, 0, 0\n0.0, 0.0\nfalse, false\n");
+}
+
+#[test]
+fn array_iteration_and_reference_equality() {
+    // An array inherits `Object.equals`, so equal contents are NOT equal —
+    // unlike a `List`, which compares structurally.
+    let src = "\
+fun main() {
+    var t = 0
+    for (x in intArrayOf(1, 2, 3)) t += x
+    println(t)
+    println(arrayOf(1) == arrayOf(1))
+    println(listOf(1) == listOf(1))
+}";
+    assert_eq!(prog(src), "6\nfalse\ntrue\n");
+}
+
+// ── kotlin.math / java.lang.Math ────────────────────────────────────────────
+
+#[test]
+fn math_functions_need_the_kotlin_math_import() {
+    // Kotlin does not auto-import `kotlin.math`, so a bare `abs` without the
+    // import is an unresolved reference — the same diagnostic kotlinc gives.
+    let err = prog_err("fun main() { println(abs(-3)) }");
+    assert!(
+        err.contains("unresolved reference: abs"),
+        "stderr was: {err}"
+    );
+    // A single-name import brings in only that name.
+    let err = prog_err("import kotlin.math.sqrt\nfun main() { println(abs(-3)) }");
+    assert!(
+        err.contains("unresolved reference: abs"),
+        "stderr was: {err}"
+    );
+    // …and `as` renames it, so the original spelling is gone.
+    let err = prog_err("import kotlin.math.abs as absolute\nfun main() { println(abs(-3)) }");
+    assert!(
+        err.contains("unresolved reference: abs"),
+        "stderr was: {err}"
+    );
+}
+
+#[test]
+fn math_functions_keep_their_int_and_double_overloads() {
+    let src = "\
+import kotlin.math.*
+fun main() {
+    println(abs(-3))
+    println(abs(-3.5))
+    println(max(2, 9))
+    println(min(-2.5, 9.5))
+    println(sqrt(9.0))
+    println(maxOf(2, 9))
+    println(abs(-7) / 2)
+    println(PI)
+}";
+    assert_eq!(prog(src), "3\n3.5\n9\n-2.5\n3.0\n9\n3\n3.141592653589793\n");
+}
+
+#[test]
+fn kotlin_round_and_java_math_round_differ() {
+    // `kotlin.math.round` is half-to-even and yields a `Double`;
+    // `java.lang.Math.round` is half-up and yields a `Long`. `java.lang` is
+    // auto-imported, so `Math.abs` needs no import line.
+    let src = "\
+import kotlin.math.*
+fun main() {
+    println(round(2.5))
+    println(round(3.5))
+    println(Math.round(2.5))
+    println(Math.round(-2.5))
+    println(floor(2.7))
+    println(ceil(2.1))
+}";
+    assert_eq!(prog(src), "2.0\n4.0\n3\n-2\n2.0\n3.0\n");
+    assert_eq!(stdout("println(Math.abs(-3))"), "3\n");
+}
+
+// ── ++ / -- in expression position ──────────────────────────────────────────
+
+#[test]
+fn increment_yields_the_pre_or_post_update_value() {
+    // Postfix yields the value from before the update, prefix the one after.
+    assert_eq!(stdout("var i = 0\nprintln(i++)\nprintln(i)"), "0\n1\n");
+    assert_eq!(stdout("var i = 0\nprintln(++i)\nprintln(i)"), "1\n1\n");
+    assert_eq!(stdout("var i = 0\nprintln(i--)\nprintln(i)"), "0\n-1\n");
+    assert_eq!(stdout("var i = 0\nprintln(--i)"), "-1\n");
+    // Both operands are read before either update lands.
+    assert_eq!(
+        stdout("var j = 5\nprintln(j++ + j++)\nprintln(j)"),
+        "11\n7\n"
+    );
+}
+
+#[test]
+fn increment_works_on_elements_and_keeps_the_val_check() {
+    let src = "\
+fun main() {
+    val a = intArrayOf(1, 2)
+    println(a[0]++)
+    println(a.joinToString())
+}";
+    assert_eq!(prog(src), "1\n2, 2\n");
+    let err = prog_err("fun main() { val n = 1; n++ }");
+    assert!(
+        err.contains("val cannot be reassigned"),
+        "stderr was: {err}"
+    );
+}

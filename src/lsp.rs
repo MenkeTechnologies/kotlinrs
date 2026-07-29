@@ -76,8 +76,8 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
     (
         "in",
         "Keyword",
-        "the `for (x in range)` separator",
-        "for (c in 0 until 3) println(c)",
+        "the `for (x in iterable)` separator, and the membership operator",
+        "for (c in 0 until 3) println(c)\nprintln(2 in 1..3)   // true",
     ),
     (
         "return",
@@ -90,6 +90,12 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "Keyword",
         "half-open ascending range: `a until b` excludes b",
         "for (i in 0 until 3) println(i)   // 0 1 2",
+    ),
+    (
+        "..",
+        "Keyword",
+        "inclusive range: `a..b` builds an IntRange value",
+        "val r = 1..5\nprintln(r.sum())   // 15",
     ),
     (
         "downTo",
@@ -206,6 +212,60 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "Builtin",
         "write a value to stdout with no trailing newline",
         "print(\"a\"); print(\"b\")   // ab",
+    ),
+    (
+        "listOf",
+        "Builtin",
+        "build a read-only List; `mutableListOf` builds a mutable one",
+        "val xs = listOf(1, 2, 3)\nprintln(xs.size)   // 3",
+    ),
+    (
+        "mapOf",
+        "Builtin",
+        "build a Map from `k to v` pairs; `mutableMapOf` builds a mutable one",
+        "val m = mapOf(\"a\" to 1)\nprintln(m[\"a\"])   // 1",
+    ),
+    (
+        "arrayOf",
+        "Builtin",
+        "build an array; `intArrayOf`/`doubleArrayOf`/`booleanArrayOf` are typed",
+        "val a = arrayOf(1, 2, 3)\nprintln(a[1])   // 2",
+    ),
+    (
+        "IntArray",
+        "Builtin",
+        "a zero-filled primitive array; also `DoubleArray`/`BooleanArray`",
+        "val a = IntArray(3)\nprintln(a.sum())   // 0",
+    ),
+    (
+        "abs",
+        "Builtin",
+        "absolute value (kotlin.math; needs `import kotlin.math.*`)",
+        "import kotlin.math.*\nprintln(abs(-3))   // 3",
+    ),
+    (
+        "sqrt",
+        "Builtin",
+        "square root of a Double (kotlin.math; needs the import)",
+        "import kotlin.math.*\nprintln(sqrt(9.0))   // 3.0",
+    ),
+    (
+        "max",
+        "Builtin",
+        "larger of two values (kotlin.math); `maxOf` needs no import",
+        "println(maxOf(2, 9))   // 9",
+    ),
+    (
+        "min",
+        "Builtin",
+        "smaller of two values (kotlin.math); `minOf` needs no import",
+        "println(minOf(2, 9))   // 2",
+    ),
+    (
+        "Math",
+        "Builtin",
+        "the java.lang.Math statics, auto-imported (abs/max/min/sqrt/round/…)",
+        "println(Math.abs(-3))   // 3",
     ),
 ];
 

@@ -21,9 +21,10 @@
 
 use crate::ast::*;
 use crate::host::{
-    KT_CHR_STRING, KT_CLOSURE_CALL, KT_COLL_HOF, KT_DBG_LINE, KT_FFI_CALL, KT_FFI_COMPILE,
-    KT_DDIV, KT_GETFIELD, KT_IDIV, KT_IMOD, KT_INDEX_GET, KT_INDEX_SET, KT_IS, KT_ISNULL, KT_LIST,
-    KT_MAKE_CLOSURE, KT_MAP, KT_METHOD, KT_NEW, KT_NOTNULL, KT_OBJEQ, KT_PAIR, KT_SCOPE_FN,
+    KT_ARRAY, KT_ARRAY_NEW, KT_CHR_STRING, KT_CLOSURE_CALL, KT_COLL_HOF, KT_DBG_LINE, KT_DDIV,
+    KT_FFI_CALL, KT_FFI_COMPILE, KT_GETFIELD, KT_IDIV, KT_IMOD, KT_IN, KT_INDEX_GET, KT_INDEX_SET,
+    KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_LIST, KT_MAKE_CLOSURE, KT_MAP, KT_MATH,
+    KT_METHOD, KT_NEW, KT_NOTNULL, KT_OBJEQ, KT_PAIR, KT_RANGE, KT_RANGE_STEP, KT_SCOPE_FN,
     KT_SETFIELD, KT_TO_STRING,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
@@ -236,6 +237,31 @@ pub struct Compiler {
     pending_lambdas: Vec<PendingLambda>,
     /// Monotonic id for synthetic lambda sub names (`$lambda$0`, `$lambda$1`, …).
     lambdas_seen: u32,
+    /// The `kotlin.math` names the program's imports brought into scope, as
+    /// *visible spelling* → *runtime name*. Kotlin does NOT auto-import
+    /// `kotlin.math`, so `abs`/`sqrt`/`PI` are compile errors without an import,
+    /// a single-name import brings in only that name, and `as` renames it — all
+    /// three are reproduced by resolving through this table.
+    /// (`java.lang.Math` is auto-imported, so `Math.abs` never needs an entry.)
+    math_scope: HashMap<String, String>,
+    /// Set by `import kotlin.math.*`, which puts every math name in scope.
+    math_star: bool,
+}
+
+/// Build the visible-name → runtime-name table for the `kotlin.math` imports.
+fn math_scope(imports: &[ImportDecl]) -> (HashMap<String, String>, bool) {
+    let mut scope = HashMap::new();
+    let mut star = false;
+    for imp in imports.iter().filter(|i| i.package() == "kotlin.math") {
+        let name = imp.tail();
+        if name == "*" {
+            star = true;
+        } else if is_math_fn(name) || is_math_const(name) {
+            let visible = imp.alias.clone().unwrap_or_else(|| name.to_string());
+            scope.insert(visible, name.to_string());
+        }
+    }
+    (scope, star)
 }
 
 /// A lambda body queued for emission as a subroutine. `params` already has the
@@ -364,7 +390,10 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
         loops: Vec::new(),
         pending_lambdas: Vec::new(),
         lambdas_seen: 0,
+        math_scope: HashMap::new(),
+        math_star: false,
     };
+    (c.math_scope, c.math_star) = math_scope(&program.imports);
 
     // Preamble: build `object` singletons into globals, then bind main's args
     // (an empty Array per declared parameter — the program-args wiring is an M0
@@ -598,6 +627,14 @@ impl Compiler {
             } => {
                 self.compile_for(sc, var, start, end, *kind, step, body, label)?;
             }
+            StmtKind::ForIn {
+                var,
+                iter,
+                body,
+                label,
+            } => {
+                self.compile_for_in(sc, var, iter, body, label)?;
+            }
             StmtKind::Break(label) => {
                 let j = self.b.emit(Op::Jump(0), 0);
                 self.loop_for_label(label, s.line)?.breaks.push(j);
@@ -732,6 +769,72 @@ impl Compiler {
         Ok(())
     }
 
+    /// `for (v in iterable)` over a value — a `List`, an array, or a range held
+    /// in a variable. The iterable is evaluated ONCE into a slot (Kotlin
+    /// evaluates the header expression once), its length read once, and the loop
+    /// then walks indices with native ops, fetching each element through
+    /// `KT_ITER_GET`. Counted ranges never reach here; the parser routes those to
+    /// [`Compiler::compile_for`], which needs no host call per iteration.
+    fn compile_for_in(
+        &mut self,
+        sc: &mut Scope,
+        var: &str,
+        iter: &Expr,
+        body: &[Stmt],
+        label: &Option<String>,
+    ) -> Result<(), String> {
+        let mark = sc.enter();
+        // The iterable and the loop's index/length temporaries.
+        let cslot = sc.temp();
+        self.compile_expr(sc, iter)?;
+        self.b.emit(Op::SetSlot(cslot), 0);
+        let nslot = sc.temp();
+        self.b.emit(Op::GetSlot(cslot), 0);
+        self.b.emit(Op::Extended(KT_ITER_SIZE, 0), 0);
+        self.b.emit(Op::SetSlot(nslot), 0);
+        let islot = sc.temp();
+        self.b.emit(Op::LoadInt(0), 0);
+        self.b.emit(Op::SetSlot(islot), 0);
+        // The element binding is a `val` (Kotlin's `for` variable is read-only).
+        let vslot = sc.declare(var, Type::Unknown, false);
+
+        let top = self.b.current_pos();
+        self.b.emit(Op::GetSlot(islot), 0);
+        self.b.emit(Op::GetSlot(nslot), 0);
+        self.b.emit(Op::NumLt, 0);
+        let jf = self.b.emit(Op::JumpIfFalse(0), 0);
+        self.b.emit(Op::GetSlot(cslot), 0);
+        self.b.emit(Op::GetSlot(islot), 0);
+        self.b.emit(Op::Extended(KT_ITER_GET, 0), 0);
+        self.b.emit(Op::SetSlot(vslot), 0);
+
+        self.loops.push(LoopCtx {
+            label: label.clone(),
+            breaks: Vec::new(),
+            continues: Vec::new(),
+        });
+        for s in body {
+            self.compile_stmt(sc, s)?;
+        }
+        let ctx = self.loops.pop().unwrap();
+        let cont_target = self.b.current_pos();
+        for j in &ctx.continues {
+            self.b.patch_jump(*j, cont_target);
+        }
+        self.b.emit(Op::GetSlot(islot), 0);
+        self.b.emit(Op::LoadInt(1), 0);
+        self.b.emit(Op::Add, 0);
+        self.b.emit(Op::SetSlot(islot), 0);
+        self.b.emit(Op::Jump(top), 0);
+        let done = self.b.current_pos();
+        self.b.patch_jump(jf, done);
+        for j in &ctx.breaks {
+            self.b.patch_jump(*j, done);
+        }
+        sc.exit(mark);
+        Ok(())
+    }
+
     // ── Expressions (leave exactly one value) ──────────────────────
 
     fn compile_expr(&mut self, sc: &mut Scope, e: &Expr) -> Result<Type, String> {
@@ -793,6 +896,10 @@ impl Compiler {
                     self.b.emit(Op::GetVar(g), 0);
                     return Ok(Type::Obj);
                 }
+                // `kotlin.math.PI` / `.E`, in scope only under the import.
+                if let Some(rt) = self.resolve_math_const(name) {
+                    return self.compile_math_const(&rt, 0);
+                }
                 Err(format!("unresolved reference: {name}"))
             }
             Expr::Unary { op, expr } => {
@@ -845,10 +952,108 @@ impl Compiler {
                 self.b.emit(Op::Extended(KT_PAIR, 0), 0);
                 Ok(Type::Obj)
             }
+            Expr::Range { start, end, kind } => {
+                self.compile_expr(sc, start)?;
+                self.compile_expr(sc, end)?;
+                self.b.emit(Op::Extended(KT_RANGE, range_form(*kind)), 0);
+                Ok(Type::Obj)
+            }
+            Expr::Step { recv, by } => {
+                self.compile_expr(sc, recv)?;
+                self.compile_expr(sc, by)?;
+                self.b.emit(Op::Extended(KT_RANGE_STEP, 0), 0);
+                Ok(Type::Obj)
+            }
+            Expr::In {
+                value,
+                container,
+                negated,
+            } => {
+                self.compile_expr(sc, value)?;
+                self.compile_expr(sc, container)?;
+                self.b.emit(Op::Extended(KT_IN, 0), 0);
+                if *negated {
+                    self.b.emit(Op::LogNot, 0);
+                }
+                Ok(Type::Boolean)
+            }
+            Expr::IncDec {
+                target,
+                inc,
+                prefix,
+            } => self.compile_incdec(sc, target, *inc, *prefix),
             Expr::Lambda { params, body } => self.compile_lambda(sc, params, body),
             Expr::If(ie) => self.compile_if(sc, ie),
             Expr::When(w) => self.compile_when(sc, w),
         }
+    }
+
+    /// `x++` / `x--` / `++x` / `--x` in either statement or expression position.
+    ///
+    /// The update reuses the ordinary assignment lowering, so the increment
+    /// covers a variable, a property, and an indexed element identically — and,
+    /// as with `x += 1`, a non-variable target has its receiver evaluated twice.
+    /// The distinction between the two forms is only WHICH value is left on the
+    /// stack: a postfix increment saves the pre-update value into a temp and
+    /// pushes that afterwards, a prefix one re-reads the target.
+    fn compile_incdec(
+        &mut self,
+        sc: &mut Scope,
+        target: &Expr,
+        inc: bool,
+        prefix: bool,
+    ) -> Result<Type, String> {
+        let ty = self.infer(sc, target);
+        let op = if inc { BinOp::Add } else { BinOp::Sub };
+        let mark = sc.enter();
+        // Postfix yields the value from BEFORE the update, so capture it first.
+        let saved = if prefix {
+            None
+        } else {
+            self.compile_expr(sc, target)?;
+            let slot = sc.temp();
+            self.b.emit(Op::SetSlot(slot), 0);
+            Some(slot)
+        };
+        let update = match target {
+            Expr::Var(name) => StmtKind::Assign {
+                name: name.clone(),
+                op: Some(op),
+                value: Expr::Int(1),
+            },
+            Expr::Member {
+                recv,
+                name,
+                safe: false,
+                ..
+            } => StmtKind::SetMember {
+                recv: (**recv).clone(),
+                name: name.clone(),
+                op: Some(op),
+                value: Expr::Int(1),
+            },
+            Expr::Index { recv, index, .. } => StmtKind::SetIndex {
+                recv: (**recv).clone(),
+                index: (**index).clone(),
+                op: Some(op),
+                value: Expr::Int(1),
+            },
+            _ => {
+                return Err("the operand of ++/-- must be a variable, property, or element".into())
+            }
+        };
+        self.compile_stmt(sc, &Stmt::new(0, update))?;
+        match saved {
+            Some(slot) => {
+                self.b.emit(Op::GetSlot(slot), 0);
+            }
+            // Prefix: the value is the target AFTER the update, so re-read it.
+            None => {
+                self.compile_expr(sc, target)?;
+            }
+        }
+        sc.exit(mark);
+        Ok(ty)
     }
 
     /// Emit the ops that turn the top-of-stack value of static type `t` into its
@@ -906,6 +1111,18 @@ impl Compiler {
         // dispatch the member on the non-null path.
         if safe {
             return self.compile_safe_member(sc, recv, name, args, line);
+        }
+        // `java.lang.Math` statics. Kotlin auto-imports `java.lang.*` on the JVM,
+        // so `Math.abs(-3)` compiles with no import — unlike the `kotlin.math`
+        // top-level spellings. `Math.round` is NOT `kotlin.math.round`: it is
+        // half-up and returns a `Long`, so it dispatches under its own name.
+        if self.is_java_math(sc, recv) {
+            match name {
+                "PI" | "E" => return self.compile_math_const(name, line),
+                "round" => return self.compile_math(sc, "jround", args, line),
+                _ if is_math_fn(name) => return self.compile_math(sc, name, args, line),
+                _ => return Err(format!("unresolved reference: Math.{name}")),
+            }
         }
         // `Char.toString()` must render the character, not its code. The runtime
         // value is an `Int`, so the host's generic `toString` can't tell it is a
@@ -1516,6 +1733,45 @@ impl Compiler {
                 self.b.emit(Op::Extended(KT_LIST, args.len() as u8), line);
                 Ok(Type::Obj)
             }
+            // Array builders → a heap array. The element values decide the JVM
+            // descriptor at runtime (see `crate::host::array_desc`), so the
+            // typed builders differ from `arrayOf` only in the primitive case.
+            "arrayOf" | "intArrayOf" | "doubleArrayOf" | "booleanArrayOf" | "charArrayOf" => {
+                for a in args {
+                    self.compile_expr(sc, a)?;
+                }
+                self.b.emit(Op::Extended(KT_ARRAY, args.len() as u8), line);
+                Ok(Type::Obj)
+            }
+            // `IntArray(n)` / `DoubleArray(n)` / `BooleanArray(n)` — a zero-filled
+            // primitive array. The lambda-initializer form `IntArray(n) { … }` is
+            // not supported; it arrives here with two arguments and is rejected
+            // rather than silently dropping the initializer.
+            "IntArray" | "DoubleArray" | "BooleanArray" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{name} takes a single size argument (the `{name}(n) {{ … }}` \
+                         initializer form is not supported)"
+                    ));
+                }
+                self.compile_expr(sc, &args[0])?;
+                let desc = match name {
+                    "DoubleArray" => "[D",
+                    "BooleanArray" => "[Z",
+                    _ => "[I",
+                };
+                let didx = self.b.add_constant(Value::str(desc));
+                self.b.emit(Op::LoadConst(didx), line);
+                self.b.emit(Op::Extended(KT_ARRAY_NEW, 0), line);
+                Ok(Type::Obj)
+            }
+            // `kotlin.math` — resolvable only under `import kotlin.math.…`, which
+            // is what Kotlin itself requires. `maxOf`/`minOf` live in the
+            // auto-imported `kotlin` package and need no import.
+            _ if self.resolve_math_fn(name).is_some() => {
+                let rt = self.resolve_math_fn(name).unwrap();
+                self.compile_math(sc, &rt, args, line)
+            }
             "mapOf" | "mutableMapOf" | "hashMapOf" | "emptyMap" => {
                 // Each argument is a `k to v` Pair.
                 for a in args {
@@ -1579,6 +1835,75 @@ impl Compiler {
                 Err(format!("unresolved reference: {name}"))
             }
         }
+    }
+
+    /// Resolve a bare name to the math function it dispatches to, honouring the
+    /// import rules: an auto-imported `kotlin` name always resolves, a star
+    /// import opens every `kotlin.math` function, and a single-name import opens
+    /// exactly the name (or alias) it declared.
+    fn resolve_math_fn(&self, name: &str) -> Option<String> {
+        if let Some(rt) = auto_math_fn(name) {
+            return Some(rt.to_string());
+        }
+        if self.math_star && is_math_fn(name) {
+            return Some(name.to_string());
+        }
+        self.math_scope
+            .get(name)
+            .filter(|rt| is_math_fn(rt))
+            .cloned()
+    }
+
+    /// As [`Compiler::resolve_math_fn`], for the `kotlin.math` constants.
+    fn resolve_math_const(&self, name: &str) -> Option<String> {
+        if self.math_star && is_math_const(name) {
+            return Some(name.to_string());
+        }
+        self.math_scope
+            .get(name)
+            .filter(|rt| is_math_const(rt))
+            .cloned()
+    }
+
+    /// Whether `recv` is the `java.lang.Math` class reference rather than a
+    /// value. A local binding or a user class named `Math` shadows it, so the
+    /// name is only treated as the JVM class when nothing else claims it.
+    fn is_java_math(&self, sc: &Scope, recv: &Expr) -> bool {
+        matches!(recv, Expr::Var(n) if n == "Math")
+            && sc.slot("Math").is_none()
+            && !self.classes.contains_key("Math")
+    }
+
+    /// `Math.PI` / `kotlin.math.PI` — a literal `Double` constant, so it folds at
+    /// compile time rather than paying a host dispatch.
+    fn compile_math_const(&mut self, name: &str, line: u32) -> Result<Type, String> {
+        let v = if name == "PI" {
+            std::f64::consts::PI
+        } else {
+            std::f64::consts::E
+        };
+        self.b.emit(Op::LoadFloat(v), line);
+        Ok(Type::Double)
+    }
+
+    /// Lower a math call to the `KT_MATH` host dispatch: arguments deepest-first,
+    /// then the runtime function name, with the argument count in the extension
+    /// payload — the same shape `KT_METHOD` uses.
+    fn compile_math(
+        &mut self,
+        sc: &mut Scope,
+        name: &str,
+        args: &[Expr],
+        line: u32,
+    ) -> Result<Type, String> {
+        let mut tys = Vec::with_capacity(args.len());
+        for a in args {
+            tys.push(self.compile_expr(sc, a)?);
+        }
+        let nidx = self.b.add_constant(Value::str(name.to_string()));
+        self.b.emit(Op::LoadConst(nidx), line);
+        self.b.emit(Op::Extended(KT_MATH, args.len() as u8), line);
+        Ok(math_ret_type(name, &tys))
     }
 
     /// Lower a constructor call `Class(args)`: push the class metadata string,
@@ -1817,7 +2142,13 @@ impl Compiler {
             Expr::Char(_) => Type::Char,
             Expr::Null => Type::Unknown,
             Expr::Str(_) => Type::String,
-            Expr::Var(n) => sc.ty(n),
+            Expr::Var(n) => {
+                if sc.slot(n).is_none() && self.resolve_math_const(n).is_some() {
+                    Type::Double
+                } else {
+                    sc.ty(n)
+                }
+            }
             Expr::Unary { op, expr } => match op {
                 UnOp::Not => Type::Boolean,
                 UnOp::Neg => {
@@ -1871,11 +2202,19 @@ impl Compiler {
                     }
                 }
             },
-            Expr::Call { name, .. } => match name.as_str() {
+            Expr::Call { name, args, .. } => match name.as_str() {
                 "println" | "print" => Type::Unit,
                 "listOf" | "mutableListOf" | "arrayListOf" | "emptyList" | "mapOf"
-                | "mutableMapOf" | "hashMapOf" | "emptyMap" => Type::Obj,
+                | "mutableMapOf" | "hashMapOf" | "emptyMap" | "arrayOf" | "intArrayOf"
+                | "doubleArrayOf" | "booleanArrayOf" | "charArrayOf" | "IntArray"
+                | "DoubleArray" | "BooleanArray" => Type::Obj,
                 _ if self.classes.contains_key(name) => Type::Obj, // constructor
+                // A math call keeps its `Int` overload for integral arguments —
+                // this is what makes `abs(-7) / 2` truncate rather than divide.
+                _ if self.resolve_math_fn(name).is_some() => {
+                    let tys: Vec<Type> = args.iter().map(|a| self.infer(sc, a)).collect();
+                    math_ret_type(&self.resolve_math_fn(name).unwrap(), &tys)
+                }
                 _ => self
                     .fun_sig
                     .get(name)
@@ -1884,8 +2223,17 @@ impl Compiler {
             },
             Expr::Index { .. } => Type::Unknown,
             Expr::Pair { .. } => Type::Obj,
+            // A range and an array are heap objects; `in` is a predicate.
+            Expr::Range { .. } | Expr::Step { .. } => Type::Obj,
+            Expr::In { .. } => Type::Boolean,
+            // `++`/`--` keep the target's type, so `d++` on a `Double` stays a
+            // `Double` for display and `/` dispatch.
+            Expr::IncDec { target, .. } => self.infer(sc, target),
             Expr::Lambda { .. } => Type::Unknown,
             Expr::Member { recv, name, .. } => {
+                if self.is_java_math(sc, recv) {
+                    return Type::Double; // `Math.PI` / `Math.E`
+                }
                 // A property read on a known class yields the property's type.
                 if let Some(cls) = self.infer_class(sc, recv) {
                     if let Some(p) = self.classes.get(&cls).and_then(|m| m.prop(name)) {
@@ -1894,7 +2242,18 @@ impl Compiler {
                 }
                 method_ret_type(name)
             }
-            Expr::MethodCall { recv, name, .. } => {
+            Expr::MethodCall {
+                recv, name, args, ..
+            } => {
+                // `Math.round` returns a `Long`; the rest follow the shared
+                // math overload rule.
+                if self.is_java_math(sc, recv) {
+                    if name == "round" {
+                        return Type::Long;
+                    }
+                    let tys: Vec<Type> = args.iter().map(|a| self.infer(sc, a)).collect();
+                    return math_ret_type(name, &tys);
+                }
                 // A higher-order collection method's result type is fixed.
                 if is_coll_hof(name) {
                     return hof_ret_type(name);
@@ -2006,8 +2365,61 @@ impl Compiler {
             Expr::NotNull(inner) => self.infer_class(sc, inner),
             Expr::Elvis { left, .. } => self.infer_class(sc, left),
             Expr::Pair { .. } => Some("Pair".to_string()),
+            // Container names for dispatch. None of these is a user class, so
+            // member access on them falls through to the host method table.
+            Expr::Range { .. } | Expr::Step { .. } => Some("IntRange".to_string()),
             _ => None,
         }
+    }
+}
+
+/// The math functions kotlinrs resolves. `abs`/`max`/`min`/`sqrt`/`floor`/
+/// `ceil`/`round` are `kotlin.math` members (import-gated); `maxOf`/`minOf` are
+/// `kotlin` package members and always in scope.
+fn is_math_fn(name: &str) -> bool {
+    matches!(
+        name,
+        "abs" | "max" | "min" | "sqrt" | "floor" | "ceil" | "round" | "maxOf" | "minOf"
+    )
+}
+
+/// The `kotlin.math` constants.
+fn is_math_const(name: &str) -> bool {
+    matches!(name, "PI" | "E")
+}
+
+/// The math functions Kotlin auto-imports (the `kotlin` package), usable with no
+/// `import` line. `maxOf`/`minOf` are the `kotlin` package spellings of the same
+/// operation `kotlin.math.max`/`min` performs, so they share one implementation.
+fn auto_math_fn(name: &str) -> Option<&'static str> {
+    match name {
+        "maxOf" => Some("max"),
+        "minOf" => Some("min"),
+        _ => None,
+    }
+}
+
+/// Static result type of a math call, given its argument types. `sqrt` and the
+/// rounding family are `Double`-only; `abs`/`max`/`min` are overloaded and keep
+/// an `Int` result for integral arguments — which matters because it decides
+/// whether a following `/` lowers to truncating integer or IEEE division.
+fn math_ret_type(name: &str, args: &[Type]) -> Type {
+    match name {
+        "sqrt" | "floor" | "ceil" | "round" => Type::Double,
+        // `java.lang.Math.round` is the odd one out: `Long`, not `Double`.
+        "jround" => Type::Long,
+        _ if args.contains(&Type::Double) => Type::Double,
+        _ if args.iter().all(|t| t.is_int()) => Type::Int,
+        _ => Type::Unknown,
+    }
+}
+
+/// The [`crate::host::RangeForm`] discriminant the `KT_RANGE` op carries.
+fn range_form(kind: RangeKind) -> u8 {
+    match kind {
+        RangeKind::Inclusive => 0,
+        RangeKind::Until => 1,
+        RangeKind::DownTo => 2,
     }
 }
 
@@ -2089,6 +2501,7 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
         StmtKind::For {
             start, end, body, ..
         } => expr_has_ffi(start) || expr_has_ffi(end) || body_has_ffi(body),
+        StmtKind::ForIn { iter, body, .. } => expr_has_ffi(iter) || body_has_ffi(body),
         StmtKind::Break(_) | StmtKind::Continue(_) => false,
         StmtKind::If(ie) => if_has_ffi(ie),
         StmtKind::When(w) => when_has_ffi(w),
@@ -2128,6 +2541,12 @@ fn expr_has_ffi(e: &Expr) -> bool {
         Expr::NotNull(inner) => expr_has_ffi(inner),
         Expr::Index { recv, index, .. } => expr_has_ffi(recv) || expr_has_ffi(index),
         Expr::Pair { first, second } => expr_has_ffi(first) || expr_has_ffi(second),
+        Expr::Range { start, end, .. } => expr_has_ffi(start) || expr_has_ffi(end),
+        Expr::Step { recv, by } => expr_has_ffi(recv) || expr_has_ffi(by),
+        Expr::In {
+            value, container, ..
+        } => expr_has_ffi(value) || expr_has_ffi(container),
+        Expr::IncDec { target, .. } => expr_has_ffi(target),
         Expr::Lambda { body, .. } => body_has_ffi(body),
         Expr::If(ie) => if_has_ffi(ie),
         Expr::When(w) => when_has_ffi(w),

@@ -20,13 +20,17 @@
 //!
 //! Scope + determinism invariants (mirroring the javars/scalars harnesses):
 //!   * Only constructs kotlinrs actually implements are emitted — an unsupported
-//!     construct would be a known gap, not a parity signal. In particular
-//!     `Math.*`/`kotlin.math.*`, ranges (`1..3`) and `arrayOf` are NOT generated.
+//!     construct would be a known gap, not a parity signal.
 //!   * No nondeterministic output (no `Random`, no time, no identity hashes, no
 //!     unordered collections). Every probe's output is a pure function of source.
+//!     This is why an array is never printed directly: a JVM array inherits
+//!     `Object.toString`, so `println(arrayOf(1))` emits an identity hash. Array
+//!     probes read `size`/elements/`sum()`/`joinToString()` instead.
 //!   * Integer operands stay well inside range so 32-bit overflow — a documented
 //!     gap — is never the thing under test, and integer divisors are never zero
 //!     (Kotlin throws there; that is a fault-path test, not a value test).
+//!     Likewise ranges are never empty where a probe calls `max()`/`min()`,
+//!     which throw on an empty sequence.
 //!
 //! Subprocess-only: this binary never links the kotlinrs library.
 //!
@@ -74,6 +78,11 @@ const BOOLS: &[&str] = &["true", "false"];
 const AOPS: &[&str] = &["+", "-", "*"];
 const CMPOPS: &[&str] = &["==", "!=", "<", ">", "<=", ">="];
 const LOGOPS: &[&str] = &["&&", "||"];
+/// Range endpoints — small enough that a materialized range stays short, and
+/// spanning both orientations so ascending, descending, and empty ranges all
+/// occur.
+const RINTS: &[&str] = &["0", "1", "2", "3", "5", "8", "-2", "-5"];
+const STEPS: &[&str] = &["1", "2", "3"];
 
 fn p(body: String) -> String {
     format!("println({body})")
@@ -214,6 +223,99 @@ fn g_list(r: &mut Rng) -> String {
     }
 }
 
+/// Ranges: the `toString` forms (an `IntRange` prints `a..b`, an
+/// `IntProgression` prints `a..b step n` / `a downTo b step n`), the aggregate
+/// members, membership, and range-driven `for` loops. Endpoints are small so a
+/// materialized range stays short.
+fn g_range(r: &mut Rng, idx: usize) -> String {
+    let a = pick(r, RINTS);
+    let b = pick(r, RINTS);
+    let s = pick(r, STEPS);
+    match r.below(14) {
+        0 => p(format!("{a}..{b}")),
+        1 => p(format!("{a} until {b}")),
+        2 => p(format!("{a} downTo {b}")),
+        3 => p(format!("({a}..{b} step {s})")),
+        4 => p(format!("({a} downTo {b} step {s})")),
+        5 => p(format!("({a}..{b}).sum()")),
+        6 => p(format!("({a}..{b}).count()")),
+        7 => p(format!("({a}..{b}).toList()")),
+        8 => p(format!("({a}..{b}).joinToString()")),
+        9 => p(format!("{} in {a}..{b}", pick(r, RINTS))),
+        10 => p(format!("{} !in {a}..{b} step {s}", pick(r, RINTS))),
+        11 => p(format!("({a}..{b}).map {{ it * 2 }}")),
+        12 => format!("var g{idx} = 0; for (i in {a}..{b}) g{idx} += i; println(g{idx})"),
+        _ => format!(
+            "var g{idx} = 0; for (i in {a} downTo {b} step {s}) g{idx} += i; println(g{idx})"
+        ),
+    }
+}
+
+/// Arrays. Never printed directly (see the identity-hash note above) — every
+/// probe reads a deterministic projection.
+fn g_array(r: &mut Rng, idx: usize) -> String {
+    let (a, b, c) = (pick(r, INTS), pick(r, INTS), pick(r, INTS));
+    let decl = format!("val z{idx} = arrayOf({a}, {b}, {c})");
+    match r.below(10) {
+        0 => format!("{decl}; println(z{idx}.size)"),
+        1 => format!("{decl}; println(z{idx}[{}])", r.below(3)),
+        2 => format!("{decl}; println(z{idx}.sum())"),
+        3 => format!("{decl}; println(z{idx}.joinToString())"),
+        4 => format!("{decl}; z{idx}[0] = {}; println(z{idx}[0])", pick(r, INTS)),
+        5 => format!("{decl}; println(z{idx}.toList())"),
+        6 => format!("{decl}; println({} in z{idx})", pick(r, INTS)),
+        7 => format!(
+            "val z{idx} = IntArray({}); println(z{idx}.size + z{idx}.sum())",
+            1 + r.below(4)
+        ),
+        8 => format!(
+            "val z{idx} = intArrayOf({a}, {b}); var q{idx} = 0; for (x in z{idx}) q{idx} += x; println(q{idx})"
+        ),
+        _ => format!("{decl}; println(z{idx}.indexOf({}))", pick(r, INTS)),
+    }
+}
+
+/// `kotlin.math` (via the harness's `import kotlin.math.*`) and the
+/// `java.lang.Math` statics. `round` and `Math.round` differ in Kotlin — one is
+/// half-to-even returning `Double`, the other half-up returning `Long` — so both
+/// are probed.
+fn g_math(r: &mut Rng) -> String {
+    let i = pick(r, INTS);
+    let d = pick(r, DBLS);
+    match r.below(12) {
+        0 => p(format!("abs({i})")),
+        1 => p(format!("abs({d})")),
+        2 => p(format!("max({i}, {})", pick(r, INTS))),
+        3 => p(format!("min({d}, {})", pick(r, DBLS))),
+        4 => p(format!("sqrt({d})")),
+        5 => p(format!("floor({d})")),
+        6 => p(format!("ceil({d})")),
+        7 => p(format!("round({d})")),
+        8 => p(format!("Math.abs({i})")),
+        9 => p(format!("Math.round({d})")),
+        10 => p(format!("maxOf({i}, {})", pick(r, INTS))),
+        _ => p(format!("abs({i}) / {}", pick(r, DIVS))),
+    }
+}
+
+/// `++`/`--` in expression position (the value is the pre-update one for the
+/// postfix forms, the post-update one for the prefix forms) as well as in
+/// statement position.
+fn g_incdec(r: &mut Rng, idx: usize) -> String {
+    let a = pick(r, INTS);
+    match r.below(6) {
+        0 => format!("var n{idx} = {a}; println(n{idx}++); println(n{idx})"),
+        1 => format!("var n{idx} = {a}; println(n{idx}--); println(n{idx})"),
+        2 => format!("var n{idx} = {a}; println(++n{idx})"),
+        3 => format!("var n{idx} = {a}; println(--n{idx})"),
+        4 => format!("var n{idx} = {a}; println(n{idx}++ + n{idx}++); println(n{idx})"),
+        _ => format!(
+            "val e{idx} = intArrayOf({a}, {}); println(e{idx}[0]++); println(e{idx}[0])",
+            pick(r, INTS)
+        ),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     All,
@@ -231,6 +333,10 @@ enum Mode {
     StrMember,
     Loop,
     List,
+    Range,
+    Array,
+    Math,
+    IncDec,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -248,6 +354,10 @@ const CONCRETE: &[Mode] = &[
     Mode::StrMember,
     Mode::Loop,
     Mode::List,
+    Mode::Range,
+    Mode::Array,
+    Mode::Math,
+    Mode::IncDec,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -267,6 +377,10 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::StrMember => "strmember",
         Mode::Loop => "loop",
         Mode::List => "list",
+        Mode::Range => "range",
+        Mode::Array => "array",
+        Mode::Math => "math",
+        Mode::IncDec => "incdec",
     }
 }
 
@@ -298,6 +412,10 @@ fn gen_probe(r: &mut Rng, mode: Mode, idx: usize) -> String {
         Mode::StrMember => g_strmember(r),
         Mode::Loop => g_loop(r, idx),
         Mode::List => g_list(r),
+        Mode::Range => g_range(r, idx),
+        Mode::Array => g_array(r, idx),
+        Mode::Math => g_math(r),
+        Mode::IncDec => g_incdec(r, idx),
         Mode::All => unreachable!("resolved above"),
     }
 }
@@ -312,8 +430,12 @@ fn gen_probes(seed: u64, mode: Mode, n: usize) -> Vec<String> {
 /// independent for [`minimize`] without a block wrapper — kotlinrs has no
 /// `run { }` scope function, so wrapping would test the harness, not the
 /// frontend.
+///
+/// The `kotlin.math` import is unconditional: Kotlin does not auto-import that
+/// package, so the math probes need it, and an unused import is only a warning
+/// (never a compile failure) for the programs that contain no math probe.
 fn build_program(probes: &[String]) -> String {
-    let mut s = String::from("fun main() {\n");
+    let mut s = String::from("import kotlin.math.*\n\nfun main() {\n");
     for probe in probes {
         s.push_str("    ");
         s.push_str(probe);
@@ -509,7 +631,7 @@ fn parse_args() -> Args {
     let mut i = 0;
     while i < argv.len() {
         let arg = argv[i].clone();
-        let mut take = |i: &mut usize| -> String {
+        let take = |i: &mut usize| -> String {
             *i += 1;
             argv.get(*i).cloned().unwrap_or_default()
         };

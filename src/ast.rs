@@ -58,6 +58,36 @@ impl Type {
 pub struct Program {
     pub classes: Vec<ClassDecl>,
     pub funs: Vec<FunDecl>,
+    /// `import` declarations in source order. Kotlin resolves `abs`/`sqrt`/`PI`
+    /// ONLY when `kotlin.math` is imported — without the import the reference is
+    /// a compile error — so the compiler gates those names on this list rather
+    /// than treating them as always-available builtins.
+    pub imports: Vec<ImportDecl>,
+}
+
+/// One `import` line: the dotted path (a star import keeps its trailing `.*`)
+/// and the `as` alias, if any. The alias matters for name resolution because it
+/// *replaces* the original spelling — after `import kotlin.math.abs as absolute`
+/// the name `abs` is no longer in scope.
+#[derive(Debug, Clone)]
+pub struct ImportDecl {
+    pub path: String,
+    pub alias: Option<String>,
+}
+
+impl ImportDecl {
+    /// The last path segment — the imported name itself (`abs` for
+    /// `kotlin.math.abs`, `*` for a star import).
+    pub fn tail(&self) -> &str {
+        self.path.rsplit('.').next().unwrap_or(&self.path)
+    }
+    /// The package the import reaches into (`kotlin.math`).
+    pub fn package(&self) -> &str {
+        match self.path.rfind('.') {
+            Some(i) => &self.path[..i],
+            None => "",
+        }
+    }
 }
 
 /// A function parameter, or a primary-constructor property parameter. `class`
@@ -189,6 +219,17 @@ pub enum StmtKind {
         step: Option<Expr>,
         body: Vec<Stmt>,
         /// Optional loop label (`outer@ for (…)`) for `break@outer`.
+        label: Option<String>,
+    },
+    /// `for (v in iterable)` over a value that is not a syntactic range — a
+    /// `List`, an array, or a range held in a variable. Kept distinct from
+    /// [`StmtKind::For`] so the counted-range form keeps its native-op lowering
+    /// (a slot counter plus `NumLe`/`Add`, which fusevm's JIT can trace) instead
+    /// of paying a host indexing call per iteration.
+    ForIn {
+        var: String,
+        iter: Expr,
+        body: Vec<Stmt>,
         label: Option<String>,
     },
     /// `break` / `break@label` — jump past the (labeled) enclosing loop.
@@ -348,6 +389,38 @@ pub enum Expr {
     Pair {
         first: Box<Expr>,
         second: Box<Expr>,
+    },
+    /// A range value in expression position — `a..b`, `a until b`, `a downTo b`.
+    /// Ranges are ordinary values in Kotlin (`val r = 1..5`, `(1..3).sum()`), so
+    /// they lower to a heap object rather than only existing as a `for` header.
+    Range {
+        start: Box<Expr>,
+        end: Box<Expr>,
+        kind: RangeKind,
+    },
+    /// `range step n` — re-steps a range, yielding an `IntProgression`. `step` is
+    /// an ordinary infix function in Kotlin, so its left operand is any range
+    /// expression (`(1..10) step 2`, `r step 2`), not just a literal range.
+    Step {
+        recv: Box<Expr>,
+        by: Box<Expr>,
+    },
+    /// `value in container` / `value !in container` — membership in a range, a
+    /// `List`, a `Map`'s keys, or a substring of a `String`.
+    In {
+        value: Box<Expr>,
+        container: Box<Expr>,
+        negated: bool,
+    },
+    /// `x++` / `x--` / `++x` / `--x`. The expression's value is the target's
+    /// value *before* the update for the postfix forms and *after* it for the
+    /// prefix forms; the target is a variable, a property, or an indexed element.
+    IncDec {
+        target: Box<Expr>,
+        /// `true` for `++`, `false` for `--`.
+        inc: bool,
+        /// `true` for the prefix forms (`++x`), `false` for postfix (`x++`).
+        prefix: bool,
     },
     /// A first-class lambda `{ params -> body }`. Each parameter carries its
     /// (optionally annotated) coarse type — `Unknown` when unannotated, which is
