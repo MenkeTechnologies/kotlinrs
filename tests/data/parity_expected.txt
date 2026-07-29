@@ -1,0 +1,28 @@
+fun main() {\n    println(7 / 2)\n}	3\n
+fun main() {\n    println(-7 / 2)\n}	-3\n
+fun main() {\n    println(7 % 3)\n}	1\n
+fun main() {\n    println(7 / 2.0)\n}	3.5\n
+fun main() {\n    println(2.5 / 1.0e-7)\n}	2.5E7\n
+fun main() {\n    println(5.0 / 0.0)\n}	Infinity\n
+fun main() {\n    println(0.0 / 0.0)\n}	NaN\n
+fun main() {\n    println(-1.0 / 0.0)\n}	-Infinity\n
+fun main() {\n    println(2.5e7)\n}	2.5E7\n
+fun main() {\n    println(1.0e7)\n}	1.0E7\n
+fun main() {\n    println(9999999.0)\n}	9999999.0\n
+fun main() {\n    println(9.999e-4)\n}	9.999E-4\n
+fun main() {\n    println(1e-3)\n}	0.001\n
+fun main() {\n    println(123456789.0)\n}	1.23456789E8\n
+fun main() {\n    println(0.0)\n}	0.0\n
+fun main() {\n    println(-0.0)\n}	-0.0\n
+fun main() {\n    println(1.0 / 3.0)\n}	0.3333333333333333\n
+fun main() {\n    println("a" + 1)\n}	a1\n
+fun main() {\n    println("x" + true)\n}	xtrue\n
+fun main() {\n    println("abc".length)\n}	3\n
+fun main() {\n    println("abc".uppercase())\n}	ABC\n
+fun main() {\n    println(" x ".trim())\n}	x\n
+fun main() {\n    println("".isEmpty())\n}	true\n
+fun main() {\n    println(if (1 < 2) 10 else 20)\n}	10\n
+fun main() {\n    println(listOf(1, 2, 3))\n}	[1, 2, 3]\n
+fun main() {\n    println(listOf(1, 2).size)\n}	2\n
+fun main() {\n    println(true && false)\n}	false\n
+fun main() {\n    println(3.5 >= 3.5)\n}	true\n

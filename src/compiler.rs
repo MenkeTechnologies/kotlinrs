@@ -22,7 +22,7 @@
 use crate::ast::*;
 use crate::host::{
     KT_CHR_STRING, KT_CLOSURE_CALL, KT_COLL_HOF, KT_DBG_LINE, KT_FFI_CALL, KT_FFI_COMPILE,
-    KT_GETFIELD, KT_IDIV, KT_IMOD, KT_INDEX_GET, KT_INDEX_SET, KT_IS, KT_ISNULL, KT_LIST,
+    KT_DDIV, KT_GETFIELD, KT_IDIV, KT_IMOD, KT_INDEX_GET, KT_INDEX_SET, KT_IS, KT_ISNULL, KT_LIST,
     KT_MAKE_CLOSURE, KT_MAP, KT_METHOD, KT_NEW, KT_NOTNULL, KT_OBJEQ, KT_PAIR, KT_SCOPE_FN,
     KT_SETFIELD, KT_TO_STRING,
 };
@@ -1405,7 +1405,10 @@ impl Compiler {
                     self.b.emit(Op::Extended(KT_IDIV, 0), 0);
                     Type::Int
                 } else {
-                    self.b.emit(Op::Div, 0);
+                    // IEEE division, not the native op: Kotlin's `x / 0.0` is a
+                    // signed infinity and `0.0 / 0.0` is NaN, where `Op::Div`
+                    // yields `Undef` (which printed as `null`).
+                    self.b.emit(Op::Extended(KT_DDIV, 0), 0);
                     Type::Double
                 }
             }

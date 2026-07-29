@@ -82,6 +82,15 @@ pub const KT_LISTPUSH: u16 = 21;
 /// Structural equality `a == b` over heap objects (and primitives). Stack:
 /// `[a, b]`; pushes a `Bool`.
 pub const KT_OBJEQ: u16 = 22;
+/// Kotlin floating-point `/`: both operands coerced to `Double` and divided
+/// under IEEE-754, so `x / 0.0` is a signed infinity and `0.0 / 0.0` is NaN.
+///
+/// Emitted when the operands are statically not both `Int`. fusevm's native
+/// `Op::Div` cannot serve there — its shell/awk flavour has no infinities and
+/// yields `Undef` for a zero divisor, which printed as `null`. `KT_IDIV` cannot
+/// either: it branches on the *runtime* representation, so a `Double`-typed
+/// value still holding an `Int` would take the integer path and truncate.
+pub const KT_DDIV: u16 = 23;
 
 // ── Builtin ids (`Op::CallBuiltin`) ─────────────────────────────────────────
 //
@@ -113,6 +122,7 @@ pub const KT_COLL_HOF: u16 = 102;
 /// Stack: `[recv, closure, nameStr]` with the name (a `Str`) on top. Invokes the
 /// lambda with the receiver bound to `it` and pushes the scope function's result.
 pub const KT_SCOPE_FN: u16 = 103;
+
 
 thread_local! {
     /// Set by a runtime fault (e.g. integer divide-by-zero) so the CLI can
@@ -407,6 +417,11 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             } else {
                 vm.push(v);
             }
+        }
+        KT_DDIV => {
+            let b = vm.pop();
+            let a = vm.pop();
+            vm.push(Value::Float(a.to_float() / b.to_float()));
         }
         KT_IDIV => {
             let b = vm.pop();
@@ -1287,8 +1302,14 @@ pub fn kotlin_string(v: &Value) -> String {
     }
 }
 
-/// Kotlin `Double.toString()`: shortest round-trip, but whole values keep a
-/// trailing `.0`, and the non-finite forms are `NaN` / `Infinity` / `-Infinity`.
+/// Kotlin `Double.toString()`: shortest round-trip, whole values keep a trailing
+/// `.0`, and the non-finite forms are `NaN` / `Infinity` / `-Infinity`.
+///
+/// Kotlin delegates to the JVM's `Double.toString`, which uses plain decimal
+/// only inside `[1e-3, 1e7)` and switches to "computerized scientific notation"
+/// outside that range. Rust's `{}` never switches, so the range test has to be
+/// explicit or large and small magnitudes print as long digit strings
+/// (`25000000.0` where Kotlin says `2.5E7`, `0.0009999` where it says `9.999E-4`).
 pub fn format_double(f: f64) -> String {
     if f.is_nan() {
         return "NaN".to_string();
@@ -1296,10 +1317,29 @@ pub fn format_double(f: f64) -> String {
     if f.is_infinite() {
         return if f > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
     }
-    let s = format!("{f}");
-    if s.bytes().any(|c| matches!(c, b'.' | b'e' | b'E')) {
-        s
-    } else {
-        format!("{s}.0")
+    if f == 0.0 {
+        // The signed zeroes are distinguished: `-0.0` prints with its sign.
+        return if f.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
     }
+
+    let mag = f.abs();
+    if (1e-3..1e7).contains(&mag) {
+        let s = format!("{f}");
+        return if s.contains('.') { s } else { format!("{s}.0") };
+    }
+
+    // Scientific form. Rust renders `2.5e7` / `1e7`; the JVM wants `2.5E7` /
+    // `1.0E7` — uppercase exponent, no `+`, and a mantissa that always carries a
+    // fractional digit.
+    let s = format!("{f:e}");
+    let (mantissa, exp) = match s.split_once('e') {
+        Some((m, e)) => (m, e),
+        None => return s,
+    };
+    let mantissa = if mantissa.contains('.') {
+        mantissa.to_string()
+    } else {
+        format!("{mantissa}.0")
+    };
+    format!("{mantissa}E{exp}")
 }
