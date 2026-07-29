@@ -21,6 +21,7 @@ pub mod lsp;
 pub mod parser;
 pub mod runtime;
 pub mod rust_ffi;
+pub mod tiers;
 pub mod token;
 
 use lexer::Lexer;

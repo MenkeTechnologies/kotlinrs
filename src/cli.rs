@@ -23,6 +23,8 @@ pub struct Cli {
     pub dump: Option<Dump>,
     /// `--lsp`: speak the Language Server Protocol on stdio.
     pub lsp: bool,
+    /// `--tiers`: run the script, then report which fusevm tiers took its chunk.
+    pub tiers: bool,
     /// `--dap`: speak the Debug Adapter Protocol on stdio.
     pub dap: bool,
 }
@@ -40,6 +42,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
             "--dump-bytecode" | "--disasm" => cli.dump = Some(Dump::Bytecode),
             "--lsp" => cli.lsp = true,
             "--dap" => cli.dap = true,
+            "--tiers" => cli.tiers = true,
             "-e" | "--eval" => {
                 let expr = it.next().ok_or("-e requires an argument")?;
                 cli.eval.push(expr);

@@ -18,6 +18,10 @@ pub fn run_source(src: &str) -> Result<i32, String> {
     host::set_catchable(compiler::uses_exceptions(&program));
     let mut vm = VM::new(chunk);
     host::install(&mut vm);
+    // Arm the tracing tier: a hot loop whose body is native fusevm ops gets
+    // recorded and compiled to native code instead of dispatched forever.
+    // `kotlin --tiers` reports whether a given script actually reaches it.
+    vm.enable_tracing_jit();
     match vm.run() {
         VMResult::Ok(_) | VMResult::Halted => {
             // An uncaught runtime fault (e.g. integer `/ by zero`) halts the VM
@@ -51,8 +55,14 @@ pub fn dump_ast(src: &str) -> Result<String, String> {
 
 /// `--dump-bytecode` / `--disasm`: the lowered fusevm chunk, disassembled.
 pub fn dump_bytecode(src: &str) -> Result<String, String> {
+    Ok(compile(src)?.disassemble())
+}
+
+/// Desugar, parse, and lower `src` to the fusevm chunk [`run_source`] executes.
+/// Shared by `--dump-bytecode` and by [`crate::tiers`], so the chunk a tier
+/// report inspects is the one the run compiled.
+pub fn compile(src: &str) -> Result<fusevm::Chunk, String> {
     let src = crate::rust_ffi::desugar(src);
     let program = parser::parse_program(&src)?;
-    let chunk = compiler::compile(&program)?;
-    Ok(chunk.disassemble())
+    compiler::compile(&program)
 }

@@ -60,13 +60,17 @@ path = "src/bin/gen_docs.rs"
 #
 # `jit` turns on fusevm's three-tier Cranelift JIT so arithmetic and comparison
 # operators — which kotlinrs lowers to *native* fusevm ops — can be block- and
-# trace-compiled on hot loops instead of dispatched.
+# trace-compiled on hot loops instead of dispatched. `jit-disk-cache` adds the
+# persistent on-disk cache of that native code (keyed by chunk hash), so a warm
+# run skips Cranelift codegen entirely; `aot` enables fusevm's ahead-of-time
+# object emitter. `kotlin --tiers` reports which of those tiers a script
+# actually reaches.
 #
 # `ffi` enables fusevm's inline-Rust FFI bridge: a `rust { pub extern "C" fn … }`
 # block compiles to a cached cdylib whose exported functions become callable by
 # name from Kotlin (src/rust_ffi.rs desugars the block; src/host.rs routes the
 # `__rust_compile` / by-name-call dispatch into `fusevm::ffi`).
-fusevm = { version = "0.14.17", features = ["jit", "ffi"] }
+fusevm = { version = "0.15.0", features = ["jit", "jit-disk-cache", "aot", "ffi"] }
 
 # LSP (`kotlin --lsp`) + DAP (`kotlin --dap`) over stdio. libc gives the DAP
 # server a pipe + dup2 to capture the debuggee's stdout (println) so program

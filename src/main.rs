@@ -22,6 +22,7 @@ OPTIONS:
     --dump-ast           Print the parsed AST and exit.
     --dump-bytecode      Print the lowered fusevm chunk (disassembly) and exit.
     --disasm             Alias for --dump-bytecode.
+    --tiers              Run the script, then report which fusevm tiers took it.
     --lsp                Speak the Language Server Protocol over stdio.
     --dap                Speak the Debug Adapter Protocol over stdio.
     -v, --version        Print the version and exit.
@@ -85,6 +86,16 @@ fn main() -> ExitCode {
         return match res {
             Ok(text) => {
                 print!("{text}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e),
+        };
+    }
+
+    if cli.tiers {
+        return match kotlinrs::tiers::report(&prepared) {
+            Ok(r) => {
+                println!("{r}");
                 ExitCode::SUCCESS
             }
             Err(e) => fail(&e),

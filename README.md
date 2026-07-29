@@ -244,6 +244,7 @@ as well).
 | `--dump-tokens` | Print the lexer token stream and exit. |
 | `--dump-ast` | Print the parsed AST and exit. |
 | `--dump-bytecode`, `--disasm` | Print the lowered fusevm chunk disassembly and exit. |
+| `--tiers FILE` | Run it, then report which fusevm execution tier took each of its chunks. |
 | `--lsp` | Speak the Language Server Protocol over stdio (diagnostics, completion, hover). |
 | `--dap` | Speak the Debug Adapter Protocol over stdio (breakpoints, stepping, live locals). |
 | `-v`, `--version` | Print the version and exit. |
