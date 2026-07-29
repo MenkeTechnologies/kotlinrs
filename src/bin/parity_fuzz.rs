@@ -532,6 +532,47 @@ fn g_class(r: &mut Rng, idx: usize) -> String {
     }
 }
 
+/// `Set` and the collection operations layered on an `Iterable`: the ordering a
+/// `LinkedHashSet` preserves, the de-duplication `setOf`/`toSet`/`distinct`
+/// perform, the order-insensitive `Set` equality, the set operators, and the
+/// lambda-taking `associate`/`sorted*`/`flatMap` family.
+///
+/// Determinism: `setOf` is a `LinkedHashSet`, so iteration and display follow
+/// insertion order and are reproducible; a `HashSet` would not be. Element
+/// counts stay small so a printed collection stays short.
+fn g_coll(r: &mut Rng, idx: usize) -> String {
+    let a = pick(r, &["0", "1", "2", "3", "5", "7"]);
+    let b = pick(r, &["1", "2", "3", "5", "8"]);
+    let c = pick(r, &["0", "2", "3", "9"]);
+    let set = format!("setOf({a}, {b}, {c}, {a})");
+    let list = format!("listOf({a}, {b}, {c}, {b})");
+    match r.below(18) {
+        0 => p(set),
+        1 => p(format!("{set}.size")),
+        2 => p(format!("{b} in {set}")),
+        3 => p(format!("{set}.toList()")),
+        4 => p(format!("{list}.toSet()")),
+        5 => p(format!("{list}.distinct()")),
+        6 => p(format!("setOf({a}, {b}) == setOf({b}, {a})")),
+        7 => p(format!("setOf({a}, {b}) == setOf({a}, {c})")),
+        8 => p(format!("{set}.union(setOf({c}, {b}))")),
+        9 => p(format!("{set}.intersect(setOf({c}, {b}))")),
+        10 => p(format!("{set}.subtract(setOf({b}))")),
+        11 => p(format!("{list}.sorted()")),
+        12 => p(format!("{list}.sortedDescending()")),
+        13 => p(format!("{list}.take({a})")),
+        14 => p(format!("{list}.drop({a})")),
+        15 => p(format!("{list}.associate {{ it to it * 2 }}")),
+        16 => p(format!("{list}.flatMap {{ listOf(it, it + 1) }}")),
+        _ => format!(
+            "val cl{idx} = {list}; println(cl{idx}.mapIndexed {{ i, x -> i * x }}); \
+             println(cl{idx}.filterNot {{ it > {b} }}); println(cl{idx}.none {{ it > 99 }}); \
+             println(cl{idx}.minByOrNull {{ it }}); println(cl{idx}.sortedByDescending {{ it }}); \
+             println(cl{idx}.associateBy {{ it % 2 }})"
+        ),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     All,
@@ -559,6 +600,7 @@ enum Mode {
     NullSafe,
     DataWhen,
     Class,
+    Coll,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -586,6 +628,7 @@ const CONCRETE: &[Mode] = &[
     Mode::NullSafe,
     Mode::DataWhen,
     Mode::Class,
+    Mode::Coll,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -615,6 +658,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::NullSafe => "nullsafe",
         Mode::DataWhen => "datawhen",
         Mode::Class => "class",
+        Mode::Coll => "coll",
     }
 }
 
@@ -656,6 +700,7 @@ fn gen_probe(r: &mut Rng, mode: Mode, idx: usize) -> String {
         Mode::NullSafe => g_nullsafe(r, idx),
         Mode::DataWhen => g_datawhen(r, idx),
         Mode::Class => g_class(r, idx),
+        Mode::Coll => g_coll(r, idx),
         Mode::All => unreachable!("resolved above"),
     }
 }

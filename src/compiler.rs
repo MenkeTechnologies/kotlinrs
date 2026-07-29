@@ -27,7 +27,7 @@ use crate::host::{
     KT_FFI_CALL, KT_FFI_COMPILE, KT_GETFIELD, KT_IDIV, KT_IMOD, KT_IN, KT_INDEX_GET, KT_INDEX_SET,
     KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_LIST, KT_MAKE_CLOSURE, KT_MAP, KT_MATH,
     KT_DISPLAY, KT_JOIN, KT_METHOD, KT_NEW, KT_NOTNULL, KT_OBJEQ, KT_PAIR, KT_PRINT, KT_PRINTLN, KT_RANGE,
-    KT_RANGE_STEP, KT_SCOPE_FN, KT_SETFIELD, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG,
+    KT_RANGE_STEP, KT_SCOPE_FN, KT_SET, KT_SETFIELD, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::collections::{HashMap, HashSet};
@@ -2792,6 +2792,16 @@ impl Compiler {
                 let rt = self.resolve_math_fn(name).unwrap();
                 self.compile_math(sc, &rt, args, line)
             }
+            // `Set` builders → an insertion-ordered distinct heap collection,
+            // which is what Kotlin's `LinkedHashSet`-backed `setOf` is.
+            "setOf" | "mutableSetOf" | "hashSetOf" | "linkedSetOf" | "sortedSetOf"
+            | "emptySet" => {
+                for a in args {
+                    self.compile_expr(sc, a)?;
+                }
+                self.b.emit(Op::Extended(KT_SET, args.len() as u8), line);
+                Ok(Type::Obj)
+            }
             "mapOf" | "mutableMapOf" | "hashMapOf" | "emptyMap" => {
                 // Each argument is a `k to v` Pair.
                 for a in args {
@@ -3239,9 +3249,10 @@ impl Compiler {
             Expr::Call { name, args, .. } => match name.as_str() {
                 "println" | "print" => Type::Unit,
                 "listOf" | "mutableListOf" | "arrayListOf" | "emptyList" | "mapOf"
-                | "mutableMapOf" | "hashMapOf" | "emptyMap" | "arrayOf" | "intArrayOf"
-                | "doubleArrayOf" | "booleanArrayOf" | "charArrayOf" | "IntArray"
-                | "DoubleArray" | "BooleanArray" => Type::Obj,
+                | "mutableMapOf" | "hashMapOf" | "emptyMap" | "setOf" | "mutableSetOf"
+                | "hashSetOf" | "linkedSetOf" | "sortedSetOf" | "emptySet" | "arrayOf"
+                | "intArrayOf" | "doubleArrayOf" | "booleanArrayOf" | "charArrayOf"
+                | "IntArray" | "DoubleArray" | "BooleanArray" | "CharArray" | "Array" => Type::Obj,
                 _ if self.classes.contains_key(name) => Type::Obj, // constructor
                 // A math call keeps its `Int` overload for integral arguments —
                 // this is what makes `abs(-7) / 2` truncate rather than divide.
@@ -3397,6 +3408,17 @@ impl Compiler {
                 if self.classes.contains_key(name) {
                     return Some(name.clone()); // constructor
                 }
+                match name.as_str() {
+                    "listOf" | "mutableListOf" | "arrayListOf" | "emptyList" => {
+                        return Some("List".to_string())
+                    }
+                    "setOf" | "mutableSetOf" | "hashSetOf" | "linkedSetOf" | "sortedSetOf"
+                    | "emptySet" => return Some("Set".to_string()),
+                    "mapOf" | "mutableMapOf" | "hashMapOf" | "emptyMap" => {
+                        return Some("Map".to_string())
+                    }
+                    _ => {}
+                }
                 self.fun_sig.get(name).and_then(|s| s.ret_class.clone())
             }
             Expr::Member { recv, name, .. } => {
@@ -3408,8 +3430,15 @@ impl Compiler {
             }
             Expr::MethodCall { recv, name, .. } => {
                 match name.as_str() {
-                    "map" | "filter" | "sortedBy" => return Some("List".to_string()),
-                    "associateWith" | "groupBy" => return Some("Map".to_string()),
+                    "map" | "mapIndexed" | "flatMap" | "filter" | "filterNot" | "sortedBy"
+                    | "sortedByDescending" | "toList" | "distinct" | "sorted"
+                    | "sortedDescending" | "take" | "drop" => return Some("List".to_string()),
+                    "toSet" | "toMutableSet" | "union" | "intersect" | "subtract" => {
+                        return Some("Set".to_string())
+                    }
+                    "associate" | "associateBy" | "associateWith" | "groupBy" => {
+                        return Some("Map".to_string())
+                    }
                     _ => {}
                 }
                 let cls = self.infer_class(sc, recv)?;
@@ -3510,16 +3539,24 @@ fn is_coll_hof(name: &str) -> bool {
     matches!(
         name,
         "map"
+            | "mapIndexed"
+            | "flatMap"
             | "filter"
+            | "filterNot"
             | "forEach"
             | "fold"
             | "reduce"
             | "any"
             | "all"
+            | "none"
             | "count"
             | "sumOf"
             | "maxByOrNull"
+            | "minByOrNull"
             | "sortedBy"
+            | "sortedByDescending"
+            | "associate"
+            | "associateBy"
             | "associateWith"
             | "groupBy"
     )
@@ -3530,9 +3567,12 @@ fn is_coll_hof(name: &str) -> bool {
 /// coarse (`Unknown` display routes through the generic Kotlin stringifier).
 fn hof_ret_type(name: &str) -> Type {
     match name {
-        "map" | "filter" | "sortedBy" | "associateWith" | "groupBy" => Type::Obj,
+        "map" | "mapIndexed" | "flatMap" | "filter" | "filterNot" | "sortedBy"
+        | "sortedByDescending" | "associate" | "associateBy" | "associateWith" | "groupBy" => {
+            Type::Obj
+        }
         "forEach" => Type::Unit,
-        "any" | "all" => Type::Boolean,
+        "any" | "all" | "none" => Type::Boolean,
         "count" => Type::Int,
         _ => Type::Unknown,
     }

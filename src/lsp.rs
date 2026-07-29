@@ -304,6 +304,12 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "val m = mapOf(\"a\" to 1)\nprintln(m[\"a\"])   // 1",
     ),
     (
+        "setOf",
+        "Builtin",
+        "build a Set: insertion-ordered display, order-insensitive equality",
+        "println(setOf(3, 1, 3))   // [3, 1]",
+    ),
+    (
         "arrayOf",
         "Builtin",
         "build an array; `intArrayOf`/`doubleArrayOf`/`booleanArrayOf` are typed",

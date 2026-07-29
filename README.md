@@ -161,12 +161,21 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   built once and reachable by name (`Counter.inc()`). An `object` may
   declare supertypes (`object Registry : Greeter`), which its own methods and
   `is` checks answer for.
-- **Collections** — `listOf`/`mutableListOf` and `mapOf`/`mutableMapOf` (with
-  `k to v` `Pair`s), indexing `xs[i]` / `m[k]` (and indexed assignment), `.size`,
-  `.add`/`.get`/`.contains`/`.indexOf`/`.sum` on lists, `.containsKey`/`.keys`/
-  `.values`/`.put` on maps. `List`s, arrays, and ranges share one sequence-member
-  table: `.count()`, `.first()`/`.last()`, `.max()`/`.min()`, `.average()`,
-  `.toList()`, `.joinToString(sep)`, `.reversed()`.
+- **Collections** — `listOf`/`mutableListOf`, `setOf`/`mutableSetOf`, and
+  `mapOf`/`mutableMapOf` (with `k to v` `Pair`s), indexing `xs[i]` / `m[k]` (and
+  indexed assignment), `.size`, `.add`/`.remove`/`.get`/`.contains`/`.indexOf`/
+  `.sum` on lists, `.containsKey`/`.keys`/`.values`/`.put` on maps. `List`s,
+  `Set`s, arrays, and ranges share one sequence-member table: `.count()`,
+  `.first()`/`.last()`, `.max()`/`.min()`, `.average()`, `.toList()`/`.toSet()`,
+  `.distinct()`, `.sorted()`/`.sortedDescending()`, `.take(n)`/`.drop(n)`
+  (both clamp rather than fault), `.union`/`.intersect`/`.subtract`,
+  `.joinToString(sep)`, `.reversed()`.
+- **`Set`** — `setOf`/`mutableSetOf` build a `LinkedHashSet`, so iteration and
+  display follow *insertion* order (`setOf(3, 1, 2, 3)` prints `[3, 1, 2]`) while
+  equality ignores it (`setOf(1, 2) == setOf(2, 1)`). `MutableSet.add` answers
+  whether the element was new, where `MutableList.add` always answers `true`.
+  A `Set` iterates, indexes into the sequence members, and feeds the
+  higher-order functions like any other `Iterable`.
 - **Ranges** — first-class values, not just `for` headers: `1..5`,
   `1 until 5`, `5 downTo 1`, `… step n`, bound to names, printed
   (`IntRange` shows `1..5`, `IntProgression` shows `1..9 step 2` — its last
@@ -194,9 +203,11 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   lambda is a heap closure object invoked through a re-entrant VM run — no
   compiler inlining and no fusevm-core change.
 - **Higher-order stdlib** — the lambda-taking collection functions operate on
-  real lambda values: `.map`/`.filter`/`.forEach`, `.fold`/`.reduce`,
-  `.any`/`.all`/`.count`, `.sumOf`, `.maxByOrNull`, `.sortedBy`,
-  `.associateWith`, `.groupBy`. `it` is the implicit parameter.
+  real lambda values: `.map`/`.mapIndexed`/`.flatMap`, `.filter`/`.filterNot`,
+  `.forEach`, `.fold`/`.reduce`, `.any`/`.all`/`.none`/`.count`, `.sumOf`,
+  `.maxByOrNull`/`.minByOrNull`, `.sortedBy`/`.sortedByDescending`,
+  `.associate`/`.associateBy`/`.associateWith`, `.groupBy`. `it` is the implicit
+  parameter, and `mapIndexed` takes `(index, element)`.
 - **Scope functions** — the `it`-form `.let`/`.also`/`.takeIf` on any receiver.
 - **Control flow** — `if`/`else` (statement **and** expression, incl.
   `else if`); `when` (statement **and** expression) in subject and subjectless
@@ -250,9 +261,20 @@ bind it first), lambda element-type inference (an unannotated `it` is coarsely
 typed, so `/` and `%` on it default to float — annotate the parameter `Int` for
 integer semantics), class body property initializers (stored properties go in the
 primary constructor), secondary constructors, `as`/`as?` casts, named / default
-arguments, `Set`, the lambda-taking collection functions on a `String` receiver
+arguments, the lambda-taking collection functions on a `String` receiver
 (`"abc".map { … }`; `for (c in s)` works), and the rest of the standard-library
 surface.
+
+The `String`-receiver gap has one cause: a `Char` is carried as its integer code
+unit, not as a distinct runtime type, so a lambda over a `String`'s characters
+would receive an `Int` and `println(it)` would print `97` where Kotlin prints
+`a`. Passing a one-character `String` instead trades that for a different
+divergence (`it + 1` would concatenate where Kotlin does `Char` arithmetic), so
+neither shortcut is correct. A faithful fix needs a distinct runtime `Char`
+representation AND every statically-untyped `+`/`-`/comparison routed through a
+host op that dispatches on it — today those lower to native fusevm ops, which
+cannot see a non-numeric `Char`. That is a change to the arithmetic hot path,
+not a stdlib addition, and it is not started rather than half-done.
 
 Inheritance carries three deliberate simplifications. The modifiers are recorded
 but not **enforced** — kotlinrs accepts an `override` of a member the base did not
@@ -363,12 +385,18 @@ throwables (so `class ParseError(m: String) : IllegalArgumentException(m)` is
 caught and printed like a JVM one), and a `toString()` override honoured through
 nested collection rendering.
 
-Next: generics, `Set`, a real runtime `Char` (it is an `Int` code unit today,
-which is why the lambda-taking collection functions have no `String` receiver
-form), the `this`-receiver scope functions (`apply`/`run`), lambda element-type
-inference, named/default arguments, `as` casts, class body property
-initializers, and a growing standard-library surface — alongside the sibling
-parity tooling (LSP/DAP, reference generator, differential harness).
+Also landed: `Set` (`setOf`/`mutableSetOf`, insertion-ordered display,
+order-insensitive equality, `union`/`intersect`/`subtract`, `toSet`/`distinct`)
+and a wider `Iterable` surface — `sorted`/`sortedDescending`/`take`/`drop` plus
+the `associate`/`associateBy`/`minByOrNull`/`none`/`filterNot`/`flatMap`/
+`mapIndexed`/`sortedByDescending` higher-order members.
+
+Next: a real runtime `Char` (see the note above — it gates the `String`-receiver
+collection functions), generics, the `this`-receiver scope functions
+(`apply`/`run`), lambda element-type inference, named/default arguments, `as`
+casts, class body property initializers, and a growing standard-library surface —
+alongside the sibling parity tooling (LSP/DAP, reference generator, differential
+harness).
 
 ## [0xFF] LICENSE
 

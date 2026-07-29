@@ -69,6 +69,9 @@ pub const KT_SETFIELD: u16 = 14;
 pub const KT_LIST: u16 = 15;
 /// Build a `Map` from `arg` `Pair` handles `[p0 .. p{n-1}]`; pushes its handle.
 pub const KT_MAP: u16 = 16;
+/// Build a `Set` from `arg` stack values `[v0 .. v{n-1}]`, keeping the first
+/// occurrence of a repeat; pushes its handle.
+pub const KT_SET: u16 = 36;
 /// Build a `Pair` from `[first, second]`; pushes its handle.
 pub const KT_PAIR: u16 = 17;
 /// Indexed read `recv[index]`. Stack: `[recv, index]`; pushes the element/value.
@@ -292,6 +295,11 @@ enum HeapObj {
         fields: Vec<(String, Value)>,
     },
     List(Vec<Value>),
+    /// A `Set`, kept as its insertion-ordered distinct elements. Kotlin's
+    /// `setOf`/`mutableSetOf` build a `LinkedHashSet`, so iteration and display
+    /// follow insertion order and are reproducible; equality, by contrast, is
+    /// order-insensitive (`setOf(1, 2) == setOf(2, 1)`).
+    Set(Vec<Value>),
     /// Insertion-ordered key/value pairs (Kotlin `mapOf` preserves order).
     Map(Vec<(Value, Value)>),
     Pair(Value, Value),
@@ -1094,6 +1102,15 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             vals.reverse();
             vm.push(alloc(HeapObj::List(vals)));
         }
+        KT_SET => {
+            let n = arg as usize;
+            let mut vals = Vec::with_capacity(n);
+            for _ in 0..n {
+                vals.push(vm.pop());
+            }
+            vals.reverse();
+            vm.push(alloc(HeapObj::Set(distinct(&vals))));
+        }
         KT_MAP => {
             // Stack: [pair0 .. pair{n-1}]; each a Pair handle.
             let n = arg as usize;
@@ -1415,7 +1432,7 @@ fn contains_value(container: &Value, value: &Value) -> bool {
     }
     with_obj(container, |o| match o {
         HeapObj::Range(r) => r.contains(value.to_int()),
-        HeapObj::List(items) | HeapObj::Array { items, .. } => {
+        HeapObj::List(items) | HeapObj::Set(items) | HeapObj::Array { items, .. } => {
             items.iter().any(|v| value_eq(v, value))
         }
         HeapObj::Map(entries) => entries.iter().any(|(k, _)| value_eq(k, value)),
@@ -1434,7 +1451,9 @@ fn iter_len(recv: &Value) -> Option<i64> {
         return Some(s.encode_utf16().count() as i64);
     }
     with_obj(recv, |o| match o {
-        HeapObj::List(items) | HeapObj::Array { items, .. } => Some(items.len() as i64),
+        HeapObj::List(items) | HeapObj::Set(items) | HeapObj::Array { items, .. } => {
+            Some(items.len() as i64)
+        }
         HeapObj::Range(r) => Some(r.count()),
         _ => None,
     })
@@ -1456,7 +1475,7 @@ fn iter_at(recv: &Value, i: i64) -> Value {
             .unwrap_or(Value::Undef);
     }
     with_obj(recv, |o| match o {
-        HeapObj::List(items) | HeapObj::Array { items, .. } => {
+        HeapObj::List(items) | HeapObj::Set(items) | HeapObj::Array { items, .. } => {
             usize::try_from(i).ok().and_then(|i| items.get(i).cloned())
         }
         HeapObj::Range(r) => Some(Value::Int(r.at(i))),
@@ -1616,6 +1635,19 @@ fn run_sub(vm: &mut VM, entry: usize, stack_base: usize) -> Result<Value, String
     }
 }
 
+/// The distinct elements of `vals`, keeping the first occurrence of a repeat —
+/// the element order a Kotlin `LinkedHashSet` iterates in. Membership uses
+/// [`value_eq`] (structural), so two equal `data class` instances collapse.
+fn distinct(vals: &[Value]) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(vals.len());
+    for v in vals {
+        if !out.iter().any(|x| value_eq(x, v)) {
+            out.push(v.clone());
+        }
+    }
+    out
+}
+
 /// The declared class tag of a value, when it is a class instance or an `object`
 /// singleton; `None` for every other value kind.
 fn instance_tag(v: &Value) -> Option<String> {
@@ -1656,7 +1688,7 @@ fn display_vm(vm: &mut VM, v: &Value) -> String {
         Plain,
     }
     let shape = with_obj(v, |o| match o {
-        HeapObj::List(items) => Shape::List(items.clone()),
+        HeapObj::List(items) | HeapObj::Set(items) => Shape::List(items.clone()),
         HeapObj::Map(entries) => Shape::Map(entries.clone()),
         HeapObj::Pair(a, b) => Shape::Pair(a.clone(), b.clone()),
         _ => Shape::Plain,
@@ -1701,7 +1733,7 @@ fn b_join(vm: &mut VM, argc: u8) -> Value {
 /// The elements of any iterable receiver — a `List`, an array, or a range.
 fn sequence_items(v: &Value) -> Vec<Value> {
     with_obj(v, |o| match o {
-        HeapObj::List(items) => items.clone(),
+        HeapObj::List(items) | HeapObj::Set(items) => items.clone(),
         HeapObj::Array { items, .. } => items.clone(),
         HeapObj::Range(r) => r.to_vec(),
         _ => Vec::new(),
@@ -1788,7 +1820,9 @@ fn b_scope_fn(vm: &mut VM, _argc: u8) -> Value {
 /// methods here.
 fn list_snapshot(recv: &Value) -> Option<Vec<Value>> {
     with_obj(recv, |o| match o {
-        HeapObj::List(items) | HeapObj::Array { items, .. } => Some(items.clone()),
+        HeapObj::List(items) | HeapObj::Set(items) | HeapObj::Array { items, .. } => {
+            Some(items.clone())
+        }
         HeapObj::Range(r) => Some(r.to_vec()),
         _ => None,
     })
@@ -1926,6 +1960,95 @@ fn coll_hof(
             Ok(alloc(HeapObj::List(
                 keyed.into_iter().map(|(_, it)| it).collect(),
             )))
+        }
+        "minByOrNull" => {
+            let mut best: Option<(Value, Value)> = None;
+            for it in items {
+                let sel = invoke_closure(vm, clo, std::slice::from_ref(&it))?;
+                let take = match &best {
+                    Some((_, bsel)) => value_cmp(&sel, bsel) == std::cmp::Ordering::Less,
+                    None => true,
+                };
+                if take {
+                    best = Some((it, sel));
+                }
+            }
+            Ok(best.map(|(el, _)| el).unwrap_or(Value::Undef))
+        }
+        "none" => {
+            for it in items {
+                if truthy(&invoke_closure(vm, clo, &[it])?) {
+                    return Ok(Value::Bool(false));
+                }
+            }
+            Ok(Value::Bool(true))
+        }
+        "filterNot" => {
+            let mut out = Vec::new();
+            for it in items {
+                if !truthy(&invoke_closure(vm, clo, std::slice::from_ref(&it))?) {
+                    out.push(it);
+                }
+            }
+            Ok(alloc(HeapObj::List(out)))
+        }
+        "flatMap" => {
+            // Each result is itself iterable; its elements are spliced in.
+            let mut out = Vec::new();
+            for it in items {
+                let sub = invoke_closure(vm, clo, &[it])?;
+                out.extend(sequence_items(&sub));
+            }
+            Ok(alloc(HeapObj::List(out)))
+        }
+        "mapIndexed" => {
+            let mut out = Vec::with_capacity(items.len());
+            for (i, it) in items.into_iter().enumerate() {
+                out.push(invoke_closure(vm, clo, &[Value::Int(i as i64), it])?);
+            }
+            Ok(alloc(HeapObj::List(out)))
+        }
+        "sortedByDescending" => {
+            let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(items.len());
+            for it in items {
+                let key = invoke_closure(vm, clo, std::slice::from_ref(&it))?;
+                keyed.push((key, it));
+            }
+            // Reversing a stable ascending sort would also reverse the ties;
+            // Kotlin keeps them in input order, so the comparison is flipped
+            // instead.
+            keyed.sort_by(|a, b| value_cmp(&b.0, &a.0));
+            Ok(alloc(HeapObj::List(
+                keyed.into_iter().map(|(_, it)| it).collect(),
+            )))
+        }
+        // `associate` takes the lambda's `Pair` result as the entry; `associateBy`
+        // takes its result as the KEY and the element as the value — the mirror
+        // image of `associateWith`.
+        "associate" | "associateBy" => {
+            let mut entries: Vec<(Value, Value)> = Vec::with_capacity(items.len());
+            for it in items {
+                let out = invoke_closure(vm, clo, std::slice::from_ref(&it))?;
+                let (k, v) = if name == "associateBy" {
+                    (out, it)
+                } else {
+                    match with_obj(&out, |o| match o {
+                        HeapObj::Pair(a, b) => Some((a.clone(), b.clone())),
+                        _ => None,
+                    })
+                    .flatten()
+                    {
+                        Some(kv) => kv,
+                        None => return Err("kotlin: associate expects a Pair".to_string()),
+                    }
+                };
+                if let Some(slot) = entries.iter_mut().find(|(ek, _)| value_eq(ek, &k)) {
+                    slot.1 = v;
+                } else {
+                    entries.push((k, v));
+                }
+            }
+            Ok(alloc(HeapObj::Map(entries)))
         }
         "associateWith" => {
             let mut entries: Vec<(Value, Value)> = Vec::with_capacity(items.len());
@@ -2128,20 +2251,65 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
 
     // Mutating list operations need a mutable borrow.
     match name {
+        // `MutableList.add` always appends and answers `true`; `MutableSet.add`
+        // answers whether the element was NEW, which is Kotlin's contract and
+        // the reason the two share one arm but not one result.
         "add" => {
             let v = args.first().cloned().unwrap_or(Value::Undef);
-            let ok = with_obj_mut(recv, |o| match o {
+            let added = with_obj_mut(recv, |o| match o {
                 HeapObj::List(items) => {
                     items.push(v);
-                    true
+                    Some(true)
                 }
-                _ => false,
+                HeapObj::Set(items) => {
+                    if items.iter().any(|x| value_eq(x, &v)) {
+                        Some(false)
+                    } else {
+                        items.push(v);
+                        Some(true)
+                    }
+                }
+                _ => None,
             })
-            .unwrap_or(false);
-            return if ok {
-                Ok(Value::Bool(true))
-            } else {
-                Err(format!("unresolved reference: add on {}", obj_label(recv)))
+            .flatten();
+            return match added {
+                Some(b) => Ok(Value::Bool(b)),
+                None => Err(format!("unresolved reference: add on {}", obj_label(recv))),
+            };
+        }
+        // `remove(element)` on a mutable list or set — `removeAt(index)` is the
+        // by-position form and stays separate.
+        "remove" => {
+            let v = args.first().cloned().unwrap_or(Value::Undef);
+            let removed = with_obj_mut(recv, |o| match o {
+                HeapObj::List(items) | HeapObj::Set(items) => {
+                    match items.iter().position(|x| value_eq(x, &v)) {
+                        Some(i) => {
+                            items.remove(i);
+                            Some(true)
+                        }
+                        None => Some(false),
+                    }
+                }
+                // `MutableMap.remove(key)` answers the previous value, or null.
+                HeapObj::Map(entries) => {
+                    match entries.iter().position(|(k, _)| value_eq(k, &v)) {
+                        Some(i) => {
+                            entries.remove(i);
+                            Some(true)
+                        }
+                        None => Some(false),
+                    }
+                }
+                _ => None,
+            })
+            .flatten();
+            return match removed {
+                Some(b) => Ok(Value::Bool(b)),
+                None => Err(format!(
+                    "unresolved reference: remove on {}",
+                    obj_label(recv)
+                )),
             };
         }
         "removeAt" => {
@@ -2205,7 +2373,7 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
     // `first`/`last` are *properties* of the progression (defined even when it is
     // empty), where a list's are element accessors.
     let kind = with_obj(recv, |o| match o {
-        HeapObj::List(_) => 1u8,
+        HeapObj::List(_) | HeapObj::Set(_) => 1u8,
         HeapObj::Array { .. } => 2,
         HeapObj::Range(_) => 3,
         _ => 0,
@@ -2326,6 +2494,55 @@ fn sequence_member(
         "toList" | "toMutableList" | "toTypedArray" | "asList" => {
             return Some(Ok(alloc(HeapObj::List(items.to_vec()))))
         }
+        // `toSet` yields a `Set`; `distinct` yields a `List` with the same
+        // elements — the pair Kotlin draws the distinction between.
+        "toSet" | "toMutableSet" | "toHashSet" => {
+            return Some(Ok(alloc(HeapObj::Set(distinct(items)))))
+        }
+        "distinct" => return Some(Ok(alloc(HeapObj::List(distinct(items))))),
+        // The set operators are defined on any `Iterable` and all return a
+        // `Set`, whichever kind the receiver was.
+        "union" | "intersect" | "subtract" => {
+            let other = args.first().map(sequence_items).unwrap_or_default();
+            let out: Vec<Value> = match name {
+                "union" => distinct(&[items.to_vec(), other].concat()),
+                "intersect" => distinct(items)
+                    .into_iter()
+                    .filter(|x| other.iter().any(|y| value_eq(x, y)))
+                    .collect(),
+                _ => distinct(items)
+                    .into_iter()
+                    .filter(|x| !other.iter().any(|y| value_eq(x, y)))
+                    .collect(),
+            };
+            return Some(Ok(alloc(HeapObj::Set(out))));
+        }
+        "sorted" | "sortedDescending" => {
+            let mut out = items.to_vec();
+            out.sort_by(value_cmp);
+            if name == "sortedDescending" {
+                out.reverse();
+            }
+            return Some(Ok(alloc(HeapObj::List(out))));
+        }
+        // `take`/`drop` clamp rather than fault: Kotlin returns the whole
+        // sequence for an oversized `take` and an empty one for an oversized
+        // `drop`. A negative count is an IllegalArgumentException there.
+        "take" | "drop" => {
+            let n = args.first().map(|v| v.to_int()).unwrap_or(0);
+            if n < 0 {
+                return Some(Err(format!(
+                    "java.lang.IllegalArgumentException: Requested element count {n} is less than zero."
+                )));
+            }
+            let n = (n as usize).min(items.len());
+            let out = if name == "take" {
+                items[..n].to_vec()
+            } else {
+                items[n..].to_vec()
+            };
+            return Some(Ok(alloc(HeapObj::List(out))));
+        }
         // `joinToString(separator)` — the separator defaults to `", "`.
         "joinToString" => {
             let sep = match args.first() {
@@ -2363,7 +2580,9 @@ fn sequence_member(
 fn component(recv: &Value, n: usize) -> Result<Value, String> {
     with_obj(recv, |o| match o {
         HeapObj::Instance { fields, .. } => fields.get(n - 1).map(|(_, v)| v.clone()),
-        HeapObj::List(items) | HeapObj::Array { items, .. } => items.get(n - 1).cloned(),
+        HeapObj::List(items) | HeapObj::Set(items) | HeapObj::Array { items, .. } => {
+            items.get(n - 1).cloned()
+        }
         HeapObj::Pair(a, b) => match n {
             1 => Some(a.clone()),
             2 => Some(b.clone()),
@@ -2494,6 +2713,11 @@ fn heap_eq(a: &HeapObj, b: &HeapObj) -> bool {
         (HeapObj::List(xa), HeapObj::List(xb)) => {
             xa.len() == xb.len() && xa.iter().zip(xb).all(|(x, y)| value_eq(x, y))
         }
+        // A `Set`'s equality is order-INSENSITIVE (`setOf(1, 2) == setOf(2, 1)`),
+        // unlike a `List`'s, and a Set never equals a List.
+        (HeapObj::Set(xa), HeapObj::Set(xb)) => {
+            xa.len() == xb.len() && xa.iter().all(|x| xb.iter().any(|y| value_eq(x, y)))
+        }
         (HeapObj::Pair(a1, a2), HeapObj::Pair(b1, b2)) => value_eq(a1, b1) && value_eq(a2, b2),
         (HeapObj::Map(ea), HeapObj::Map(eb)) => {
             ea.len() == eb.len()
@@ -2550,6 +2774,17 @@ fn obj_hash(recv: &Value) -> i64 {
                     kotlin_string(v).hash(&mut h);
                 }
             }
+            HeapObj::Set(items) => {
+                // Order-independent: two equal sets built in different insertion
+                // orders must agree, so the per-element hashes are summed.
+                let mut sum: u64 = 0;
+                for v in items {
+                    let mut e = DefaultHasher::new();
+                    kotlin_string(v).hash(&mut e);
+                    sum = sum.wrapping_add(e.finish());
+                }
+                sum.hash(&mut h);
+            }
             HeapObj::Closure { name_idx, .. } => name_idx.hash(&mut h),
             HeapObj::Exc { class, msg } => {
                 class.hash(&mut h);
@@ -2569,6 +2804,7 @@ fn obj_label(recv: &Value) -> String {
     with_obj(recv, |o| match o {
         HeapObj::Instance { class, .. } => class.clone(),
         HeapObj::List(_) => "List".to_string(),
+        HeapObj::Set(_) => "Set".to_string(),
         HeapObj::Map(_) => "Map".to_string(),
         HeapObj::Pair(_, _) => "Pair".to_string(),
         HeapObj::Closure { .. } => "Function".to_string(),
@@ -2616,7 +2852,9 @@ fn display_obj(id: u32) -> String {
                     format!("{class}@{id:x}")
                 }
             }
-            HeapObj::List(items) => {
+            // A `Set` prints exactly like a `List` in Kotlin — square brackets,
+            // elements in iteration (insertion) order.
+            HeapObj::List(items) | HeapObj::Set(items) => {
                 let body = items
                     .iter()
                     .map(kotlin_string)

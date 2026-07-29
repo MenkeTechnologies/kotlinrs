@@ -300,41 +300,46 @@ println(xs.size)   // 3</code></pre>
 println(m["a"])   // 1</code></pre>
         </article>
         <article class="doc-entry" id="doc-builtin-5">
-          <h3><a class="doc-anchor" href="#doc-builtin-5">#</a> <code>arrayOf</code></h3>
+          <h3><a class="doc-anchor" href="#doc-builtin-5">#</a> <code>setOf</code></h3>
+          <p>build a Set: insertion-ordered display, order-insensitive equality</p>
+          <pre><code class="lang-kotlin">println(setOf(3, 1, 3))   // [3, 1]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-6">
+          <h3><a class="doc-anchor" href="#doc-builtin-6">#</a> <code>arrayOf</code></h3>
           <p>build an array; `intArrayOf`/`doubleArrayOf`/`booleanArrayOf` are typed</p>
           <pre><code class="lang-kotlin">val a = arrayOf(1, 2, 3)
 println(a[1])   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-6">
-          <h3><a class="doc-anchor" href="#doc-builtin-6">#</a> <code>IntArray</code></h3>
+        <article class="doc-entry" id="doc-builtin-7">
+          <h3><a class="doc-anchor" href="#doc-builtin-7">#</a> <code>IntArray</code></h3>
           <p>a zero-filled primitive array; also `DoubleArray`/`BooleanArray`</p>
           <pre><code class="lang-kotlin">val a = IntArray(3)
 println(a.sum())   // 0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-7">
-          <h3><a class="doc-anchor" href="#doc-builtin-7">#</a> <code>abs</code></h3>
+        <article class="doc-entry" id="doc-builtin-8">
+          <h3><a class="doc-anchor" href="#doc-builtin-8">#</a> <code>abs</code></h3>
           <p>absolute value (kotlin.math; needs `import kotlin.math.*`)</p>
           <pre><code class="lang-kotlin">import kotlin.math.*
 println(abs(-3))   // 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-8">
-          <h3><a class="doc-anchor" href="#doc-builtin-8">#</a> <code>sqrt</code></h3>
+        <article class="doc-entry" id="doc-builtin-9">
+          <h3><a class="doc-anchor" href="#doc-builtin-9">#</a> <code>sqrt</code></h3>
           <p>square root of a Double (kotlin.math; needs the import)</p>
           <pre><code class="lang-kotlin">import kotlin.math.*
 println(sqrt(9.0))   // 3.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-9">
-          <h3><a class="doc-anchor" href="#doc-builtin-9">#</a> <code>max</code></h3>
+        <article class="doc-entry" id="doc-builtin-10">
+          <h3><a class="doc-anchor" href="#doc-builtin-10">#</a> <code>max</code></h3>
           <p>larger of two values (kotlin.math); `maxOf` needs no import</p>
           <pre><code class="lang-kotlin">println(maxOf(2, 9))   // 9</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-10">
-          <h3><a class="doc-anchor" href="#doc-builtin-10">#</a> <code>min</code></h3>
+        <article class="doc-entry" id="doc-builtin-11">
+          <h3><a class="doc-anchor" href="#doc-builtin-11">#</a> <code>min</code></h3>
           <p>smaller of two values (kotlin.math); `minOf` needs no import</p>
           <pre><code class="lang-kotlin">println(minOf(2, 9))   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-11">
-          <h3><a class="doc-anchor" href="#doc-builtin-11">#</a> <code>Math</code></h3>
+        <article class="doc-entry" id="doc-builtin-12">
+          <h3><a class="doc-anchor" href="#doc-builtin-12">#</a> <code>Math</code></h3>
           <p>the java.lang.Math statics, auto-imported (abs/max/min/sqrt/round/…)</p>
           <pre><code class="lang-kotlin">println(Math.abs(-3))   // 3</code></pre>
         </article>

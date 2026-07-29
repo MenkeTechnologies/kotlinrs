@@ -1629,3 +1629,110 @@ fun main() {
 }";
     assert_eq!(prog(src), "5\n6\n4\n[1, 4, 7]\n");
 }
+
+// ─── Set and the collection operations ────────────────────────────────────
+//
+// Expected strings captured from the reference toolchain (kotlinc-jvm 2.4.10).
+
+#[test]
+fn set_keeps_insertion_order_and_compares_without_it() {
+    // `setOf` builds a LinkedHashSet: iteration and display follow insertion
+    // order (so the output is reproducible), while equality does not.
+    let src = "\
+fun main() {
+    val s = setOf(3, 1, 2, 3, 1)
+    println(s)
+    println(s.size)
+    println(2 in s)
+    println(9 in s)
+    println(s.toList())
+    println(s.sum())
+    println(setOf(1, 2) == setOf(2, 1))
+    println(setOf(1, 2) == setOf(1, 3))
+    println(listOf(1, 2, 2, 3).toSet())
+    println(listOf(1, 2, 2, 3).distinct())
+}";
+    assert_eq!(
+        prog(src),
+        "[3, 1, 2]\n3\ntrue\nfalse\n[3, 1, 2]\n6\ntrue\nfalse\n[1, 2, 3]\n[1, 2, 3]\n"
+    );
+}
+
+#[test]
+fn set_operators_and_mutation() {
+    // `MutableSet.add` answers whether the element was NEW, unlike
+    // `MutableList.add`, which always appends and answers `true`.
+    let src = "\
+fun main() {
+    println(setOf(1, 2).union(setOf(2, 3)))
+    println(setOf(1, 2).intersect(setOf(2, 3)))
+    println(setOf(1, 2).subtract(setOf(2)))
+    val m = mutableSetOf(1, 2)
+    println(m.add(3))
+    println(m.add(2))
+    println(m)
+    println(m.remove(1))
+    println(m)
+    val l = mutableListOf(1, 2, 3)
+    println(l.add(3))
+    println(l.remove(9))
+    println(l)
+}";
+    assert_eq!(
+        prog(src),
+        "[1, 2, 3]\n[2]\n[1]\ntrue\nfalse\n[1, 2, 3]\ntrue\n[2, 3]\ntrue\nfalse\n[1, 2, 3, 3]\n"
+    );
+}
+
+#[test]
+fn ordering_and_slicing_members() {
+    // `take`/`drop` clamp to the sequence's length rather than faulting, and
+    // `sortedByDescending` keeps ties in input order (it flips the comparison
+    // rather than reversing a stable ascending sort).
+    let src = "\
+fun main() {
+    val ns = listOf(5, 3, 9, 1, 3)
+    println(ns.sorted())
+    println(ns.sortedDescending())
+    println(ns.take(2))
+    println(ns.drop(2))
+    println(ns.take(99))
+    println(ns.drop(99))
+    println((1..5).take(2))
+    println(listOf(\"bb\", \"a\", \"cc\").sortedByDescending { it.length })
+}";
+    assert_eq!(
+        prog(src),
+        "[1, 3, 3, 5, 9]\n[9, 5, 3, 3, 1]\n[5, 3]\n[9, 1, 3]\n[5, 3, 9, 1, 3]\n[]\n[1, 2]\n[bb, cc, a]\n"
+    );
+}
+
+#[test]
+fn associate_family_and_the_new_higher_order_members() {
+    // `associate` reads the lambda's Pair as the entry; `associateBy` reads its
+    // result as the KEY and the element as the value.
+    let src = "\
+data class P(val n: String, val a: Int)
+fun main() {
+    val ps = listOf(P(\"ann\", 30), P(\"bob\", 25), P(\"cid\", 30))
+    println(ps.associate { it.n to it.a })
+    println(ps.associateBy { it.a })
+    println(ps.groupBy { it.a })
+    println(ps.minByOrNull { it.a })
+    println(ps.filterNot { it.a > 26 })
+    println(ps.none { it.a > 99 })
+    println(ps.flatMap { listOf(it.n, it.n) })
+    println(ps.mapIndexed { i, x -> \"$i:${x.n}\" })
+}";
+    assert_eq!(
+        prog(src),
+        "{ann=30, bob=25, cid=30}\n\
+         {30=P(n=cid, a=30), 25=P(n=bob, a=25)}\n\
+         {30=[P(n=ann, a=30), P(n=cid, a=30)], 25=[P(n=bob, a=25)]}\n\
+         P(n=bob, a=25)\n\
+         [P(n=bob, a=25)]\n\
+         true\n\
+         [ann, ann, bob, bob, cid, cid]\n\
+         [0:ann, 1:bob, 2:cid]\n"
+    );
+}
