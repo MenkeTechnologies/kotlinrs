@@ -603,6 +603,99 @@ fun main() {
 }
 
 #[test]
+fn qualified_super_picks_the_named_supertype() {
+    // `super<T>.m()` names WHICH inherited `m` to run. Kotlin requires it when
+    // more than one supertype implements the member, so this is the only
+    // spelling that compiles for `Both` — an unqualified `super.hi()` there
+    // would be ambiguous.
+    let src = "\
+interface A { fun hi(): String = \"A\" }
+interface B { fun hi(): String = \"B\" }
+open class Base { open fun hi(): String = \"Base\" }
+class Both : A, B {
+    override fun hi(): String = super<A>.hi() + \"/\" + super<B>.hi()
+}
+class Mixed : Base(), A {
+    override fun hi(): String = super<Base>.hi() + \"+\" + super<A>.hi()
+}
+class Plain : Base() {
+    override fun hi(): String = \"E(\" + super.hi() + \")\"
+}
+fun main() {
+    println(Both().hi())
+    println(Mixed().hi())
+    println(Plain().hi())
+    val a: A = Both()
+    println(a.hi())
+}";
+    assert_eq!(prog(src), "A/B\nBase+A\nE(Base)\nA/B\n");
+}
+
+#[test]
+fn qualified_super_rejects_a_type_that_is_not_a_direct_supertype() {
+    // Kotlin rejects `super<T>` for a `T` the class does not directly extend.
+    let src = "\
+interface A { fun hi(): String = \"A\" }
+interface B { fun hi(): String = \"B\" }
+class Only : A {
+    override fun hi(): String = super<B>.hi()
+}
+fun main() { println(Only().hi()) }";
+    let err = prog_err(src);
+    assert!(
+        err.contains("not a direct supertype"),
+        "unexpected diagnostic: {err}"
+    );
+}
+
+#[test]
+fn data_class_inheriting_stored_properties() {
+    // Kotlin derives a `data class`'s members from the primary constructor
+    // ALONE, so an inherited field is readable but is not part of `toString`,
+    // `equals`, `hashCode`, or `componentN`.
+    let src = "\
+open class Node(val depth: Int)
+data class Leaf(val v: Int) : Node(1)
+data class Branch(val l: String, val r: Int) : Node(2)
+fun main() {
+    val f = Leaf(5)
+    println(f)
+    println(f.depth)
+    println(f == Leaf(5))
+    println(f == Leaf(6))
+    println(f.hashCode() == Leaf(5).hashCode())
+    println(Branch(\"x\", 1))
+    val (a, b) = Branch(\"x\", 1)
+    println(\"$a/$b\")
+    println(listOf(Leaf(1), Branch(\"a\", 2)))
+    println(setOf(Leaf(1), Leaf(1), Leaf(2)))
+}";
+    assert_eq!(
+        prog(src),
+        "Leaf(v=5)\n1\ntrue\nfalse\ntrue\nBranch(l=x, r=1)\nx/1\n\
+         [Leaf(v=1), Branch(l=a, r=2)]\n[Leaf(v=1), Leaf(v=2)]\n"
+    );
+}
+
+#[test]
+fn data_class_copy_reruns_the_superclass_constructor() {
+    // Kotlin's generated `copy` calls the primary constructor, so a superclass
+    // argument written in terms of a constructor parameter is recomputed from
+    // the NEW value rather than carried over from the receiver.
+    let src = "\
+open class Base(val len: Int)
+data class W(val s: String) : Base(s.length)
+fun main() {
+    val w = W(\"abc\")
+    println(w.len)
+    val z = w.copy(\"zzzzz\")
+    println(z)
+    println(z.len)
+}";
+    assert_eq!(prog(src), "3\nW(s=zzzzz)\n5\n");
+}
+
+#[test]
 fn class_typed_parameters_and_returns() {
     // A function taking and returning a class type dispatches faithfully.
     let src = "\

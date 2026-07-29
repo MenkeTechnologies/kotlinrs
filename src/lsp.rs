@@ -184,8 +184,8 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
     (
         "super",
         "Keyword",
-        "call the supertype's implementation instead of the overriding one",
-        "override fun f(): Int = super.f() + 1",
+        "call the supertype's implementation instead of the overriding one; `super<T>.f()` names which supertype",
+        "override fun f(): Int = super.f() + 1\noverride fun g(): String = super<Left>.g() + super<Right>.g()",
     ),
     (
         "break",

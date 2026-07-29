@@ -1412,6 +1412,22 @@ impl Parser {
                     Ok(Expr::Var(name))
                 }
             }
+            Tok::Ident(name) if name == "super" => {
+                self.bump();
+                // `super<Base>.m()` — the supertype qualifier that disambiguates
+                // when more than one supertype implements `m`. Not consumed by
+                // `skip_call_type_args`, which only takes a type-argument list
+                // followed by `(`; this one is followed by `.`.
+                let qualifier = if self.at(&Tok::Lt) {
+                    self.bump();
+                    let n = self.ident()?;
+                    self.eat(&Tok::Gt)?;
+                    Some(n)
+                } else {
+                    None
+                };
+                Ok(Expr::Super { qualifier })
+            }
             Tok::Ident(name) => {
                 self.bump();
                 // Explicit type arguments on a call — `listOf<Int>()`,

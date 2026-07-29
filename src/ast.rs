@@ -376,6 +376,17 @@ pub enum Expr {
     /// String literal, split into literal runs and interpolated sub-expressions.
     Str(Vec<StrExpr>),
     Var(String),
+    /// The `super` receiver of `super.m(args)` / `super<T>.m(args)`.
+    ///
+    /// A node of its own rather than a `Var("super")` because the qualified form
+    /// carries a supertype name, which is the whole point of writing it: with
+    /// two supertypes implementing `m`, `super<T>.m()` says *which* body to run,
+    /// where the unqualified form takes the first one in the supertype list.
+    /// `super` never stands alone as a value in Kotlin, so this only ever
+    /// appears as a member/method-call receiver.
+    Super {
+        qualifier: Option<String>,
+    },
     Unary {
         op: UnOp,
         expr: Box<Expr>,

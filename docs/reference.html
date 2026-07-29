@@ -189,8 +189,9 @@ data class Num(val v: Int) : Expr()</code></pre>
         </article>
         <article class="doc-entry" id="doc-keyword-26">
           <h3><a class="doc-anchor" href="#doc-keyword-26">#</a> <code>super</code></h3>
-          <p>call the supertype's implementation instead of the overriding one</p>
-          <pre><code class="lang-kotlin">override fun f(): Int = super.f() + 1</code></pre>
+          <p>call the supertype's implementation instead of the overriding one; `super&lt;T&gt;.f()` names which supertype</p>
+          <pre><code class="lang-kotlin">override fun f(): Int = super.f() + 1
+override fun g(): String = super&lt;Left&gt;.g() + super&lt;Right&gt;.g()</code></pre>
         </article>
         <article class="doc-entry" id="doc-keyword-27">
           <h3><a class="doc-anchor" href="#doc-keyword-27">#</a> <code>break</code></h3>

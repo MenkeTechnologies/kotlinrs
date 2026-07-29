@@ -564,7 +564,7 @@ fn g_class(r: &mut Rng, idx: usize) -> String {
     let k = pick(r, &["0", "1", "2", "3", "5"]);
     let j = pick(r, &["1", "2", "4"]);
     let s = pick(r, STRS);
-    match r.below(14) {
+    match r.below(18) {
         0 => p(format!("Sq({k}).area()")),
         1 => p(format!("Ci({k}).area()")),
         2 => p(format!("Sq({k}).tag()")),
@@ -592,8 +592,44 @@ fn g_class(r: &mut Rng, idx: usize) -> String {
         12 => format!(
             "try {{ throw KtErr({s}) }} catch (e: KtErr) {{ println(e.message); println(e) }}"
         ),
-        _ => format!(
+        13 => format!(
             "println(try {{ throw KtErr({s}); \"no\" }} catch (e: Exception) {{ \"c:\" + e.message }})"
+        ),
+        // `super<T>.m()`: two supertypes implement `m`, so the qualifier is what
+        // decides which body runs — and Kotlin *requires* it here, which makes
+        // this the only spelling that can be tested against the oracle.
+        14 => p(format!("Both({k}).pick()")),
+        15 => p(format!("Both({k}).only()")),
+        16 => format!("val bt{idx}: Left = Both({k}); println(bt{idx}.pick()); println(bt{idx}.only())"),
+        _ => p(format!("Sub({k}).chain()")),
+    }
+}
+
+/// A `data class` that inherits stored properties: Kotlin derives its
+/// `toString`/`equals`/`hashCode`/`componentN`/`copy` from the primary
+/// constructor *alone*, while the inherited field is still readable.
+fn g_datainherit(r: &mut Rng, idx: usize) -> String {
+    let k = pick(r, &["0", "1", "2", "7", "-3"]);
+    let j = pick(r, &["1", "2", "9"]);
+    let s = pick(r, &["\"a\"", "\"abc\"", "\"\"", "\"Hi\""]);
+    match r.below(14) {
+        0 => p(format!("Lf({k})")),
+        1 => p(format!("Br({s}, {j})")),
+        2 => p(format!("Lf({k}).d")),
+        3 => p(format!("Lf({k}).depth()")),
+        4 => p(format!("Lf({k}) == Lf({k})")),
+        5 => p(format!("Lf({k}) == Lf({j})")),
+        6 => p(format!("Lf({k}).hashCode() == Lf({k}).hashCode()")),
+        7 => p(format!("Lf({k}).copy({j})")),
+        8 => p(format!("Br({s}, {j}).copy({s}, {k})")),
+        9 => format!("val (a{idx}, b{idx}) = Br({s}, {j}); println(\"$a{idx}|$b{idx}\")"),
+        10 => p(format!("listOf(Lf({k}), Br({s}, {j}))")),
+        11 => p(format!("setOf(Lf({k}), Lf({k}), Lf({j}))")),
+        // `copy` re-runs the superclass header, so the base field follows the
+        // NEW constructor argument, not the receiver's old one.
+        12 => format!("val w{idx} = Wd({s}).copy(\"zzzz\"); println(w{idx}); println(w{idx}.d)"),
+        _ => format!(
+            "val n{idx}: Nd = Lf({k}); println(n{idx} is Lf); println(n{idx} is Nd); println(n{idx})"
         ),
     }
 }
@@ -667,6 +703,7 @@ enum Mode {
     NullSafe,
     DataWhen,
     Class,
+    DataInherit,
     Coll,
 }
 
@@ -696,6 +733,7 @@ const CONCRETE: &[Mode] = &[
     Mode::NullSafe,
     Mode::DataWhen,
     Mode::Class,
+    Mode::DataInherit,
     Mode::Coll,
 ];
 
@@ -727,6 +765,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::NullSafe => "nullsafe",
         Mode::DataWhen => "datawhen",
         Mode::Class => "class",
+        Mode::DataInherit => "datainherit",
         Mode::Coll => "coll",
     }
 }
@@ -770,6 +809,7 @@ fn gen_probe(r: &mut Rng, mode: Mode, idx: usize) -> String {
         Mode::NullSafe => g_nullsafe(r, idx),
         Mode::DataWhen => g_datawhen(r, idx),
         Mode::Class => g_class(r, idx),
+        Mode::DataInherit => g_datainherit(r, idx),
         Mode::Coll => g_coll(r, idx),
         Mode::All => unreachable!("resolved above"),
     }
@@ -845,6 +885,49 @@ fn declarations(probes: &[String]) -> String {
         (
             "KtErr(",
             "class KtErr(msg: String) : Exception(msg)\n",
+        ),
+        // `super<T>.m()`. `Both` implements two interfaces that both supply
+        // `pick`, which is exactly when Kotlin *requires* the qualifier — so the
+        // oracle accepts only the qualified spelling, and the two arms it can
+        // resolve to differ. `only` is implemented by one supertype and `chain`
+        // by a superclass, covering the qualified forms that have an unqualified
+        // equivalent.
+        (
+            "Both(",
+            "interface Left {\n\
+             \x20   fun pick(): String = \"L\"\n\
+             \x20   fun only(): String = \"only-L\"\n\
+             }\n\
+             interface Right {\n\
+             \x20   fun pick(): String = \"R\"\n\
+             }\n\
+             class Both(val k: Int) : Left, Right {\n\
+             \x20   override fun pick(): String = super<Left>.pick() + super<Right>.pick() + k\n\
+             \x20   override fun only(): String = super<Left>.only() + \"/\" + k\n\
+             }\n",
+        ),
+        (
+            "Sub(",
+            "open class Sup(val k: Int) {\n\
+             \x20   open fun chain(): String = \"sup$k\"\n\
+             }\n\
+             class Sub(k: Int) : Sup(k) {\n\
+             \x20   override fun chain(): String = \"sub[\" + super<Sup>.chain() + \"]\"\n\
+             }\n",
+        ),
+        // A `data class` under a field-carrying supertype. `Wd`'s superclass
+        // argument is written in terms of its own constructor parameter, which
+        // is what makes `copy` observable: Kotlin's generated `copy` calls the
+        // primary constructor, so the base field is recomputed rather than
+        // carried over.
+        (
+            "Lf(",
+            "open class Nd(val d: Int) {\n\
+             \x20   fun depth(): Int = d\n\
+             }\n\
+             data class Lf(val v: Int) : Nd(1)\n\
+             data class Br(val l: String, val r: Int) : Nd(2)\n\
+             data class Wd(val s: String) : Nd(s.length)\n",
         ),
     ] {
         // `Sq(`/`Ci(` also need the `Shp` block, so the shape marker is the bare

@@ -145,8 +145,12 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `val`-property reassignment is a compile error.
 - **Inheritance** — `open class`/`abstract class`/`sealed class`/`interface`,
   the `: Super(args), Iface1, Iface2` supertype list, `override`, `abstract`
-  members with no body, interface members *with* a default body, and `super.m()`
-  for the supertype's implementation. Dispatch is **virtual**: a call resolves
+  members with no body, interface members *with* a default body, and
+  `super.m()` — plus the qualified `super<T>.m()`, which names *which* supertype
+  to run and is what Kotlin requires when two of them implement `m`
+  (`super<Left>.pick() + super<Right>.pick()`); a `T` that is not a direct
+  supertype, or that does not implement `m`, is a compile error, as in Kotlin.
+  Dispatch is **virtual**: a call resolves
   against the receiver's *runtime* class, so `val a: Animal = Dog(…)` runs
   `Dog`'s override, and a base-class method calling an overridden one lands in
   the override too. Fields are flattened base-most first and a subclass's
@@ -167,7 +171,13 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 - **`data class`** — auto-generated `equals`/`hashCode` (structural),
   `toString()` (`C(x=1, y=2)`), `copy(...)` (positional overrides), and
   `componentN`, so `val (a, b) = p` destructures. `==` on a data class /
-  collection is structural.
+  collection is structural. A `data class` **may inherit stored properties**
+  (`data class Leaf(val v: Int) : Node(1)`): Kotlin derives the members from the
+  primary constructor *alone*, so the inherited field is readable (`leaf.depth`)
+  but is not part of `toString`/`equals`/`hashCode`/`componentN`, and `copy`
+  calls the primary constructor — re-running the `: Super(args)` header, which
+  is what makes `data class W(val s: String) : Base(s.length)` recompute its base
+  field on a copy rather than carry the old one over.
 - **`object`** — singleton declarations with `val`/`var` properties and methods,
   built once and reachable by name (`Counter.inc()`). An `object` may
   declare supertypes (`object Registry : Greeter`), which its own methods and
@@ -276,16 +286,10 @@ arguments, the collection functions on a `String` receiver (`"abc".map { … }`,
 `"abc".toCharArray()`, `"abc".first()`; `for (c in s)` and `s[i]` work), and the
 rest of the standard-library surface.
 
-Inheritance carries three deliberate simplifications. The modifiers are recorded
-but not **enforced** — kotlinrs accepts an `override` of a member the base did not
-mark `open`, where Kotlin would reject it; it never *mis*-runs a valid program,
-it only accepts some invalid ones. A `data class` may not inherit stored
-properties (Kotlin derives its members from the primary constructor alone, which
-a flattened field record cannot reproduce), so `data class Num(val v: Int) :
-Expr()` over a field-less supertype is fine and a `data class` under a
-field-carrying one is a compile error. And an unqualified `super.m()` resolves to
-the first supertype that implements `m`; the `super<T>.m()` disambiguation form is
-not parsed.
+Inheritance carries one deliberate simplification: the modifiers are recorded but
+not **enforced** — kotlinrs accepts an `override` of a member the base did not
+mark `open`, where Kotlin would reject it. It never *mis*-runs a valid program,
+it only accepts some invalid ones.
 
 A `return` out of a `try` that owns a `finally` is honoured — the finalizer runs
 first, nesting outward — but a `break`/`continue` out of one is refused at
@@ -412,7 +416,10 @@ answers `is Char`, and keeps Kotlin's `Char` arithmetic and ordering inside a
 lambda; plus `CharRange` (`'a'..'e'`, `step`/`downTo`/`reversed`/`in`) and the
 `Char` classification and case members. The strict-numeric switch it needed also
 fixed `+` with a `String` operand in an untyped position (`xs.fold("") { a, b ->
-a + b }` concatenates instead of summing).
+a + b }` concatenates instead of summing). A `data class` may now inherit stored
+properties, with its derived members taken from the primary constructor alone.
+And `super<T>.m()` is parsed and resolved, so a class implementing two
+supertypes that both supply `m` can say which one it means.
 
 Next: the collection functions on a `String` receiver (`"abc".map { … }`,
 `toCharArray`), generics, the `this`-receiver scope functions (`apply`/`run`),

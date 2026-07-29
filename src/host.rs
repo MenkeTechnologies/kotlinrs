@@ -293,6 +293,16 @@ enum HeapObj {
         class: String,
         is_data: bool,
         fields: Vec<(String, Value)>,
+        /// Index in `fields` at which this class's **own** (primary-constructor)
+        /// properties begin — everything before it was inherited.
+        ///
+        /// Kotlin derives a `data class`'s `toString`/`equals`/`hashCode`/
+        /// `componentN` from the primary constructor *alone*, so
+        /// `data class Child(val name: String) : Base(7)` prints
+        /// `Child(name=x)` and compares only `name`, while `child.id` still
+        /// reads the inherited field. The record stays flat (property lookup
+        /// wants every field); this marks where the derived members start.
+        data_from: usize,
     },
     List(Vec<Value>),
     /// A `Set`, kept as its insertion-ordered distinct elements. Kotlin's
@@ -1184,6 +1194,8 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
                 class,
                 is_data,
                 fields,
+                // No superclass, so every field is this class's own.
+                data_from: 0,
             }));
         }
         KT_TYPE_REG => {
@@ -1218,11 +1230,13 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
                 _ => Vec::new(),
             })
             .unwrap_or_default();
+            let data_from = fields.len();
             fields.extend(it.map(|s| s.to_string()).zip(vals));
             vm.push(alloc(HeapObj::Instance {
                 class,
                 is_data,
                 fields,
+                data_from,
             }));
         }
         KT_CLASSOF => {
@@ -2845,7 +2859,11 @@ fn sequence_member(
 /// pair half) — 1-based, as Kotlin destructuring uses.
 fn component(recv: &Value, n: usize) -> Result<Value, String> {
     with_obj(recv, |o| match o {
-        HeapObj::Instance { fields, .. } => fields.get(n - 1).map(|(_, v)| v.clone()),
+        // `componentN` counts from the first primary-constructor property, so
+        // destructuring an inheriting `data class` skips its inherited fields.
+        HeapObj::Instance {
+            fields, data_from, ..
+        } => fields.get(data_from + n - 1).map(|(_, v)| v.clone()),
         HeapObj::List(items) | HeapObj::Set(items) | HeapObj::Array { items, .. } => {
             items.get(n - 1).cloned()
         }
@@ -2998,14 +3016,24 @@ fn heap_eq(a: &HeapObj, b: &HeapObj) -> bool {
             HeapObj::Instance {
                 class: ca,
                 fields: fa,
-                ..
+                data_from: da,
+                is_data: ia,
             },
             HeapObj::Instance {
                 class: cb,
                 fields: fb,
+                data_from: db,
                 ..
             },
         ) => {
+            // A `data class`'s generated `equals` compares the primary-
+            // constructor properties only, so an inherited field is not part of
+            // the comparison even though the record carries it.
+            let (fa, fb) = if *ia {
+                (&fa[*da..], &fb[(*db).min(fb.len())..])
+            } else {
+                (&fa[..], &fb[..])
+            };
             ca == cb
                 && fa.len() == fb.len()
                 && fa.iter().zip(fb).all(|((_, x), (_, y))| value_eq(x, y))
@@ -3047,9 +3075,15 @@ fn obj_hash(recv: &Value) -> i64 {
     with_obj(recv, |o| {
         let mut h = DefaultHasher::new();
         match o {
-            HeapObj::Instance { class, fields, .. } => {
+            // A `data class` hashes over exactly what its `equals` compares.
+            HeapObj::Instance {
+                class,
+                fields,
+                data_from,
+                is_data,
+            } => {
                 class.hash(&mut h);
-                for (n, v) in fields {
+                for (n, v) in &fields[if *is_data { *data_from } else { 0 }..] {
                     n.hash(&mut h);
                     kotlin_string(v).hash(&mut h);
                 }
@@ -3137,9 +3171,12 @@ fn display_obj(id: u32) -> String {
                 class,
                 is_data,
                 fields,
+                data_from,
             } => {
                 if *is_data {
-                    let body = fields
+                    // Only the primary-constructor properties, which is what
+                    // Kotlin's generated `toString` renders.
+                    let body = fields[*data_from..]
                         .iter()
                         .map(|(n, v)| format!("{n}={}", kotlin_string(v)))
                         .collect::<Vec<_>>()

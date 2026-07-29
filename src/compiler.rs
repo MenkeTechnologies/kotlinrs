@@ -521,16 +521,11 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
                 props.push(p.clone());
             }
         }
-        // Kotlin's `data` members are derived from the primary constructor only,
-        // so a `data class` that would inherit stored fields cannot be rendered
-        // faithfully here. The common sealed-hierarchy shape (`data class Num(…)
-        // : Expr()`, whose supertype stores nothing) is unaffected.
-        if cd.is_data && props.len() != own_props.len() {
-            return Err(format!(
-                "data class {} cannot inherit stored properties",
-                cd.name
-            ));
-        }
+        // Kotlin's `data` members are derived from the primary constructor
+        // alone. The flat field record keeps the inherited fields too (property
+        // lookup needs them), so the *instance* records where this class's own
+        // fields begin and the derived members read only from there — see
+        // `HeapObj::Instance::data_from`.
 
         // Methods, own first: the class's own declaration shadows an inherited
         // one, and an earlier-listed supertype shadows a later one.
@@ -1405,6 +1400,10 @@ impl Compiler {
 
     fn compile_expr(&mut self, sc: &mut Scope, e: &Expr) -> Result<Type, String> {
         match e {
+            // `super` is a receiver, never a value — `compile_member` takes it
+            // before it can be compiled on its own, so reaching here means the
+            // program wrote it somewhere Kotlin does not allow it either.
+            Expr::Super { .. } => Err("`super` is not an expression".to_string()),
             Expr::Int(n) => {
                 self.b.emit(Op::LoadInt(*n), 0);
                 Ok(Type::Int)
@@ -1890,8 +1889,8 @@ impl Compiler {
         }
         // `super.m(args)` — the *statically* resolved supertype implementation,
         // never the virtual one, which is the whole point of the keyword.
-        if matches!(recv, Expr::Var(v) if v == "super") {
-            return self.compile_super_call(sc, name, args, line);
+        if let Expr::Super { qualifier } = recv {
+            return self.compile_super_call(sc, qualifier.as_deref(), name, args, line);
         }
         // `java.lang.Math` statics. Kotlin auto-imports `java.lang.*` on the JVM,
         // so `Math.abs(-3)` compiles with no import — unlike the `kotlin.math`
@@ -2124,6 +2123,7 @@ impl Compiler {
     fn compile_super_call(
         &mut self,
         sc: &mut Scope,
+        qualifier: Option<&str>,
         name: &str,
         args: &[Expr],
         line: u32,
@@ -2133,15 +2133,35 @@ impl Compiler {
             .clone()
             .ok_or_else(|| format!("`super` outside a class (line {line})"))?;
         let meta = self.classes[&cls].clone();
-        let owner = meta.mro[1..]
-            .iter()
-            .find(|a| {
-                self.classes
-                    .get(*a)
-                    .is_some_and(|m| m.own_methods.contains(name))
-            })
-            .cloned()
-            .ok_or_else(|| format!("no supertype of {cls} implements `{name}` (line {line})"))?;
+        let implements = |a: &str| {
+            self.classes
+                .get(a)
+                .is_some_and(|m| m.own_methods.contains(name))
+        };
+        // `super<T>.m()` names the supertype to run — the reason to write it is
+        // that more than one supertype implements `m`, so resolving it by
+        // supertype-list order (what the unqualified form does) would pick the
+        // wrong body. `T` must be a *direct* supertype, as in Kotlin.
+        let owner = match qualifier {
+            Some(t) => {
+                if !meta.parents.iter().any(|p| p == t) {
+                    return Err(format!(
+                        "{t} is not a direct supertype of {cls} (line {line})"
+                    ));
+                }
+                if !implements(t) {
+                    return Err(format!("{t} does not implement `{name}` (line {line})"));
+                }
+                t.to_string()
+            }
+            None => meta.mro[1..]
+                .iter()
+                .find(|a| implements(a))
+                .cloned()
+                .ok_or_else(|| {
+                    format!("no supertype of {cls} implements `{name}` (line {line})")
+                })?,
+        };
         self.compile_expr(sc, &Expr::Var("this".into()))?;
         for a in args {
             self.compile_expr(sc, a)?;
@@ -2187,20 +2207,18 @@ impl Compiler {
         args: &[Expr],
         line: u32,
     ) -> Result<Type, String> {
-        if args.len() > meta.props.len() {
+        if args.len() > meta.ctor_params.len() {
             return Err(format!(
                 "{}.copy takes at most {} argument(s)",
                 meta.name,
-                meta.props.len()
+                meta.ctor_params.len()
             ));
         }
         let mark = sc.enter();
         self.compile_expr(sc, recv)?; // [recv]
         let rslot = sc.temp();
         self.b.emit(Op::SetSlot(rslot), 0);
-        let meta_idx = self.b.add_constant(Value::str(meta.meta_string()));
-        self.b.emit(Op::LoadConst(meta_idx), line);
-        for (i, p) in meta.props.iter().enumerate() {
+        for (i, p) in meta.ctor_params.iter().enumerate() {
             match args.get(i) {
                 Some(a) => {
                     self.compile_expr(sc, a)?;
@@ -2214,8 +2232,14 @@ impl Compiler {
                 }
             }
         }
+        // Kotlin's generated `copy` *calls the primary constructor*, so a data
+        // class under a superclass re-runs its `: Super(args)` header rather
+        // than carrying the receiver's base fields over — which matters as soon
+        // as those arguments are written in terms of the constructor
+        // parameters.
+        let idx = self.b.add_name(&ctor_sub_name(&meta.name));
         self.b
-            .emit(Op::Extended(KT_NEW, meta.props.len() as u8), line);
+            .emit(Op::Call(idx, meta.ctor_params.len() as u8), line);
         sc.exit(mark);
         Ok(Type::Obj)
     }
@@ -3189,6 +3213,7 @@ impl Compiler {
 
     fn infer(&self, sc: &Scope, e: &Expr) -> Type {
         match e {
+            Expr::Super { .. } => Type::Unknown,
             Expr::Int(_) => Type::Int,
             Expr::Float(_) => Type::Double,
             Expr::Bool(_) => Type::Boolean,
@@ -3699,6 +3724,7 @@ fn expr_any(e: &Expr, f: &dyn Fn(&Expr) -> bool) -> bool {
         | Expr::Bool(_)
         | Expr::Char(_)
         | Expr::Null
+        | Expr::Super { .. }
         | Expr::Var(_) => false,
     }
 }
