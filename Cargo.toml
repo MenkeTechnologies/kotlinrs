@@ -18,10 +18,19 @@ publish = true
 # config, integration-test corpus, or self-test .kt examples. None are referenced
 # at compile time (no include_str! into them), so the packaged crate still builds.
 exclude = [
-    "/docs/",
     "/.github/",
     "/tests/",
     "/examples/",
+    "/docs/",
+    "/bench/",
+    "/benches/",
+    "/parity/",
+    "/parity-scripts/",
+    "/scripts/",
+    "/vendor/",
+    "/tools/",
+    "/fuzz/",
+    "/BUGS.md",
 ]
 
 # kotlinrs is a standalone crate, not a workspace member. An explicit empty
