@@ -21,16 +21,16 @@
 
 use crate::ast::*;
 use crate::host::{
-    KT_ARRAY, KT_ARRAY_INIT, KT_ARRAY_NEW, KT_CHR_STRING, KT_CLOSURE_CALL, KT_COLL_HOF,
+    KT_ARRAY, KT_ARRAY_INIT, KT_ARRAY_NEW, KT_CHR_STRING, KT_CLASSOF, KT_CLOSURE_CALL, KT_COLL_HOF,
     KT_DBG_LINE, KT_DDIV, KT_EXC_ABORT, KT_EXC_CUT, KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW,
-    KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW, KT_EXC_UNSTASH, KT_FFI_CALL,
-    KT_FFI_COMPILE, KT_GETFIELD, KT_IDIV, KT_IMOD, KT_IN, KT_INDEX_GET, KT_INDEX_SET, KT_IS,
-    KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_LIST, KT_MAKE_CLOSURE, KT_MAP, KT_MATH, KT_METHOD,
-    KT_NEW, KT_NOTNULL, KT_OBJEQ, KT_PAIR, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP,
-    KT_SCOPE_FN, KT_SETFIELD, KT_TO_STRING,
+    KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND,
+    KT_FFI_CALL, KT_FFI_COMPILE, KT_GETFIELD, KT_IDIV, KT_IMOD, KT_IN, KT_INDEX_GET, KT_INDEX_SET,
+    KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_LIST, KT_MAKE_CLOSURE, KT_MAP, KT_MATH,
+    KT_DISPLAY, KT_JOIN, KT_METHOD, KT_NEW, KT_NOTNULL, KT_OBJEQ, KT_PAIR, KT_PRINT, KT_PRINTLN, KT_RANGE,
+    KT_RANGE_STEP, KT_SCOPE_FN, KT_SETFIELD, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The desugar target a `rust { ... }` block lowers to (see [`crate::rust_ffi`]).
 const RUST_COMPILE: &str = "__rust_compile";
@@ -175,33 +175,70 @@ struct FnSig {
     arity: usize,
 }
 
-/// Compile-time metadata for a `class` / `data class` / `object`, driving
-/// constructor lowering, field access, method dispatch, and (for `data`)
+/// Compile-time metadata for a `class` / `data class` / `object` / `interface`,
+/// driving constructor lowering, field access, method dispatch, and (for `data`)
 /// synthesized-member routing.
 #[derive(Clone)]
 struct ClassMeta {
     name: String,
     is_data: bool,
     is_object: bool,
+    is_interface: bool,
+    /// `abstract class` / `sealed class` — has a constructor its subclasses call
+    /// but cannot itself be instantiated.
+    is_abstract: bool,
+    /// Every stored field an instance carries, base-most first: the ancestors'
+    /// fields, then this class's own. Drives property lookup and `data` display.
     props: Vec<PropMeta>,
-    /// method name → its signature; the sub is named `Class#method`.
+    /// This class's own stored fields only — what its constructor contributes on
+    /// top of the base instance. Equal to `props` for a class with no superclass.
+    own_props: Vec<PropMeta>,
+    /// The primary-constructor parameters in declaration order, including the
+    /// ones that are *not* stored properties (`class Dog(name: String, …)`,
+    /// whose `name` is forwarded to the superclass rather than kept).
+    ctor_params: Vec<CtorProp>,
+    /// method name → its signature; own methods first, then inherited ones.
     methods: HashMap<String, FnSig>,
+    /// The method names this class *implements* itself (a non-`abstract` body),
+    /// which is what `super.m()` resolves against.
+    own_methods: HashSet<String>,
+    /// Self first, then every user-declared ancestor (superclass and
+    /// interfaces), nearest first. See [`linearize`].
+    mro: Vec<String>,
+    /// The direct supertypes as written.
+    parents: Vec<String>,
+    /// The superclass whose constructor this class's constructor calls — the
+    /// first parent that is a user `class` (an `interface` has no constructor).
+    base: Option<String>,
+    /// The superclass constructor arguments of `: Super(a, b)`.
+    super_args: Vec<Expr>,
+    /// The built-in JVM throwable this class ultimately extends, if any
+    /// (`class MyError(m: String) : Exception(m)` → `Some("Exception")`). Such a
+    /// class carries a synthetic `message` field and displays / is caught like
+    /// the built-in throwables.
+    throwable_base: Option<String>,
 }
 
 impl ClassMeta {
     fn prop(&self, name: &str) -> Option<&PropMeta> {
         self.props.iter().find(|p| p.name == name)
     }
-    /// The `KT_NEW` metadata string: `"Name\x1f(d|c)\x1ffield0\x1f…"`.
+    /// The `KT_NEW` / `KT_EXTEND` metadata string for this class's OWN fields:
+    /// `"Name\x1f(d|c)\x1ffield0\x1f…"`. A subclass's base fields ride on the
+    /// base instance `KT_EXTEND` builds from, so they are not repeated here.
     fn meta_string(&self) -> String {
         let mut s = self.name.clone();
         s.push('\u{1f}');
         s.push(if self.is_data { 'd' } else { 'c' });
-        for p in &self.props {
+        for p in &self.own_props {
             s.push('\u{1f}');
             s.push_str(&p.name);
         }
         s
+    }
+    /// Whether this type can be written as a constructor call.
+    fn instantiable(&self) -> bool {
+        !self.is_object && !self.is_interface && !self.is_abstract
     }
 }
 
@@ -210,12 +247,51 @@ fn method_sub_name(class: &str, method: &str) -> String {
     format!("{class}#{method}")
 }
 
+/// The mangled sub name for a class constructor (`Person#$init`). `$` cannot
+/// appear in a Kotlin identifier, so the name can never collide with a method.
+fn ctor_sub_name(class: &str) -> String {
+    format!("{class}#$init")
+}
+
+/// The synthetic field a class extending a built-in throwable stores its
+/// `Exception(message)` argument in, so `e.message` and the `Class: message`
+/// display form both work.
+const MESSAGE_FIELD: &str = "message";
+
+/// Depth-first supertype order for `name`: the type itself, then each direct
+/// parent's own order, keeping the first occurrence of a repeat. This is the
+/// order an override resolves in — the class before what it inherits from, and
+/// an earlier-listed supertype before a later one, which is how Kotlin resolves
+/// an unqualified `super` call when only one supertype implements the member.
+///
+/// The depth cap makes a cyclic `: A`/`: B` hierarchy terminate rather than
+/// recurse forever; the cycle is reported separately.
+fn linearize(name: &str, parents: &HashMap<String, Vec<String>>) -> Vec<String> {
+    fn go(name: &str, parents: &HashMap<String, Vec<String>>, out: &mut Vec<String>, depth: u32) {
+        if depth > 64 || out.iter().any(|x| x == name) {
+            return;
+        }
+        out.push(name.to_string());
+        if let Some(ps) = parents.get(name) {
+            for p in ps {
+                go(p, parents, out, depth + 1);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    go(name, parents, &mut out, 0);
+    out
+}
+
 pub struct Compiler {
     b: ChunkBuilder,
     /// name → signature for user functions, filled before lowering.
     fun_sig: HashMap<String, FnSig>,
     /// class/object name → metadata, filled before lowering.
     classes: HashMap<String, ClassMeta>,
+    /// method name → the `(runtime class tag, owning type)` pairs a call on that
+    /// name may land in. Backs virtual dispatch; see [`build_method_index`].
+    method_index: HashMap<String, Vec<(String, String)>>,
     /// The class whose method is currently being lowered (enables implicit
     /// `this` for member/method access). `None` at top level and in free funcs.
     cur_class: Option<String>,
@@ -338,6 +414,213 @@ struct LoopCtx {
     continues: Vec<usize>,
 }
 
+/// Index every declared `class`/`object`/`interface`: its linearized ancestry,
+/// its flattened field record, and the method set an instance responds to.
+fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, String> {
+    let mut by_name: HashMap<&str, &ClassDecl> = HashMap::new();
+    for cd in &program.classes {
+        if by_name.insert(cd.name.as_str(), cd).is_some() {
+            return Err(format!("conflicting declarations for class {}", cd.name));
+        }
+    }
+    // Only USER supertypes take part in the linearization; a built-in throwable
+    // parent (`: Exception(msg)`) has no declaration to inherit fields or method
+    // bodies from and is tracked separately as `throwable_base`.
+    let parent_map: HashMap<String, Vec<String>> = program
+        .classes
+        .iter()
+        .map(|cd| {
+            let ps = cd
+                .parents
+                .iter()
+                .filter(|p| by_name.contains_key(p.as_str()))
+                .cloned()
+                .collect();
+            (cd.name.clone(), ps)
+        })
+        .collect();
+
+    let mut classes: HashMap<String, ClassMeta> = HashMap::new();
+    for cd in &program.classes {
+        let mro = linearize(&cd.name, &parent_map);
+        // A supertype that is neither declared nor a built-in throwable would
+        // silently vanish from dispatch, so it is rejected up front.
+        for p in &cd.parents {
+            if !by_name.contains_key(p.as_str()) && crate::host::throwable_fqn(p).is_none() {
+                return Err(format!("unresolved supertype {p} of class {}", cd.name));
+            }
+        }
+        if cd.parents.iter().any(|p| p == &cd.name) || mro[1..].iter().any(|a| a == &cd.name) {
+            return Err(format!("class {} is its own supertype", cd.name));
+        }
+
+        let own_field = |p: &CtorProp| PropMeta {
+            name: p.name.clone(),
+            ty: p.ty,
+            class: p.class.clone(),
+            mutable: p.kind == PropKind::Var,
+        };
+        // The superclass whose constructor this one chains to (interfaces have
+        // none), and the built-in throwable the ancestry ultimately reaches.
+        let base = cd
+            .parents
+            .iter()
+            .find(|p| by_name.get(p.as_str()).is_some_and(|d| !d.is_interface))
+            .cloned();
+        let throwable_base = mro
+            .iter()
+            .filter_map(|a| by_name.get(a.as_str()))
+            .flat_map(|d| d.parents.iter())
+            .find(|p| crate::host::throwable_fqn(p).is_some())
+            .cloned();
+
+        let mut own_props: Vec<PropMeta> = Vec::new();
+        // A throwable subclass stores its `Exception(message)` argument in a
+        // synthetic leading field, which is what `e.message` reads and what the
+        // `Class: message` display form prints.
+        if throwable_base.is_some() && cd.parents.iter().any(|p| Some(p) == throwable_base.as_ref())
+        {
+            own_props.push(PropMeta {
+                name: MESSAGE_FIELD.to_string(),
+                ty: Type::NullableString,
+                class: None,
+                mutable: false,
+            });
+        }
+        if cd.is_object {
+            own_props.extend(cd.obj_props.iter().map(|(n, ty, class, _)| PropMeta {
+                name: n.clone(),
+                ty: *ty,
+                class: class.clone(),
+                mutable: true,
+            }));
+        } else {
+            own_props.extend(
+                cd.params
+                    .iter()
+                    .filter(|p| p.kind != PropKind::None)
+                    .map(own_field),
+            );
+        }
+
+        // The full field record, base-most first — the order `KT_EXTEND` builds
+        // an instance in, so property lookup and `data` display agree with it.
+        let mut props: Vec<PropMeta> = Vec::new();
+        for anc in mro.iter().skip(1).rev() {
+            let Some(d) = by_name.get(anc.as_str()) else {
+                continue;
+            };
+            for p in d.params.iter().filter(|p| p.kind != PropKind::None) {
+                if !props.iter().any(|x| x.name == p.name) {
+                    props.push(own_field(p));
+                }
+            }
+        }
+        for p in &own_props {
+            if !props.iter().any(|x| x.name == p.name) {
+                props.push(p.clone());
+            }
+        }
+        // Kotlin's `data` members are derived from the primary constructor only,
+        // so a `data class` that would inherit stored fields cannot be rendered
+        // faithfully here. The common sealed-hierarchy shape (`data class Num(…)
+        // : Expr()`, whose supertype stores nothing) is unaffected.
+        if cd.is_data && props.len() != own_props.len() {
+            return Err(format!(
+                "data class {} cannot inherit stored properties",
+                cd.name
+            ));
+        }
+
+        // Methods, own first: the class's own declaration shadows an inherited
+        // one, and an earlier-listed supertype shadows a later one.
+        let mut methods: HashMap<String, FnSig> = HashMap::new();
+        for anc in &mro {
+            let Some(d) = by_name.get(anc.as_str()) else {
+                continue;
+            };
+            for m in &d.methods {
+                methods.entry(m.name.clone()).or_insert(FnSig {
+                    ret: m.ret,
+                    ret_class: m.ret_class.clone(),
+                    arity: m.params.len(),
+                });
+            }
+        }
+        let own_methods = cd
+            .methods
+            .iter()
+            .filter(|m| !m.is_abstract)
+            .map(|m| m.name.clone())
+            .collect();
+
+        classes.insert(
+            cd.name.clone(),
+            ClassMeta {
+                name: cd.name.clone(),
+                is_data: cd.is_data,
+                is_object: cd.is_object,
+                is_interface: cd.is_interface,
+                is_abstract: cd.is_abstract || cd.is_sealed,
+                props,
+                own_props,
+                ctor_params: cd.params.clone(),
+                methods,
+                own_methods,
+                mro,
+                parents: cd.parents.clone(),
+                base,
+                super_args: cd.super_args.clone(),
+                throwable_base,
+            },
+        );
+    }
+    Ok(classes)
+}
+
+/// The runtime dispatch table: for every method name, the concrete class tags
+/// that respond to it paired with the type owning the implementation. A call on
+/// a receiver whose static class is a supertype tests the tag at runtime and
+/// lands in the right `Owner#method` sub — virtual dispatch, without a vtable
+/// the VM has no notion of.
+fn build_method_index(
+    program: &Program,
+    classes: &HashMap<String, ClassMeta>,
+) -> HashMap<String, Vec<(String, String)>> {
+    let by_name: HashMap<&str, &ClassDecl> =
+        program.classes.iter().map(|c| (c.name.as_str(), c)).collect();
+    let mut index: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for (tag, meta) in classes {
+        // Only a type that can exist at runtime is a dispatch tag: an interface
+        // or an abstract class is never a receiver's own class.
+        if meta.is_interface || meta.is_abstract {
+            continue;
+        }
+        let mut seen: HashSet<&str> = HashSet::new();
+        for owner in &meta.mro {
+            let Some(d) = by_name.get(owner.as_str()) else {
+                continue;
+            };
+            for m in &d.methods {
+                // An `abstract` declaration reserves the name so a later
+                // supertype's stale implementation cannot shadow the override
+                // that a nearer type supplied.
+                if seen.insert(&m.name) && !m.is_abstract {
+                    index
+                        .entry(m.name.clone())
+                        .or_default()
+                        .push((tag.clone(), owner.clone()));
+                }
+            }
+        }
+    }
+    // A stable order keeps the emitted dispatch chain reproducible.
+    for v in index.values_mut() {
+        v.sort();
+    }
+    index
+}
+
 /// Compile a program to a runnable chunk. Requires a `fun main`.
 pub fn compile(program: &Program) -> Result<Chunk, String> {
     compile_with(program, false)
@@ -363,62 +646,8 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
         );
     }
 
-    // Build class/object metadata before lowering so calls, constructors, and
-    // member access can resolve against it regardless of declaration order.
-    let mut classes: HashMap<String, ClassMeta> = HashMap::new();
-    for cd in &program.classes {
-        let props: Vec<PropMeta> = if cd.is_object {
-            cd.obj_props
-                .iter()
-                .map(|(n, ty, class, _)| PropMeta {
-                    name: n.clone(),
-                    ty: *ty,
-                    class: class.clone(),
-                    mutable: true,
-                })
-                .collect()
-        } else {
-            cd.params
-                .iter()
-                .filter(|p| p.kind != PropKind::None)
-                .map(|p| PropMeta {
-                    name: p.name.clone(),
-                    ty: p.ty,
-                    class: p.class.clone(),
-                    mutable: p.kind == PropKind::Var,
-                })
-                .collect()
-        };
-        let methods = cd
-            .methods
-            .iter()
-            .map(|m| {
-                (
-                    m.name.clone(),
-                    FnSig {
-                        ret: m.ret,
-                        ret_class: m.ret_class.clone(),
-                        arity: m.params.len(),
-                    },
-                )
-            })
-            .collect();
-        if classes
-            .insert(
-                cd.name.clone(),
-                ClassMeta {
-                    name: cd.name.clone(),
-                    is_data: cd.is_data,
-                    is_object: cd.is_object,
-                    props,
-                    methods,
-                },
-            )
-            .is_some()
-        {
-            return Err(format!("conflicting declarations for class {}", cd.name));
-        }
-    }
+    let classes = build_class_meta(program)?;
+    let method_index = build_method_index(program, &classes);
 
     let main = program
         .funs
@@ -432,6 +661,7 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
         b: ChunkBuilder::new(),
         fun_sig,
         classes,
+        method_index,
         cur_class: None,
         debug,
         has_ffi,
@@ -446,9 +676,22 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
     };
     (c.math_scope, c.math_star) = math_scope(&program.imports);
 
-    // Preamble: build `object` singletons into globals, then bind main's args
-    // (an empty Array per declared parameter — the program-args wiring is an M0
-    // stub), call main, discard its Unit, skip the bodies.
+    // Preamble: publish each declared type's supertypes to the runtime (which
+    // `is` checks, `catch` matching, and the throwable display form all consult),
+    // build `object` singletons into globals, then bind main's args (an empty
+    // Array per declared parameter — the program-args wiring is an M0 stub),
+    // call main, discard its Unit, skip the bodies.
+    for cd in &program.classes {
+        let meta = &c.classes[&cd.name];
+        let supers = c.runtime_supers(meta).join(",");
+        let (name, line) = (cd.name.clone(), cd.line);
+        let n = c.b.add_constant(Value::str(name));
+        c.b.emit(Op::LoadConst(n), line);
+        let s = c.b.add_constant(Value::str(supers));
+        c.b.emit(Op::LoadConst(s), line);
+        c.b.emit(Op::Extended(KT_TYPE_REG, 0), line);
+    }
+    c.emit_tostring_registry();
     for cd in &program.classes {
         if cd.is_object {
             c.build_object(cd)?;
@@ -476,10 +719,17 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
         c.compile_fun(f, None)?;
     }
     // Class/object methods lower as subs named `Class#method`, with `this`
-    // (slot 0) as an implicit first parameter of the enclosing class type.
+    // (slot 0) as an implicit first parameter of the enclosing class type. An
+    // `abstract` declaration owns no body — it only reserves the name so a
+    // subtype's override is reachable through the dispatch chain.
     for cd in &program.classes {
+        if !cd.is_object && !cd.is_interface {
+            c.compile_ctor(cd)?;
+        }
         for m in &cd.methods {
-            c.compile_fun(m, Some(&cd.name))?;
+            if !m.is_abstract {
+                c.compile_fun(m, Some(&cd.name))?;
+            }
         }
     }
     // Lambda bodies emit as subroutine regions last. Draining may enqueue further
@@ -505,10 +755,134 @@ impl Compiler {
             self.compile_expr(&mut sc, init)?;
         }
         self.b
-            .emit(Op::Extended(KT_NEW, meta.props.len() as u8), cd.line);
+            .emit(Op::Extended(KT_NEW, meta.own_props.len() as u8), cd.line);
         let g = self.b.add_name(&cd.name);
         self.b.emit(Op::SetVar(g), cd.line);
         Ok(())
+    }
+
+    /// The supertype names an instance of `meta` answers `is` / `catch` with:
+    /// its user-declared ancestors, then the built-in throwable chain it reaches
+    /// (so `class MyError : Exception(…)` is caught by `catch (e: Exception)` and
+    /// `catch (e: Throwable)` alike).
+    fn runtime_supers(&self, meta: &ClassMeta) -> Vec<String> {
+        let mut out: Vec<String> = meta.mro[1..].to_vec();
+        if let Some(t) = &meta.throwable_base {
+            for name in crate::host::throwable_ancestry(t) {
+                if !out.iter().any(|x| x == name) {
+                    out.push(name.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// Emit a class's constructor subroutine `Class#$init`.
+    ///
+    /// The subroutine exists (rather than an inline `KT_NEW` at every `C(...)`
+    /// site) because a subclass's superclass arguments are written in terms of
+    /// its own constructor parameters — `class Dog(name: String) : Animal(name)`
+    /// — which only a frame that has bound those parameters can evaluate. The
+    /// body is one of three shapes:
+    ///
+    /// * **superclass** — evaluate the `: Super(args)`, call `Super#$init` to get
+    ///   the base instance, then `KT_EXTEND` it with this class's own fields
+    ///   under this class's runtime tag. Nesting takes care of deeper ancestries.
+    /// * **built-in throwable superclass** — no base instance exists, so the
+    ///   `Exception(message)` argument lands in the synthetic `message` field.
+    /// * **no superclass** — a plain `KT_NEW` over the class's own fields.
+    fn compile_ctor(&mut self, cd: &ClassDecl) -> Result<(), String> {
+        let meta = self.classes[&cd.name].clone();
+        let entry = self.b.current_pos();
+        let name_idx = self.b.add_name(&ctor_sub_name(&cd.name));
+        self.b.add_sub_entry(name_idx, entry);
+
+        // Bind the primary-constructor parameters to slots, deepest last.
+        let mut sc = Scope::new();
+        for p in &meta.ctor_params {
+            sc.declare_obj(&p.name, p.ty, false, p.class.clone());
+        }
+        for i in (0..meta.ctor_params.len()).rev() {
+            self.b.emit(Op::SetSlot(i as u16), cd.line);
+        }
+
+        // The base instance, when there is a superclass to chain to.
+        if let Some(base) = &meta.base {
+            let bmeta = self.classes[base].clone();
+            if meta.super_args.len() != bmeta.ctor_params.len() {
+                return Err(format!(
+                    "superclass constructor {base} expects {} argument(s), got {}",
+                    bmeta.ctor_params.len(),
+                    meta.super_args.len()
+                ));
+            }
+            for a in &meta.super_args {
+                self.compile_expr(&mut sc, a)?;
+            }
+            let idx = self.b.add_name(&ctor_sub_name(base));
+            self.b
+                .emit(Op::Call(idx, meta.super_args.len() as u8), cd.line);
+        }
+
+        let midx = self.b.add_constant(Value::str(meta.meta_string()));
+        self.b.emit(Op::LoadConst(midx), cd.line);
+        // A throwable subclass's first own field is the synthetic `message`.
+        let direct_throwable = meta
+            .throwable_base
+            .as_ref()
+            .is_some_and(|t| meta.parents.iter().any(|p| p == t));
+        if direct_throwable {
+            match meta.super_args.first() {
+                Some(a) => {
+                    let t = self.compile_expr(&mut sc, a)?;
+                    self.emit_display(t);
+                }
+                // `class E : Exception()` — `E().message` is Kotlin `null`.
+                None => {
+                    self.b.emit(Op::LoadUndef, cd.line);
+                }
+            }
+        }
+        for p in meta.own_props.iter().filter(|p| p.name != MESSAGE_FIELD) {
+            let slot = sc
+                .slot(&p.name)
+                .ok_or_else(|| format!("class {}: unbound property {}", cd.name, p.name))?;
+            self.b.emit(Op::GetSlot(slot), cd.line);
+        }
+        let n = meta.own_props.len() as u8;
+        let op = if meta.base.is_some() {
+            Op::Extended(KT_EXTEND, n)
+        } else {
+            Op::Extended(KT_NEW, n)
+        };
+        self.b.emit(op, cd.line);
+        self.b.emit(Op::ReturnValue, cd.line);
+        Ok(())
+    }
+
+    /// Whether the program declares a `toString()` override, which is what makes
+    /// display route through the re-entrant [`KT_DISPLAY`] builtin instead of the
+    /// VM-less `KT_TO_STRING` extension op.
+    fn has_tostring_override(&self) -> bool {
+        self.method_index
+            .get("toString")
+            .is_some_and(|t| !t.is_empty())
+    }
+
+    /// Publish each overriding class's `toString()` subroutine to the runtime, so
+    /// [`KT_DISPLAY`] can invoke it for a receiver whose class is only known
+    /// there. Emitted once, before `main`, and only when an override exists.
+    fn emit_tostring_registry(&mut self) {
+        if !self.has_tostring_override() {
+            return;
+        }
+        for (tag, owner) in self.method_index["toString"].clone() {
+            let t = self.b.add_constant(Value::str(tag));
+            self.b.emit(Op::LoadConst(t), 0);
+            let sub = self.b.add_name(&method_sub_name(&owner, "toString"));
+            self.b.emit(Op::LoadInt(sub as i64), 0);
+            self.b.emit(Op::Extended(KT_TOSTRING_REG, 0), 0);
+        }
     }
 
     /// Lower a free function (`class` = `None`) or a class method (`class` =
@@ -1169,6 +1543,16 @@ impl Compiler {
                 }
                 Ok(Type::Boolean)
             }
+            Expr::Is { value, ty, negated } => {
+                self.compile_expr(sc, value)?;
+                let nidx = self.b.add_constant(Value::str(ty.clone()));
+                self.b.emit(Op::LoadConst(nidx), 0);
+                self.b.emit(Op::Extended(KT_IS, 0), 0);
+                if *negated {
+                    self.b.emit(Op::LogNot, 0);
+                }
+                Ok(Type::Boolean)
+            }
             Expr::IncDec {
                 target,
                 inc,
@@ -1446,6 +1830,14 @@ impl Compiler {
                 let idx = self.b.add_constant(Value::str("kotlin.Unit"));
                 self.b.emit(Op::LoadConst(idx), 0);
             }
+            // A value that may be a class instance goes through the re-entrant
+            // display builtin when the program declares a `toString()` override,
+            // so the override is honoured for a receiver whose class is only
+            // known at runtime — and for one nested inside a printed
+            // collection. Every other program emits the single host op it did.
+            Type::Obj | Type::Unknown if self.has_tostring_override() => {
+                self.b.emit(Op::CallBuiltin(KT_DISPLAY, 1), 0);
+            }
             _ => {
                 self.b.emit(Op::Extended(KT_TO_STRING, 0), 0);
             }
@@ -1487,6 +1879,11 @@ impl Compiler {
         if safe {
             return self.compile_safe_member(sc, recv, name, args, line);
         }
+        // `super.m(args)` — the *statically* resolved supertype implementation,
+        // never the virtual one, which is the whole point of the keyword.
+        if matches!(recv, Expr::Var(v) if v == "super") {
+            return self.compile_super_call(sc, name, args, line);
+        }
         // `java.lang.Math` statics. Kotlin auto-imports `java.lang.*` on the JVM,
         // so `Math.abs(-3)` compiles with no import — unlike the `kotlin.math`
         // top-level spellings. `Math.round` is NOT `kotlin.math.round`: it is
@@ -1507,6 +1904,31 @@ impl Compiler {
             self.b.emit(Op::Extended(KT_CHR_STRING, 0), line);
             return Ok(Type::String);
         }
+        // In a program with a `toString()` override, the two members that render
+        // a value as a string route through the re-entrant display builtin so
+        // the override is used — the host's own stringifier has no VM to run it
+        // with. `Class#toString` itself must NOT be rerouted, or it would
+        // recurse; a receiver whose static class implements the override is
+        // dispatched directly below.
+        if self.has_tostring_override() {
+            let own_override = self
+                .infer_class(sc, recv)
+                .is_some_and(|c| self.classes.get(&c).is_some_and(|m| m.methods.contains_key("toString")));
+            if name == "toString" && args.is_empty() && !own_override {
+                self.compile_expr(sc, recv)?;
+                self.b.emit(Op::CallBuiltin(KT_DISPLAY, 1), line);
+                return Ok(Type::String);
+            }
+            if name == "joinToString" && args.len() <= 1 {
+                self.compile_expr(sc, recv)?;
+                for a in args {
+                    let t = self.compile_expr(sc, a)?;
+                    self.emit_display(t);
+                }
+                self.b.emit(Op::CallBuiltin(KT_JOIN, args.len() as u8), line);
+                return Ok(Type::String);
+            }
+        }
         // Collection higher-order functions take a first-class lambda VALUE (a
         // trailing-lambda literal or a passed closure) and invoke it per element
         // at runtime via the `KT_COLL_HOF` builtin.
@@ -1523,12 +1945,14 @@ impl Compiler {
             self.b.emit(Op::CallBuiltin(KT_SCOPE_FN, 0), line);
             return Ok(Type::Unknown);
         }
-        // A statically-known user class: dispatch a user method as a native
-        // `Op::Call`, read a property directly, or route a `data` member.
-        if let Some(cls) = self.infer_class(sc, recv) {
-            if let Some(meta) = self.classes.get(&cls).cloned() {
-                // A user-declared method → direct call on the `Class#method` sub,
-                // pushing `this` (the receiver) as arg 0.
+        // A statically-known user class: dispatch a user method, read a property
+        // directly, or route a `data` member.
+        let static_cls = self.infer_class(sc, recv);
+        if let Some(cls) = &static_cls {
+            if let Some(meta) = self.classes.get(cls).cloned() {
+                // A user-declared method. The receiver's *runtime* class may be
+                // any subtype of its static one, so the call resolves against
+                // every candidate implementation (see [`Compiler::candidates`]).
                 if let Some(sig) = meta.methods.get(name) {
                     if args.len() != sig.arity {
                         return Err(format!(
@@ -1537,13 +1961,11 @@ impl Compiler {
                             args.len()
                         ));
                     }
-                    self.compile_expr(sc, recv)?;
-                    for a in args {
-                        self.compile_expr(sc, a)?;
+                    let cands = self.candidates(Some(cls), name, args.len());
+                    if !cands.is_empty() {
+                        self.emit_virtual_call(sc, recv, name, args, &cands, line)?;
+                        return Ok(sig.ret);
                     }
-                    let idx = self.b.add_name(&method_sub_name(&cls, name));
-                    self.b.emit(Op::Call(idx, (sig.arity + 1) as u8), line);
-                    return Ok(sig.ret);
                 }
                 // A stored property read.
                 if args.is_empty() {
@@ -1564,7 +1986,165 @@ impl Compiler {
                 // fall through to the host dispatch below.
             }
         }
+        // An untyped receiver (a lambda parameter, a `List` element, a `when`
+        // subject) that names a user method: decide by runtime class tag, with
+        // the host stdlib dispatch as the fallback arm.
+        if static_cls.is_none() {
+            let cands = self.candidates(None, name, args.len());
+            if !cands.is_empty() {
+                self.emit_virtual_call(sc, recv, name, args, &cands, line)?;
+                return Ok(self.virtual_ret_type(&cands, name));
+            }
+        }
         self.emit_kt_method(sc, recv, name, args, line)
+    }
+
+    /// The `(runtime tag, owning type)` pairs a call to `name` on a receiver of
+    /// static class `cls` may land in: every instantiable type that is `cls` or
+    /// a subtype of it and implements `name` at the requested arity. `cls` of
+    /// `None` means "receiver type unknown" — every implementor is a candidate.
+    fn candidates(&self, cls: Option<&str>, name: &str, argc: usize) -> Vec<(String, String)> {
+        let Some(all) = self.method_index.get(name) else {
+            return Vec::new();
+        };
+        all.iter()
+            .filter(|(tag, _)| match cls {
+                Some(c) => self.classes.get(tag).is_some_and(|m| m.mro.iter().any(|a| a == c)),
+                None => true,
+            })
+            .filter(|(tag, _)| {
+                self.classes
+                    .get(tag)
+                    .and_then(|m| m.methods.get(name))
+                    .is_some_and(|s| s.arity == argc)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The declared return type shared by every candidate implementation, or
+    /// `Unknown` when they disagree (nothing then relies on it statically).
+    fn virtual_ret_type(&self, cands: &[(String, String)], name: &str) -> Type {
+        let mut ty: Option<Type> = None;
+        for (tag, _) in cands {
+            let Some(sig) = self.classes.get(tag).and_then(|m| m.methods.get(name)) else {
+                return Type::Unknown;
+            };
+            match ty {
+                Some(t) if t != sig.ret => return Type::Unknown,
+                _ => ty = Some(sig.ret),
+            }
+        }
+        ty.unwrap_or(Type::Unknown)
+    }
+
+    /// Emit a call to `recv.name(args)` against a candidate set.
+    ///
+    /// A single candidate owner needs no test — every instance that reaches this
+    /// site runs the same body, so the call is a direct `Op::Call` and the
+    /// program pays nothing for the hierarchy. Otherwise the receiver is
+    /// evaluated once into a slot, its runtime class tag read with
+    /// [`KT_CLASSOF`], and each candidate's tag compared in turn; a receiver
+    /// matching none falls through to the host stdlib dispatch, which is what
+    /// keeps `x.length` working when `x` is a `String` rather than an instance.
+    fn emit_virtual_call(
+        &mut self,
+        sc: &mut Scope,
+        recv: &Expr,
+        name: &str,
+        args: &[Expr],
+        cands: &[(String, String)],
+        line: u32,
+    ) -> Result<(), String> {
+        let owners: HashSet<&str> = cands.iter().map(|(_, o)| o.as_str()).collect();
+        if owners.len() == 1 {
+            let owner = cands[0].1.clone();
+            self.compile_expr(sc, recv)?;
+            for a in args {
+                self.compile_expr(sc, a)?;
+            }
+            let idx = self.b.add_name(&method_sub_name(&owner, name));
+            self.b.emit(Op::Call(idx, (args.len() + 1) as u8), line);
+            return Ok(());
+        }
+        let mark = sc.enter();
+        self.compile_expr(sc, recv)?;
+        let rslot = sc.temp();
+        self.b.emit(Op::SetSlot(rslot), line);
+        self.b.emit(Op::GetSlot(rslot), line);
+        self.b.emit(Op::Extended(KT_CLASSOF, 0), line);
+        let cslot = sc.temp();
+        self.b.emit(Op::SetSlot(cslot), line);
+
+        let mut done: Vec<usize> = Vec::new();
+        for (tag, owner) in cands {
+            self.b.emit(Op::GetSlot(cslot), line);
+            let c = self.b.add_constant(Value::str(tag.clone()));
+            self.b.emit(Op::LoadConst(c), line);
+            self.b.emit(Op::StrEq, line);
+            let miss = self.b.emit(Op::JumpIfFalse(0), line);
+            self.b.emit(Op::GetSlot(rslot), line);
+            for a in args {
+                self.compile_expr(sc, a)?;
+            }
+            let idx = self.b.add_name(&method_sub_name(owner, name));
+            self.b.emit(Op::Call(idx, (args.len() + 1) as u8), line);
+            done.push(self.b.emit(Op::Jump(0), line));
+            let next = self.b.current_pos();
+            self.b.patch_jump(miss, next);
+        }
+        // Fallback: the universal host member dispatch on the stored receiver.
+        self.b.emit(Op::GetSlot(rslot), line);
+        for a in args {
+            self.compile_expr(sc, a)?;
+        }
+        let nidx = self.b.add_constant(Value::str(name.to_string()));
+        self.b.emit(Op::LoadConst(nidx), line);
+        self.b.emit(Op::Extended(KT_METHOD, args.len() as u8), line);
+        let end = self.b.current_pos();
+        for j in done {
+            self.b.patch_jump(j, end);
+        }
+        sc.exit(mark);
+        Ok(())
+    }
+
+    /// Lower `super.m(args)` inside a method: resolve `m` against the enclosing
+    /// class's ancestry — the nearest supertype that *implements* it — and call
+    /// that body directly with the current `this`.
+    fn compile_super_call(
+        &mut self,
+        sc: &mut Scope,
+        name: &str,
+        args: &[Expr],
+        line: u32,
+    ) -> Result<Type, String> {
+        let cls = self
+            .cur_class
+            .clone()
+            .ok_or_else(|| format!("`super` outside a class (line {line})"))?;
+        let meta = self.classes[&cls].clone();
+        let owner = meta.mro[1..]
+            .iter()
+            .find(|a| {
+                self.classes
+                    .get(*a)
+                    .is_some_and(|m| m.own_methods.contains(name))
+            })
+            .cloned()
+            .ok_or_else(|| format!("no supertype of {cls} implements `{name}` (line {line})"))?;
+        self.compile_expr(sc, &Expr::Var("this".into()))?;
+        for a in args {
+            self.compile_expr(sc, a)?;
+        }
+        let idx = self.b.add_name(&method_sub_name(&owner, name));
+        self.b.emit(Op::Call(idx, (args.len() + 1) as u8), line);
+        Ok(self
+            .classes
+            .get(&owner)
+            .and_then(|m| m.methods.get(name))
+            .map(|s| s.ret)
+            .unwrap_or(Type::Unknown))
     }
 
     /// Emit a generic `KT_METHOD` host dispatch: push the receiver, then the
@@ -2366,24 +2946,29 @@ impl Compiler {
         args: &[Expr],
         line: u32,
     ) -> Result<Type, String> {
-        if meta.is_object {
-            return Err(format!("cannot construct object {}", meta.name));
+        if !meta.instantiable() {
+            let what = if meta.is_object {
+                "object"
+            } else if meta.is_interface {
+                "interface"
+            } else {
+                "abstract class"
+            };
+            return Err(format!("cannot construct {what} {}", meta.name));
         }
-        if args.len() != meta.props.len() {
+        if args.len() != meta.ctor_params.len() {
             return Err(format!(
                 "constructor {} expects {} argument(s), got {}",
                 meta.name,
-                meta.props.len(),
+                meta.ctor_params.len(),
                 args.len()
             ));
         }
-        let meta_idx = self.b.add_constant(Value::str(meta.meta_string()));
-        self.b.emit(Op::LoadConst(meta_idx), line);
         for a in args {
             self.compile_expr(sc, a)?;
         }
-        self.b
-            .emit(Op::Extended(KT_NEW, meta.props.len() as u8), line);
+        let idx = self.b.add_name(&ctor_sub_name(&meta.name));
+        self.b.emit(Op::Call(idx, args.len() as u8), line);
         Ok(Type::Obj)
     }
 
@@ -2674,7 +3259,7 @@ impl Compiler {
             Expr::Pair { .. } => Type::Obj,
             // A range and an array are heap objects; `in` is a predicate.
             Expr::Range { .. } | Expr::Step { .. } => Type::Obj,
-            Expr::In { .. } => Type::Boolean,
+            Expr::In { .. } | Expr::Is { .. } => Type::Boolean,
             // `++`/`--` keep the target's type, so `d++` on a `Double` stays a
             // `Double` for display and `/` dispatch.
             Expr::IncDec { target, .. } => self.infer(sc, target),
@@ -3037,6 +3622,7 @@ fn expr_any(e: &Expr, f: &dyn Fn(&Expr) -> bool) -> bool {
         Expr::In {
             value, container, ..
         } => expr_any(value, f) || expr_any(container, f),
+        Expr::Is { value, .. } => expr_any(value, f),
         Expr::IncDec { target, .. } => expr_any(target, f),
         Expr::Lambda { body, .. } => body_any(body, f),
         Expr::If(ie) => if_any(ie, f),

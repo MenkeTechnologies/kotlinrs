@@ -1457,3 +1457,175 @@ fun main() {
         "true\ntrue\nnull\n3\ndflt\nv=null\ncnull\nHEY\n0\n"
     );
 }
+
+// ─── Class inheritance ────────────────────────────────────────────────────
+//
+// Every expected string below was captured from the reference `kotlinc` +
+// `kotlin` toolchain on the identical source (kotlinc-jvm 2.4.10).
+
+#[test]
+fn override_dispatches_virtually_through_a_supertype_method() {
+    // `call()` is declared once on `A` and invokes `v()`, which each level
+    // overrides: the body a call lands in is decided by the receiver's RUNTIME
+    // class, not by the class that declared the caller. `B`'s constructor also
+    // passes a computed argument up (`A(n + 1)`), so the inherited `n` differs
+    // from the one written at the construction site.
+    let src = "\
+open class A(val n: Int) {
+    open fun v(): Int = n
+    fun call(): Int = v() * 2
+}
+open class B(n: Int) : A(n + 1) {
+    override fun v(): Int = n * 10
+}
+class C(n: Int) : B(n) {
+    override fun v(): Int = super.v() + 1
+}
+fun main() {
+    println(A(3).call())
+    println(B(3).call())
+    println(C(3).call())
+    println(A(3).n)
+    println(B(3).n)
+    println(C(3).n)
+}";
+    assert_eq!(prog(src), "6\n80\n82\n3\n4\n4\n");
+}
+
+#[test]
+fn interface_default_member_calls_the_implementors_override() {
+    let src = "\
+interface Src { fun get(): Int
+    fun twice(): Int = get() * 2 }
+interface Sink { fun put(v: Int): String }
+class Both(val k: Int) : Src, Sink {
+    override fun get(): Int = k
+    override fun put(v: Int): String = \"put$v\"
+}
+fun main() {
+    val b = Both(4)
+    println(b.get())
+    println(b.twice())
+    println(b.put(9))
+    val s: Src = Both(6)
+    println(s.twice())
+    println(s is Sink)
+    println(s is Src)
+}";
+    assert_eq!(prog(src), "4\n8\nput9\n12\ntrue\ntrue\n");
+}
+
+#[test]
+fn abstract_member_is_reached_from_a_concrete_base_method() {
+    let src = "\
+abstract class Shape {
+    abstract fun area(): Int
+    abstract fun name(): String
+    fun show(): String = name() + \":\" + area()
+}
+class Sq(val s: Int) : Shape() {
+    override fun area(): Int = s * s
+    override fun name(): String = \"sq\"
+}
+class Rc(val w: Int, val h: Int) : Shape() {
+    override fun area(): Int = w * h
+    override fun name(): String = \"rc\"
+}
+fun main() {
+    val xs = listOf(Sq(3), Rc(2, 5))
+    for (x in xs) println(x.show())
+    println(xs.map { it.area() })
+    println(xs.filter { it.area() > 9 }.map { it.name() })
+}";
+    assert_eq!(prog(src), "sq:9\nrc:10\n[9, 10]\n[rc]\n");
+}
+
+#[test]
+fn user_class_extending_a_jvm_throwable_is_caught_and_printed_like_one() {
+    // The `catch` arms are tested against the user class's own supertypes, so a
+    // `ParseError : IllegalArgumentException` is claimed by a
+    // `catch (e: IllegalArgumentException)` and by `catch (e: Exception)`, and it
+    // renders through `Throwable.toString()` rather than the identity form.
+    let src = "\
+class ParseError(msg: String) : IllegalArgumentException(msg)
+class EmptyError : RuntimeException()
+fun parse(s: String): Int {
+    if (s == \"\") throw EmptyError()
+    if (s == \"x\") throw ParseError(\"bad token x\")
+    return s.length
+}
+fun main() {
+    for (s in listOf(\"ab\", \"\", \"x\")) {
+        println(try { parse(s) }
+            catch (e: ParseError) { \"PE:\" + e.message }
+            catch (e: RuntimeException) { \"RE:\" + e.message })
+    }
+    try { throw ParseError(\"z\") } catch (e: IllegalArgumentException) { println(\"IAE \" + e.message) }
+    try { throw ParseError(\"z\") } catch (e: Exception) { println(e) }
+    println(ParseError(\"q\") is IllegalArgumentException)
+    println(ParseError(\"q\") is RuntimeException)
+    println(EmptyError() is Exception)
+}";
+    assert_eq!(
+        prog(src),
+        "2\nRE:null\nPE:bad token x\nIAE z\nParseError: z\ntrue\ntrue\ntrue\n"
+    );
+}
+
+#[test]
+fn tostring_override_is_honoured_for_a_nested_element_too() {
+    let src = "\
+open class Vec(val x: Int, val y: Int) {
+    override fun toString(): String = \"<$x,$y>\"
+}
+class Vec3(x: Int, y: Int, val z: Int) : Vec(x, y) {
+    override fun toString(): String = \"<$x,$y,$z>\"
+}
+fun main() {
+    val vs = listOf(Vec(1, 2), Vec3(1, 2, 3))
+    println(vs)
+    println(vs.joinToString(\" | \"))
+    println(\"${vs[0]} then ${vs[1]}\")
+    println(vs[1].toString())
+    println(mapOf(\"a\" to Vec(0, 1)))
+}";
+    assert_eq!(
+        prog(src),
+        "[<1,2>, <1,2,3>]\n<1,2> | <1,2,3>\n<1,2> then <1,2,3>\n<1,2,3>\n{a=<0,1>}\n"
+    );
+}
+
+#[test]
+fn an_abstract_or_sealed_type_cannot_be_constructed() {
+    assert!(prog_err("abstract class S(val n: Int)\nfun main() { println(S(1)) }")
+        .contains("cannot construct abstract class S"));
+    assert!(prog_err("sealed class S\nfun main() { println(S()) }")
+        .contains("cannot construct abstract class S"));
+    assert!(
+        prog_err("interface I { fun f(): Int }\nfun main() { println(I()) }")
+            .contains("cannot construct interface I")
+    );
+    assert!(
+        prog_err("class D : Missing()\nfun main() { println(1) }")
+            .contains("unresolved supertype Missing")
+    );
+}
+
+#[test]
+fn soft_keywords_are_usable_as_member_names() {
+    // `step`/`until`/`downTo`/`data` are infix functions and a modifier in
+    // Kotlin, not reserved words, so a declaration may use them as names.
+    let src = "\
+class Walker(val data: Int) {
+    fun step(): Int = data + 1
+    fun until(k: Int): Int = k - data
+}
+fun main() {
+    val w = Walker(4)
+    println(w.step())
+    println(w.until(10))
+    println(w.data)
+    println((1..9 step 3).toList())
+}";
+    assert_eq!(prog(src), "5\n6\n4\n[1, 4, 7]\n");
+}

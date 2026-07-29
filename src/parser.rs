@@ -37,16 +37,49 @@ pub struct Parser {
     pos: usize,
 }
 
-/// Parse a full program: top-level `fun`, `class`/`data class`, and `object`
-/// declarations.
+/// The declaration modifiers kotlinrs recognizes. All of them are Kotlin *soft*
+/// keywords, so they lex as plain identifiers and are only meaningful in front
+/// of a `fun`/`class`.
+#[derive(Debug, Clone, Copy, Default)]
+struct Mods {
+    open: bool,
+    abstract_: bool,
+    override_: bool,
+    sealed: bool,
+}
+
+/// Parse a full program: top-level `fun`, `class`/`data class`, `interface`, and
+/// `object` declarations, each optionally preceded by modifiers.
 pub fn parse_program(src: &str) -> Result<Program, String> {
     let toks = Lexer::new(src).tokenize()?;
     let mut p = Parser { toks, pos: 0 };
     let mut prog = Program::default();
     while !p.at(&Tok::Eof) {
+        // A modifier run only starts a declaration; anything else keeps its
+        // ordinary identifier meaning (an `import`/`package` line, say).
+        if !p.at_decl_kw() && matches!(p.peek(), Tok::Ident(w) if is_modifier_word(w)) {
+            let mods = p.modifiers();
+            if p.at(&Tok::Fun) {
+                let f = p.fun_decl_mods(mods)?;
+                if f.is_abstract {
+                    return Err(format!("top-level fun {} needs a body", f.name));
+                }
+                prog.funs.push(f);
+            } else {
+                prog.classes.push(p.class_decl_mods(mods)?);
+            }
+            continue;
+        }
         match p.peek() {
-            Tok::Fun => prog.funs.push(p.fun_decl()?),
+            Tok::Fun => {
+                let f = p.fun_decl()?;
+                if f.is_abstract {
+                    return Err(format!("top-level fun {} needs a body", f.name));
+                }
+                prog.funs.push(f);
+            }
             Tok::Class | Tok::Data | Tok::Object => prog.classes.push(p.class_decl()?),
+            Tok::Ident(w) if w == "interface" => prog.classes.push(p.class_decl()?),
             // `package a.b` / `import a.b.*` — a dotted path, optionally ending
             // in `.*`. The package declaration is accepted and discarded (a
             // single-file program has no package-level name resolution here);
@@ -69,6 +102,39 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
         }
     }
     Ok(prog)
+}
+
+/// The spelling of a token that is a *soft* keyword in Kotlin — meaningful only
+/// in one syntactic position and an ordinary identifier everywhere else. The
+/// lexer gives `until`/`downTo`/`step` (infix range functions) and `data` (a
+/// class modifier) dedicated tokens because the range and declaration grammars
+/// read them positionally, so an identifier position has to accept them back:
+/// `fun step(): Int` and `x.data` are both legal Kotlin.
+fn soft_keyword(t: &Tok) -> Option<&'static str> {
+    match t {
+        Tok::Until => Some("until"),
+        Tok::DownTo => Some("downTo"),
+        Tok::Step => Some("step"),
+        Tok::Data => Some("data"),
+        _ => None,
+    }
+}
+
+/// Whether an identifier is one of the declaration modifiers (see [`Mods`]).
+fn is_modifier_word(w: &str) -> bool {
+    matches!(
+        w,
+        "open"
+            | "abstract"
+            | "override"
+            | "sealed"
+            | "final"
+            | "public"
+            | "private"
+            | "internal"
+            | "protected"
+            | "inner"
+    )
 }
 
 impl Parser {
@@ -109,6 +175,10 @@ impl Parser {
         }
     }
     fn ident(&mut self) -> Result<String, String> {
+        if let Some(s) = soft_keyword(self.peek()) {
+            self.bump();
+            return Ok(s.to_string());
+        }
         match self.bump() {
             Tok::Ident(s) => Ok(s),
             other => Err(format!("expected identifier, found {:?}", other)),
@@ -141,7 +211,41 @@ impl Parser {
 
     // ── Declarations ───────────────────────────────────────────────
 
+    /// Consume the declaration modifiers that precede a `fun`/`class`. They are
+    /// soft keywords in Kotlin — ordinary identifiers everywhere else — so they
+    /// arrive as [`Tok::Ident`] and are recognized only in this position. The
+    /// visibility modifiers are accepted and discarded: a single-file program has
+    /// no visibility boundaries to enforce.
+    fn modifiers(&mut self) -> Mods {
+        let mut m = Mods::default();
+        while let Tok::Ident(w) = self.peek() {
+            match w.as_str() {
+                "open" => m.open = true,
+                "abstract" => m.abstract_ = true,
+                "override" => m.override_ = true,
+                "sealed" => m.sealed = true,
+                "final" | "public" | "private" | "internal" | "protected" | "inner" => {}
+                _ => break,
+            }
+            self.bump();
+        }
+        m
+    }
+
+    /// True when the parser is positioned on a declaration keyword — `fun`,
+    /// `class`, `data`, `object`, or the soft keyword `interface`.
+    fn at_decl_kw(&self) -> bool {
+        matches!(
+            self.peek(),
+            Tok::Fun | Tok::Class | Tok::Data | Tok::Object
+        ) || matches!(self.peek(), Tok::Ident(w) if w == "interface")
+    }
+
     fn fun_decl(&mut self) -> Result<FunDecl, String> {
+        self.fun_decl_mods(Mods::default())
+    }
+
+    fn fun_decl_mods(&mut self, mods: Mods) -> Result<FunDecl, String> {
         let line = self.line();
         self.eat(&Tok::Fun)?;
         let name = self.ident()?;
@@ -176,7 +280,13 @@ impl Parser {
         };
         // Body is either a block `{ … }` or a single-expression body `= expr`
         // (Kotlin `fun f(...) = expr`), which desugars to `{ return expr }`.
-        let (body, is_expr_body) = if self.at(&Tok::Assign) {
+        // An `abstract`/`interface` member has NO body: the declaration ends
+        // right there, and the next token opens the following member (or closes
+        // the class body).
+        let bodyless = !self.at(&Tok::Assign) && !self.at(&Tok::LBrace);
+        let (body, is_expr_body) = if bodyless {
+            (Vec::new(), false)
+        } else if self.at(&Tok::Assign) {
             self.bump();
             let e = self.expr()?;
             (vec![Stmt::new(line, StmtKind::Return(Some(e)))], true)
@@ -199,11 +309,20 @@ impl Parser {
             ret_class,
             body,
             line,
+            is_abstract: bodyless,
+            is_open: mods.open,
+            is_override: mods.override_,
         })
     }
 
-    /// A `class C(...)`, `data class C(...)`, or `object O { ... }`.
+    /// A `class C(...)`, `data class C(...)`, `object O { ... }`, or
+    /// `interface I { ... }`, with the modifiers already consumed by
+    /// [`Parser::modifiers`].
     fn class_decl(&mut self) -> Result<ClassDecl, String> {
+        self.class_decl_mods(Mods::default())
+    }
+
+    fn class_decl_mods(&mut self, mods: Mods) -> Result<ClassDecl, String> {
         let line = self.line();
         let is_data = if self.at(&Tok::Data) {
             self.bump();
@@ -211,7 +330,11 @@ impl Parser {
         } else {
             false
         };
-        let is_object = if self.at(&Tok::Object) {
+        let is_interface = matches!(self.peek(), Tok::Ident(w) if w == "interface");
+        let is_object = if is_interface {
+            self.bump();
+            false
+        } else if self.at(&Tok::Object) {
             if is_data {
                 return Err("`data object` is not supported".into());
             }
@@ -223,9 +346,10 @@ impl Parser {
         };
         let name = self.ident()?;
 
-        // Primary constructor (classes only). `object`s have none.
+        // Primary constructor (classes only). `object`s and `interface`s have
+        // none.
         let mut params = Vec::new();
-        if !is_object && self.at(&Tok::LParen) {
+        if !is_object && !is_interface && self.at(&Tok::LParen) {
             self.bump();
             while !self.at(&Tok::RParen) {
                 let kind = match self.peek() {
@@ -262,6 +386,45 @@ impl Parser {
             ));
         }
 
+        // Supertype list: `: Super(args), Iface1, Iface2`. Only the *first*
+        // entry may carry constructor arguments — Kotlin's own rule, since a
+        // class has exactly one superclass and interfaces have no constructor.
+        let mut parents = Vec::new();
+        let mut super_args = Vec::new();
+        if self.at(&Tok::Colon) {
+            self.bump();
+            loop {
+                let pname = self.ident()?;
+                // A generic supertype (`Comparable<T>`) keeps only its head name.
+                self.skip_type_args();
+                if self.at(&Tok::LParen) {
+                    if !parents.is_empty() {
+                        return Err(format!(
+                            "class {name}: only the superclass may take constructor arguments \
+                             (line {})",
+                            self.line()
+                        ));
+                    }
+                    self.bump();
+                    while !self.at(&Tok::RParen) {
+                        super_args.push(self.expr()?);
+                        if self.at(&Tok::Comma) {
+                            self.bump();
+                        } else {
+                            break;
+                        }
+                    }
+                    self.eat(&Tok::RParen)?;
+                }
+                parents.push(pname);
+                if self.at(&Tok::Comma) {
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+        }
+
         // Body: methods, plus (for `object`) property initializers.
         let mut methods = Vec::new();
         let mut obj_props = Vec::new();
@@ -272,8 +435,9 @@ impl Parser {
                     self.bump();
                     continue;
                 }
+                let mods = self.modifiers();
                 match self.peek() {
-                    Tok::Fun => methods.push(self.fun_decl()?),
+                    Tok::Fun => methods.push(self.fun_decl_mods(mods)?),
                     Tok::Val | Tok::Var => {
                         if !is_object {
                             return Err(format!(
@@ -311,8 +475,36 @@ impl Parser {
             methods,
             is_data,
             is_object,
+            is_interface,
+            is_abstract: mods.abstract_,
+            is_open: mods.open,
+            is_sealed: mods.sealed,
+            parents,
+            super_args,
             line,
         })
+    }
+
+    /// Consume a `<…>` type-argument list if one is present, discarding it.
+    /// Coarse typing keeps only the head name of a generic supertype.
+    fn skip_type_args(&mut self) {
+        if !self.at(&Tok::Lt) {
+            return;
+        }
+        let mut depth = 0;
+        loop {
+            match self.bump() {
+                Tok::Lt => depth += 1,
+                Tok::Gt => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return;
+                    }
+                }
+                Tok::Eof => return,
+                _ => {}
+            }
+        }
     }
 
     /// A type reference — `Int`, `String`, `Array<String>`, `Int?`, … Generic
@@ -712,9 +904,49 @@ impl Parser {
     /// `x in 1..5` groups as `x in (1..5)` and `a in b == c` as `(a in b) == c`.
     /// A `for` header consumes its own `in` before reaching an expression, so the
     /// two uses never collide.
+    /// Whether the parser sits on a `when` arm's `is Type ->` / `!is Type ->`
+    /// header rather than on an `is` operator continuing the current expression.
+    fn at_when_is_arm(&self) -> bool {
+        let off = usize::from(self.at(&Tok::Not));
+        matches!(self.peek_at(off), Tok::Is)
+            && matches!(self.peek_at(off + 1), Tok::Ident(_))
+            && matches!(self.peek_at(off + 2), Tok::Arrow)
+    }
+
     fn in_expr(&mut self) -> Result<Expr, String> {
         let mut l = self.elvis_expr()?;
         loop {
+            // `is Type` / `!is Type` share this precedence level with `in`
+            // (Kotlin's "named checks"), so `x is Dog == true` groups as
+            // `(x is Dog) == true`.
+            //
+            // The lexer drops newlines, so a `when` arm body that ends in an
+            // expression sits directly against the NEXT arm's `is Type ->`. An
+            // `is` whose type is immediately followed by `->` therefore opens an
+            // arm and is left for the `when` parser: `x is T ->` is never a
+            // valid expression on its own (`->` only closes a lambda's
+            // parameter list), so the test cannot misread real code.
+            if self.at_when_is_arm() {
+                break;
+            }
+            if self.at(&Tok::Is) || (self.at(&Tok::Not) && matches!(self.peek_at(1), Tok::Is)) {
+                let negated = self.at(&Tok::Not);
+                if negated {
+                    self.bump();
+                }
+                self.bump(); // is
+                let ty = self.ident()?;
+                self.skip_type_args();
+                if self.at(&Tok::Question) {
+                    self.bump(); // `is String?`
+                }
+                l = Expr::Is {
+                    value: Box::new(l),
+                    ty,
+                    negated,
+                };
+                continue;
+            }
             let negated = if self.at(&Tok::In) {
                 self.bump();
                 false
@@ -1167,6 +1399,19 @@ impl Parser {
                 self.eat(&Tok::RParen)?;
                 Ok(e)
             }
+            // A soft keyword in leading expression position is a plain name: the
+            // infix forms (`a until b`, `r step 2`) consume theirs from the
+            // operator loop, which has a left operand and never reaches here,
+            // and a `data class` declaration is taken by the top-level parser.
+            ref t if soft_keyword(t).is_some() => {
+                let name = soft_keyword(t).unwrap().to_string();
+                self.bump();
+                if self.at(&Tok::LParen) {
+                    self.primary_call(name, line)
+                } else {
+                    Ok(Expr::Var(name))
+                }
+            }
             Tok::Ident(name) => {
                 self.bump();
                 // Explicit type arguments on a call — `listOf<Int>()`,
@@ -1208,6 +1453,26 @@ impl Parser {
             }
             other => Err(format!("unexpected token {:?} (line {})", other, line)),
         }
+    }
+
+    /// The argument list of a parenthesized call whose callee name is already
+    /// consumed, plus an optional trailing lambda.
+    fn primary_call(&mut self, name: String, line: u32) -> Result<Expr, String> {
+        self.eat(&Tok::LParen)?;
+        let mut args = Vec::new();
+        while !self.at(&Tok::RParen) {
+            args.push(self.expr()?);
+            if self.at(&Tok::Comma) {
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        self.eat(&Tok::RParen)?;
+        if self.at(&Tok::LBrace) {
+            args.push(self.lambda()?);
+        }
+        Ok(Expr::Call { name, args, line })
     }
 
     fn if_expr(&mut self) -> Result<IfExpr, String> {

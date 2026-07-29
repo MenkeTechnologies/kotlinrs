@@ -127,16 +127,40 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `.uppercase()`/`.lowercase()`, `.trim()`, `.isEmpty()`/`.isNotEmpty()`,
   `Char.code`, `Int.toChar()`, and `Any.toString()`.
 - **Classes** — `class C(val x: Int, var y: Int) { fun m() {…} }`: primary-
-  constructor properties (`val`/`var`), instance methods (dispatched as native
-  fusevm `Op::Call`s with an implicit `this`), property get/set (`p.x`, `p.y =
-  …`), and implicit-`this` member access inside methods. `val`-property
-  reassignment is a compile error.
+  constructor properties (`val`/`var`), plain constructor parameters (a
+  parameter with no `val`/`var` is forwarded, not stored), instance methods
+  (dispatched as native fusevm `Op::Call`s with an implicit `this`), property
+  get/set (`p.x`, `p.y = …`), and implicit-`this` member access inside methods.
+  `val`-property reassignment is a compile error.
+- **Inheritance** — `open class`/`abstract class`/`sealed class`/`interface`,
+  the `: Super(args), Iface1, Iface2` supertype list, `override`, `abstract`
+  members with no body, interface members *with* a default body, and `super.m()`
+  for the supertype's implementation. Dispatch is **virtual**: a call resolves
+  against the receiver's *runtime* class, so `val a: Animal = Dog(…)` runs
+  `Dog`'s override, and a base-class method calling an overridden one lands in
+  the override too. Fields are flattened base-most first and a subclass's
+  constructor chains to its superclass's, so `class Dog(name: String) :
+  Animal(name)` forwards. `is` is a full expression (`x is Dog`, `x !is Cat`),
+  not only a `when` arm, and it answers for every level of the hierarchy —
+  including an `interface`.
+  A user class may extend a **built-in throwable** (`class ParseError(m: String)
+  : IllegalArgumentException(m)`): it carries `.message`, is claimed by
+  `catch (e: IllegalArgumentException)` / `catch (e: Exception)` on the real
+  hierarchy, and prints as `ParseError: m` rather than the identity form.
+  A `toString()` override is honoured wherever a value is rendered — `println(x)`,
+  a template, `x.toString()`, and *inside* a printed `List`/`Map`/`Pair` or a
+  `joinToString`.
+  A single-implementation call stays a direct `Op::Call`; only a genuinely
+  polymorphic site pays for a runtime class-tag test, and a program with no
+  supertype anywhere emits the bytecode it did before.
 - **`data class`** — auto-generated `equals`/`hashCode` (structural),
   `toString()` (`C(x=1, y=2)`), `copy(...)` (positional overrides), and
   `componentN`, so `val (a, b) = p` destructures. `==` on a data class /
   collection is structural.
 - **`object`** — singleton declarations with `val`/`var` properties and methods,
-  built once and reachable by name (`Counter.inc()`).
+  built once and reachable by name (`Counter.inc()`). An `object` may
+  declare supertypes (`object Registry : Greeter`), which its own methods and
+  `is` checks answer for.
 - **Collections** — `listOf`/`mutableListOf` and `mapOf`/`mutableMapOf` (with
   `k to v` `Pair`s), indexing `xs[i]` / `m[k]` (and indexed assignment), `.size`,
   `.add`/`.get`/`.contains`/`.indexOf`/`.sum` on lists, `.containsKey`/`.keys`/
@@ -185,7 +209,8 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `break`/`continue`, including labeled `outer@ for (…)` with
   `break@outer` / `continue@outer`. Blocks are lexically scoped: bindings
   declared in a nested block (and the `for` variable) drop at the block's end;
-  shadowing is restored.
+  shadowing is restored. A `when` over a `sealed` hierarchy's `is` arms needs no
+  `else` — the arms cover every subtype, so the fallthrough is unreachable.
 - **Null safety** — `null` literal and nullable types `T?`; safe call `?.`
   (short-circuits to null, and chains: `a?.b?.c`), Elvis `?:`, and the not-null
   assertion `!!` (throws `NullPointerException` on null). `x == null` / `x != null`
@@ -223,11 +248,22 @@ are not accepted; only type arguments at a call site are), the `this`-receiver
 scope functions (`.apply`/`.run`), directly invoking a call result (`f()()`;
 bind it first), lambda element-type inference (an unannotated `it` is coarsely
 typed, so `/` and `%` on it default to float — annotate the parameter `Int` for
-integer semantics), interfaces/inheritance (so a user class cannot extend
-`Exception` — `throw`/`catch` cover the built-in throwables), class body property
-initializers, named / default arguments, the lambda-taking collection functions
-on a `String` receiver (`"abc".map { … }`; `for (c in s)` works), and the rest of
-the standard-library surface.
+integer semantics), class body property initializers (stored properties go in the
+primary constructor), secondary constructors, `as`/`as?` casts, named / default
+arguments, `Set`, the lambda-taking collection functions on a `String` receiver
+(`"abc".map { … }`; `for (c in s)` works), and the rest of the standard-library
+surface.
+
+Inheritance carries three deliberate simplifications. The modifiers are recorded
+but not **enforced** — kotlinrs accepts an `override` of a member the base did not
+mark `open`, where Kotlin would reject it; it never *mis*-runs a valid program,
+it only accepts some invalid ones. A `data class` may not inherit stored
+properties (Kotlin derives its members from the primary constructor alone, which
+a flattened field record cannot reproduce), so `data class Num(val v: Int) :
+Expr()` over a field-less supertype is fine and a `data class` under a
+field-carrying one is a compile error. And an unqualified `super.m()` resolves to
+the first supertype that implements `m`; the `super<T>.m()` disambiguation form is
+not parsed.
 
 A `return` out of a `try` that owns a `finally` is honoured — the finalizer runs
 first, nesting outward — but a `break`/`continue` out of one is refused at
@@ -319,12 +355,20 @@ initializers (`IntArray(n) { it * 2 }`, `Array(n) { … }`); `String` iteration
 (`for (c in "abc")`); and the null-safety corners — `x == null` as a null test,
 `String?` display, and the operator methods (`n?.plus(1)`).
 
-Next: generics, `Set`, the `this`-receiver scope functions (`apply`/`run`),
-lambda element-type inference, interfaces/inheritance (including user classes
-extending `Exception`), named/default arguments, the lambda-taking collection
-functions on a `String` receiver, and a growing standard-library surface —
-alongside the sibling parity tooling (LSP/DAP, reference generator, differential
-harness).
+Landed since then: **class inheritance** — `open`/`abstract`/`sealed` classes,
+`interface`s with default members, the `: Super(args), Iface` supertype list,
+`override`, `super.m()`, virtual dispatch by runtime class tag, `is` as a full
+expression over the whole hierarchy, user classes extending the built-in
+throwables (so `class ParseError(m: String) : IllegalArgumentException(m)` is
+caught and printed like a JVM one), and a `toString()` override honoured through
+nested collection rendering.
+
+Next: generics, `Set`, a real runtime `Char` (it is an `Int` code unit today,
+which is why the lambda-taking collection functions have no `String` receiver
+form), the `this`-receiver scope functions (`apply`/`run`), lambda element-type
+inference, named/default arguments, `as` casts, class body property
+initializers, and a growing standard-library surface — alongside the sibling
+parity tooling (LSP/DAP, reference generator, differential harness).
 
 ## [0xFF] LICENSE
 

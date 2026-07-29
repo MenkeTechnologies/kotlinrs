@@ -137,41 +137,93 @@ println(r.sum())   // 15</code></pre>
         </article>
         <article class="doc-entry" id="doc-keyword-17">
           <h3><a class="doc-anchor" href="#doc-keyword-17">#</a> <code>is</code></h3>
-          <p>runtime type check in a `when` arm: `is String`, `!is Int`</p>
+          <p>runtime type check, in a `when` arm or any expression: `is String`, `!is Int`</p>
           <pre><code class="lang-kotlin">when (x) { is String -&gt; "str"; is Int -&gt; "int"; else -&gt; "?" }</code></pre>
         </article>
         <article class="doc-entry" id="doc-keyword-18">
-          <h3><a class="doc-anchor" href="#doc-keyword-18">#</a> <code>break</code></h3>
+          <h3><a class="doc-anchor" href="#doc-keyword-18">#</a> <code>class</code></h3>
+          <p>declare a class; `: Super(args), Iface` names its supertypes</p>
+          <pre><code class="lang-kotlin">open class Animal(val name: String)
+class Dog(n: String) : Animal(n)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-19">
+          <h3><a class="doc-anchor" href="#doc-keyword-19">#</a> <code>interface</code></h3>
+          <p>declare an interface; members may carry a default body</p>
+          <pre><code class="lang-kotlin">interface Greeter {
+    fun greet(): String
+    fun loud(): String = greet().uppercase()
+}</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-20">
+          <h3><a class="doc-anchor" href="#doc-keyword-20">#</a> <code>object</code></h3>
+          <p>declare a singleton, built once and reachable by name</p>
+          <pre><code class="lang-kotlin">object Counter { var n = 0 }
+println(Counter.n)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-21">
+          <h3><a class="doc-anchor" href="#doc-keyword-21">#</a> <code>data</code></h3>
+          <p>`data class` — structural equals/hashCode/toString plus copy and componentN</p>
+          <pre><code class="lang-kotlin">data class Pt(val x: Int, val y: Int)
+println(Pt(1, 2))   // Pt(x=1, y=2)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-22">
+          <h3><a class="doc-anchor" href="#doc-keyword-22">#</a> <code>open</code></h3>
+          <p>mark a class or member as extendable/overridable</p>
+          <pre><code class="lang-kotlin">open class Base { open fun f(): Int = 1 }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-23">
+          <h3><a class="doc-anchor" href="#doc-keyword-23">#</a> <code>override</code></h3>
+          <p>replace a supertype's member; dispatch picks the receiver's runtime class</p>
+          <pre><code class="lang-kotlin">class D : Base() { override fun f(): Int = 2 }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-24">
+          <h3><a class="doc-anchor" href="#doc-keyword-24">#</a> <code>abstract</code></h3>
+          <p>a class that cannot be instantiated, or a member with no body</p>
+          <pre><code class="lang-kotlin">abstract class Shape { abstract fun area(): Double }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-25">
+          <h3><a class="doc-anchor" href="#doc-keyword-25">#</a> <code>sealed</code></h3>
+          <p>an abstract class whose subtypes make a `when` over `is` arms exhaustive</p>
+          <pre><code class="lang-kotlin">sealed class Expr
+data class Num(val v: Int) : Expr()</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-26">
+          <h3><a class="doc-anchor" href="#doc-keyword-26">#</a> <code>super</code></h3>
+          <p>call the supertype's implementation instead of the overriding one</p>
+          <pre><code class="lang-kotlin">override fun f(): Int = super.f() + 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-27">
+          <h3><a class="doc-anchor" href="#doc-keyword-27">#</a> <code>break</code></h3>
           <p>exit the enclosing loop; `break@label` targets a labeled loop</p>
           <pre><code class="lang-kotlin">for (i in 1..9) { if (i == 5) break }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-19">
-          <h3><a class="doc-anchor" href="#doc-keyword-19">#</a> <code>continue</code></h3>
+        <article class="doc-entry" id="doc-keyword-28">
+          <h3><a class="doc-anchor" href="#doc-keyword-28">#</a> <code>continue</code></h3>
           <p>skip to the loop's next iteration; `continue@label` for a labeled loop</p>
           <pre><code class="lang-kotlin">for (i in 1..9) { if (i % 2 == 0) continue; println(i) }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-20">
-          <h3><a class="doc-anchor" href="#doc-keyword-20">#</a> <code>try</code></h3>
+        <article class="doc-entry" id="doc-keyword-29">
+          <h3><a class="doc-anchor" href="#doc-keyword-29">#</a> <code>try</code></h3>
           <p>guarded block; an EXPRESSION whose value is the body's or the matching handler's</p>
           <pre><code class="lang-kotlin">val n = try { "x".length } catch (e: Exception) { -1 }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-21">
-          <h3><a class="doc-anchor" href="#doc-keyword-21">#</a> <code>catch</code></h3>
+        <article class="doc-entry" id="doc-keyword-30">
+          <h3><a class="doc-anchor" href="#doc-keyword-30">#</a> <code>catch</code></h3>
           <p>handler arm: `catch (e: T) { … }`; the first arm whose type matches wins</p>
           <pre><code class="lang-kotlin">try { 1 / 0 } catch (e: ArithmeticException) { println(e.message) }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-22">
-          <h3><a class="doc-anchor" href="#doc-keyword-22">#</a> <code>finally</code></h3>
+        <article class="doc-entry" id="doc-keyword-31">
+          <h3><a class="doc-anchor" href="#doc-keyword-31">#</a> <code>finally</code></h3>
           <p>cleanup block; runs on the normal and the exceptional path alike</p>
           <pre><code class="lang-kotlin">try { work() } finally { println("done") }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-23">
-          <h3><a class="doc-anchor" href="#doc-keyword-23">#</a> <code>throw</code></h3>
+        <article class="doc-entry" id="doc-keyword-32">
+          <h3><a class="doc-anchor" href="#doc-keyword-32">#</a> <code>throw</code></h3>
           <p>raise a throwable; typed `Nothing`, so it is usable as an expression</p>
           <pre><code class="lang-kotlin">val v = x ?: throw IllegalStateException("missing")</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-24">
-          <h3><a class="doc-anchor" href="#doc-keyword-24">#</a> <code>null</code></h3>
+        <article class="doc-entry" id="doc-keyword-33">
+          <h3><a class="doc-anchor" href="#doc-keyword-33">#</a> <code>null</code></h3>
           <p>the null reference; used with `T?`, `?.`, `?:`, and `!!`</p>
           <pre><code class="lang-kotlin">val x: Int? = null
 println(x ?: 0)   // 0</code></pre>

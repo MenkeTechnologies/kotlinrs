@@ -130,8 +130,62 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
     (
         "is",
         "Keyword",
-        "runtime type check in a `when` arm: `is String`, `!is Int`",
+        "runtime type check, in a `when` arm or any expression: `is String`, `!is Int`",
         "when (x) { is String -> \"str\"; is Int -> \"int\"; else -> \"?\" }",
+    ),
+    (
+        "class",
+        "Keyword",
+        "declare a class; `: Super(args), Iface` names its supertypes",
+        "open class Animal(val name: String)\nclass Dog(n: String) : Animal(n)",
+    ),
+    (
+        "interface",
+        "Keyword",
+        "declare an interface; members may carry a default body",
+        "interface Greeter {\n    fun greet(): String\n    fun loud(): String = greet().uppercase()\n}",
+    ),
+    (
+        "object",
+        "Keyword",
+        "declare a singleton, built once and reachable by name",
+        "object Counter { var n = 0 }\nprintln(Counter.n)",
+    ),
+    (
+        "data",
+        "Keyword",
+        "`data class` — structural equals/hashCode/toString plus copy and componentN",
+        "data class Pt(val x: Int, val y: Int)\nprintln(Pt(1, 2))   // Pt(x=1, y=2)",
+    ),
+    (
+        "open",
+        "Keyword",
+        "mark a class or member as extendable/overridable",
+        "open class Base { open fun f(): Int = 1 }",
+    ),
+    (
+        "override",
+        "Keyword",
+        "replace a supertype's member; dispatch picks the receiver's runtime class",
+        "class D : Base() { override fun f(): Int = 2 }",
+    ),
+    (
+        "abstract",
+        "Keyword",
+        "a class that cannot be instantiated, or a member with no body",
+        "abstract class Shape { abstract fun area(): Double }",
+    ),
+    (
+        "sealed",
+        "Keyword",
+        "an abstract class whose subtypes make a `when` over `is` arms exhaustive",
+        "sealed class Expr\ndata class Num(val v: Int) : Expr()",
+    ),
+    (
+        "super",
+        "Keyword",
+        "call the supertype's implementation instead of the overriding one",
+        "override fun f(): Int = super.f() + 1",
     ),
     (
         "break",

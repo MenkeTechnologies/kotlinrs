@@ -121,6 +121,25 @@ pub const KT_ARRAY_NEW: u16 = 30;
 /// the argument count. Stack: `[arg0 .. arg{n-1}, nameStr]` with the function
 /// name on top; pushes the result.
 pub const KT_MATH: u16 = 31;
+/// Register a declared type's supertypes. Stack: `[nameStr, supersCsvStr]`;
+/// pops both. The runtime consults the table for `is` checks on user classes,
+/// `catch` matching of a user class extending a built-in throwable, and the
+/// throwable display form. Emitted once per declared class, before `main`.
+pub const KT_TYPE_REG: u16 = 32;
+/// Build a subclass instance on top of its superclass instance. Stack:
+/// `[baseObj, metaStr, v0 .. v{n-1}]` (`arg` = the subclass's OWN field count
+/// `n`). The result carries the base's fields followed by the subclass's own,
+/// under the subclass's runtime class tag.
+pub const KT_EXTEND: u16 = 33;
+/// The runtime class tag of a value: the declared name for a class instance /
+/// `object` singleton, or the empty string for anything else. Stack: `[value]`;
+/// pushes a `Str`. Backs the virtual method dispatch chain the compiler emits.
+pub const KT_CLASSOF: u16 = 34;
+/// Register a class's `toString()` override. Stack: `[tagStr, subNameIdx]`; the
+/// index is the emitted `Owner#toString` subroutine's name-pool slot, which
+/// [`KT_DISPLAY`] resolves with `Chunk::find_sub`. Emitted once per overriding
+/// class, before `main`, and only in a program that declares one.
+pub const KT_TOSTRING_REG: u16 = 35;
 
 // ── Builtin ids (`Op::CallBuiltin`) ─────────────────────────────────────────
 //
@@ -165,6 +184,24 @@ pub const KT_ARRAY_INIT: u16 = 104;
 pub const KT_PRINTLN: u16 = 105;
 /// Builtin id for `print(x)` — see [`KT_PRINTLN`].
 pub const KT_PRINT: u16 = 106;
+
+/// Builtin id for the Kotlin display form of a value in a program that declares
+/// a `toString()` override. Stack: `[value]`; pushes a `Str`.
+///
+/// It is a *builtin* rather than an [`Op::Extended`] because rendering an
+/// instance means running the user's `toString()` body through a nested
+/// `vm.run()`, and only the builtin table stays live across that re-entry. It
+/// recurses through `List`/`Map`/`Pair` so an override is honoured for an
+/// element too (`println(listOf(shape))`), which the VM-less
+/// [`KT_TO_STRING`] cannot do. A program with no override never emits it and
+/// keeps the single extension op it had.
+///
+/// [`Op::Extended`]: fusevm::Op::Extended
+pub const KT_DISPLAY: u16 = 107;
+/// Builtin id for `joinToString(sep)` in a program that declares a `toString()`
+/// override — the [`KT_DISPLAY`] element rendering with a separator. Stack:
+/// `[recv]` or `[recv, sep]` (`argc` distinguishes).
+pub const KT_JOIN: u16 = 108;
 
 // ── Exception builtins (`try` / `catch` / `finally` / `throw`) ──────────────
 //
@@ -213,6 +250,35 @@ thread_local! {
     /// their class/collection model. Reset per VM install so runs don't share
     /// object identity.
     static HEAP: RefCell<Vec<HeapObj>> = const { RefCell::new(Vec::new()) };
+
+    /// Declared type name → its supertypes, nearest first, as published by
+    /// [`KT_TYPE_REG`] before `main` runs. The flat instance record cannot carry
+    /// a hierarchy, and three things need one: `is` on a user class, `catch` on a
+    /// user class extending a built-in throwable, and the `Class: message`
+    /// display form such a class inherits.
+    static TYPES: RefCell<std::collections::HashMap<String, Vec<String>>> =
+        RefCell::new(std::collections::HashMap::new());
+
+    /// Class tag → the name-pool index of its `toString()` subroutine, as
+    /// published by [`KT_TOSTRING_REG`]. Consulted by [`KT_DISPLAY`].
+    static TOSTRING_SUBS: RefCell<std::collections::HashMap<String, u16>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Whether the declared type `class` is `ty` itself or lists it as a supertype.
+fn type_is_a(class: &str, ty: &str) -> bool {
+    class == ty
+        || TYPES.with(|t| {
+            t.borrow()
+                .get(class)
+                .is_some_and(|s| s.iter().any(|x| x == ty))
+        })
+}
+
+/// Whether the declared type `class` reaches `java.lang.Throwable` — i.e. it was
+/// declared as `class C(…) : Exception(…)` or below one.
+fn type_is_throwable(class: &str) -> bool {
+    type_is_a(class, "Throwable")
 }
 
 /// A heap-resident object: a class instance, a `List`, a `Map`, or a `Pair`.
@@ -379,6 +445,8 @@ fn difference_modulo(a: i64, b: i64, c: i64) -> i64 {
 /// no residual objects (handles are per-run identities).
 fn reset_heap() {
     HEAP.with(|h| h.borrow_mut().clear());
+    TYPES.with(|t| t.borrow_mut().clear());
+    TOSTRING_SUBS.with(|t| t.borrow_mut().clear());
     PENDING.with(|p| *p.borrow_mut() = None);
     STASH.with(|s| s.borrow_mut().clear());
 }
@@ -579,7 +647,27 @@ fn throwable_is_a(thrown: &str, want: &str) -> bool {
     }
 }
 
-/// The simple class name used for `catch` matching.
+/// The built-in throwable ancestry of `simple`, nearest first and including
+/// `simple` itself (`"IllegalStateException"` → `["IllegalStateException",
+/// "RuntimeException", "Exception", "Throwable"]`). The compiler publishes it
+/// with a user class's own supertypes so `catch (e: Exception)` claims a user
+/// class declared `: IllegalStateException(…)`.
+pub fn throwable_ancestry(simple: &str) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    let mut cur = simple;
+    while let Some((s, _)) = BUILTIN_THROWABLES.iter().find(|(s, _)| *s == cur) {
+        out.push(*s);
+        match THROWABLE_PARENTS.iter().find(|(c, _)| *c == cur) {
+            Some((_, parent)) => cur = parent,
+            None => break,
+        }
+    }
+    out
+}
+
+/// The simple class name used for `catch` matching: a built-in throwable's last
+/// path segment, or a user class's declared name when its ancestry reaches
+/// `Throwable`.
 fn thrown_class(v: &Value) -> Option<String> {
     with_obj(v, |o| match o {
         HeapObj::Exc { class, .. } => Some(
@@ -589,20 +677,41 @@ fn thrown_class(v: &Value) -> Option<String> {
                 .unwrap_or(class.as_str())
                 .to_string(),
         ),
+        HeapObj::Instance { class, .. } if type_is_throwable(class) => Some(class.clone()),
         _ => None,
     })
     .flatten()
 }
 
+/// Whether the in-flight throwable `v` is an instance of the caught type `want`.
+/// A built-in walks the fixed [`THROWABLE_PARENTS`] chain; a user class walks the
+/// supertypes it registered at startup, which already end in that chain.
+fn throwable_matches(v: &Value, want: &str) -> bool {
+    with_obj(v, |o| match o {
+        HeapObj::Instance { class, .. } if type_is_throwable(class) => type_is_a(class, want),
+        _ => false,
+    })
+    .unwrap_or(false)
+        || thrown_class(v).is_some_and(|c| throwable_is_a(&c, want))
+}
+
 /// A throwable's `toString()`: `fqn` alone when the message is null, else
-/// `fqn: message` (`java.lang.Throwable.toString`). A non-throwable value falls
-/// back to its ordinary Kotlin display form.
+/// `fqn: message` (`java.lang.Throwable.toString`). A user class extending one
+/// renders under its own (unqualified — kotlinrs compiles a single default-package
+/// file) name and its stored `message`. A non-throwable value falls back to its
+/// ordinary Kotlin display form.
 fn throwable_str(v: &Value) -> String {
     with_obj(v, |o| match o {
         HeapObj::Exc { class, msg } => Some(match msg {
             Some(m) => format!("{class}: {m}"),
             None => class.clone(),
         }),
+        HeapObj::Instance { class, fields, .. } if type_is_throwable(class) => {
+            Some(match fields.iter().find(|(n, _)| n == "message") {
+                Some((_, Value::Undef)) | None => class.clone(),
+                Some((_, m)) => format!("{class}: {}", kotlin_string(m)),
+            })
+        }
         _ => None,
     })
     .flatten()
@@ -635,12 +744,12 @@ fn b_exc_pending(_vm: &mut VM, _argc: u8) -> Value {
 /// `KT_EXC_MATCH` — see [`KT_EXC_MATCH`].
 fn b_exc_match(vm: &mut VM, _argc: u8) -> Value {
     let want = vm.pop().to_str();
-    let thrown = PENDING.with(|p| p.borrow().as_ref().and_then(thrown_class));
+    let thrown = PENDING.with(|p| p.borrow().clone());
     Value::Bool(match thrown {
         // `catch (e: Throwable)` catches everything, including a value outside
         // the modeled hierarchy.
         Some(_) if want == "Throwable" => true,
-        Some(c) => throwable_is_a(&c, &want),
+        Some(v) => throwable_matches(&v, &want),
         None => false,
     })
 }
@@ -885,6 +994,55 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
                 is_data,
                 fields,
             }));
+        }
+        KT_TYPE_REG => {
+            // Stack: [nameStr, supersCsvStr].
+            let supers_csv = vm.pop().to_str();
+            let name = vm.pop().to_str();
+            let supers: Vec<String> = if supers_csv.is_empty() {
+                Vec::new()
+            } else {
+                supers_csv.split(',').map(|s| s.to_string()).collect()
+            };
+            TYPES.with(|t| t.borrow_mut().insert(name, supers));
+        }
+        KT_EXTEND => {
+            // Stack: [baseObj, metaStr, v0 .. v{n-1}]; n = arg (own fields).
+            let n = arg as usize;
+            let mut vals = Vec::with_capacity(n);
+            for _ in 0..n {
+                vals.push(vm.pop());
+            }
+            vals.reverse();
+            let meta = vm.pop().to_str();
+            let base = vm.pop();
+            let mut it = meta.split('\u{1f}');
+            let class = it.next().unwrap_or("").to_string();
+            let is_data = it.next() == Some("d");
+            // The base's fields come first, so a subclass's record reads
+            // base-most first — the order the compiler's flattened property
+            // table assumes.
+            let mut fields = with_obj(&base, |o| match o {
+                HeapObj::Instance { fields, .. } => fields.clone(),
+                _ => Vec::new(),
+            })
+            .unwrap_or_default();
+            fields.extend(it.map(|s| s.to_string()).zip(vals));
+            vm.push(alloc(HeapObj::Instance {
+                class,
+                is_data,
+                fields,
+            }));
+        }
+        KT_CLASSOF => {
+            let v = vm.pop();
+            vm.push(Value::str(instance_tag(&v).unwrap_or_default()));
+        }
+        KT_TOSTRING_REG => {
+            // Stack: [tagStr, subNameIdx].
+            let idx = vm.pop().to_int() as u16;
+            let tag = vm.pop().to_str();
+            TOSTRING_SUBS.with(|t| t.borrow_mut().insert(tag, idx));
         }
         KT_GETFIELD => {
             // Stack: [obj, nameStr].
@@ -1213,6 +1371,8 @@ fn register_builtins(vm: &mut VM) {
     vm.register_builtin(KT_ARRAY_INIT, b_array_init);
     vm.register_builtin(KT_PRINTLN, b_println);
     vm.register_builtin(KT_PRINT, b_print);
+    vm.register_builtin(KT_DISPLAY, b_display);
+    vm.register_builtin(KT_JOIN, b_join);
     vm.register_builtin(KT_EXC_NEW, b_exc_new);
     vm.register_builtin(KT_EXC_THROW, b_exc_throw);
     vm.register_builtin(KT_EXC_PENDING, b_exc_pending);
@@ -1454,6 +1614,99 @@ fn run_sub(vm: &mut VM, entry: usize, stack_base: usize) -> Result<Value, String
         VMResult::Halted => Ok(vm.stack.pop().unwrap_or(Value::Undef)),
         VMResult::Error(e) => Err(e),
     }
+}
+
+/// The declared class tag of a value, when it is a class instance or an `object`
+/// singleton; `None` for every other value kind.
+fn instance_tag(v: &Value) -> Option<String> {
+    with_obj(v, |o| match o {
+        HeapObj::Instance { class, .. } => Some(class.clone()),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// The Kotlin display form of `v`, honouring a user `toString()` override.
+///
+/// An instance whose class registered an override runs that body through a
+/// nested `vm.run()`; a `List`/`Map`/`Pair` recurses so an override applies to
+/// its elements too. Everything else falls back to the VM-less
+/// [`kotlin_string`]. The heap borrow is always released before re-entering the
+/// VM, because the override body can allocate.
+fn display_vm(vm: &mut VM, v: &Value) -> String {
+    if let Some(tag) = instance_tag(v) {
+        let sub = TOSTRING_SUBS.with(|t| t.borrow().get(&tag).copied());
+        if let Some(idx) = sub {
+            if let Some(entry) = vm.chunk.find_sub(idx) {
+                let base = vm.stack.len();
+                vm.stack.push(v.clone());
+                return match run_sub(vm, entry, base) {
+                    Ok(r) => kotlin_string(&r),
+                    Err(_) => kotlin_string(v),
+                };
+            }
+        }
+        return kotlin_string(v);
+    }
+    // Clone the children out before recursing: the nested run mutates the heap.
+    enum Shape {
+        List(Vec<Value>),
+        Map(Vec<(Value, Value)>),
+        Pair(Value, Value),
+        Plain,
+    }
+    let shape = with_obj(v, |o| match o {
+        HeapObj::List(items) => Shape::List(items.clone()),
+        HeapObj::Map(entries) => Shape::Map(entries.clone()),
+        HeapObj::Pair(a, b) => Shape::Pair(a.clone(), b.clone()),
+        _ => Shape::Plain,
+    })
+    .unwrap_or(Shape::Plain);
+    match shape {
+        Shape::List(items) => {
+            let body: Vec<String> = items.iter().map(|x| display_vm(vm, x)).collect();
+            format!("[{}]", body.join(", "))
+        }
+        Shape::Map(entries) => {
+            let body: Vec<String> = entries
+                .iter()
+                .map(|(k, val)| format!("{}={}", display_vm(vm, k), display_vm(vm, val)))
+                .collect();
+            format!("{{{}}}", body.join(", "))
+        }
+        Shape::Pair(a, b) => format!("({}, {})", display_vm(vm, &a), display_vm(vm, &b)),
+        Shape::Plain => kotlin_string(v),
+    }
+}
+
+/// `KT_DISPLAY` — see [`KT_DISPLAY`].
+fn b_display(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.pop();
+    Value::str(display_vm(vm, &v))
+}
+
+/// `KT_JOIN` — see [`KT_JOIN`]. `argc` is 1 when a separator was supplied.
+fn b_join(vm: &mut VM, argc: u8) -> Value {
+    let sep = if argc >= 1 {
+        kotlin_string(&vm.pop())
+    } else {
+        ", ".to_string()
+    };
+    let recv = vm.pop();
+    let items = sequence_items(&recv);
+    let body: Vec<String> = items.iter().map(|x| display_vm(vm, x)).collect();
+    Value::str(body.join(&sep))
+}
+
+/// The elements of any iterable receiver — a `List`, an array, or a range.
+fn sequence_items(v: &Value) -> Vec<Value> {
+    with_obj(v, |o| match o {
+        HeapObj::List(items) => items.clone(),
+        HeapObj::Array { items, .. } => items.clone(),
+        HeapObj::Range(r) => r.to_vec(),
+        _ => Vec::new(),
+    })
+    .unwrap_or_default()
 }
 
 /// `KT_CLOSURE_CALL`: invoke a closure directly, `f(args)`. Stack (top-down):
@@ -2352,6 +2605,13 @@ fn display_obj(id: u32) -> String {
                         .collect::<Vec<_>>()
                         .join(", ");
                     format!("{class}({body})")
+                } else if type_is_throwable(class) {
+                    // A user class extending a built-in throwable inherits
+                    // `Throwable.toString()`, not `Object`'s identity form.
+                    match fields.iter().find(|(n, _)| n == "message") {
+                        Some((_, Value::Undef)) | None => class.clone(),
+                        Some((_, m)) => format!("{class}: {}", kotlin_string(m)),
+                    }
                 } else {
                     format!("{class}@{id:x}")
                 }
@@ -2417,12 +2677,25 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         "String" | "CharSequence" => matches!(v, Value::Str(_)),
         // `Any` matches any non-null value; unknown names never match.
         "Any" => !matches!(v, Value::Undef),
-        // A throwable matches its own class and every supertype it reaches, so
-        // `when (e) { is RuntimeException -> … }` behaves like a `catch` arm.
-        other => match thrown_class(v) {
-            Some(c) => other == "Throwable" || throwable_is_a(&c, other),
-            None => false,
-        },
+        other => {
+            // A class instance matches its own class and every supertype it
+            // registered — the `is Dog` / `is Animal` / `is Greeter` chain.
+            let inst = with_obj(v, |o| match o {
+                HeapObj::Instance { class, .. } => Some(class.clone()),
+                _ => None,
+            })
+            .flatten();
+            if let Some(class) = inst {
+                return type_is_a(&class, other);
+            }
+            // A built-in throwable matches its own class and every supertype it
+            // reaches, so `when (e) { is RuntimeException -> … }` behaves like a
+            // `catch` arm.
+            match thrown_class(v) {
+                Some(c) => other == "Throwable" || throwable_is_a(&c, other),
+                None => false,
+            }
+        }
     }
 }
 

@@ -486,6 +486,52 @@ fn g_datawhen(r: &mut Rng, idx: usize) -> String {
     }
 }
 
+/// Class inheritance: virtual dispatch through a supertype-typed binding, an
+/// `override` that calls `super`, an `interface` default member, an `abstract`
+/// member reached from a base-class method, `is` against every level of the
+/// hierarchy, and a user class extending `Exception`.
+///
+/// Every probe here renders through a `toString()` override or a primitive, so
+/// no identity hash (which no reimplementation can reproduce) is ever printed.
+/// The declarations these reference live in [`declarations`].
+fn g_class(r: &mut Rng, idx: usize) -> String {
+    let k = pick(r, &["0", "1", "2", "3", "5"]);
+    let j = pick(r, &["1", "2", "4"]);
+    let s = pick(r, STRS);
+    match r.below(14) {
+        0 => p(format!("Sq({k}).area()")),
+        1 => p(format!("Ci({k}).area()")),
+        2 => p(format!("Sq({k}).tag()")),
+        3 => p(format!("Sq({k})")),
+        4 => p(format!("Ci({k})")),
+        // Dispatch through a supertype-typed binding: the runtime class decides.
+        5 => format!(
+            "val sh{idx}: Shp = {}; println(sh{idx}.area()); println(sh{idx}.tag()); println(sh{idx})",
+            pick(r, &["Sq", "Ci", "Shp"]).to_string() + "(" + k + ")"
+        ),
+        6 => format!(
+            "val sl{idx} = listOf(Shp({k}), Sq({j}), Ci({k})); println(sl{idx}); println(sl{idx}.map {{ it.area() }}); println(sl{idx}.joinToString(\"/\"))"
+        ),
+        7 => format!(
+            "val si{idx}: Shp = {}({k}); println(si{idx} is Shp); println(si{idx} is Sq); println(si{idx} is Ci)",
+            pick(r, &["Sq", "Ci", "Shp"])
+        ),
+        // An interface default member calling the implementor's override.
+        8 => p(format!("Yell({s}).twice()")),
+        9 => format!("val ld{idx}: Loud = Yell({s}); println(ld{idx}.shout()); println(ld{idx}.twice()); println(ld{idx} is Yell)"),
+        // A concrete method on an abstract base calling the abstract member.
+        10 => p(format!("D2({k}, {j}).g()")),
+        11 => format!("val ab{idx}: Base2 = D2({k}, {j}); println(ab{idx}.g()); println(ab{idx}.f()); println(ab{idx}.b)"),
+        // A user class extending Exception: message, display, catch matching.
+        12 => format!(
+            "try {{ throw KtErr({s}) }} catch (e: KtErr) {{ println(e.message); println(e) }}"
+        ),
+        _ => format!(
+            "println(try {{ throw KtErr({s}); \"no\" }} catch (e: Exception) {{ \"c:\" + e.message }})"
+        ),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     All,
@@ -512,6 +558,7 @@ enum Mode {
     StrChars,
     NullSafe,
     DataWhen,
+    Class,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -538,6 +585,7 @@ const CONCRETE: &[Mode] = &[
     Mode::StrChars,
     Mode::NullSafe,
     Mode::DataWhen,
+    Mode::Class,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -566,6 +614,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::StrChars => "strchars",
         Mode::NullSafe => "nullsafe",
         Mode::DataWhen => "datawhen",
+        Mode::Class => "class",
     }
 }
 
@@ -606,6 +655,7 @@ fn gen_probe(r: &mut Rng, mode: Mode, idx: usize) -> String {
         Mode::StrChars => g_strchars(r, idx),
         Mode::NullSafe => g_nullsafe(r, idx),
         Mode::DataWhen => g_datawhen(r, idx),
+        Mode::Class => g_class(r, idx),
         Mode::All => unreachable!("resolved above"),
     }
 }
@@ -634,6 +684,65 @@ fn declarations(probes: &[String]) -> String {
     let mut out = String::new();
     if probes.iter().any(|p| p.contains("Pt(")) {
         out.push_str("data class Pt(val x: Int, val y: String)\n");
+    }
+    // The class hierarchy the `class` mode probes: a three-level `open`/`override`
+    // chain with a `super` call and a `toString()` override, an interface with a
+    // default member, an abstract class whose concrete method calls its abstract
+    // one, and a user throwable. Each block is emitted only when a probe names it,
+    // so `minimize` keeps producing compilable reductions.
+    for (marker, decl) in [
+        (
+            "Shp",
+            "open class Shp(val k: Int) {\n\
+             \x20   open fun area(): Int = k\n\
+             \x20   open fun tag(): String = \"shp$k\"\n\
+             \x20   override fun toString(): String = \"Shp[\" + tag() + \"=\" + area() + \"]\"\n\
+             }\n\
+             class Sq(k: Int) : Shp(k) {\n\
+             \x20   override fun area(): Int = k * k\n\
+             \x20   override fun tag(): String = \"sq/\" + super.tag()\n\
+             }\n\
+             class Ci(k: Int) : Shp(k) {\n\
+             \x20   override fun area(): Int = 3 * k * k\n\
+             \x20   override fun toString(): String = \"Ci[\" + area() + \"]\"\n\
+             }\n",
+        ),
+        (
+            "Yell(",
+            "interface Loud {\n\
+             \x20   fun shout(): String\n\
+             \x20   fun twice(): String = shout() + \"-\" + shout()\n\
+             }\n\
+             class Yell(val w: String) : Loud {\n\
+             \x20   override fun shout(): String = w.uppercase()\n\
+             }\n",
+        ),
+        (
+            "D2(",
+            "abstract class Base2(val b: Int) {\n\
+             \x20   abstract fun f(): Int\n\
+             \x20   fun g(): Int = f() + b\n\
+             }\n\
+             class D2(b: Int, val m: Int) : Base2(b) {\n\
+             \x20   override fun f(): Int = m * 2\n\
+             }\n",
+        ),
+        (
+            "KtErr(",
+            "class KtErr(msg: String) : Exception(msg)\n",
+        ),
+    ] {
+        // `Sq(`/`Ci(` also need the `Shp` block, so the shape marker is the bare
+        // type prefix rather than a constructor call.
+        let named = match marker {
+            "Shp" => probes
+                .iter()
+                .any(|p| p.contains("Shp") || p.contains("Sq(") || p.contains("Ci(")),
+            _ => probes.iter().any(|p| p.contains(marker)),
+        };
+        if named {
+            out.push_str(decl);
+        }
     }
     for (marker, decl) in [
         ("boom", exc_helper as fn(usize) -> String),

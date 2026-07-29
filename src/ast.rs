@@ -123,6 +123,14 @@ pub struct FunDecl {
     pub ret_class: Option<String>,
     pub body: Vec<Stmt>,
     pub line: u32,
+    /// `abstract fun m(): T` (or an `interface` member with no body) — the
+    /// declaration reserves the name for dispatch but owns no subroutine.
+    pub is_abstract: bool,
+    /// `open fun` / `override fun`. Recorded for tooling; kotlinrs does not
+    /// *enforce* the modifiers (see the README), so overriding is accepted
+    /// whether or not the base was marked `open`.
+    pub is_open: bool,
+    pub is_override: bool,
 }
 
 /// Whether a primary-constructor parameter also declares a stored property.
@@ -136,7 +144,7 @@ pub enum PropKind {
     None,
 }
 
-/// A `class` / `data class` / `object` declaration.
+/// A `class` / `data class` / `object` / `interface` declaration.
 ///
 /// A regular class's primary constructor lists [`Param`]s; those marked
 /// `val`/`var` ([`PropKind`]) become stored properties. `data` classes
@@ -153,6 +161,24 @@ pub struct ClassDecl {
     pub methods: Vec<FunDecl>,
     pub is_data: bool,
     pub is_object: bool,
+    /// `interface I { … }` — no constructor, no stored properties; its members
+    /// with bodies are inherited by every implementor.
+    pub is_interface: bool,
+    /// `abstract class` — has a constructor (subclasses call it) but cannot be
+    /// instantiated directly.
+    pub is_abstract: bool,
+    /// `open class` — recorded for tooling; subclassing is accepted regardless
+    /// (kotlinrs does not enforce the modifier, see the README).
+    pub is_open: bool,
+    /// `sealed class` — implicitly abstract, so it cannot be instantiated.
+    pub is_sealed: bool,
+    /// `: Super(args), Iface1, Iface2` — the direct supertypes in source order.
+    /// A superclass (the one carrying constructor arguments) may only be first,
+    /// which is Kotlin's own rule.
+    pub parents: Vec<String>,
+    /// The superclass constructor arguments of `: Super(a, b)`. Empty when the
+    /// supertype list holds only interfaces or a parameterless superclass.
+    pub super_args: Vec<Expr>,
     pub line: u32,
 }
 
@@ -421,6 +447,13 @@ pub enum Expr {
     In {
         value: Box<Expr>,
         container: Box<Expr>,
+        negated: bool,
+    },
+    /// `value is Type` / `value !is Type` — a runtime type check in ordinary
+    /// expression position (the `when` arm form is [`WhenCond::Is`]).
+    Is {
+        value: Box<Expr>,
+        ty: String,
         negated: bool,
     },
     /// `x++` / `x--` / `++x` / `--x`. The expression's value is the target's
