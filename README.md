@@ -286,10 +286,19 @@ arguments, the collection functions on a `String` receiver (`"abc".map { … }`,
 `"abc".toCharArray()`, `"abc".first()`; `for (c in s)` and `s[i]` work), and the
 rest of the standard-library surface.
 
-Inheritance carries one deliberate simplification: the modifiers are recorded but
-not **enforced** — kotlinrs accepts an `override` of a member the base did not
-mark `open`, where Kotlin would reject it. It never *mis*-runs a valid program,
-it only accepts some invalid ones.
+The inheritance **modifiers are enforced**, on the same four rules Kotlin
+applies: a class may only extend a `class` marked `open`/`abstract`/`sealed`
+(an `interface` is always implementable); `override` must have something to
+override; a member that redeclares a supertype's must say `override`; and what
+it overrides must be overridable — `open`, `abstract`, or itself an `override`,
+with every `interface` member implicitly open. A member is matched by name *and*
+arity, so a same-named member at another arity stays an overload.
+
+Two members are not routed to a user override: `==` and `hashCode()` on a class
+that declares its own `equals`/`hashCode` still use the built-in structural
+comparison (a `toString()` override *is* honoured everywhere). And method
+overloading is not supported — two `fun f` at different arities in one class is
+a compile error here.
 
 A `return` out of a `try` that owns a `finally` is honoured — the finalizer runs
 first, nesting outward — but a `break`/`continue` out of one is refused at
@@ -418,8 +427,9 @@ lambda; plus `CharRange` (`'a'..'e'`, `step`/`downTo`/`reversed`/`in`) and the
 fixed `+` with a `String` operand in an untyped position (`xs.fold("") { a, b ->
 a + b }` concatenates instead of summing). A `data class` may now inherit stored
 properties, with its derived members taken from the primary constructor alone.
-And `super<T>.m()` is parsed and resolved, so a class implementing two
-supertypes that both supply `m` can say which one it means.
+`super<T>.m()` is parsed and resolved, so a class implementing two supertypes
+that both supply `m` can say which one it means. And the inheritance modifiers
+are now enforced rather than merely recorded.
 
 Next: the collection functions on a `String` receiver (`"abc".map { … }`,
 `toCharArray`), generics, the `this`-receiver scope functions (`apply`/`run`),

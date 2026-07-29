@@ -414,6 +414,85 @@ struct LoopCtx {
     continues: Vec<usize>,
 }
 
+/// The `kotlin.Any` members every class already inherits. They are `open`
+/// there, and overriding one needs no *user* supertype to declare it — so the
+/// "overrides nothing" check below must let them through.
+const ANY_MEMBERS: &[&str] = &["toString", "equals", "hashCode"];
+
+/// Enforce Kotlin's inheritance modifiers on `cd`.
+///
+/// Four rules, each rejecting a program `kotlinc` also rejects:
+///
+/// * a class may only extend a `class` marked `open` / `abstract` / `sealed`
+///   (an `interface` is always implementable, and a built-in throwable parent
+///   has no declaration here to check);
+/// * `override` must have something to override;
+/// * a member that *does* redeclare a supertype's must say `override`;
+/// * and what it overrides must be overridable — `open`, `abstract`, or itself
+///   an `override` (which Kotlin leaves open unless marked `final`). Every
+///   member of an `interface` is implicitly open.
+///
+/// A member is matched by name **and** arity, because a same-named member at a
+/// different arity is an overload, not an override.
+fn check_modifiers(
+    cd: &ClassDecl,
+    mro: &[String],
+    by_name: &HashMap<&str, &ClassDecl>,
+) -> Result<(), String> {
+    for p in &cd.parents {
+        if let Some(d) = by_name.get(p.as_str()) {
+            if !d.is_interface && !(d.is_open || d.is_abstract || d.is_sealed) {
+                return Err(format!(
+                    "class {}: {p} is final, so it cannot be inherited from (line {})",
+                    cd.name, cd.line
+                ));
+            }
+        }
+    }
+    // Where each inherited member is declared, nearest supertype first.
+    let inherited = |name: &str, arity: usize| -> Option<(&ClassDecl, &FunDecl)> {
+        mro[1..]
+            .iter()
+            .filter_map(|a| by_name.get(a.as_str()))
+            .find_map(|d| {
+                d.methods
+                    .iter()
+                    .find(|m| m.name == name && m.params.len() == arity)
+                    .map(|m| (*d, m))
+            })
+    };
+    for m in &cd.methods {
+        let found = inherited(&m.name, m.params.len());
+        match (m.is_override, found) {
+            (true, None) if !ANY_MEMBERS.contains(&m.name.as_str()) => {
+                return Err(format!(
+                    "class {}: `{}` overrides nothing (line {})",
+                    cd.name, m.name, m.line
+                ));
+            }
+            (false, Some((owner, _))) if !m.is_abstract => {
+                return Err(format!(
+                    "class {}: `{}` hides a member of supertype {} and needs an `override` \
+                     modifier (line {})",
+                    cd.name, m.name, owner.name, m.line
+                ));
+            }
+            (true, Some((owner, base))) => {
+                let overridable =
+                    owner.is_interface || base.is_abstract || base.is_open || base.is_override;
+                if !overridable {
+                    return Err(format!(
+                        "class {}: `{}` in {} is final and cannot be overridden (line {})",
+                        cd.name, m.name, owner.name, m.line
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Index every declared `class`/`object`/`interface`: its linearized ancestry,
 /// its flattened field record, and the method set an instance responds to.
 fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, String> {
@@ -453,6 +532,7 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
         if cd.parents.iter().any(|p| p == &cd.name) || mro[1..].iter().any(|a| a == &cd.name) {
             return Err(format!("class {} is its own supertype", cd.name));
         }
+        check_modifiers(cd, &mro, &by_name)?;
 
         let own_field = |p: &CtorProp| PropMeta {
             name: p.name.clone(),

@@ -603,6 +603,80 @@ fun main() {
 }
 
 #[test]
+fn inheritance_modifiers_are_enforced() {
+    // Each of these is rejected by `kotlinc` too. The check matches a member by
+    // name AND arity, so a same-named member at another arity stays an overload.
+    let cases = [
+        (
+            "class Base { fun f(): Int = 1 }\n\
+             class Sub : Base() { override fun f(): Int = 2 }\n\
+             fun main() { println(Sub().f()) }",
+            "final, so it cannot be inherited from",
+        ),
+        (
+            "open class Base { fun f(): Int = 1 }\n\
+             class Sub : Base() { override fun f(): Int = 2 }\n\
+             fun main() { println(Sub().f()) }",
+            "is final and cannot be overridden",
+        ),
+        (
+            "open class Base { open fun f(): Int = 1 }\n\
+             class Sub : Base() { fun f(): Int = 2 }\n\
+             fun main() { println(Sub().f()) }",
+            "needs an `override` modifier",
+        ),
+        (
+            "open class Base { open fun f(): Int = 1 }\n\
+             class Sub : Base() { override fun g(): Int = 2 }\n\
+             fun main() { println(Sub().g()) }",
+            "overrides nothing",
+        ),
+        (
+            "interface I { fun f(): Int }\n\
+             class C : I { fun f(): Int = 1 }\n\
+             fun main() { println(C().f()) }",
+            "needs an `override` modifier",
+        ),
+    ];
+    for (src, want) in cases {
+        let err = prog_err(src);
+        assert!(err.contains(want), "expected {want:?} for {src:?}, got {err}");
+    }
+}
+
+#[test]
+fn valid_override_shapes_still_compile() {
+    // The enforcement above must not reject anything `kotlinc` accepts: an
+    // `override` is itself open, an `interface` member is implicitly open, an
+    // `abstract` member may be re-declared abstract, a member may be inherited
+    // through a silent middle class, and the `Any` members need no user
+    // supertype to override.
+    let src = "\
+interface Base { fun m(): String = \"b\" }
+interface Mid : Base { override fun m(): String = \"m\" }
+class Impl : Mid { override fun m(): String = \"i/\" + super<Mid>.m() }
+object Single : Base { override fun m(): String = \"s\" }
+abstract class AA { abstract fun k(): Int }
+abstract class AB : AA() { abstract override fun k(): Int }
+class AC : AB() { override fun k(): Int = 9 }
+open class G { open fun g(): Int = 1 }
+open class H : G()
+class I2 : H() { override fun g(): Int = 2 }
+class Plain { override fun toString(): String = \"P\" }
+class MyErr(m: String) : Exception(m)
+fun main() {
+    println(Impl().m())
+    println(Single.m())
+    println(AC().k())
+    println(I2().g())
+    println(H().g())
+    println(Plain())
+    println(try { throw MyErr(\"x\") } catch (e: MyErr) { e.message })
+}";
+    assert_eq!(prog(src), "i/m\ns\n9\n2\n1\nP\nx\n");
+}
+
+#[test]
 fn qualified_super_picks_the_named_supertype() {
     // `super<T>.m()` names WHICH inherited `m` to run. Kotlin requires it when
     // more than one supertype implements the member, so this is the only

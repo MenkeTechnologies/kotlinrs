@@ -126,9 +126,9 @@ pub struct FunDecl {
     /// `abstract fun m(): T` (or an `interface` member with no body) — the
     /// declaration reserves the name for dispatch but owns no subroutine.
     pub is_abstract: bool,
-    /// `open fun` / `override fun`. Recorded for tooling; kotlinrs does not
-    /// *enforce* the modifiers (see the README), so overriding is accepted
-    /// whether or not the base was marked `open`.
+    /// `open fun` / `override fun`. Both are enforced — see
+    /// `crate::compiler::check_modifiers`, which rejects an `override` of a
+    /// member the base left final, and a redeclaration that omits `override`.
     pub is_open: bool,
     pub is_override: bool,
 }
@@ -167,8 +167,8 @@ pub struct ClassDecl {
     /// `abstract class` — has a constructor (subclasses call it) but cannot be
     /// instantiated directly.
     pub is_abstract: bool,
-    /// `open class` — recorded for tooling; subclassing is accepted regardless
-    /// (kotlinrs does not enforce the modifier, see the README).
+    /// `open class` — a class without it (and without `abstract`/`sealed`) is
+    /// final, and extending it is a compile error.
     pub is_open: bool,
     /// `sealed class` — implicitly abstract, so it cannot be instantiated.
     pub is_sealed: bool,
