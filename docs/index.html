@@ -107,7 +107,7 @@ fun main() {
       <section class="tutorial-section">
         <h2>Toolchain</h2>
         <div class="cat-grid">
-          <div class="cat-card"><h4>--lsp</h4><p>A Language Server Protocol server on stdio: parser-driven diagnostics, plus keyword / type / builtin completion and hover from the reference corpus (<code>src/lsp.rs</code>).</p></div>
+          <div class="cat-card"><h4>--lsp</h4><p>A Language Server Protocol server on stdio: parser-driven diagnostics, plus completion and hover over the whole 273-entry reference corpus — keywords, operators, types, builtins, throwables and every stdlib member — each with a signature, a description and an example (<code>src/lsp.rs</code>).</p></div>
           <div class="cat-card"><h4>--dap</h4><p>A Debug Adapter Protocol server on stdio: source-line breakpoints, step in/over/out, a stack frame, and live local values, with the debuggee's stdout streamed as output events (<code>src/dap.rs</code>).</p></div>
           <div class="cat-card"><h4>rust { … } FFI</h4><p>An inline <code>rust { pub extern "C" fn … }</code> block compiles to a cached cdylib whose exported functions are callable by name from Kotlin (<code>src/rust_ffi.rs</code>, <code>fusevm::ffi</code>).</p></div>
           <div class="cat-card"><h4>Introspection</h4><p><code>--dump-tokens</code>, <code>--dump-ast</code>, and <code>--disasm</code> (a fusevm bytecode disassembly listing) print each stage and exit.</p></div>
@@ -167,7 +167,7 @@ cargo test</pre>
         <h2>Repository &amp; links</h2>
         <ul>
           <li><strong>Engineering report</strong> — <a href="report.html">report.html</a> (architecture, fusevm hosting, roadmap, dependency posture)</li>
-          <li><strong>Language reference</strong> — <a href="reference.html">reference.html</a> (keywords, types, builtins)</li>
+          <li><strong>Language reference</strong> — <a href="reference.html">reference.html</a> (keywords, operators, types, builtins, throwables, stdlib members)</li>
           <li><strong>Source</strong> — <a href="https://github.com/MenkeTechnologies/kotlinrs">github.com/MenkeTechnologies/kotlinrs</a></li>
           <li><strong>The shared VM</strong> — <a href="https://github.com/MenkeTechnologies/fusevm">fusevm</a> (also behind <code>zshrs</code>, <code>stryke</code>, <code>awkrs</code>, <code>elisprs</code>, <code>rubylang</code>, <code>phplang</code>, <code>pythonrs</code>, <code>node-js</code>)</li>
         </ul>

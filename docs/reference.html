@@ -46,304 +46,1916 @@
 
     <main class="tutorial-main">
       <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>LANGUAGE REFERENCE</h2>
-      <p class="tutorial-subtitle">Every reserved keyword, built-in type, and builtin call the current kotlinrs build recognizes, grouped by keyword then type then builtin. This page is generated from the language-server corpus (<code>src/lsp.rs</code>) by the <code>gen-docs</code> binary, so it stays in sync with what the runtime and editor tooling actually know about. Keywords mirror <code>lexer.rs</code>, types mirror <code>ast::Type::from_name</code>, and each builtin mirrors a real arm in <code>compiler::compile_call</code>.</p>
+      <p class="tutorial-subtitle">Every keyword, operator, type, builtin call and stdlib member the current kotlinrs build recognizes, grouped into chapters and carrying a signature, a description and a runnable example. This page is generated from the language-server corpus (<code>src/lsp.rs</code>) by the <code>gen-docs</code> binary, so it stays in sync with what the runtime and editor tooling actually know about: keywords mirror <code>lexer.rs</code> and the <code>parser.rs</code> modifier table, operators mirror <code>lexer::operator</code>, types mirror <code>ast::Type::from_name</code>, builtins mirror the arms of <code>compiler::compile_call</code>, and each member mirrors an arm of <code>host::kt_method</code>, <code>char_method</code>, <code>obj_method</code>, <code>sequence_member</code> or <code>coll_hof</code>. Descriptions state what <em>this</em> runtime does; where the behaviour diverges from Kotlin proper, the entry says so.</p>
 
-      <section class="tutorial-section" id="ch-keyword">
-        <h2>Keyword</h2>
-        <article class="doc-entry" id="doc-keyword-1">
-          <h3><a class="doc-anchor" href="#doc-keyword-1">#</a> <code>fun</code></h3>
-          <p>declare a function; execution enters `fun main`</p>
-          <pre><code class="lang-kotlin">fun square(n: Int): Int { return n * n }</code></pre>
+      <section class="tutorial-section" id="ch-keywords-declarations">
+        <h2>Keywords &amp; Declarations</h2>
+        <article class="doc-entry" id="doc-keywords-declarations-1">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-1">#</a> <code>fun</code></h3>
+          <pre><code class="lang-kotlin">fun name(p: T, …): R { … }
+fun name(p: T, …): R = expr</code></pre>
+          <p>Declares a function. Execution enters <code>fun main</code>, with or without an <code>args: Array&lt;String&gt;</code> parameter. A <code>= expr</code> body is a single-expression function. Only <code>fun</code>, <code>class</code>, <code>object</code> and <code>interface</code> may appear at the top level — kotlinrs has no top-level <code>val</code>/<code>var</code>.</p>
+          <pre><code class="lang-kotlin">fun cube(n: Int): Int = n * n * n
+fun main() { println(cube(3)) }   // 27</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-2">
-          <h3><a class="doc-anchor" href="#doc-keyword-2">#</a> <code>val</code></h3>
-          <p>declare a read-only (immutable) binding</p>
+        <article class="doc-entry" id="doc-keywords-declarations-2">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-2">#</a> <code>val</code></h3>
+          <pre><code class="lang-kotlin">val name: T = expr</code></pre>
+          <p>Declares a read-only binding. The type annotation is optional and inferred from the initializer when it is absent.</p>
           <pre><code class="lang-kotlin">val x = 41
 println(x + 1)   // 42</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-3">
-          <h3><a class="doc-anchor" href="#doc-keyword-3">#</a> <code>var</code></h3>
-          <p>declare a reassignable (mutable) binding</p>
+        <article class="doc-entry" id="doc-keywords-declarations-3">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-3">#</a> <code>var</code></h3>
+          <pre><code class="lang-kotlin">var name: T = expr</code></pre>
+          <p>Declares a reassignable binding. The compound assignments (<code>+=</code>, <code>-=</code>, <code>*=</code>, <code>/=</code>, <code>%=</code>) and <code>++</code>/<code>--</code> all write through a <code>var</code>.</p>
           <pre><code class="lang-kotlin">var i = 0
-i += 1   // i == 1</code></pre>
+i += 1
+println(i)   // 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-4">
-          <h3><a class="doc-anchor" href="#doc-keyword-4">#</a> <code>if</code></h3>
-          <p>conditional branch; also usable as an expression</p>
-          <pre><code class="lang-kotlin">val m = if (a &gt; b) a else b</code></pre>
+        <article class="doc-entry" id="doc-keywords-declarations-4">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-4">#</a> <code>if</code></h3>
+          <pre><code class="lang-kotlin">if (cond) { … } else { … }</code></pre>
+          <p>Conditional branch. It is also an expression whose value is the last statement of the branch taken; an <code>if</code> with no <code>else</code> that falls through evaluates to <code>null</code>.</p>
+          <pre><code class="lang-kotlin">val m = if (3 &gt; 2) 3 else 2
+println(m)   // 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-5">
-          <h3><a class="doc-anchor" href="#doc-keyword-5">#</a> <code>else</code></h3>
-          <p>the fallback branch of an `if`</p>
-          <pre><code class="lang-kotlin">if (n % 2 == 0) println("even") else println("odd")</code></pre>
+        <article class="doc-entry" id="doc-keywords-declarations-5">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-5">#</a> <code>else</code></h3>
+          <pre><code class="lang-kotlin">if (cond) { … } else { … }
+when { … else -&gt; … }</code></pre>
+          <p>The fallback branch of an <code>if</code>, and the catch-all arm of a <code>when</code>. In a <code>when</code> it is terminal: arms written after it are unreachable and are not compiled at all.</p>
+          <pre><code class="lang-kotlin">println(if (4 % 2 == 0) "even" else "odd")   // even</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-6">
-          <h3><a class="doc-anchor" href="#doc-keyword-6">#</a> <code>while</code></h3>
-          <p>loop while the condition stays true</p>
+        <article class="doc-entry" id="doc-keywords-declarations-6">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-6">#</a> <code>while</code></h3>
+          <pre><code class="lang-kotlin">while (cond) { … }</code></pre>
+          <p>Loops while the condition stays true. kotlinrs has no <code>do … while</code>; the post-test loop is not part of the grammar.</p>
           <pre><code class="lang-kotlin">var i = 0
-while (i &lt; 3) { i += 1 }</code></pre>
+while (i &lt; 3) i += 1
+println(i)   // 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-7">
-          <h3><a class="doc-anchor" href="#doc-keyword-7">#</a> <code>for</code></h3>
-          <p>iterate a range: `for (x in a..b)`</p>
-          <pre><code class="lang-kotlin">for (i in 1..5) println(i)</code></pre>
+        <article class="doc-entry" id="doc-keywords-declarations-7">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-7">#</a> <code>for</code></h3>
+          <pre><code class="lang-kotlin">for (v in a..b) { … }
+for (v in iterable) { … }</code></pre>
+          <p>Iterates a range or an iterable value — a <code>List</code>, <code>Set</code>, <code>Array</code>, range, or <code>String</code> (by UTF-16 code unit). A syntactic range header compiles to a counted loop the JIT can trace; every other receiver goes through the host iterator. A <code>Map</code> is not iterable here and faults at run time.</p>
+          <pre><code class="lang-kotlin">for (i in 1..3) print(i)      // 123
+for (c in "ab") print(c)      // ab</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-8">
-          <h3><a class="doc-anchor" href="#doc-keyword-8">#</a> <code>in</code></h3>
-          <p>the `for (x in iterable)` separator, and the membership operator</p>
-          <pre><code class="lang-kotlin">for (c in 0 until 3) println(c)
-println(2 in 1..3)   // true</code></pre>
+        <article class="doc-entry" id="doc-keywords-declarations-8">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-8">#</a> <code>in</code></h3>
+          <pre><code class="lang-kotlin">for (v in iterable)
+value in container</code></pre>
+          <p>Two roles: the <code>for</code> header separator, and the membership operator over a range, <code>List</code>, <code>Set</code>, <code>Array</code>, a <code>Map</code>'s keys, or a <code>String</code>'s substrings. A <code>when</code> arm may also read <code>in a..b</code>.</p>
+          <pre><code class="lang-kotlin">println(2 in 1..3)                  // true
+println("b" in "abc")               // true
+println("a" in mapOf("a" to 1))     // true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-9">
-          <h3><a class="doc-anchor" href="#doc-keyword-9">#</a> <code>return</code></h3>
-          <p>return a value (or Unit) from the current function</p>
-          <pre><code class="lang-kotlin">fun answer(): Int { return 42 }</code></pre>
+        <article class="doc-entry" id="doc-keywords-declarations-9">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-9">#</a> <code>return</code></h3>
+          <pre><code class="lang-kotlin">return
+return expr</code></pre>
+          <p>Returns from the enclosing function. A bare <code>return</code> yields <code>Unit</code>. There is no labeled <code>return@label</code> for returning out of a lambda.</p>
+          <pre><code class="lang-kotlin">fun answer(): Int { return 42 }
+fun main() { println(answer()) }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-10">
-          <h3><a class="doc-anchor" href="#doc-keyword-10">#</a> <code>until</code></h3>
-          <p>half-open ascending range: `a until b` excludes b</p>
-          <pre><code class="lang-kotlin">for (i in 0 until 3) println(i)   // 0 1 2</code></pre>
+        <article class="doc-entry" id="doc-keywords-declarations-10">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-10">#</a> <code>until</code></h3>
+          <pre><code class="lang-kotlin">a until b</code></pre>
+          <p>Half-open ascending range: <code>a until b</code> includes <code>a</code> and excludes <code>b</code>. An infix function, so it binds looser than <code>..</code> and than arithmetic.</p>
+          <pre><code class="lang-kotlin">for (i in 0 until 3) print(i)   // 012</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-11">
-          <h3><a class="doc-anchor" href="#doc-keyword-11">#</a> <code>..</code></h3>
-          <p>inclusive range: `a..b` builds an IntRange value</p>
-          <pre><code class="lang-kotlin">val r = 1..5
-println(r.sum())   // 15</code></pre>
+        <article class="doc-entry" id="doc-keywords-declarations-11">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-11">#</a> <code>downTo</code></h3>
+          <pre><code class="lang-kotlin">a downTo b</code></pre>
+          <p>Descending inclusive range, stepping by -1. Printing one shows the progression form, <code>a downTo b step 1</code>.</p>
+          <pre><code class="lang-kotlin">for (i in 3 downTo 1) print(i)   // 321</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-12">
-          <h3><a class="doc-anchor" href="#doc-keyword-12">#</a> <code>downTo</code></h3>
-          <p>descending inclusive range: `a downTo b`</p>
-          <pre><code class="lang-kotlin">for (i in 3 downTo 1) println(i)   // 3 2 1</code></pre>
+        <article class="doc-entry" id="doc-keywords-declarations-12">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-12">#</a> <code>step</code></h3>
+          <pre><code class="lang-kotlin">range step n</code></pre>
+          <p>Re-steps a range into a progression. Its left operand is any range expression, not just a literal one, because <code>step</code> is an infix function at a looser precedence than <code>..</code>. A non-positive <code>n</code> raises <code>IllegalArgumentException</code>.</p>
+          <pre><code class="lang-kotlin">for (i in 0..10 step 5) print(i)   // 0510
+println(1..10 step 3)              // 1..10 step 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-13">
-          <h3><a class="doc-anchor" href="#doc-keyword-13">#</a> <code>step</code></h3>
-          <p>stride for a range: `a..b step n`</p>
-          <pre><code class="lang-kotlin">for (i in 0..10 step 2) println(i)</code></pre>
+        <article class="doc-entry" id="doc-keywords-declarations-13">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-13">#</a> <code>when</code></h3>
+          <pre><code class="lang-kotlin">when (subject) { cond -&gt; … else -&gt; … }
+when { boolExpr -&gt; … }</code></pre>
+          <p>Multi-way branch, statement or expression. The subject form tests each arm against the subject with <code>==</code>, <code>in</code>, or <code>is</code>; the subjectless form tests each arm as a Boolean. Arms are tried top to bottom and the first match wins; several conditions may share one arm, comma-separated. With no matching arm and no <code>else</code> the value is <code>null</code>.</p>
+          <pre><code class="lang-kotlin">val n = 5
+println(when (n) { 1 -&gt; "one"; in 2..9 -&gt; "few"; else -&gt; "many" })   // few</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-14">
-          <h3><a class="doc-anchor" href="#doc-keyword-14">#</a> <code>true</code></h3>
-          <p>the Boolean true literal</p>
-          <pre><code class="lang-kotlin">val ok: Boolean = true</code></pre>
+        <article class="doc-entry" id="doc-keywords-declarations-14">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-14">#</a> <code>is</code></h3>
+          <pre><code class="lang-kotlin">value is Type
+value !is Type</code></pre>
+          <p>Runtime type check, in a <code>when</code> arm or in ordinary expression position. It compares the receiver's runtime class tag, so it recognizes the built-in kinds (<code>Int</code>, <code>String</code>, <code>List</code>, …) and user classes including inherited supertypes. A trailing <code>?</code> on the type and a type-argument list are both accepted and ignored.</p>
+          <pre><code class="lang-kotlin">val x: Any = "s"
+println(when (x) { is String -&gt; "str"; is Int -&gt; "int"; else -&gt; "?" })   // str</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-15">
-          <h3><a class="doc-anchor" href="#doc-keyword-15">#</a> <code>false</code></h3>
-          <p>the Boolean false literal</p>
-          <pre><code class="lang-kotlin">val done: Boolean = false</code></pre>
-        </article>
-        <article class="doc-entry" id="doc-keyword-16">
-          <h3><a class="doc-anchor" href="#doc-keyword-16">#</a> <code>when</code></h3>
-          <p>multi-way branch (statement or expression); subject or subjectless</p>
-          <pre><code class="lang-kotlin">when (n) { 1 -&gt; "one"; in 2..9 -&gt; "few"; else -&gt; "many" }</code></pre>
-        </article>
-        <article class="doc-entry" id="doc-keyword-17">
-          <h3><a class="doc-anchor" href="#doc-keyword-17">#</a> <code>is</code></h3>
-          <p>runtime type check, in a `when` arm or any expression: `is String`, `!is Int`</p>
-          <pre><code class="lang-kotlin">when (x) { is String -&gt; "str"; is Int -&gt; "int"; else -&gt; "?" }</code></pre>
-        </article>
-        <article class="doc-entry" id="doc-keyword-18">
-          <h3><a class="doc-anchor" href="#doc-keyword-18">#</a> <code>class</code></h3>
-          <p>declare a class; `: Super(args), Iface` names its supertypes</p>
+        <article class="doc-entry" id="doc-keywords-declarations-15">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-15">#</a> <code>class</code></h3>
+          <pre><code class="lang-kotlin">class Name(val p: T, …) : Super(args), Iface { … }</code></pre>
+          <p>Declares a class. Only the primary constructor exists — there are no secondary constructors and no <code>init</code> block. A <code>val</code>/<code>var</code> primary-constructor parameter becomes a stored property; a plain parameter does not. The supertype list may name one class and any number of interfaces.</p>
           <pre><code class="lang-kotlin">open class Animal(val name: String)
-class Dog(n: String) : Animal(n)</code></pre>
+class Dog(n: String) : Animal(n)
+fun main() { println(Dog("rex").name) }   // rex</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-19">
-          <h3><a class="doc-anchor" href="#doc-keyword-19">#</a> <code>interface</code></h3>
-          <p>declare an interface; members may carry a default body</p>
+        <article class="doc-entry" id="doc-keywords-declarations-16">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-16">#</a> <code>interface</code></h3>
+          <pre><code class="lang-kotlin">interface Name { fun m(): T; fun d(): T = expr }</code></pre>
+          <p>Declares an interface. A member with no body is abstract; one with a body is a default implementation an implementor inherits. Interfaces cannot be instantiated. A soft keyword — <code>interface</code> is still usable as an ordinary identifier elsewhere.</p>
           <pre><code class="lang-kotlin">interface Greeter {
     fun greet(): String
     fun loud(): String = greet().uppercase()
-}</code></pre>
+}
+class En : Greeter { override fun greet(): String = "hi" }
+fun main() { println(En().loud()) }   // HI</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-20">
-          <h3><a class="doc-anchor" href="#doc-keyword-20">#</a> <code>object</code></h3>
-          <p>declare a singleton, built once and reachable by name</p>
+        <article class="doc-entry" id="doc-keywords-declarations-17">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-17">#</a> <code>object</code></h3>
+          <pre><code class="lang-kotlin">object Name { … }</code></pre>
+          <p>Declares a singleton, constructed once before <code>main</code> runs and reachable by its own name. kotlinrs has no <code>companion object</code> and no anonymous <code>object : T { }</code> expression.</p>
           <pre><code class="lang-kotlin">object Counter { var n = 0 }
-println(Counter.n)</code></pre>
+fun main() { Counter.n = 5; println(Counter.n) }   // 5</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-21">
-          <h3><a class="doc-anchor" href="#doc-keyword-21">#</a> <code>data</code></h3>
-          <p>`data class` — structural equals/hashCode/toString plus copy and componentN</p>
+        <article class="doc-entry" id="doc-keywords-declarations-18">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-18">#</a> <code>data</code></h3>
+          <pre><code class="lang-kotlin">data class Name(val p: T, …)</code></pre>
+          <p>Marks a class as a data class, which generates <code>equals</code>, <code>hashCode</code>, <code>toString</code>, <code>copy</code> and <code>componentN</code> over the primary-constructor properties only. An inherited field is carried but is not part of the comparison and is skipped by <code>componentN</code>. A soft keyword — <code>x.data</code> is still a legal property read.</p>
           <pre><code class="lang-kotlin">data class Pt(val x: Int, val y: Int)
-println(Pt(1, 2))   // Pt(x=1, y=2)</code></pre>
+fun main() { println(Pt(1, 2)) }   // Pt(x=1, y=2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-22">
-          <h3><a class="doc-anchor" href="#doc-keyword-22">#</a> <code>open</code></h3>
-          <p>mark a class or member as extendable/overridable</p>
-          <pre><code class="lang-kotlin">open class Base { open fun f(): Int = 1 }</code></pre>
+        <article class="doc-entry" id="doc-keywords-declarations-19">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-19">#</a> <code>open</code></h3>
+          <pre><code class="lang-kotlin">open class Name
+open fun m(): T</code></pre>
+          <p>Marks a class as extendable or a member as overridable, and it is enforced. Inheriting from a class that is not <code>open</code> is rejected with <code>B is final, so it cannot be inherited from</code>, and overriding a member that is not <code>open</code> with <code></code> <code>f</code> in B is final and cannot be overridden <code></code>.</p>
+          <pre><code class="lang-kotlin">open class Base { open fun f(): Int = 1 }
+class D : Base() { override fun f(): Int = 2 }
+fun main() { println(D().f()) }   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-23">
-          <h3><a class="doc-anchor" href="#doc-keyword-23">#</a> <code>override</code></h3>
-          <p>replace a supertype's member; dispatch picks the receiver's runtime class</p>
-          <pre><code class="lang-kotlin">class D : Base() { override fun f(): Int = 2 }</code></pre>
+        <article class="doc-entry" id="doc-keywords-declarations-20">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-20">#</a> <code>override</code></h3>
+          <pre><code class="lang-kotlin">override fun m(): T { … }</code></pre>
+          <p>Replaces a supertype's member, and it is required — redeclaring a supertype member without it is rejected with <code></code> <code>f</code> hides a member of supertype B and needs an <code>override</code> modifier <code></code>, and writing it on a member that overrides nothing is rejected too. Dispatch is by the receiver's runtime class, resolved at the call site against every instantiable implementor; a single candidate compiles to a direct call with no test.</p>
+          <pre><code class="lang-kotlin">open class Base { open fun f(): Int = 1 }
+class D : Base() { override fun f(): Int = 2 }
+fun main() { val b: Base = D(); println(b.f()) }   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-24">
-          <h3><a class="doc-anchor" href="#doc-keyword-24">#</a> <code>abstract</code></h3>
-          <p>a class that cannot be instantiated, or a member with no body</p>
-          <pre><code class="lang-kotlin">abstract class Shape { abstract fun area(): Double }</code></pre>
+        <article class="doc-entry" id="doc-keywords-declarations-21">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-21">#</a> <code>abstract</code></h3>
+          <pre><code class="lang-kotlin">abstract class Name
+abstract fun m(): T</code></pre>
+          <p>Declares a class that cannot be constructed, or a member with no body that subtypes must supply. Constructing one is a compile error: <code>cannot construct abstract class Name</code>.</p>
+          <pre><code class="lang-kotlin">abstract class Shape { abstract fun area(): Double }
+class Sq(val s: Double) : Shape() { override fun area(): Double = s * s }
+fun main() { println(Sq(3.0).area()) }   // 9.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-25">
-          <h3><a class="doc-anchor" href="#doc-keyword-25">#</a> <code>sealed</code></h3>
-          <p>an abstract class whose subtypes make a `when` over `is` arms exhaustive</p>
+        <article class="doc-entry" id="doc-keywords-declarations-22">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-22">#</a> <code>sealed</code></h3>
+          <pre><code class="lang-kotlin">sealed class Name</code></pre>
+          <p>Declares a sealed class — abstract, and conventionally the root of a closed set of subtypes matched by <code>is</code> arms. kotlinrs treats it exactly as <code>abstract</code>: it does not check that a <code>when</code> over the subtypes is exhaustive, so an unmatched subject still falls through to <code>null</code>.</p>
           <pre><code class="lang-kotlin">sealed class Expr
-data class Num(val v: Int) : Expr()</code></pre>
+data class Num(val v: Int) : Expr()
+fun main() { val e: Expr = Num(3); println(when (e) { is Num -&gt; e.v; else -&gt; 0 }) }   // 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-26">
-          <h3><a class="doc-anchor" href="#doc-keyword-26">#</a> <code>super</code></h3>
-          <p>call the supertype's implementation instead of the overriding one; `super&lt;T&gt;.f()` names which supertype</p>
-          <pre><code class="lang-kotlin">override fun f(): Int = super.f() + 1
-override fun g(): String = super&lt;Left&gt;.g() + super&lt;Right&gt;.g()</code></pre>
+        <article class="doc-entry" id="doc-keywords-declarations-23">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-23">#</a> <code>final</code></h3>
+          <pre><code class="lang-kotlin">final fun m(): T</code></pre>
+          <p>Accepted and discarded — it restates the default. A class or member that is not marked <code>open</code> is already final, and the compiler enforces that, so writing <code>final</code> changes nothing.</p>
+          <pre><code class="lang-kotlin">open class B { open fun f(): Int = 1 }
+class C : B() { final override fun f(): Int = 2 }
+fun main() { println(C().f()) }   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-27">
-          <h3><a class="doc-anchor" href="#doc-keyword-27">#</a> <code>break</code></h3>
-          <p>exit the enclosing loop; `break@label` targets a labeled loop</p>
-          <pre><code class="lang-kotlin">for (i in 1..9) { if (i == 5) break }</code></pre>
+        <article class="doc-entry" id="doc-keywords-declarations-24">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-24">#</a> <code>private</code></h3>
+          <pre><code class="lang-kotlin">private fun m()
+private class C</code></pre>
+          <p>A visibility modifier. <code>public</code>, <code>private</code>, <code>internal</code> and <code>protected</code> are all parsed and then discarded — a single-file program has no visibility boundary to enforce, so every declaration is reachable from every other one.</p>
+          <pre><code class="lang-kotlin">private class Box(val v: Int)
+fun main() { println(Box(7).v) }   // 7</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-28">
-          <h3><a class="doc-anchor" href="#doc-keyword-28">#</a> <code>continue</code></h3>
-          <p>skip to the loop's next iteration; `continue@label` for a labeled loop</p>
-          <pre><code class="lang-kotlin">for (i in 1..9) { if (i % 2 == 0) continue; println(i) }</code></pre>
+        <article class="doc-entry" id="doc-keywords-declarations-25">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-25">#</a> <code>inner</code></h3>
+          <pre><code class="lang-kotlin">inner class C</code></pre>
+          <p>Accepted and discarded. kotlinrs has no nested classes at all — every <code>class</code> is top-level — so the modifier never changes what is compiled.</p>
+          <pre><code class="lang-kotlin">class Holder(val v: Int)
+fun main() { println(Holder(1).v) }   // 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-29">
-          <h3><a class="doc-anchor" href="#doc-keyword-29">#</a> <code>try</code></h3>
-          <p>guarded block; an EXPRESSION whose value is the body's or the matching handler's</p>
-          <pre><code class="lang-kotlin">val n = try { "x".length } catch (e: Exception) { -1 }</code></pre>
+        <article class="doc-entry" id="doc-keywords-declarations-26">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-26">#</a> <code>super</code></h3>
+          <pre><code class="lang-kotlin">super.m(args)
+super&lt;T&gt;.m(args)</code></pre>
+          <p>Calls the supertype's implementation rather than the overriding one, resolved statically. The unqualified form walks the linearized ancestry for the nearest supertype that implements the member; <code>super&lt;T&gt;</code> names the supertype explicitly, and <code>T</code> must be a direct one.</p>
+          <pre><code class="lang-kotlin">open class B { open fun f(): Int = 1 }
+class D : B() { override fun f(): Int = super.f() + 1 }
+fun main() { println(D().f()) }   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-30">
-          <h3><a class="doc-anchor" href="#doc-keyword-30">#</a> <code>catch</code></h3>
-          <p>handler arm: `catch (e: T) { … }`; the first arm whose type matches wins</p>
-          <pre><code class="lang-kotlin">try { 1 / 0 } catch (e: ArithmeticException) { println(e.message) }</code></pre>
+        <article class="doc-entry" id="doc-keywords-declarations-27">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-27">#</a> <code>this</code></h3>
+          <pre><code class="lang-kotlin">this
+this.property</code></pre>
+          <p>The receiver inside a class method or a property initializer. A bare name that matches a property of the enclosing class resolves to <code>this.name</code> implicitly, so writing <code>this</code> is optional. There is no <code>this@Label</code>.</p>
+          <pre><code class="lang-kotlin">class P(val x: Int) { fun twice(): Int = this.x * 2 }
+fun main() { println(P(4).twice()) }   // 8</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-31">
-          <h3><a class="doc-anchor" href="#doc-keyword-31">#</a> <code>finally</code></h3>
-          <p>cleanup block; runs on the normal and the exceptional path alike</p>
-          <pre><code class="lang-kotlin">try { work() } finally { println("done") }</code></pre>
+        <article class="doc-entry" id="doc-keywords-declarations-28">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-28">#</a> <code>it</code></h3>
+          <pre><code class="lang-kotlin">{ it }</code></pre>
+          <p>The implicit single parameter of a lambda written with no parameter list. A lambda with an explicit list (<code>{ a, b -&gt; … }</code>) has no <code>it</code>. Its type is unknown to the compiler, so <code>it + 1</code> lowers to a native op that stays on the fast path when the value turns out to be a number and is handed back to the runtime when it turns out to be a <code>Char</code> — which is what keeps <code>{ it + 1 }</code> over a <code>List&lt;Char&gt;</code> correct.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).map { it * 2 })   // [2, 4, 6]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-32">
-          <h3><a class="doc-anchor" href="#doc-keyword-32">#</a> <code>throw</code></h3>
-          <p>raise a throwable; typed `Nothing`, so it is usable as an expression</p>
-          <pre><code class="lang-kotlin">val v = x ?: throw IllegalStateException("missing")</code></pre>
+        <article class="doc-entry" id="doc-keywords-declarations-29">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-29">#</a> <code>break</code></h3>
+          <pre><code class="lang-kotlin">break
+break@label</code></pre>
+          <p>Exits the enclosing loop. <code>break@label</code> exits the loop carrying that label, which is written <code>label@</code> before the <code>for</code>/<code>while</code>.</p>
+          <pre><code class="lang-kotlin">for (i in 1..9) { if (i == 3) break; print(i) }   // 12</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-33">
-          <h3><a class="doc-anchor" href="#doc-keyword-33">#</a> <code>null</code></h3>
-          <p>the null reference; used with `T?`, `?.`, `?:`, and `!!`</p>
+        <article class="doc-entry" id="doc-keywords-declarations-30">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-30">#</a> <code>continue</code></h3>
+          <pre><code class="lang-kotlin">continue
+continue@label</code></pre>
+          <p>Skips to the enclosing loop's next iteration. <code>continue@label</code> targets a labeled loop, which is how an inner loop advances an outer one.</p>
+          <pre><code class="lang-kotlin">outer@ for (i in 1..2) { for (j in 1..3) { if (j == 2) continue@outer; print("$i$j") } }   // 1121</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keywords-declarations-31">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-31">#</a> <code>try</code></h3>
+          <pre><code class="lang-kotlin">try { … } catch (e: T) { … } finally { … }</code></pre>
+          <p>Guarded block, and an expression: its value is the last statement of the body, or of the handler that ran. While an exception is unwinding, <code>println</code>/<code>print</code> are suppressed so nothing is emitted between the <code>throw</code> and its handler.</p>
+          <pre><code class="lang-kotlin">val n = try { 1 / 0 } catch (e: ArithmeticException) { -1 }
+println(n)   // -1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keywords-declarations-32">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-32">#</a> <code>catch</code></h3>
+          <pre><code class="lang-kotlin">catch (name: Type) { … }</code></pre>
+          <p>A handler arm. The first arm whose type the in-flight throwable is an instance of wins, walking the modelled JVM parent chain — so <code>catch (e: Exception)</code> catches an <code>IllegalArgumentException</code>. <code>catch (e: Throwable)</code> catches anything.</p>
+          <pre><code class="lang-kotlin">try { "x".substring(9) } catch (e: Exception) { println(e.message) }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keywords-declarations-33">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-33">#</a> <code>finally</code></h3>
+          <pre><code class="lang-kotlin">finally { … }</code></pre>
+          <p>Cleanup block, run on the normal and the exceptional path alike. Its own value is discarded — the <code>try</code> expression's value still comes from the body or the handler.</p>
+          <pre><code class="lang-kotlin">try { println("work") } finally { println("done") }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keywords-declarations-34">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-34">#</a> <code>throw</code></h3>
+          <pre><code class="lang-kotlin">throw expr</code></pre>
+          <p>Raises a throwable. Kotlin types it <code>Nothing</code>, so it is an expression and may appear on the right of <code>?:</code> or as the body of a <code>when</code> arm. An uncaught throw prints <code>Exception in thread "main" &lt;fqn&gt;: &lt;message&gt;</code> and exits non-zero.</p>
+          <pre><code class="lang-kotlin">val x: Int? = null
+val v = x ?: throw IllegalStateException("missing")
+// Exception in thread "main" java.lang.IllegalStateException: missing</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keywords-declarations-35">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-35">#</a> <code>null</code></h3>
+          <pre><code class="lang-kotlin">null</code></pre>
+          <p>The null reference, carried internally as the VM's undefined value. It prints and interpolates as <code>null</code>. Nullability is not checked statically: <code>T?</code> is parsed and discarded, so a null only makes itself known through <code>?.</code>, <code>?:</code>, <code>!!</code>, or a runtime fault.</p>
           <pre><code class="lang-kotlin">val x: Int? = null
 println(x ?: 0)   // 0</code></pre>
         </article>
+        <article class="doc-entry" id="doc-keywords-declarations-36">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-36">#</a> <code>true</code></h3>
+          <pre><code class="lang-kotlin">true</code></pre>
+          <p>The Boolean true literal. <code>&amp;&amp;</code> and <code>||</code> short-circuit on it; a lambda predicate is only treated as satisfied when it returns exactly <code>true</code> (a <code>null</code> or non-Boolean result counts as false).</p>
+          <pre><code class="lang-kotlin">val ok: Boolean = true
+println(ok)   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keywords-declarations-37">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-37">#</a> <code>false</code></h3>
+          <pre><code class="lang-kotlin">false</code></pre>
+          <p>The Boolean false literal.</p>
+          <pre><code class="lang-kotlin">val done: Boolean = false
+println(!done)   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keywords-declarations-38">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-38">#</a> <code>import</code></h3>
+          <pre><code class="lang-kotlin">import a.b.c
+import a.b.*
+import a.b.c as alias</code></pre>
+          <p>Records an import. It matters for exactly one thing: <code>kotlin.math</code> names are unresolvable without it, matching Kotlin. A star import opens the whole package; a single-name import opens only that name; an <code>as</code> alias *replaces* the original spelling, so after <code>import kotlin.math.abs as absolute</code> the name <code>abs</code> is no longer in scope.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.*
+fun main() { println(sqrt(9.0)) }   // 3.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keywords-declarations-39">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-39">#</a> <code>package</code></h3>
+          <pre><code class="lang-kotlin">package a.b</code></pre>
+          <p>Accepted and discarded. A kotlinrs program is a single file with no package-level name resolution, so the declaration exists only so real Kotlin source parses.</p>
+          <pre><code class="lang-kotlin">package demo
+fun main() { println("ok") }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keywords-declarations-40">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-40">#</a> <code>as</code></h3>
+          <pre><code class="lang-kotlin">import a.b.c as alias</code></pre>
+          <p>The import-renaming keyword — and only that. kotlinrs has no <code>as</code> cast operator and no <code>as?</code>: <code>x as Int</code> is a parse error. Use <code>is</code> for a runtime type check.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.abs as absolute
+fun main() { println(absolute(-4)) }   // 4</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keywords-declarations-41">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-41">#</a> <code>rust</code></h3>
+          <pre><code class="lang-kotlin">rust { … }</code></pre>
+          <p>An inline Rust FFI block, recognized before lexing and rewritten in place into a <code>__rust_compile("&lt;base64&gt;", line)</code> call. The block must sit inside a function body. Its <code>#[no_mangle] pub extern</code> exports become callable barewords from Kotlin, dispatched by name at run time.</p>
+          <pre><code class="lang-kotlin">fun main() {
+    rust { #[no_mangle] pub extern "C" fn twice(n: i64) -&gt; i64 { n * 2 } }
+    println(twice(21))   // 42
+}</code></pre>
+        </article>
       </section>
 
-      <section class="tutorial-section" id="ch-type">
-        <h2>Type</h2>
-        <article class="doc-entry" id="doc-type-1">
-          <h3><a class="doc-anchor" href="#doc-type-1">#</a> <code>Int</code></h3>
-          <p>32/64-bit signed integer; `/` and `%` truncate toward zero</p>
-          <pre><code class="lang-kotlin">val n: Int = 7 / 2   // 3</code></pre>
+      <section class="tutorial-section" id="ch-operators">
+        <h2>Operators</h2>
+        <article class="doc-entry" id="doc-operators-1">
+          <h3><a class="doc-anchor" href="#doc-operators-1">#</a> <code>+</code></h3>
+          <pre><code class="lang-kotlin">a + b</code></pre>
+          <p>Addition on numbers, concatenation on <code>String</code>, and code-unit displacement on <code>Char</code> (<code>'A' + 1</code> is <code>'B'</code>). Two <code>Int</code> operands wrap on overflow; a <code>Double</code> operand makes the result <code>Double</code>. Its method spelling is <code>plus</code>.</p>
+          <pre><code class="lang-kotlin">println(1 + 2)          // 3
+println("a" + "b")      // ab
+println('A' + 1)        // B</code></pre>
         </article>
-        <article class="doc-entry" id="doc-type-2">
-          <h3><a class="doc-anchor" href="#doc-type-2">#</a> <code>Long</code></h3>
-          <p>64-bit signed integer; shares Int's integer division rules</p>
-          <pre><code class="lang-kotlin">val big: Long = 1000</code></pre>
+        <article class="doc-entry" id="doc-operators-2">
+          <h3><a class="doc-anchor" href="#doc-operators-2">#</a> <code>-</code></h3>
+          <pre><code class="lang-kotlin">a - b
+-a</code></pre>
+          <p>Subtraction, and unary negation. <code>Char - Char</code> is the <code>Int</code> distance between the code units; <code>Char - Int</code> is a <code>Char</code>. Its method spelling is <code>minus</code>.</p>
+          <pre><code class="lang-kotlin">println(5 - 2)          // 3
+println('c' - 'a')      // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-type-3">
-          <h3><a class="doc-anchor" href="#doc-type-3">#</a> <code>Double</code></h3>
-          <p>IEEE-754 double; prints with a trailing `.0` when whole</p>
-          <pre><code class="lang-kotlin">val d: Double = 3.0   // "3.0"</code></pre>
-        </article>
-        <article class="doc-entry" id="doc-type-4">
-          <h3><a class="doc-anchor" href="#doc-type-4">#</a> <code>Float</code></h3>
-          <p>floating-point value (coerced to Double behavior here)</p>
-          <pre><code class="lang-kotlin">val f: Float = 1.5f</code></pre>
-        </article>
-        <article class="doc-entry" id="doc-type-5">
-          <h3><a class="doc-anchor" href="#doc-type-5">#</a> <code>Boolean</code></h3>
-          <p>true/false; prints as `true` or `false`</p>
-          <pre><code class="lang-kotlin">val b: Boolean = 1 &lt; 2</code></pre>
-        </article>
-        <article class="doc-entry" id="doc-type-6">
-          <h3><a class="doc-anchor" href="#doc-type-6">#</a> <code>Char</code></h3>
-          <p>a single UTF-16 code unit, distinct from `Int` — `'A' + 1`, `.code`, `.toChar()`, `'a'..'z'`</p>
-          <pre><code class="lang-kotlin">val c: Char = 'A'
-println(c + 1)        // B
-println(listOf(c))    // [A]</code></pre>
-        </article>
-        <article class="doc-entry" id="doc-type-7">
-          <h3><a class="doc-anchor" href="#doc-type-7">#</a> <code>String</code></h3>
-          <p>text; `+` concatenates and `"$x"` interpolates</p>
-          <pre><code class="lang-kotlin">val s: String = "n = ${1 + 1}"</code></pre>
-        </article>
-        <article class="doc-entry" id="doc-type-8">
-          <h3><a class="doc-anchor" href="#doc-type-8">#</a> <code>Unit</code></h3>
-          <p>the no-value type; the result of a function with no return</p>
-          <pre><code class="lang-kotlin">fun log(): Unit { println("hi") }</code></pre>
-        </article>
-      </section>
-
-      <section class="tutorial-section" id="ch-builtin">
-        <h2>Builtin</h2>
-        <article class="doc-entry" id="doc-builtin-1">
-          <h3><a class="doc-anchor" href="#doc-builtin-1">#</a> <code>println</code></h3>
-          <p>write a value to stdout followed by a newline</p>
+        <article class="doc-entry" id="doc-operators-3">
+          <h3><a class="doc-anchor" href="#doc-operators-3">#</a> <code>*</code></h3>
+          <pre><code class="lang-kotlin">a * b</code></pre>
+          <p>Multiplication, wrapping for two <code>Int</code> operands. Its method spelling is <code>times</code>. There is no <code>String * Int</code> repeat operator — use <code>String.repeat</code>.</p>
           <pre><code class="lang-kotlin">println(6 * 7)   // 42</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-2">
-          <h3><a class="doc-anchor" href="#doc-builtin-2">#</a> <code>print</code></h3>
-          <p>write a value to stdout with no trailing newline</p>
+        <article class="doc-entry" id="doc-operators-4">
+          <h3><a class="doc-anchor" href="#doc-operators-4">#</a> <code>/</code></h3>
+          <pre><code class="lang-kotlin">a / b</code></pre>
+          <p>Division. Two integral operands divide truncating toward zero; a <code>Double</code> operand switches the whole expression to IEEE-754 division. Integer division by zero raises <code>ArithmeticException: / by zero</code>; <code>Double</code> division by zero yields <code>Infinity</code>.</p>
+          <pre><code class="lang-kotlin">println(7 / 2)       // 3
+println(7 / 2.0)     // 3.5</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-5">
+          <h3><a class="doc-anchor" href="#doc-operators-5">#</a> <code>%</code></h3>
+          <pre><code class="lang-kotlin">a % b</code></pre>
+          <p>Remainder, taking the dividend's sign for integers (<code>-7 % 2</code> is <code>-1</code>). Integer <code>%</code> by zero raises <code>ArithmeticException</code>. Its method spelling is <code>rem</code>.</p>
+          <pre><code class="lang-kotlin">println(7 % 3)    // 1
+println(-7 % 3)   // -1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-6">
+          <h3><a class="doc-anchor" href="#doc-operators-6">#</a> <code>=</code></h3>
+          <pre><code class="lang-kotlin">name = value
+recv.prop = value
+recv[i] = value</code></pre>
+          <p>Assignment to a <code>var</code>, to a property, or to an indexed slot. An indexed write into a <code>Map</code> inserts the key when it is absent; into a <code>List</code> or <code>Array</code> it is bounds-checked and raises <code>IndexOutOfBoundsException</code> past the end.</p>
+          <pre><code class="lang-kotlin">var i = 1
+i = 2
+val m = mutableMapOf&lt;String, Int&gt;()
+m["a"] = 1
+println("$i ${m["a"]}")   // 2 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-7">
+          <h3><a class="doc-anchor" href="#doc-operators-7">#</a> <code>+=</code></h3>
+          <pre><code class="lang-kotlin">target += value</code></pre>
+          <p>Compound add-assign. It works on a <code>var</code>, a property, and an indexed slot alike, and reuses the <code>+</code> semantics — so it concatenates on a <code>String</code> target.</p>
+          <pre><code class="lang-kotlin">var s = "a"
+s += "b"
+println(s)   // ab</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-8">
+          <h3><a class="doc-anchor" href="#doc-operators-8">#</a> <code>-=</code></h3>
+          <pre><code class="lang-kotlin">target -= value</code></pre>
+          <p>Compound subtract-assign, on a <code>var</code>, a property, or an indexed slot.</p>
+          <pre><code class="lang-kotlin">var n = 5
+n -= 2
+println(n)   // 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-9">
+          <h3><a class="doc-anchor" href="#doc-operators-9">#</a> <code>*=</code></h3>
+          <pre><code class="lang-kotlin">target *= value</code></pre>
+          <p>Compound multiply-assign.</p>
+          <pre><code class="lang-kotlin">var n = 6
+n *= 7
+println(n)   // 42</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-10">
+          <h3><a class="doc-anchor" href="#doc-operators-10">#</a> <code>/=</code></h3>
+          <pre><code class="lang-kotlin">target /= value</code></pre>
+          <p>Compound divide-assign, truncating when both sides are integral.</p>
+          <pre><code class="lang-kotlin">var n = 9
+n /= 2
+println(n)   // 4</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-11">
+          <h3><a class="doc-anchor" href="#doc-operators-11">#</a> <code>%=</code></h3>
+          <pre><code class="lang-kotlin">target %= value</code></pre>
+          <p>Compound remainder-assign.</p>
+          <pre><code class="lang-kotlin">var n = 9
+n %= 4
+println(n)   // 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-12">
+          <h3><a class="doc-anchor" href="#doc-operators-12">#</a> <code>++</code></h3>
+          <pre><code class="lang-kotlin">x++
+++x</code></pre>
+          <p>Increment by one. The postfix form's value is the target *before* the update, the prefix form's is the value *after* — and both work in expression position, not only as a statement. The target may be a variable, a property, or an indexed element.</p>
+          <pre><code class="lang-kotlin">var k = 0
+println(k++)   // 0
+println(++k)   // 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-13">
+          <h3><a class="doc-anchor" href="#doc-operators-13">#</a> <code>--</code></h3>
+          <pre><code class="lang-kotlin">x--
+--x</code></pre>
+          <p>Decrement by one, with the same prefix/postfix value rule as <code>++</code>.</p>
+          <pre><code class="lang-kotlin">var k = 2
+println(k--)   // 2
+println(k)     // 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-14">
+          <h3><a class="doc-anchor" href="#doc-operators-14">#</a> <code>==</code></h3>
+          <pre><code class="lang-kotlin">a == b</code></pre>
+          <p>Structural equality. It compares numbers by value across <code>Int</code>/<code>Double</code>, <code>List</code>s element-wise, <code>Set</code>s order-insensitively, <code>Map</code>s entry-wise, and data-class instances over their primary-constructor properties. An <code>Array</code> inherits identity equality, so <code>arrayOf(1) == arrayOf(1)</code> is <code>false</code>. There is no <code>===</code> identity operator.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2) == listOf(1, 2))   // true
+println(setOf(1, 2) == setOf(2, 1))     // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-15">
+          <h3><a class="doc-anchor" href="#doc-operators-15">#</a> <code>!=</code></h3>
+          <pre><code class="lang-kotlin">a != b</code></pre>
+          <p>The negation of <code>==</code>, with the same structural rules. There is no <code>!==</code>.</p>
+          <pre><code class="lang-kotlin">println(1 != 2)   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-16">
+          <h3><a class="doc-anchor" href="#doc-operators-16">#</a> <code>&lt;</code></h3>
+          <pre><code class="lang-kotlin">a &lt; b</code></pre>
+          <p>Less-than. Numbers compare numerically and <code>Char</code>s by code unit. <code>String</code>s do not compare with the relational operators here — kotlinrs implements no <code>compareTo</code> on <code>String</code>.</p>
+          <pre><code class="lang-kotlin">println(1 &lt; 2)       // true
+println('a' &lt; 'z')   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-17">
+          <h3><a class="doc-anchor" href="#doc-operators-17">#</a> <code>&gt;</code></h3>
+          <pre><code class="lang-kotlin">a &gt; b</code></pre>
+          <p>Greater-than, over numbers and <code>Char</code>s.</p>
+          <pre><code class="lang-kotlin">println(3 &gt; 2)   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-18">
+          <h3><a class="doc-anchor" href="#doc-operators-18">#</a> <code>&lt;=</code></h3>
+          <pre><code class="lang-kotlin">a &lt;= b</code></pre>
+          <p>Less-than-or-equal, over numbers and <code>Char</code>s.</p>
+          <pre><code class="lang-kotlin">println(2 &lt;= 2)   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-19">
+          <h3><a class="doc-anchor" href="#doc-operators-19">#</a> <code>&gt;=</code></h3>
+          <pre><code class="lang-kotlin">a &gt;= b</code></pre>
+          <p>Greater-than-or-equal, over numbers and <code>Char</code>s.</p>
+          <pre><code class="lang-kotlin">println(2 &gt;= 3)   // false</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-20">
+          <h3><a class="doc-anchor" href="#doc-operators-20">#</a> <code>&amp;&amp;</code></h3>
+          <pre><code class="lang-kotlin">a &amp;&amp; b</code></pre>
+          <p>Short-circuiting logical AND: the right operand is not evaluated when the left is false.</p>
+          <pre><code class="lang-kotlin">val xs = listOf(1)
+println(xs.isNotEmpty() &amp;&amp; xs[0] == 1)   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-21">
+          <h3><a class="doc-anchor" href="#doc-operators-21">#</a> <code>||</code></h3>
+          <pre><code class="lang-kotlin">a || b</code></pre>
+          <p>Short-circuiting logical OR: the right operand is not evaluated when the left is true.</p>
+          <pre><code class="lang-kotlin">println(false || 1 &lt; 2)   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-22">
+          <h3><a class="doc-anchor" href="#doc-operators-22">#</a> <code>!</code></h3>
+          <pre><code class="lang-kotlin">!a</code></pre>
+          <p>Logical negation. Written twice as a postfix it is instead the not-null assertion <code>!!</code>, and followed by <code>=</code>, <code>in</code> or <code>is</code> it forms <code>!=</code>, <code>!in</code>, <code>!is</code>.</p>
+          <pre><code class="lang-kotlin">println(!(1 &gt; 2))   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-23">
+          <h3><a class="doc-anchor" href="#doc-operators-23">#</a> <code>..</code></h3>
+          <pre><code class="lang-kotlin">a..b</code></pre>
+          <p>Inclusive ascending range. It is a value, not only a loop header: it can be bound, passed, iterated, and asked for <code>sum</code>, <code>first</code>, <code>last</code>, <code>reversed</code> and the higher-order collection functions. <code>'a'..'z'</code> builds a <code>Char</code> range.</p>
+          <pre><code class="lang-kotlin">val r = 1..5
+println(r.sum())   // 15</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-24">
+          <h3><a class="doc-anchor" href="#doc-operators-24">#</a> <code>?.</code></h3>
+          <pre><code class="lang-kotlin">recv?.member
+recv?.method(args)</code></pre>
+          <p>Safe call. The receiver is evaluated once; when it is null the whole expression is <code>null</code> and the member is never dispatched. Chains short-circuit as a unit.</p>
+          <pre><code class="lang-kotlin">val s: String? = null
+println(s?.length)   // null</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-25">
+          <h3><a class="doc-anchor" href="#doc-operators-25">#</a> <code>?:</code></h3>
+          <pre><code class="lang-kotlin">a ?: b</code></pre>
+          <p>Elvis. Yields the left operand unless it is null, in which case it evaluates and yields the right. Right-associative, binding looser than arithmetic and tighter than the comparisons — and its right side may be a <code>throw</code>.</p>
+          <pre><code class="lang-kotlin">val x: Int? = null
+println(x ?: 0)   // 0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-26">
+          <h3><a class="doc-anchor" href="#doc-operators-26">#</a> <code>!!</code></h3>
+          <pre><code class="lang-kotlin">expr!!</code></pre>
+          <p>Not-null assertion: yields the operand, or raises <code>NullPointerException</code> when it is null. Lexed as two consecutive <code>!</code> tokens, so <code>a != b</code> is unaffected.</p>
+          <pre><code class="lang-kotlin">val x: Int? = 1
+println(x!! + 1)   // 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-27">
+          <h3><a class="doc-anchor" href="#doc-operators-27">#</a> <code>?</code></h3>
+          <pre><code class="lang-kotlin">T?</code></pre>
+          <p>Marks a type nullable. kotlinrs parses the mark and then discards it — there is no static null checking, so a nullable and a non-nullable annotation compile identically and a null only surfaces at run time.</p>
+          <pre><code class="lang-kotlin">val x: Int? = null
+println(x)   // null</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-28">
+          <h3><a class="doc-anchor" href="#doc-operators-28">#</a> <code>[]</code></h3>
+          <pre><code class="lang-kotlin">recv[index]</code></pre>
+          <p>Indexed read. On a <code>String</code> the index is a UTF-16 code unit offset and the result is a <code>Char</code>; on a <code>List</code>, <code>Set</code> or <code>Array</code> it is a bounds-checked position; on a <code>Map</code> it is a key lookup that yields <code>null</code> when absent. Chainable: <code>m[k][i]</code>.</p>
+          <pre><code class="lang-kotlin">println("abc"[1])                 // b
+println(listOf(10, 20)[1])        // 20
+println(mapOf("a" to 1)["z"])     // null</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-29">
+          <h3><a class="doc-anchor" href="#doc-operators-29">#</a> <code>[]=</code></h3>
+          <pre><code class="lang-kotlin">recv[index] = value</code></pre>
+          <p>Indexed write. A <code>List</code> or <code>Array</code> slot is bounds-checked and raises <code>IndexOutOfBoundsException</code> past the end; a <code>Map</code> key is inserted when absent. Compound forms (<code>xs[0] += 1</code>) go through the same path.</p>
+          <pre><code class="lang-kotlin">val xs = mutableListOf(1, 2)
+xs[0] = 9
+println(xs)   // [9, 2]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-30">
+          <h3><a class="doc-anchor" href="#doc-operators-30">#</a> <code>-&gt;</code></h3>
+          <pre><code class="lang-kotlin">{ params -&gt; body }
+cond -&gt; result</code></pre>
+          <p>Two roles: it separates a lambda's parameters from its body, and a <code>when</code> arm's conditions from its result. It also appears in a function type annotation, <code>(Int) -&gt; Int</code>, whose parameter and return types are parsed and discarded.</p>
+          <pre><code class="lang-kotlin">val f: (Int) -&gt; Int = { n -&gt; n * 2 }
+println(f(21))   // 42</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-31">
+          <h3><a class="doc-anchor" href="#doc-operators-31">#</a> <code>@</code></h3>
+          <pre><code class="lang-kotlin">label@ for (…) { … }
+break@label</code></pre>
+          <p>Loop labels. A <code>label@</code> prefix names the loop that follows, and <code>break@label</code> / <code>continue@label</code> target it. There is no <code>this@Label</code> and no <code>return@label</code>.</p>
+          <pre><code class="lang-kotlin">outer@ for (i in 1..3) { for (j in 1..3) { if (j == 2) continue@outer; print(i) } }   // 123</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-32">
+          <h3><a class="doc-anchor" href="#doc-operators-32">#</a> <code>$</code></h3>
+          <pre><code class="lang-kotlin">"text $name text ${expr}"</code></pre>
+          <p>String template interpolation. A bare <code>$name</code> splices an identifier; <code>${…}</code> splices an arbitrary expression, re-parsed from the source between the braces. Each interpolated value is rendered by the same stringifier <code>println</code> uses, so a <code>Double</code> keeps its <code>.0</code> and <code>null</code> reads as <code>null</code>. <code>\$</code> escapes a literal dollar.</p>
+          <pre><code class="lang-kotlin">val x = 2
+println("x=$x sq=${x * x}")   // x=2 sq=4</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-33">
+          <h3><a class="doc-anchor" href="#doc-operators-33">#</a> <code>to</code></h3>
+          <pre><code class="lang-kotlin">first to second</code></pre>
+          <p>The infix <code>Pair</code> constructor — the only way to build a <code>Pair</code> here, since <code>Pair(a, b)</code> is not a resolvable constructor. It is what <code>mapOf</code> takes as each argument.</p>
+          <pre><code class="lang-kotlin">val p = 1 to "one"
+println(p.first)   // 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-34">
+          <h3><a class="doc-anchor" href="#doc-operators-34">#</a> <code>!in</code></h3>
+          <pre><code class="lang-kotlin">value !in container</code></pre>
+          <p>Negated membership, over the same containers <code>in</code> accepts. A <code>when</code> arm may also read <code>!in a..b</code>.</p>
+          <pre><code class="lang-kotlin">println(4 !in 1..3)   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-35">
+          <h3><a class="doc-anchor" href="#doc-operators-35">#</a> <code>!is</code></h3>
+          <pre><code class="lang-kotlin">value !is Type</code></pre>
+          <p>Negated runtime type check, usable in a <code>when</code> arm and in ordinary expression position.</p>
+          <pre><code class="lang-kotlin">val x: Any = 1
+println(x !is String)   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-36">
+          <h3><a class="doc-anchor" href="#doc-operators-36">#</a> <code>.</code></h3>
+          <pre><code class="lang-kotlin">recv.member
+recv.method(args)</code></pre>
+          <p>Member access. kotlinrs does not distinguish a property from a zero-argument method: both resolve through the same dispatch, so <code>xs.size</code> and <code>xs.size()</code> — and <code>xs.sum</code> and <code>xs.sum()</code> — are the same call. Chains are left-associative and bind tighter than the prefix unary operators.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).size)   // 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-37">
+          <h3><a class="doc-anchor" href="#doc-operators-37">#</a> <code>:</code></h3>
+          <pre><code class="lang-kotlin">name: Type
+class C : Super(), Iface</code></pre>
+          <p>Two roles: the type annotation separator on a binding, parameter or return type, and the supertype-list introducer on a class. Any identifier is accepted as a type name; only the eight primitives resolve to a static type, and every other name is carried as an opaque class name for dispatch.</p>
+          <pre><code class="lang-kotlin">val n: Int = 1
+println(n)   // 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-38">
+          <h3><a class="doc-anchor" href="#doc-operators-38">#</a> <code>;</code></h3>
+          <pre><code class="lang-kotlin">stmt; stmt</code></pre>
+          <p>The optional statement separator. Newlines already terminate statements, so <code>;</code> matters only when two statements share a line — including inside a <code>when</code> arm list written on one line.</p>
+          <pre><code class="lang-kotlin">var a = 1; a += 1; println(a)   // 2</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-types">
+        <h2>Types</h2>
+        <article class="doc-entry" id="doc-types-1">
+          <h3><a class="doc-anchor" href="#doc-types-1">#</a> <code>Int</code></h3>
+          <pre><code class="lang-kotlin">Int</code></pre>
+          <p>Signed integer. It is 64-bit at run time — kotlinrs has one integer representation, so <code>Int</code> and <code>Long</code> are the same value and <code>Int</code> arithmetic does not overflow at 32 bits the way the JVM's does. <code>/</code> and <code>%</code> truncate toward zero.</p>
+          <pre><code class="lang-kotlin">val n: Int = 7 / 2
+println(n)   // 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-2">
+          <h3><a class="doc-anchor" href="#doc-types-2">#</a> <code>Long</code></h3>
+          <pre><code class="lang-kotlin">Long</code></pre>
+          <p>Signed 64-bit integer, sharing <code>Int</code>'s representation and division rules. An <code>L</code> literal suffix is accepted and prints without it, so <code>println(10L)</code> writes <code>10</code>.</p>
+          <pre><code class="lang-kotlin">val big: Long = 10L
+println(big)   // 10</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-3">
+          <h3><a class="doc-anchor" href="#doc-types-3">#</a> <code>Double</code></h3>
+          <pre><code class="lang-kotlin">Double</code></pre>
+          <p>IEEE-754 double. It stringifies the way the JVM does: a whole value keeps a trailing <code>.0</code>, magnitudes outside <code>[1e-3, 1e7)</code> switch to scientific form (<code>2.5E7</code>), and the non-finite values print as <code>NaN</code> / <code>Infinity</code> / <code>-Infinity</code>.</p>
+          <pre><code class="lang-kotlin">println(3.0)          // 3.0
+println(1.0 / 0.0)    // Infinity</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-4">
+          <h3><a class="doc-anchor" href="#doc-types-4">#</a> <code>Float</code></h3>
+          <pre><code class="lang-kotlin">Float</code></pre>
+          <p>Accepted as an annotation and as an <code>f</code>-suffixed literal, but there is no distinct single-precision type: <code>Type::from_name</code> folds <code>Float</code> into <code>Double</code>, so a <code>Float</code> is stored, computed and printed at double precision.</p>
+          <pre><code class="lang-kotlin">val f: Float = 1.5f
+println(f)   // 1.5</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-5">
+          <h3><a class="doc-anchor" href="#doc-types-5">#</a> <code>Boolean</code></h3>
+          <pre><code class="lang-kotlin">Boolean</code></pre>
+          <p>The <code>true</code>/<code>false</code> type, printed as <code>true</code> or <code>false</code>. A lambda predicate must return one: any other result — including <code>null</code> — is treated as not satisfied.</p>
+          <pre><code class="lang-kotlin">val b: Boolean = 1 &lt; 2
+println(b)   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-6">
+          <h3><a class="doc-anchor" href="#doc-types-6">#</a> <code>Char</code></h3>
+          <pre><code class="lang-kotlin">Char</code></pre>
+          <p>A single UTF-16 code unit, and a distinct type from <code>Int</code> — it is carried as a tagged handle rather than a number, which is what makes it print as its character inside a <code>List</code> or a <code>Map</code>. Supports <code>+</code>/<code>-</code> displacement, comparison, <code>.code</code>, and <code>'a'..'z'</code> ranges.</p>
+          <pre><code class="lang-kotlin">val c: Char = 'A'
+println(c + 1)         // B
+println(listOf(c))     // [A]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-7">
+          <h3><a class="doc-anchor" href="#doc-types-7">#</a> <code>String</code></h3>
+          <pre><code class="lang-kotlin">String</code></pre>
+          <p>Text, with <code>+</code> concatenation and <code>"$x"</code> interpolation. Every length, index and slice position is a UTF-16 code-unit offset, matching the JVM contract rather than the Unicode scalar count. Indexing yields a <code>Char</code>; iterating a <code>String</code> walks its code units. String *literals* are read one source byte at a time, so a non-ASCII character written inside <code>"…"</code> splits into its UTF-8 bytes — a <code>Char</code> literal (<code>'é'</code>) decodes correctly, a string literal does not.</p>
+          <pre><code class="lang-kotlin">val s: String = "n = ${1 + 1}"
+println(s)   // n = 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-8">
+          <h3><a class="doc-anchor" href="#doc-types-8">#</a> <code>Unit</code></h3>
+          <pre><code class="lang-kotlin">Unit</code></pre>
+          <p>The no-value type — the result of a function with no <code>return</code> and of <code>println</code>, <code>forEach</code> and the other effect-only calls. The compiler renders it statically as the literal <code>kotlin.Unit</code>.</p>
+          <pre><code class="lang-kotlin">fun log(): Unit { println("hi") }
+fun main() { log() }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-9">
+          <h3><a class="doc-anchor" href="#doc-types-9">#</a> <code>Any</code></h3>
+          <pre><code class="lang-kotlin">Any</code></pre>
+          <p>The top type. It resolves to no static type here, so it behaves as an unannotated binding: members dispatch dynamically on the runtime value and <code>is</code> decides what it actually holds.</p>
+          <pre><code class="lang-kotlin">val x: Any = "s"
+println(x is String)   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-10">
+          <h3><a class="doc-anchor" href="#doc-types-10">#</a> <code>List</code></h3>
+          <pre><code class="lang-kotlin">List&lt;T&gt;</code></pre>
+          <p>An ordered sequence, built by <code>listOf</code>. kotlinrs does not enforce read-only-ness — <code>List</code> and <code>MutableList</code> are the same runtime object, so <code>listOf(1, 2).add(3)</code> succeeds here where Kotlin rejects it at compile time. Prints as <code>[a, b]</code>.</p>
+          <pre><code class="lang-kotlin">val xs: List&lt;Int&gt; = listOf(1, 2, 3)
+println(xs)   // [1, 2, 3]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-11">
+          <h3><a class="doc-anchor" href="#doc-types-11">#</a> <code>MutableList</code></h3>
+          <pre><code class="lang-kotlin">MutableList&lt;T&gt;</code></pre>
+          <p>The mutable <code>List</code> annotation, built by <code>mutableListOf</code> / <code>arrayListOf</code>. It denotes the same runtime object as <code>List</code>; the distinction is documentation only.</p>
+          <pre><code class="lang-kotlin">val xs: MutableList&lt;Int&gt; = mutableListOf(1)
+xs.add(2)
+println(xs)   // [1, 2]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-12">
+          <h3><a class="doc-anchor" href="#doc-types-12">#</a> <code>Set</code></h3>
+          <pre><code class="lang-kotlin">Set&lt;T&gt;</code></pre>
+          <p>A distinct-element collection built by <code>setOf</code>. It keeps insertion order for display but compares order-insensitively, so <code>setOf(1, 2) == setOf(2, 1)</code> and a <code>Set</code> never equals a <code>List</code>. Prints as <code>[a, b]</code>.</p>
+          <pre><code class="lang-kotlin">println(setOf(3, 1, 3))   // [3, 1]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-13">
+          <h3><a class="doc-anchor" href="#doc-types-13">#</a> <code>MutableSet</code></h3>
+          <pre><code class="lang-kotlin">MutableSet&lt;T&gt;</code></pre>
+          <p>The mutable <code>Set</code> annotation, built by <code>mutableSetOf</code>. <code>add</code> answers whether the element was new, which is what distinguishes it from a list's <code>add</code>.</p>
+          <pre><code class="lang-kotlin">val s: MutableSet&lt;Int&gt; = mutableSetOf(1)
+println(s.add(1))   // false</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-14">
+          <h3><a class="doc-anchor" href="#doc-types-14">#</a> <code>Map</code></h3>
+          <pre><code class="lang-kotlin">Map&lt;K, V&gt;</code></pre>
+          <p>A key/value association built by <code>mapOf</code> from <code>k to v</code> pairs. It is an insertion-ordered entry list, not a hash table — lookup is a linear scan under structural key equality, and iteration order is always insertion order even for <code>hashMapOf</code>. Prints as <code>{k=v, k=v}</code>.</p>
+          <pre><code class="lang-kotlin">val m: Map&lt;String, Int&gt; = mapOf("a" to 1)
+println(m)   // {a=1}</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-15">
+          <h3><a class="doc-anchor" href="#doc-types-15">#</a> <code>MutableMap</code></h3>
+          <pre><code class="lang-kotlin">MutableMap&lt;K, V&gt;</code></pre>
+          <p>The mutable <code>Map</code> annotation, built by <code>mutableMapOf</code> / <code>hashMapOf</code>. <code>put</code>, <code>remove</code> and indexed assignment all write through it.</p>
+          <pre><code class="lang-kotlin">val m: MutableMap&lt;String, Int&gt; = mutableMapOf()
+m["a"] = 1
+println(m)   // {a=1}</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-16">
+          <h3><a class="doc-anchor" href="#doc-types-16">#</a> <code>Pair</code></h3>
+          <pre><code class="lang-kotlin">Pair&lt;A, B&gt;</code></pre>
+          <p>A two-element tuple, built only by the infix <code>to</code> — <code>Pair(a, b)</code> is not a resolvable constructor here. Its members are <code>first</code> and <code>second</code>, and it destructures through <code>component1</code>/<code>component2</code>.</p>
+          <pre><code class="lang-kotlin">val p: Pair&lt;Int, String&gt; = 1 to "one"
+println(p.second)   // one</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-17">
+          <h3><a class="doc-anchor" href="#doc-types-17">#</a> <code>Array</code></h3>
+          <pre><code class="lang-kotlin">Array&lt;T&gt;</code></pre>
+          <p>A JVM-style array. It inherits identity equality and the JVM's descriptor <code>toString</code>, so <code>arrayOf(1, 2)</code> prints as <code>[Ljava.lang.Integer;@0</code> rather than showing its elements — use <code>joinToString</code> or <code>toList</code> to see them.</p>
+          <pre><code class="lang-kotlin">val a: Array&lt;Int&gt; = arrayOf(1, 2, 3)
+println(a[1])              // 2
+println(a.joinToString())  // 1, 2, 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-18">
+          <h3><a class="doc-anchor" href="#doc-types-18">#</a> <code>IntArray</code></h3>
+          <pre><code class="lang-kotlin">IntArray</code></pre>
+          <p>A primitive <code>Int</code> array, descriptor <code>[I</code>. <code>DoubleArray</code> (<code>[D</code>), <code>BooleanArray</code> (<code>[Z</code>) and <code>CharArray</code> (<code>[C</code>) are the other three. All four share the sequence members with <code>List</code>.</p>
+          <pre><code class="lang-kotlin">val a: IntArray = IntArray(3)
+println(a.sum())   // 0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-19">
+          <h3><a class="doc-anchor" href="#doc-types-19">#</a> <code>IntRange</code></h3>
+          <pre><code class="lang-kotlin">IntRange</code></pre>
+          <p>The value <code>a..b</code> builds — iterable, summable, and a receiver for the higher-order collection functions. A re-stepped or reversed range becomes an <code>IntProgression</code>, which prints in its <code>a..b step n</code> / <code>a downTo b step n</code> form.</p>
+          <pre><code class="lang-kotlin">val r: IntRange = 1..5
+println(r.sum())        // 15
+println(r.reversed())   // 5 downTo 1 step 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-20">
+          <h3><a class="doc-anchor" href="#doc-types-20">#</a> <code>Nothing</code></h3>
+          <pre><code class="lang-kotlin">Nothing</code></pre>
+          <p>The bottom type, the static type Kotlin gives a <code>throw</code>. kotlinrs accepts the annotation but resolves no static type from it — like every non-primitive name it is carried as an opaque class name.</p>
+          <pre><code class="lang-kotlin">fun fail(): Nothing = throw IllegalStateException("no")
+fun main() { println(try { fail() } catch (e: Exception) { "caught" }) }</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-builtin-functions">
+        <h2>Builtin Functions</h2>
+        <article class="doc-entry" id="doc-builtin-functions-1">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-1">#</a> <code>println</code></h3>
+          <pre><code class="lang-kotlin">println()
+println(value: Any?)</code></pre>
+          <p>Writes a value to stdout followed by a newline, and returns <code>Unit</code>. It takes at most one argument. While an exception is unwinding it is suppressed, so nothing is emitted between a <code>throw</code> and its handler.</p>
+          <pre><code class="lang-kotlin">println(6 * 7)   // 42</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-2">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-2">#</a> <code>print</code></h3>
+          <pre><code class="lang-kotlin">print()
+print(value: Any?)</code></pre>
+          <p>Writes a value to stdout with no trailing newline. Same one-argument limit and unwinding suppression as <code>println</code>.</p>
           <pre><code class="lang-kotlin">print("a"); print("b")   // ab</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-3">
-          <h3><a class="doc-anchor" href="#doc-builtin-3">#</a> <code>listOf</code></h3>
-          <p>build a read-only List; `mutableListOf` builds a mutable one</p>
+        <article class="doc-entry" id="doc-builtin-functions-3">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-3">#</a> <code>listOf</code></h3>
+          <pre><code class="lang-kotlin">listOf(vararg elements: T): List&lt;T&gt;</code></pre>
+          <p>Builds a <code>List</code> from its arguments. The result is a plain mutable heap list — kotlinrs does not enforce read-only-ness, so <code>add</code> on it succeeds.</p>
           <pre><code class="lang-kotlin">val xs = listOf(1, 2, 3)
 println(xs.size)   // 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-4">
-          <h3><a class="doc-anchor" href="#doc-builtin-4">#</a> <code>mapOf</code></h3>
-          <p>build a Map from `k to v` pairs; `mutableMapOf` builds a mutable one</p>
-          <pre><code class="lang-kotlin">val m = mapOf("a" to 1)
-println(m["a"])   // 1</code></pre>
+        <article class="doc-entry" id="doc-builtin-functions-4">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-4">#</a> <code>mutableListOf</code></h3>
+          <pre><code class="lang-kotlin">mutableListOf(vararg elements: T): MutableList&lt;T&gt;</code></pre>
+          <p>Builds a mutable <code>List</code>. Identical to <code>listOf</code> at run time; the two differ only in what the annotation documents.</p>
+          <pre><code class="lang-kotlin">val xs = mutableListOf(1)
+xs.add(2)
+println(xs)   // [1, 2]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-5">
-          <h3><a class="doc-anchor" href="#doc-builtin-5">#</a> <code>setOf</code></h3>
-          <p>build a Set: insertion-ordered display, order-insensitive equality</p>
+        <article class="doc-entry" id="doc-builtin-functions-5">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-5">#</a> <code>arrayListOf</code></h3>
+          <pre><code class="lang-kotlin">arrayListOf(vararg elements: T): MutableList&lt;T&gt;</code></pre>
+          <p>The <code>java.util.ArrayList</code> spelling of <code>mutableListOf</code>. It builds the same heap list.</p>
+          <pre><code class="lang-kotlin">println(arrayListOf(1, 2))   // [1, 2]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-6">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-6">#</a> <code>emptyList</code></h3>
+          <pre><code class="lang-kotlin">emptyList(): List&lt;T&gt;</code></pre>
+          <p>Builds an empty <code>List</code>. An explicit type argument (<code>emptyList&lt;Int&gt;()</code>) is accepted and ignored — typing here is coarse.</p>
+          <pre><code class="lang-kotlin">println(emptyList&lt;Int&gt;())   // []</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-7">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-7">#</a> <code>setOf</code></h3>
+          <pre><code class="lang-kotlin">setOf(vararg elements: T): Set&lt;T&gt;</code></pre>
+          <p>Builds a <code>Set</code>: duplicates are dropped on the way in, insertion order is kept for display, and equality is order-insensitive. This is Kotlin's <code>LinkedHashSet</code>-backed behaviour.</p>
           <pre><code class="lang-kotlin">println(setOf(3, 1, 3))   // [3, 1]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-6">
-          <h3><a class="doc-anchor" href="#doc-builtin-6">#</a> <code>arrayOf</code></h3>
-          <p>build an array; `intArrayOf`/`doubleArrayOf`/`booleanArrayOf` are typed</p>
+        <article class="doc-entry" id="doc-builtin-functions-8">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-8">#</a> <code>mutableSetOf</code></h3>
+          <pre><code class="lang-kotlin">mutableSetOf(vararg elements: T): MutableSet&lt;T&gt;</code></pre>
+          <p>Builds a mutable <code>Set</code>. <code>add</code> on it answers whether the element was new.</p>
+          <pre><code class="lang-kotlin">val s = mutableSetOf(1)
+println(s.add(2))   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-9">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-9">#</a> <code>hashSetOf</code></h3>
+          <pre><code class="lang-kotlin">hashSetOf(vararg elements: T): MutableSet&lt;T&gt;</code></pre>
+          <p>Builds the same insertion-ordered <code>Set</code> every other set builder does. Kotlin's <code>HashSet</code> has no order guarantee; here the display order is always insertion order.</p>
+          <pre><code class="lang-kotlin">println(hashSetOf(3, 1))   // [3, 1]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-10">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-10">#</a> <code>linkedSetOf</code></h3>
+          <pre><code class="lang-kotlin">linkedSetOf(vararg elements: T): MutableSet&lt;T&gt;</code></pre>
+          <p>The <code>LinkedHashSet</code> spelling. Insertion-ordered, which is what every <code>Set</code> here already is.</p>
+          <pre><code class="lang-kotlin">println(linkedSetOf(2, 1))   // [2, 1]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-11">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-11">#</a> <code>sortedSetOf</code></h3>
+          <pre><code class="lang-kotlin">sortedSetOf(vararg elements: T): MutableSet&lt;T&gt;</code></pre>
+          <p>Accepted, but it does **not** sort — it builds the same insertion-ordered distinct set as <code>setOf</code>. This diverges from Kotlin, where the result is a <code>TreeSet</code> in ascending order. Call <code>sorted()</code> on it if order matters.</p>
+          <pre><code class="lang-kotlin">println(sortedSetOf(3, 1, 2))            // [3, 1, 2]
+println(sortedSetOf(3, 1, 2).sorted())   // [1, 2, 3]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-12">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-12">#</a> <code>emptySet</code></h3>
+          <pre><code class="lang-kotlin">emptySet(): Set&lt;T&gt;</code></pre>
+          <p>Builds an empty <code>Set</code>.</p>
+          <pre><code class="lang-kotlin">println(emptySet&lt;Int&gt;())   // []</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-13">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-13">#</a> <code>mapOf</code></h3>
+          <pre><code class="lang-kotlin">mapOf(vararg pairs: Pair&lt;K, V&gt;): Map&lt;K, V&gt;</code></pre>
+          <p>Builds a <code>Map</code> from <code>k to v</code> pairs. Entries stay in insertion order and keys are matched by structural equality on a linear scan.</p>
+          <pre><code class="lang-kotlin">val m = mapOf("a" to 1, "b" to 2)
+println(m["a"])   // 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-14">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-14">#</a> <code>mutableMapOf</code></h3>
+          <pre><code class="lang-kotlin">mutableMapOf(vararg pairs: Pair&lt;K, V&gt;): MutableMap&lt;K, V&gt;</code></pre>
+          <p>Builds a mutable <code>Map</code>. <code>put</code>, <code>remove</code> and <code>m[k] = v</code> all write through it.</p>
+          <pre><code class="lang-kotlin">val m = mutableMapOf("a" to 1)
+m["b"] = 2
+println(m)   // {a=1, b=2}</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-15">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-15">#</a> <code>hashMapOf</code></h3>
+          <pre><code class="lang-kotlin">hashMapOf(vararg pairs: Pair&lt;K, V&gt;): MutableMap&lt;K, V&gt;</code></pre>
+          <p>Builds the same insertion-ordered <code>Map</code> <code>mutableMapOf</code> does. Kotlin's <code>HashMap</code> has no order guarantee; here iteration and display order are always insertion order.</p>
+          <pre><code class="lang-kotlin">println(hashMapOf("b" to 1, "a" to 2))   // {b=1, a=2}</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-16">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-16">#</a> <code>emptyMap</code></h3>
+          <pre><code class="lang-kotlin">emptyMap(): Map&lt;K, V&gt;</code></pre>
+          <p>Builds an empty <code>Map</code>, which prints as <code>{}</code>.</p>
+          <pre><code class="lang-kotlin">println(emptyMap&lt;String, Int&gt;())   // {}</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-17">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-17">#</a> <code>arrayOf</code></h3>
+          <pre><code class="lang-kotlin">arrayOf(vararg elements: T): Array&lt;T&gt;</code></pre>
+          <p>Builds a JVM-style array. The element values decide the descriptor at run time, so a boxed array prints as <code>[Ljava.lang.Integer;@n</code> and compares by identity.</p>
           <pre><code class="lang-kotlin">val a = arrayOf(1, 2, 3)
 println(a[1])   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-7">
-          <h3><a class="doc-anchor" href="#doc-builtin-7">#</a> <code>IntArray</code></h3>
-          <p>a zero-filled primitive array; also `DoubleArray`/`BooleanArray`</p>
-          <pre><code class="lang-kotlin">val a = IntArray(3)
-println(a.sum())   // 0</code></pre>
+        <article class="doc-entry" id="doc-builtin-functions-18">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-18">#</a> <code>intArrayOf</code></h3>
+          <pre><code class="lang-kotlin">intArrayOf(vararg elements: Int): IntArray</code></pre>
+          <p>Builds a primitive <code>Int</code> array from the given elements.</p>
+          <pre><code class="lang-kotlin">println(intArrayOf(1, 2).sum())   // 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-8">
-          <h3><a class="doc-anchor" href="#doc-builtin-8">#</a> <code>abs</code></h3>
-          <p>absolute value (kotlin.math; needs `import kotlin.math.*`)</p>
-          <pre><code class="lang-kotlin">import kotlin.math.*
-println(abs(-3))   // 3</code></pre>
+        <article class="doc-entry" id="doc-builtin-functions-19">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-19">#</a> <code>doubleArrayOf</code></h3>
+          <pre><code class="lang-kotlin">doubleArrayOf(vararg elements: Double): DoubleArray</code></pre>
+          <p>Builds a primitive <code>Double</code> array.</p>
+          <pre><code class="lang-kotlin">println(doubleArrayOf(1.5, 2.5).sum())   // 4.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-9">
-          <h3><a class="doc-anchor" href="#doc-builtin-9">#</a> <code>sqrt</code></h3>
-          <p>square root of a Double (kotlin.math; needs the import)</p>
-          <pre><code class="lang-kotlin">import kotlin.math.*
-println(sqrt(9.0))   // 3.0</code></pre>
+        <article class="doc-entry" id="doc-builtin-functions-20">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-20">#</a> <code>booleanArrayOf</code></h3>
+          <pre><code class="lang-kotlin">booleanArrayOf(vararg elements: Boolean): BooleanArray</code></pre>
+          <p>Builds a primitive <code>Boolean</code> array.</p>
+          <pre><code class="lang-kotlin">println(booleanArrayOf(true, false).size)   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-10">
-          <h3><a class="doc-anchor" href="#doc-builtin-10">#</a> <code>max</code></h3>
-          <p>larger of two values (kotlin.math); `maxOf` needs no import</p>
+        <article class="doc-entry" id="doc-builtin-functions-21">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-21">#</a> <code>charArrayOf</code></h3>
+          <pre><code class="lang-kotlin">charArrayOf(vararg elements: Char): CharArray</code></pre>
+          <p>Builds a primitive <code>Char</code> array.</p>
+          <pre><code class="lang-kotlin">println(charArrayOf('a', 'b').joinToString(""))   // ab</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-22">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-22">#</a> <code>IntArray</code></h3>
+          <pre><code class="lang-kotlin">IntArray(size: Int): IntArray
+IntArray(size: Int) { i -&gt; … }: IntArray</code></pre>
+          <p>Builds a zero-filled <code>Int</code> array of the given size, or fills each slot with the lambda applied to its index. A negative size raises <code>NegativeArraySizeException</code>.</p>
+          <pre><code class="lang-kotlin">println(IntArray(3).sum())              // 0
+println(IntArray(3) { it * 2 }.sum())   // 6</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-23">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-23">#</a> <code>DoubleArray</code></h3>
+          <pre><code class="lang-kotlin">DoubleArray(size: Int): DoubleArray
+DoubleArray(size: Int) { i -&gt; … }: DoubleArray</code></pre>
+          <p>Builds a zero-filled <code>Double</code> array, or fills it from the index lambda.</p>
+          <pre><code class="lang-kotlin">println(DoubleArray(2).sum())   // 0.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-24">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-24">#</a> <code>BooleanArray</code></h3>
+          <pre><code class="lang-kotlin">BooleanArray(size: Int): BooleanArray
+BooleanArray(size: Int) { i -&gt; … }: BooleanArray</code></pre>
+          <p>Builds a zero-filled <code>Boolean</code> array, or fills it from the index lambda.</p>
+          <pre><code class="lang-kotlin">println(BooleanArray(3).size)   // 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-25">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-25">#</a> <code>CharArray</code></h3>
+          <pre><code class="lang-kotlin">CharArray(size: Int): CharArray
+CharArray(size: Int) { i -&gt; … }: CharArray</code></pre>
+          <p>Builds a zero-filled <code>Char</code> array, or fills it from the index lambda.</p>
+          <pre><code class="lang-kotlin">println(CharArray(2).size)   // 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-26">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-26">#</a> <code>Array</code></h3>
+          <pre><code class="lang-kotlin">Array(size: Int) { i -&gt; … }: Array&lt;T&gt;</code></pre>
+          <p>Builds a generic array from an index lambda. Unlike the four primitive builders it exists *only* in the initializer form — Kotlin has no zero-filled <code>Array(n)</code> — and its descriptor is inferred from the elements the lambda produced.</p>
+          <pre><code class="lang-kotlin">println(Array(3) { it * 2 }.joinToString())   // 0, 2, 4</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-math">
+        <h2>Math</h2>
+        <article class="doc-entry" id="doc-math-1">
+          <h3><a class="doc-anchor" href="#doc-math-1">#</a> <code>abs</code></h3>
+          <pre><code class="lang-kotlin">abs(n: Int): Int
+abs(x: Double): Double</code></pre>
+          <p>Absolute value, keeping an <code>Int</code> result for an integral argument. Lives in <code>kotlin.math</code>, so it is unresolvable without <code>import kotlin.math.abs</code> or a star import — exactly as in Kotlin.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.abs
+fun main() { println(abs(-3)) }   // 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-math-2">
+          <h3><a class="doc-anchor" href="#doc-math-2">#</a> <code>sqrt</code></h3>
+          <pre><code class="lang-kotlin">sqrt(x: Double): Double</code></pre>
+          <p>Square root, always <code>Double</code>. Needs the <code>kotlin.math</code> import.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.sqrt
+fun main() { println(sqrt(9.0)) }   // 3.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-math-3">
+          <h3><a class="doc-anchor" href="#doc-math-3">#</a> <code>floor</code></h3>
+          <pre><code class="lang-kotlin">floor(x: Double): Double</code></pre>
+          <p>Largest <code>Double</code> no greater than the argument. Needs the <code>kotlin.math</code> import.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.floor
+fun main() { println(floor(-1.5)) }   // -2.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-math-4">
+          <h3><a class="doc-anchor" href="#doc-math-4">#</a> <code>ceil</code></h3>
+          <pre><code class="lang-kotlin">ceil(x: Double): Double</code></pre>
+          <p>Smallest <code>Double</code> no less than the argument. Needs the <code>kotlin.math</code> import.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.ceil
+fun main() { println(ceil(1.2)) }   // 2.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-math-5">
+          <h3><a class="doc-anchor" href="#doc-math-5">#</a> <code>round</code></h3>
+          <pre><code class="lang-kotlin">round(x: Double): Double</code></pre>
+          <p>Rounds to the closest integer as a <code>Double</code>, with **ties to even** — <code>round(2.5)</code> is <code>2.0</code> and <code>round(3.5)</code> is <code>4.0</code>. This is <code>kotlin.math.round</code>; <code>Math.round</code> is the different, half-up, <code>Long</code>-returning one.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.round
+fun main() { println(round(2.5)) }   // 2.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-math-6">
+          <h3><a class="doc-anchor" href="#doc-math-6">#</a> <code>max</code></h3>
+          <pre><code class="lang-kotlin">max(a: Int, b: Int): Int
+max(a: Double, b: Double): Double</code></pre>
+          <p>Larger of two values, keeping an <code>Int</code> result when both are integral. Lives in <code>kotlin.math</code> and needs the import; <code>maxOf</code> is the auto-imported spelling of the same operation.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.max
+fun main() { println(max(2, 9)) }   // 9</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-math-7">
+          <h3><a class="doc-anchor" href="#doc-math-7">#</a> <code>min</code></h3>
+          <pre><code class="lang-kotlin">min(a: Int, b: Int): Int
+min(a: Double, b: Double): Double</code></pre>
+          <p>Smaller of two values, keeping an <code>Int</code> result when both are integral. Needs the <code>kotlin.math</code> import; <code>minOf</code> is the auto-imported spelling.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.min
+fun main() { println(min(2, 9)) }   // 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-math-8">
+          <h3><a class="doc-anchor" href="#doc-math-8">#</a> <code>maxOf</code></h3>
+          <pre><code class="lang-kotlin">maxOf(a: T, b: T): T</code></pre>
+          <p>Larger of two values. It lives in the auto-imported <code>kotlin</code> package, so unlike <code>max</code> it needs no import; it dispatches to the same implementation.</p>
           <pre><code class="lang-kotlin">println(maxOf(2, 9))   // 9</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-11">
-          <h3><a class="doc-anchor" href="#doc-builtin-11">#</a> <code>min</code></h3>
-          <p>smaller of two values (kotlin.math); `minOf` needs no import</p>
+        <article class="doc-entry" id="doc-math-9">
+          <h3><a class="doc-anchor" href="#doc-math-9">#</a> <code>minOf</code></h3>
+          <pre><code class="lang-kotlin">minOf(a: T, b: T): T</code></pre>
+          <p>Smaller of two values, auto-imported like <code>maxOf</code> and sharing <code>min</code>'s implementation.</p>
           <pre><code class="lang-kotlin">println(minOf(2, 9))   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-12">
-          <h3><a class="doc-anchor" href="#doc-builtin-12">#</a> <code>Math</code></h3>
-          <p>the java.lang.Math statics, auto-imported (abs/max/min/sqrt/round/…)</p>
+        <article class="doc-entry" id="doc-math-10">
+          <h3><a class="doc-anchor" href="#doc-math-10">#</a> <code>PI</code></h3>
+          <pre><code class="lang-kotlin">PI: Double</code></pre>
+          <p>The <code>kotlin.math</code> circle constant, in scope only under the import. It folds to a literal at compile time rather than paying a host dispatch. Also reachable as <code>Math.PI</code>, which needs no import.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.PI
+fun main() { println(PI) }   // 3.141592653589793</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-math-11">
+          <h3><a class="doc-anchor" href="#doc-math-11">#</a> <code>E</code></h3>
+          <pre><code class="lang-kotlin">E: Double</code></pre>
+          <p>The <code>kotlin.math</code> base of the natural logarithm, in scope only under the import, and also reachable as <code>Math.E</code>.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.E
+fun main() { println(E) }   // 2.718281828459045</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-math-12">
+          <h3><a class="doc-anchor" href="#doc-math-12">#</a> <code>Math</code></h3>
+          <pre><code class="lang-kotlin">Math.abs(…)  Math.max(…)  Math.min(…)
+Math.sqrt(…)  Math.floor(…)  Math.ceil(…)
+Math.round(…)  Math.PI  Math.E</code></pre>
+          <p>The <code>java.lang.Math</code> statics. Kotlin auto-imports <code>java.lang.*</code> on the JVM, so these need no import line — which is the practical difference from the <code>kotlin.math</code> top-level spellings. A local binding or a user class named <code>Math</code> shadows the whole thing.</p>
           <pre><code class="lang-kotlin">println(Math.abs(-3))   // 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-math-13">
+          <h3><a class="doc-anchor" href="#doc-math-13">#</a> <code>Math.round</code></h3>
+          <pre><code class="lang-kotlin">Math.round(x: Double): Long</code></pre>
+          <p>The odd one out of the rounding family: **half-up** (<code>floor(x + 0.5)</code>) and returning a <code>Long</code>, where <code>kotlin.math.round</code> is ties-to-even and returns a <code>Double</code>. It dispatches under its own name for exactly that reason.</p>
+          <pre><code class="lang-kotlin">println(Math.round(2.5))   // 3</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-throwables">
+        <h2>Throwables</h2>
+        <article class="doc-entry" id="doc-throwables-1">
+          <h3><a class="doc-anchor" href="#doc-throwables-1">#</a> <code>Throwable</code></h3>
+          <pre><code class="lang-kotlin">Throwable()
+Throwable(message: String)</code></pre>
+          <p>The root of the modelled hierarchy — <code>java.lang.Throwable</code>. <code>catch (e: Throwable)</code> matches anything in flight, including a value that is not one of the sixteen built-in classes. A constructor with no argument leaves <code>message</code> null.</p>
+          <pre><code class="lang-kotlin">try { throw Throwable("boom") } catch (e: Throwable) { println(e.message) }   // boom</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-2">
+          <h3><a class="doc-anchor" href="#doc-throwables-2">#</a> <code>Exception</code></h3>
+          <pre><code class="lang-kotlin">Exception()
+Exception(message: String)</code></pre>
+          <p><code>java.lang.Exception</code>, the parent of <code>RuntimeException</code>. Catching it catches every runtime exception below it but not an <code>Error</code>.</p>
+          <pre><code class="lang-kotlin">try { 1 / 0 } catch (e: Exception) { println("caught") }   // caught</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-3">
+          <h3><a class="doc-anchor" href="#doc-throwables-3">#</a> <code>Error</code></h3>
+          <pre><code class="lang-kotlin">Error()
+Error(message: String)</code></pre>
+          <p><code>java.lang.Error</code>, a direct child of <code>Throwable</code> and a sibling of <code>Exception</code> — so <code>catch (e: Exception)</code> does *not* catch it.</p>
+          <pre><code class="lang-kotlin">try { throw Error("fatal") } catch (e: Throwable) { println("caught") }   // caught</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-4">
+          <h3><a class="doc-anchor" href="#doc-throwables-4">#</a> <code>RuntimeException</code></h3>
+          <pre><code class="lang-kotlin">RuntimeException()
+RuntimeException(message: String)</code></pre>
+          <p><code>java.lang.RuntimeException</code>, the parent of every fault the runtime itself raises.</p>
+          <pre><code class="lang-kotlin">try { throw RuntimeException("x") } catch (e: RuntimeException) { println(e.message) }   // x</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-5">
+          <h3><a class="doc-anchor" href="#doc-throwables-5">#</a> <code>ArithmeticException</code></h3>
+          <pre><code class="lang-kotlin">ArithmeticException(message: String)</code></pre>
+          <p>Raised by integer <code>/</code> and <code>%</code> when the divisor is zero, with the message <code>/ by zero</code>. Floating-point division never raises it — it yields <code>Infinity</code> or <code>NaN</code>.</p>
+          <pre><code class="lang-kotlin">try { 1 / 0 } catch (e: ArithmeticException) { println(e.message) }   // / by zero</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-6">
+          <h3><a class="doc-anchor" href="#doc-throwables-6">#</a> <code>IllegalArgumentException</code></h3>
+          <pre><code class="lang-kotlin">IllegalArgumentException(message: String)</code></pre>
+          <p>Raised by a negative <code>take</code>/<code>drop</code>/<code>repeat</code> count, a non-positive range <code>step</code>, and <code>digitToInt</code> on a non-digit <code>Char</code>.</p>
+          <pre><code class="lang-kotlin">try { listOf(1).take(-1) } catch (e: IllegalArgumentException) { println("caught") }   // caught</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-7">
+          <h3><a class="doc-anchor" href="#doc-throwables-7">#</a> <code>IllegalStateException</code></h3>
+          <pre><code class="lang-kotlin">IllegalStateException(message: String)</code></pre>
+          <p>Never raised by the runtime itself — it is here for user code, most often as the right operand of <code>?:</code>.</p>
+          <pre><code class="lang-kotlin">val x: Int? = null
+try { x ?: throw IllegalStateException("missing") } catch (e: Exception) { println(e.message) }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-8">
+          <h3><a class="doc-anchor" href="#doc-throwables-8">#</a> <code>NumberFormatException</code></h3>
+          <pre><code class="lang-kotlin">NumberFormatException(message: String)</code></pre>
+          <p>A child of <code>IllegalArgumentException</code>. kotlinrs never raises it — there is no <code>String.toInt</code> to fail — so it exists for user code and for the hierarchy's shape.</p>
+          <pre><code class="lang-kotlin">try { throw NumberFormatException("bad") } catch (e: IllegalArgumentException) { println("caught") }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-9">
+          <h3><a class="doc-anchor" href="#doc-throwables-9">#</a> <code>IndexOutOfBoundsException</code></h3>
+          <pre><code class="lang-kotlin">IndexOutOfBoundsException(message: String)</code></pre>
+          <p>The parent of the string and array out-of-range classes. It is raised directly by <code>removeAt</code> past the end of a list and by an indexed write past the end.</p>
+          <pre><code class="lang-kotlin">try { mutableListOf(1).removeAt(5) } catch (e: IndexOutOfBoundsException) { println("caught") }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-10">
+          <h3><a class="doc-anchor" href="#doc-throwables-10">#</a> <code>StringIndexOutOfBoundsException</code></h3>
+          <pre><code class="lang-kotlin">StringIndexOutOfBoundsException(message: String)</code></pre>
+          <p>Raised by <code>s[i]</code> and <code>substring</code> when a UTF-16 offset falls outside the string.</p>
+          <pre><code class="lang-kotlin">try { "abc".substring(9) } catch (e: Exception) { println(e.message) }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-11">
+          <h3><a class="doc-anchor" href="#doc-throwables-11">#</a> <code>ArrayIndexOutOfBoundsException</code></h3>
+          <pre><code class="lang-kotlin">ArrayIndexOutOfBoundsException(message: String)</code></pre>
+          <p>Raised by an out-of-range indexed read on a <code>List</code>, <code>Set</code> or <code>Array</code> — note that the *method* form, <code>get(i)</code>, raises <code>NoSuchElementException</code> instead, which diverges from Kotlin.</p>
+          <pre><code class="lang-kotlin">try { listOf(1, 2)[5] } catch (e: Exception) { println(e.message) }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-12">
+          <h3><a class="doc-anchor" href="#doc-throwables-12">#</a> <code>NullPointerException</code></h3>
+          <pre><code class="lang-kotlin">NullPointerException()
+NullPointerException(message: String)</code></pre>
+          <p>Raised by <code>!!</code> on a null value. Since kotlinrs does no static null checking, <code>!!</code> is the only place the runtime produces one on its own.</p>
+          <pre><code class="lang-kotlin">val x: Int? = null
+try { x!! } catch (e: NullPointerException) { println("caught") }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-13">
+          <h3><a class="doc-anchor" href="#doc-throwables-13">#</a> <code>ClassCastException</code></h3>
+          <pre><code class="lang-kotlin">ClassCastException(message: String)</code></pre>
+          <p>Modelled for the hierarchy but never raised: kotlinrs has no <code>as</code> cast operator, so there is no cast to fail.</p>
+          <pre><code class="lang-kotlin">try { throw ClassCastException("x") } catch (e: RuntimeException) { println("caught") }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-14">
+          <h3><a class="doc-anchor" href="#doc-throwables-14">#</a> <code>UnsupportedOperationException</code></h3>
+          <pre><code class="lang-kotlin">UnsupportedOperationException(message: String)</code></pre>
+          <p>Raised by <code>reduce</code> on an empty sequence, with the message <code>Empty collection can't be reduced.</code></p>
+          <pre><code class="lang-kotlin">try { listOf&lt;Int&gt;().reduce { a, b -&gt; a + b } } catch (e: Exception) { println("caught") }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-15">
+          <h3><a class="doc-anchor" href="#doc-throwables-15">#</a> <code>NegativeArraySizeException</code></h3>
+          <pre><code class="lang-kotlin">NegativeArraySizeException(message: String)</code></pre>
+          <p>Raised by an array builder given a negative size, such as <code>IntArray(-1)</code>.</p>
+          <pre><code class="lang-kotlin">try { IntArray(-1) } catch (e: Exception) { println("caught") }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-16">
+          <h3><a class="doc-anchor" href="#doc-throwables-16">#</a> <code>NoSuchElementException</code></h3>
+          <pre><code class="lang-kotlin">NoSuchElementException(message: String)</code></pre>
+          <p>The one built-in throwable outside <code>java.lang</code> — it is <code>java.util.NoSuchElementException</code>, and the package is observable through <code>toString</code>. Raised by <code>first</code>, <code>last</code>, <code>get</code>, <code>max</code> and <code>min</code> on an empty sequence, with the message <code>List is empty.</code></p>
+          <pre><code class="lang-kotlin">try { listOf&lt;Int&gt;().first() } catch (e: NoSuchElementException) { println(e.message) }</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-string-members">
+        <h2>String Members</h2>
+        <article class="doc-entry" id="doc-string-members-1">
+          <h3><a class="doc-anchor" href="#doc-string-members-1">#</a> <code>length</code></h3>
+          <pre><code class="lang-kotlin">String.length: Int</code></pre>
+          <p>Number of UTF-16 code units — the JVM <code>kotlin.String.length</code> contract, not the Unicode scalar count. Every index, slice and <code>indexOf</code> result uses the same basis. A non-ASCII character written inside a string literal was split into UTF-8 bytes by the lexer, so its length is counted in those bytes.</p>
+          <pre><code class="lang-kotlin">println("abc".length)   // 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-members-2">
+          <h3><a class="doc-anchor" href="#doc-string-members-2">#</a> <code>uppercase</code></h3>
+          <pre><code class="lang-kotlin">String.uppercase(): String</code></pre>
+          <p>Full Unicode uppercase mapping, so a character whose mapping expands does expand (<code>ß</code> becomes <code>SS</code>). No locale argument is accepted.</p>
+          <pre><code class="lang-kotlin">println("abc".uppercase())   // ABC</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-members-3">
+          <h3><a class="doc-anchor" href="#doc-string-members-3">#</a> <code>toUpperCase</code></h3>
+          <pre><code class="lang-kotlin">String.toUpperCase(): String</code></pre>
+          <p>The deprecated Kotlin spelling of <code>uppercase</code>, accepted here and dispatching to the same implementation.</p>
+          <pre><code class="lang-kotlin">println("abc".toUpperCase())   // ABC</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-members-4">
+          <h3><a class="doc-anchor" href="#doc-string-members-4">#</a> <code>lowercase</code></h3>
+          <pre><code class="lang-kotlin">String.lowercase(): String</code></pre>
+          <p>Full Unicode lowercase mapping. No locale argument is accepted.</p>
+          <pre><code class="lang-kotlin">println("ABC".lowercase())   // abc</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-members-5">
+          <h3><a class="doc-anchor" href="#doc-string-members-5">#</a> <code>toLowerCase</code></h3>
+          <pre><code class="lang-kotlin">String.toLowerCase(): String</code></pre>
+          <p>The deprecated Kotlin spelling of <code>lowercase</code>, dispatching to the same implementation.</p>
+          <pre><code class="lang-kotlin">println("ABC".toLowerCase())   // abc</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-members-6">
+          <h3><a class="doc-anchor" href="#doc-string-members-6">#</a> <code>trim</code></h3>
+          <pre><code class="lang-kotlin">String.trim(): String</code></pre>
+          <p>Strips leading and trailing whitespace, by Unicode's whitespace definition. There is no predicate or char-set overload, and no <code>trimStart</code>/<code>trimEnd</code>/<code>trimIndent</code>.</p>
+          <pre><code class="lang-kotlin">println("  hi  ".trim())   // hi</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-members-7">
+          <h3><a class="doc-anchor" href="#doc-string-members-7">#</a> <code>isEmpty</code></h3>
+          <pre><code class="lang-kotlin">String.isEmpty(): Boolean</code></pre>
+          <p>True when the string has no code units at all.</p>
+          <pre><code class="lang-kotlin">println("".isEmpty())   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-members-8">
+          <h3><a class="doc-anchor" href="#doc-string-members-8">#</a> <code>isNotEmpty</code></h3>
+          <pre><code class="lang-kotlin">String.isNotEmpty(): Boolean</code></pre>
+          <p>The negation of <code>isEmpty</code>.</p>
+          <pre><code class="lang-kotlin">println("a".isNotEmpty())   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-members-9">
+          <h3><a class="doc-anchor" href="#doc-string-members-9">#</a> <code>isBlank</code></h3>
+          <pre><code class="lang-kotlin">String.isBlank(): Boolean</code></pre>
+          <p>True when the string is empty or made only of whitespace.</p>
+          <pre><code class="lang-kotlin">println("  ".isBlank())   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-members-10">
+          <h3><a class="doc-anchor" href="#doc-string-members-10">#</a> <code>isNotBlank</code></h3>
+          <pre><code class="lang-kotlin">String.isNotBlank(): Boolean</code></pre>
+          <p>The negation of <code>isBlank</code>.</p>
+          <pre><code class="lang-kotlin">println(" x ".isNotBlank())   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-members-11">
+          <h3><a class="doc-anchor" href="#doc-string-members-11">#</a> <code>contains</code></h3>
+          <pre><code class="lang-kotlin">String.contains(other: Any): Boolean</code></pre>
+          <p>Substring test. The argument is rendered by the same stringifier <code>println</code> uses, so a <code>Char</code> argument reads as its character — but an <code>Int</code> reads as its digits, which means <code>"abc".contains(97)</code> is <code>false</code> where the JVM's <code>Char</code> overload would say <code>true</code>. There is no <code>ignoreCase</code> parameter and no <code>Regex</code> overload.</p>
+          <pre><code class="lang-kotlin">println("abc".contains("bc"))   // true
+println("abc".contains('b'))     // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-members-12">
+          <h3><a class="doc-anchor" href="#doc-string-members-12">#</a> <code>startsWith</code></h3>
+          <pre><code class="lang-kotlin">String.startsWith(prefix: Any): Boolean</code></pre>
+          <p>Prefix test, with the argument rendered the same way <code>contains</code> renders it. No <code>ignoreCase</code> or start-offset parameter.</p>
+          <pre><code class="lang-kotlin">println("abc".startsWith("ab"))   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-members-13">
+          <h3><a class="doc-anchor" href="#doc-string-members-13">#</a> <code>endsWith</code></h3>
+          <pre><code class="lang-kotlin">String.endsWith(suffix: Any): Boolean</code></pre>
+          <p>Suffix test. No <code>ignoreCase</code> parameter.</p>
+          <pre><code class="lang-kotlin">println("abc".endsWith("bc"))   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-members-14">
+          <h3><a class="doc-anchor" href="#doc-string-members-14">#</a> <code>plus</code></h3>
+          <pre><code class="lang-kotlin">String.plus(other: Any): String</code></pre>
+          <p>The method spelling of <code>+</code> — what <code>a + b</code> compiles to on the JVM, and the form <code>+</code> has to take to be reached through a safe call.</p>
+          <pre><code class="lang-kotlin">println("ab".plus("c"))   // abc</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-members-15">
+          <h3><a class="doc-anchor" href="#doc-string-members-15">#</a> <code>replace</code></h3>
+          <pre><code class="lang-kotlin">String.replace(old: Any, new: Any): String</code></pre>
+          <p>Replaces every occurrence of a literal substring. There is no <code>Regex</code> overload and no <code>ignoreCase</code> parameter.</p>
+          <pre><code class="lang-kotlin">println("a-b-c".replace("-", "+"))   // a+b+c</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-members-16">
+          <h3><a class="doc-anchor" href="#doc-string-members-16">#</a> <code>repeat</code></h3>
+          <pre><code class="lang-kotlin">String.repeat(n: Int): String</code></pre>
+          <p>Concatenates the string with itself <code>n</code> times. <code>n</code> of zero yields the empty string; a negative <code>n</code> raises <code>IllegalArgumentException: Count 'n' must be non-negative, but was N.</code></p>
+          <pre><code class="lang-kotlin">println("ab".repeat(2))   // abab</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-members-17">
+          <h3><a class="doc-anchor" href="#doc-string-members-17">#</a> <code>indexOf</code></h3>
+          <pre><code class="lang-kotlin">String.indexOf(needle: Any): Int</code></pre>
+          <p>UTF-16 offset of the first occurrence, or -1 when there is none. There is no start-index parameter and no <code>lastIndexOf</code>.</p>
+          <pre><code class="lang-kotlin">println("abc".indexOf("c"))   // 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-members-18">
+          <h3><a class="doc-anchor" href="#doc-string-members-18">#</a> <code>substring</code></h3>
+          <pre><code class="lang-kotlin">String.substring(start: Int): String
+String.substring(start: Int, end: Int): String</code></pre>
+          <p>Slice between two UTF-16 offsets, <code>end</code> exclusive and defaulting to the length. An out-of-range or inverted pair raises <code>StringIndexOutOfBoundsException: Range [start, end) out of bounds for length N</code>.</p>
+          <pre><code class="lang-kotlin">println("hello".substring(1, 3))   // el</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-char-members">
+        <h2>Char Members</h2>
+        <article class="doc-entry" id="doc-char-members-1">
+          <h3><a class="doc-anchor" href="#doc-char-members-1">#</a> <code>code</code></h3>
+          <pre><code class="lang-kotlin">Char.code: Int</code></pre>
+          <p>The character's UTF-16 code unit as an <code>Int</code>. The inverse is <code>Int.toChar()</code>.</p>
+          <pre><code class="lang-kotlin">println('A'.code)   // 65</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-char-members-2">
+          <h3><a class="doc-anchor" href="#doc-char-members-2">#</a> <code>digitToInt</code></h3>
+          <pre><code class="lang-kotlin">Char.digitToInt(): Int</code></pre>
+          <p>The decimal value of a digit character. Radix 10 only — no radix parameter — and a non-digit raises <code>IllegalArgumentException: Char c is not a decimal digit</code>. There is no <code>digitToIntOrNull</code>.</p>
+          <pre><code class="lang-kotlin">println('7'.digitToInt())   // 7</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-char-members-3">
+          <h3><a class="doc-anchor" href="#doc-char-members-3">#</a> <code>isDigit</code></h3>
+          <pre><code class="lang-kotlin">Char.isDigit(): Boolean</code></pre>
+          <p>True for a Unicode numeric character. The classification delegates to Rust's Unicode tables, which agree with the JVM's <code>Character</code> over ASCII.</p>
+          <pre><code class="lang-kotlin">println('7'.isDigit())   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-char-members-4">
+          <h3><a class="doc-anchor" href="#doc-char-members-4">#</a> <code>isLetter</code></h3>
+          <pre><code class="lang-kotlin">Char.isLetter(): Boolean</code></pre>
+          <p>True for a Unicode alphabetic character. A lone surrogate half is neither letter nor digit, on this runtime and on the JVM alike.</p>
+          <pre><code class="lang-kotlin">println('a'.isLetter())   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-char-members-5">
+          <h3><a class="doc-anchor" href="#doc-char-members-5">#</a> <code>isLetterOrDigit</code></h3>
+          <pre><code class="lang-kotlin">Char.isLetterOrDigit(): Boolean</code></pre>
+          <p>True for a Unicode alphanumeric character.</p>
+          <pre><code class="lang-kotlin">println('_'.isLetterOrDigit())   // false</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-char-members-6">
+          <h3><a class="doc-anchor" href="#doc-char-members-6">#</a> <code>isWhitespace</code></h3>
+          <pre><code class="lang-kotlin">Char.isWhitespace(): Boolean</code></pre>
+          <p>True for a Unicode whitespace character.</p>
+          <pre><code class="lang-kotlin">println(' '.isWhitespace())   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-char-members-7">
+          <h3><a class="doc-anchor" href="#doc-char-members-7">#</a> <code>isUpperCase</code></h3>
+          <pre><code class="lang-kotlin">Char.isUpperCase(): Boolean</code></pre>
+          <p>True for a Unicode uppercase character.</p>
+          <pre><code class="lang-kotlin">println('A'.isUpperCase())   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-char-members-8">
+          <h3><a class="doc-anchor" href="#doc-char-members-8">#</a> <code>isLowerCase</code></h3>
+          <pre><code class="lang-kotlin">Char.isLowerCase(): Boolean</code></pre>
+          <p>True for a Unicode lowercase character.</p>
+          <pre><code class="lang-kotlin">println('a'.isLowerCase())   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-char-members-9">
+          <h3><a class="doc-anchor" href="#doc-char-members-9">#</a> <code>uppercaseChar</code></h3>
+          <pre><code class="lang-kotlin">Char.uppercaseChar(): Char</code></pre>
+          <p>The uppercase mapping as a single <code>Char</code>. When the mapping would expand to more than one character the original is kept — the JVM's <code>Character.toUpperCase(char)</code> contract, so <code>'ß'.uppercaseChar()</code> is still <code>'ß'</code>.</p>
+          <pre><code class="lang-kotlin">println('a'.uppercaseChar())   // A</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-char-members-10">
+          <h3><a class="doc-anchor" href="#doc-char-members-10">#</a> <code>lowercaseChar</code></h3>
+          <pre><code class="lang-kotlin">Char.lowercaseChar(): Char</code></pre>
+          <p>The lowercase mapping as a single <code>Char</code>, keeping the original when the mapping would expand.</p>
+          <pre><code class="lang-kotlin">println('A'.lowercaseChar())   // a</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-char-members-11">
+          <h3><a class="doc-anchor" href="#doc-char-members-11">#</a> <code>uppercase</code></h3>
+          <pre><code class="lang-kotlin">Char.uppercase(): String</code></pre>
+          <p>The full uppercase mapping as a <code>String</code>, which is what lets an expanding mapping expand — unlike <code>uppercaseChar</code>.</p>
+          <pre><code class="lang-kotlin">println('a'.uppercase())   // A</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-char-members-12">
+          <h3><a class="doc-anchor" href="#doc-char-members-12">#</a> <code>lowercase</code></h3>
+          <pre><code class="lang-kotlin">Char.lowercase(): String</code></pre>
+          <p>The full lowercase mapping as a <code>String</code>.</p>
+          <pre><code class="lang-kotlin">println('A'.lowercase())   // a</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-char-members-13">
+          <h3><a class="doc-anchor" href="#doc-char-members-13">#</a> <code>compareTo</code></h3>
+          <pre><code class="lang-kotlin">Char.compareTo(other: Char): Int</code></pre>
+          <p>Orders two characters by code unit. It returns the sign only — -1, 0 or 1 — where the JVM returns the code-unit difference. The sign is all Kotlin's <code>Comparable</code> contract promises, but a program that reads the magnitude will see a different number here.</p>
+          <pre><code class="lang-kotlin">println('b'.compareTo('a'))   // 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-char-members-14">
+          <h3><a class="doc-anchor" href="#doc-char-members-14">#</a> <code>plus</code></h3>
+          <pre><code class="lang-kotlin">Char.plus(n: Int): Char</code></pre>
+          <p>Displaces the code unit upward, yielding a <code>Char</code>. The result wraps into 16 bits.</p>
+          <pre><code class="lang-kotlin">println('A'.plus(1))   // B</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-char-members-15">
+          <h3><a class="doc-anchor" href="#doc-char-members-15">#</a> <code>minus</code></h3>
+          <pre><code class="lang-kotlin">Char.minus(n: Int): Char
+Char.minus(other: Char): Int</code></pre>
+          <p>Two behaviours chosen by the argument: subtracting an <code>Int</code> displaces the code unit and yields a <code>Char</code>; subtracting another <code>Char</code> yields the <code>Int</code> distance between them.</p>
+          <pre><code class="lang-kotlin">println('c'.minus(1))     // b
+println('c'.minus('a'))   // 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-char-members-16">
+          <h3><a class="doc-anchor" href="#doc-char-members-16">#</a> <code>equals</code></h3>
+          <pre><code class="lang-kotlin">Char.equals(other: Any?): Boolean</code></pre>
+          <p>Code-unit equality. A <code>Char</code> is a tagged handle rather than a heap object, so this needs no heap read.</p>
+          <pre><code class="lang-kotlin">println('a'.equals('a'))   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-char-members-17">
+          <h3><a class="doc-anchor" href="#doc-char-members-17">#</a> <code>hashCode</code></h3>
+          <pre><code class="lang-kotlin">Char.hashCode(): Int</code></pre>
+          <p>The code unit itself, matching the JVM's <code>Character.hashCode</code>.</p>
+          <pre><code class="lang-kotlin">println('A'.hashCode())   // 65</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-char-members-18">
+          <h3><a class="doc-anchor" href="#doc-char-members-18">#</a> <code>toString</code></h3>
+          <pre><code class="lang-kotlin">Char.toString(): String</code></pre>
+          <p>The one-character string. The compiler resolves this statically from the receiver's type rather than through the generic stringifier, because the runtime representation alone could not tell a <code>Char</code> from a number.</p>
+          <pre><code class="lang-kotlin">println('A'.toString() + "!")   // A!</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-sequence-members">
+        <h2>Sequence Members</h2>
+        <article class="doc-entry" id="doc-sequence-members-1">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-1">#</a> <code>size</code></h3>
+          <pre><code class="lang-kotlin">size: Int</code></pre>
+          <p>Element count. Implemented once and shared by <code>List</code>, <code>Set</code>, <code>Array</code> and a range, so the four cannot drift apart. <code>count()</code> with no argument is the same call.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).size)   // 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-2">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-2">#</a> <code>count</code></h3>
+          <pre><code class="lang-kotlin">count(): Int</code></pre>
+          <p>Element count, identical to <code>size</code> when called with no argument. With a lambda it is instead the predicate-counting higher-order function.</p>
+          <pre><code class="lang-kotlin">println((1..5).count())   // 5</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-3">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-3">#</a> <code>isEmpty</code></h3>
+          <pre><code class="lang-kotlin">isEmpty(): Boolean</code></pre>
+          <p>True when the sequence holds no elements.</p>
+          <pre><code class="lang-kotlin">println(emptyList&lt;Int&gt;().isEmpty())   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-4">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-4">#</a> <code>isNotEmpty</code></h3>
+          <pre><code class="lang-kotlin">isNotEmpty(): Boolean</code></pre>
+          <p>The negation of <code>isEmpty</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(1).isNotEmpty())   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-5">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-5">#</a> <code>first</code></h3>
+          <pre><code class="lang-kotlin">first(): T</code></pre>
+          <p>The first element. On a range it is instead a progression *property* — the start value, defined even when the range is empty. On a list, set or array an empty receiver raises <code>NoSuchElementException: List is empty.</code> There is no <code>firstOrNull</code> and no predicate overload.</p>
+          <pre><code class="lang-kotlin">println(listOf(10, 20).first())   // 10</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-6">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-6">#</a> <code>last</code></h3>
+          <pre><code class="lang-kotlin">last(): T</code></pre>
+          <p>The last element, or a range's end value as a progression property. An empty list, set or array raises <code>NoSuchElementException</code>. There is no <code>lastOrNull</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(10, 20).last())   // 20</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-7">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-7">#</a> <code>get</code></h3>
+          <pre><code class="lang-kotlin">get(index: Int): T</code></pre>
+          <p>Element at a position. Out of range it raises <code>NoSuchElementException: List is empty.</code> — which diverges from Kotlin, and from the <code>[]</code> operator on the same receiver, which raises <code>ArrayIndexOutOfBoundsException</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(10, 20).get(1))   // 20</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-8">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-8">#</a> <code>contains</code></h3>
+          <pre><code class="lang-kotlin">contains(element: T): Boolean</code></pre>
+          <p>Membership by structural equality — the same comparison <code>==</code> uses, so a nested list or data-class element compares by value.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2).contains(2))   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-9">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-9">#</a> <code>indexOf</code></h3>
+          <pre><code class="lang-kotlin">indexOf(element: T): Int</code></pre>
+          <p>Position of the first structurally equal element, or -1. There is no <code>lastIndexOf</code> and no <code>indexOfFirst</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf("a", "b").indexOf("b"))   // 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-10">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-10">#</a> <code>sum</code></h3>
+          <pre><code class="lang-kotlin">sum(): Int
+sum(): Double</code></pre>
+          <p>Adds the elements. The result is an <code>Int</code> when every element is integral and a <code>Double</code> otherwise — so a mixed sequence sums to a <code>Double</code>. An empty sequence sums to <code>0</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).sum())   // 6</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-11">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-11">#</a> <code>average</code></h3>
+          <pre><code class="lang-kotlin">average(): Double</code></pre>
+          <p>Arithmetic mean, always a <code>Double</code>. An empty sequence averages to <code>NaN</code> rather than raising, matching Kotlin.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2).average())   // 1.5</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-12">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-12">#</a> <code>max</code></h3>
+          <pre><code class="lang-kotlin">max(): T</code></pre>
+          <p>The largest element — strings lexicographically, chars by code unit, everything else numerically. An empty sequence raises <code>NoSuchElementException</code>. kotlinrs implements the pre-1.4 spelling only: there is no <code>maxOrNull</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(3, 1, 2).max())   // 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-13">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-13">#</a> <code>min</code></h3>
+          <pre><code class="lang-kotlin">min(): T</code></pre>
+          <p>The smallest element, by the same ordering as <code>max</code>, raising on an empty sequence. There is no <code>minOrNull</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(3, 1, 2).min())   // 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-14">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-14">#</a> <code>toList</code></h3>
+          <pre><code class="lang-kotlin">toList(): List&lt;T&gt;</code></pre>
+          <p>A <code>List</code> holding the same elements, in order. On a range this is what materializes it.</p>
+          <pre><code class="lang-kotlin">println((1..3).toList())   // [1, 2, 3]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-15">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-15">#</a> <code>toMutableList</code></h3>
+          <pre><code class="lang-kotlin">toMutableList(): MutableList&lt;T&gt;</code></pre>
+          <p>The same copy <code>toList</code> makes — <code>List</code> and <code>MutableList</code> are one runtime object here.</p>
+          <pre><code class="lang-kotlin">println(setOf(1, 2).toMutableList())   // [1, 2]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-16">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-16">#</a> <code>toTypedArray</code></h3>
+          <pre><code class="lang-kotlin">toTypedArray(): Array&lt;T&gt;</code></pre>
+          <p>Yields a <code>List</code>, not an <code>Array</code> — it shares <code>toList</code>'s implementation. This diverges from Kotlin: the result prints its elements as <code>[1, 2]</code> and compares structurally, where a real array would print its JVM descriptor and compare by identity.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2).toTypedArray())   // [1, 2]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-17">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-17">#</a> <code>asList</code></h3>
+          <pre><code class="lang-kotlin">asList(): List&lt;T&gt;</code></pre>
+          <p>A <code>List</code> over the same elements. It is a copy here rather than a view, so mutating the receiver afterwards does not show through.</p>
+          <pre><code class="lang-kotlin">println(intArrayOf(1, 2).asList())   // [1, 2]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-18">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-18">#</a> <code>toSet</code></h3>
+          <pre><code class="lang-kotlin">toSet(): Set&lt;T&gt;</code></pre>
+          <p>A <code>Set</code> of the distinct elements, first occurrence kept, in encounter order.</p>
+          <pre><code class="lang-kotlin">println(listOf(3, 1, 3).toSet())   // [3, 1]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-19">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-19">#</a> <code>toMutableSet</code></h3>
+          <pre><code class="lang-kotlin">toMutableSet(): MutableSet&lt;T&gt;</code></pre>
+          <p>The same distinct <code>Set</code> <code>toSet</code> builds.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 1).toMutableSet())   // [1]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-20">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-20">#</a> <code>toHashSet</code></h3>
+          <pre><code class="lang-kotlin">toHashSet(): MutableSet&lt;T&gt;</code></pre>
+          <p>The same insertion-ordered distinct <code>Set</code>. Kotlin's <code>HashSet</code> gives no order guarantee; here encounter order is always kept.</p>
+          <pre><code class="lang-kotlin">println(listOf(2, 1, 2).toHashSet())   // [2, 1]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-21">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-21">#</a> <code>distinct</code></h3>
+          <pre><code class="lang-kotlin">distinct(): List&lt;T&gt;</code></pre>
+          <p>The distinct elements as a **<code>List</code>**, where <code>toSet</code> gives the same elements as a <code>Set</code>. That is the whole difference between the two, and it decides how the result compares and prints.</p>
+          <pre><code class="lang-kotlin">println(listOf(3, 1, 3).distinct())   // [3, 1]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-22">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-22">#</a> <code>union</code></h3>
+          <pre><code class="lang-kotlin">union(other: Iterable&lt;T&gt;): Set&lt;T&gt;</code></pre>
+          <p>Distinct elements of the receiver followed by those of the argument, as a <code>Set</code>. Defined on any iterable receiver, and always returning a <code>Set</code> whatever kind the receiver was. Only the method form parses — <code>a union b</code> as an infix call is a syntax error.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2).union(listOf(2, 3)))   // [1, 2, 3]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-23">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-23">#</a> <code>intersect</code></h3>
+          <pre><code class="lang-kotlin">intersect(other: Iterable&lt;T&gt;): Set&lt;T&gt;</code></pre>
+          <p>Distinct receiver elements that also appear in the argument, as a <code>Set</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).intersect(listOf(2, 3, 4)))   // [2, 3]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-24">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-24">#</a> <code>subtract</code></h3>
+          <pre><code class="lang-kotlin">subtract(other: Iterable&lt;T&gt;): Set&lt;T&gt;</code></pre>
+          <p>Distinct receiver elements that do not appear in the argument, as a <code>Set</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).subtract(listOf(2)))   // [1, 3]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-25">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-25">#</a> <code>sorted</code></h3>
+          <pre><code class="lang-kotlin">sorted(): List&lt;T&gt;</code></pre>
+          <p>Ascending sort into a new <code>List</code> — strings lexicographically, chars by code unit, everything else numerically. There is no <code>sortedWith</code> and no in-place <code>sort</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(3, 1, 2).sorted())   // [1, 2, 3]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-26">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-26">#</a> <code>sortedDescending</code></h3>
+          <pre><code class="lang-kotlin">sortedDescending(): List&lt;T&gt;</code></pre>
+          <p>Descending sort into a new <code>List</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(3, 1, 2).sortedDescending())   // [3, 2, 1]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-27">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-27">#</a> <code>take</code></h3>
+          <pre><code class="lang-kotlin">take(n: Int): List&lt;T&gt;</code></pre>
+          <p>The first <code>n</code> elements as a <code>List</code>. An oversized <code>n</code> clamps to the whole sequence; a negative one raises <code>IllegalArgumentException: Requested element count N is less than zero.</code> There is no <code>takeWhile</code> and no <code>takeLast</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).take(2))   // [1, 2]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-28">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-28">#</a> <code>drop</code></h3>
+          <pre><code class="lang-kotlin">drop(n: Int): List&lt;T&gt;</code></pre>
+          <p>Everything after the first <code>n</code> elements, as a <code>List</code>. An oversized <code>n</code> yields an empty list; a negative one raises <code>IllegalArgumentException</code>. There is no <code>dropWhile</code> and no <code>dropLast</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).drop(1))   // [2, 3]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-29">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-29">#</a> <code>joinToString</code></h3>
+          <pre><code class="lang-kotlin">joinToString(): String
+joinToString(separator: Any): String</code></pre>
+          <p>Renders the elements with the same stringifier <code>println</code> uses, joined by a separator that defaults to <code>", "</code>. Only the separator parameter exists — there is no <code>prefix</code>, <code>postfix</code>, <code>limit</code> or <code>transform</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).joinToString("-"))   // 1-2-3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-30">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-30">#</a> <code>reversed</code></h3>
+          <pre><code class="lang-kotlin">reversed(): List&lt;T&gt;
+IntRange.reversed(): IntProgression</code></pre>
+          <p>Reverses the order. On a list, set or array the result is a reversed <code>List</code>; on a range it is instead a descending <code>IntProgression</code>, which prints in its <code>b downTo a step 1</code> form.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).reversed())   // [3, 2, 1]
+println((1..3).reversed())            // 3 downTo 1 step 1</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-mutable-collection-members">
+        <h2>Mutable Collection Members</h2>
+        <article class="doc-entry" id="doc-mutable-collection-members-1">
+          <h3><a class="doc-anchor" href="#doc-mutable-collection-members-1">#</a> <code>add</code></h3>
+          <pre><code class="lang-kotlin">MutableList.add(element: T): Boolean
+MutableSet.add(element: T): Boolean</code></pre>
+          <p>Appends to a list, always answering <code>true</code>; on a set it inserts only when the element is new and answers whether it was. That difference in the answer is Kotlin's contract and is why one implementation serves both.</p>
+          <pre><code class="lang-kotlin">val s = mutableSetOf(1)
+println(s.add(1))   // false
+println(s.add(2))   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-mutable-collection-members-2">
+          <h3><a class="doc-anchor" href="#doc-mutable-collection-members-2">#</a> <code>remove</code></h3>
+          <pre><code class="lang-kotlin">MutableList.remove(element: T): Boolean
+MutableSet.remove(element: T): Boolean
+MutableMap.remove(key: K): Boolean</code></pre>
+          <p>Removes the first structurally equal element (or the entry under the key) and answers whether anything was removed. On a <code>Map</code> this diverges from Kotlin, which answers the removed *value* or <code>null</code>; here it is always a <code>Boolean</code>.</p>
+          <pre><code class="lang-kotlin">val xs = mutableListOf(1, 2)
+println(xs.remove(1))   // true
+println(xs)             // [2]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-mutable-collection-members-3">
+          <h3><a class="doc-anchor" href="#doc-mutable-collection-members-3">#</a> <code>removeAt</code></h3>
+          <pre><code class="lang-kotlin">MutableList.removeAt(index: Int): T</code></pre>
+          <p>Removes the element at a position and answers it. Out of range it raises <code>IndexOutOfBoundsException</code>. Lists only — a set has no positional removal.</p>
+          <pre><code class="lang-kotlin">val xs = mutableListOf(1, 2)
+println(xs.removeAt(0))   // 1</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-map-members">
+        <h2>Map Members</h2>
+        <article class="doc-entry" id="doc-map-members-1">
+          <h3><a class="doc-anchor" href="#doc-map-members-1">#</a> <code>size</code></h3>
+          <pre><code class="lang-kotlin">Map.size: Int</code></pre>
+          <p>Number of entries.</p>
+          <pre><code class="lang-kotlin">println(mapOf("a" to 1, "b" to 2).size)   // 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-members-2">
+          <h3><a class="doc-anchor" href="#doc-map-members-2">#</a> <code>isEmpty</code></h3>
+          <pre><code class="lang-kotlin">Map.isEmpty(): Boolean</code></pre>
+          <p>True when the map has no entries.</p>
+          <pre><code class="lang-kotlin">println(emptyMap&lt;String, Int&gt;().isEmpty())   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-members-3">
+          <h3><a class="doc-anchor" href="#doc-map-members-3">#</a> <code>isNotEmpty</code></h3>
+          <pre><code class="lang-kotlin">Map.isNotEmpty(): Boolean</code></pre>
+          <p>The negation of <code>isEmpty</code>.</p>
+          <pre><code class="lang-kotlin">println(mapOf("a" to 1).isNotEmpty())   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-members-4">
+          <h3><a class="doc-anchor" href="#doc-map-members-4">#</a> <code>containsKey</code></h3>
+          <pre><code class="lang-kotlin">Map.containsKey(key: K): Boolean</code></pre>
+          <p>Whether a structurally equal key is present. It is a linear scan of the entry list, not a hash lookup. There is no <code>containsValue</code>.</p>
+          <pre><code class="lang-kotlin">println(mapOf("a" to 1).containsKey("a"))   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-members-5">
+          <h3><a class="doc-anchor" href="#doc-map-members-5">#</a> <code>get</code></h3>
+          <pre><code class="lang-kotlin">Map.get(key: K): V?</code></pre>
+          <p>The value under a key, or <code>null</code> when the key is absent — the same lookup <code>m[k]</code> performs. It never raises. There is no <code>getOrDefault</code> or <code>getOrElse</code>.</p>
+          <pre><code class="lang-kotlin">println(mapOf("a" to 1).get("z"))   // null</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-members-6">
+          <h3><a class="doc-anchor" href="#doc-map-members-6">#</a> <code>keys</code></h3>
+          <pre><code class="lang-kotlin">Map.keys: List&lt;K&gt;</code></pre>
+          <p>The keys in insertion order. It returns a **<code>List</code>**, not the <code>Set</code> Kotlin returns — so it prints as <code>[a, b]</code> and compares order-sensitively.</p>
+          <pre><code class="lang-kotlin">println(mapOf("a" to 1, "b" to 2).keys)   // [a, b]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-members-7">
+          <h3><a class="doc-anchor" href="#doc-map-members-7">#</a> <code>values</code></h3>
+          <pre><code class="lang-kotlin">Map.values: List&lt;V&gt;</code></pre>
+          <p>The values in insertion order, as a <code>List</code>. There is no <code>entries</code> member.</p>
+          <pre><code class="lang-kotlin">println(mapOf("a" to 1, "b" to 2).values)   // [1, 2]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-members-8">
+          <h3><a class="doc-anchor" href="#doc-map-members-8">#</a> <code>put</code></h3>
+          <pre><code class="lang-kotlin">MutableMap.put(key: K, value: V): V?</code></pre>
+          <p>Sets a key, appending the entry when it is new. It answers the previous value, or <code>null</code> when there was none — the same write <code>m[k] = v</code> performs.</p>
+          <pre><code class="lang-kotlin">val m = mutableMapOf("a" to 1)
+println(m.put("a", 2))   // 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-members-9">
+          <h3><a class="doc-anchor" href="#doc-map-members-9">#</a> <code>remove</code></h3>
+          <pre><code class="lang-kotlin">MutableMap.remove(key: K): Boolean</code></pre>
+          <p>Drops the entry under a key. It answers a <code>Boolean</code> — whether anything was removed — where Kotlin answers the removed value or <code>null</code>.</p>
+          <pre><code class="lang-kotlin">val m = mutableMapOf("a" to 1)
+println(m.remove("a"))   // true</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-pair-members">
+        <h2>Pair Members</h2>
+        <article class="doc-entry" id="doc-pair-members-1">
+          <h3><a class="doc-anchor" href="#doc-pair-members-1">#</a> <code>first</code></h3>
+          <pre><code class="lang-kotlin">Pair.first: A</code></pre>
+          <p>The left half of a <code>Pair</code>. Also reachable as <code>component1()</code>, which is what destructuring uses.</p>
+          <pre><code class="lang-kotlin">println((1 to "one").first)   // 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-pair-members-2">
+          <h3><a class="doc-anchor" href="#doc-pair-members-2">#</a> <code>second</code></h3>
+          <pre><code class="lang-kotlin">Pair.second: B</code></pre>
+          <p>The right half of a <code>Pair</code>, also reachable as <code>component2()</code>.</p>
+          <pre><code class="lang-kotlin">println((1 to "one").second)   // one</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-numeric-members">
+        <h2>Numeric Members</h2>
+        <article class="doc-entry" id="doc-numeric-members-1">
+          <h3><a class="doc-anchor" href="#doc-numeric-members-1">#</a> <code>plus</code></h3>
+          <pre><code class="lang-kotlin">Int.plus(other: Int): Int
+Double.plus(other: Double): Double</code></pre>
+          <p>The method spelling of <code>+</code> — the form the operator has to take to be reached through a safe call, as in <code>count?.plus(1)</code>. Two integral operands wrap; any <code>Double</code> operand makes the result <code>Double</code>.</p>
+          <pre><code class="lang-kotlin">println(2.plus(3))   // 5</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-numeric-members-2">
+          <h3><a class="doc-anchor" href="#doc-numeric-members-2">#</a> <code>minus</code></h3>
+          <pre><code class="lang-kotlin">Int.minus(other: Int): Int
+Double.minus(other: Double): Double</code></pre>
+          <p>The method spelling of <code>-</code>.</p>
+          <pre><code class="lang-kotlin">println(5.minus(2))   // 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-numeric-members-3">
+          <h3><a class="doc-anchor" href="#doc-numeric-members-3">#</a> <code>times</code></h3>
+          <pre><code class="lang-kotlin">Int.times(other: Int): Int
+Double.times(other: Double): Double</code></pre>
+          <p>The method spelling of <code>*</code>, wrapping on two integral operands.</p>
+          <pre><code class="lang-kotlin">println(6.times(7))   // 42</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-numeric-members-4">
+          <h3><a class="doc-anchor" href="#doc-numeric-members-4">#</a> <code>div</code></h3>
+          <pre><code class="lang-kotlin">Int.div(other: Int): Int
+Double.div(other: Double): Double</code></pre>
+          <p>The method spelling of <code>/</code>. Two integral operands truncate toward zero and a zero divisor raises <code>ArithmeticException: / by zero</code>; a <code>Double</code> operand switches to IEEE division.</p>
+          <pre><code class="lang-kotlin">println(7.div(2))     // 3
+println(2.5.div(2.0)) // 1.25</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-numeric-members-5">
+          <h3><a class="doc-anchor" href="#doc-numeric-members-5">#</a> <code>rem</code></h3>
+          <pre><code class="lang-kotlin">Int.rem(other: Int): Int
+Double.rem(other: Double): Double</code></pre>
+          <p>The method spelling of <code>%</code>, taking the dividend's sign for integers and raising on a zero integral divisor.</p>
+          <pre><code class="lang-kotlin">println(7.rem(2))   // 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-numeric-members-6">
+          <h3><a class="doc-anchor" href="#doc-numeric-members-6">#</a> <code>toDouble</code></h3>
+          <pre><code class="lang-kotlin">Int.toDouble(): Double
+Double.toDouble(): Double</code></pre>
+          <p>Widens to <code>Double</code>, which is what makes a following <code>/</code> divide in IEEE rather than truncate.</p>
+          <pre><code class="lang-kotlin">println(3.toDouble())   // 3.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-numeric-members-7">
+          <h3><a class="doc-anchor" href="#doc-numeric-members-7">#</a> <code>toInt</code></h3>
+          <pre><code class="lang-kotlin">Int.toInt(): Int
+Double.toInt(): Int</code></pre>
+          <p>Truncates a <code>Double</code> toward zero; on an integer it is the identity. There is no <code>String.toInt</code> — parsing text to a number is not implemented.</p>
+          <pre><code class="lang-kotlin">println(3.9.toInt())   // 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-numeric-members-8">
+          <h3><a class="doc-anchor" href="#doc-numeric-members-8">#</a> <code>toLong</code></h3>
+          <pre><code class="lang-kotlin">Int.toLong(): Long
+Double.toLong(): Long</code></pre>
+          <p>The same conversion <code>toInt</code> performs, since <code>Int</code> and <code>Long</code> share one 64-bit representation here.</p>
+          <pre><code class="lang-kotlin">println(3.9.toLong())   // 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-numeric-members-9">
+          <h3><a class="doc-anchor" href="#doc-numeric-members-9">#</a> <code>toChar</code></h3>
+          <pre><code class="lang-kotlin">Int.toChar(): Char</code></pre>
+          <p>The <code>Char</code> for the low 16 bits of the receiver — the inverse of <code>Char.code</code>.</p>
+          <pre><code class="lang-kotlin">println(65.toChar())   // A</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-universal-generated-members">
+        <h2>Universal &amp; Generated Members</h2>
+        <article class="doc-entry" id="doc-universal-generated-members-1">
+          <h3><a class="doc-anchor" href="#doc-universal-generated-members-1">#</a> <code>toString</code></h3>
+          <pre><code class="lang-kotlin">Any.toString(): String</code></pre>
+          <p>Renders any receiver as Kotlin would print it: a <code>Double</code> keeps its <code>.0</code>, <code>null</code> reads as <code>null</code>, a <code>List</code> as <code>[a, b]</code>, a <code>Map</code> as <code>{k=v}</code>, an array as its JVM descriptor, and a data class as <code>Name(p=v, …)</code>. In a program that overrides <code>toString</code>, calls route through a re-entrant display builtin so the override is what runs.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2).toString())   // [1, 2]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-universal-generated-members-2">
+          <h3><a class="doc-anchor" href="#doc-universal-generated-members-2">#</a> <code>hashCode</code></h3>
+          <pre><code class="lang-kotlin">Any.hashCode(): Int</code></pre>
+          <p>An order-independent structural hash over a heap object. Two structurally equal values hash equal — the property a data class's generated <code>hashCode</code> needs — but the numbers themselves are not the JVM's.</p>
+          <pre><code class="lang-kotlin">data class Pt(val x: Int, val y: Int)
+fun main() { println(Pt(1, 2).hashCode() == Pt(1, 2).hashCode()) }   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-universal-generated-members-3">
+          <h3><a class="doc-anchor" href="#doc-universal-generated-members-3">#</a> <code>equals</code></h3>
+          <pre><code class="lang-kotlin">Any.equals(other: Any?): Boolean</code></pre>
+          <p>The method spelling of <code>==</code>, with the same structural rules — including a data class comparing only its primary-constructor properties and an <code>Array</code> comparing by identity.</p>
+          <pre><code class="lang-kotlin">println(listOf(1).equals(listOf(1)))   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-universal-generated-members-4">
+          <h3><a class="doc-anchor" href="#doc-universal-generated-members-4">#</a> <code>componentN</code></h3>
+          <pre><code class="lang-kotlin">component1(): T  component2(): T  …</code></pre>
+          <p>Positional accessors, 1-based, used by <code>val (a, b) = expr</code> destructuring. Defined on a data-class instance (over its primary-constructor properties, skipping inherited fields), a <code>List</code>, a <code>Set</code>, an <code>Array</code> and a <code>Pair</code>. Destructuring works in a <code>val</code> declaration only — a <code>for ((k, v) in …)</code> header is a parse error here.</p>
+          <pre><code class="lang-kotlin">data class Pt(val x: Int, val y: Int)
+fun main() { val (a, b) = Pt(1, 2); println("$a $b") }   // 1 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-universal-generated-members-5">
+          <h3><a class="doc-anchor" href="#doc-universal-generated-members-5">#</a> <code>copy</code></h3>
+          <pre><code class="lang-kotlin">copy(vararg overrides: Any): T</code></pre>
+          <p>A data class's generated clone-with-overrides. The arguments are **positional**, overriding the leading properties in declaration order — kotlinrs has no named arguments, so <code>p.copy(y = 9)</code> is not available; <code>p.copy(9)</code> overrides the first property. It calls the primary constructor, so a data class under a superclass re-runs its <code>: Super(args)</code> header.</p>
+          <pre><code class="lang-kotlin">data class Pt(val x: Int, val y: Int)
+fun main() { println(Pt(1, 2).copy(9)) }   // Pt(x=9, y=2)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-universal-generated-members-6">
+          <h3><a class="doc-anchor" href="#doc-universal-generated-members-6">#</a> <code>message</code></h3>
+          <pre><code class="lang-kotlin">Throwable.message: String?</code></pre>
+          <p>The message a throwable was constructed with, or <code>null</code> when it was constructed without one.</p>
+          <pre><code class="lang-kotlin">try { 1 / 0 } catch (e: Exception) { println(e.message) }   // / by zero</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-higher-order-collection-functions">
+        <h2>Higher-Order Collection Functions</h2>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-1">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-1">#</a> <code>map</code></h3>
+          <pre><code class="lang-kotlin">map(transform: (T) -&gt; R): List&lt;R&gt;</code></pre>
+          <p>Applies the lambda to every element and collects the results into a <code>List</code>. The receiver may be a <code>List</code>, <code>Set</code>, <code>Array</code> or range — a range materializes first, which is what makes <code>(1..3).map { … }</code> work. A <code>Map</code> or <code>Pair</code> receiver is an unresolved reference.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).map { it * 2 })   // [2, 4, 6]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-2">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-2">#</a> <code>mapIndexed</code></h3>
+          <pre><code class="lang-kotlin">mapIndexed(transform: (Int, T) -&gt; R): List&lt;R&gt;</code></pre>
+          <p>Like <code>map</code>, but the lambda takes the element's index first and the element second. There is no <code>forEachIndexed</code> or <code>filterIndexed</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).mapIndexed { i, v -&gt; i * v })   // [0, 2, 6]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-3">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-3">#</a> <code>flatMap</code></h3>
+          <pre><code class="lang-kotlin">flatMap(transform: (T) -&gt; Iterable&lt;R&gt;): List&lt;R&gt;</code></pre>
+          <p>Applies the lambda to every element and splices each iterable result into one flat <code>List</code>. A result that is not iterable contributes nothing rather than raising.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2).flatMap { listOf(it, it) })   // [1, 1, 2, 2]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-4">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-4">#</a> <code>filter</code></h3>
+          <pre><code class="lang-kotlin">filter(predicate: (T) -&gt; Boolean): List&lt;T&gt;</code></pre>
+          <p>Keeps the elements whose predicate returns exactly <code>true</code>; a <code>null</code> or non-Boolean result counts as false. The result is always a <code>List</code>, even from a <code>Set</code> receiver.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3, 4).filter { it % 2 == 0 })   // [2, 4]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-5">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-5">#</a> <code>filterNot</code></h3>
+          <pre><code class="lang-kotlin">filterNot(predicate: (T) -&gt; Boolean): List&lt;T&gt;</code></pre>
+          <p>Keeps the elements whose predicate does *not* hold. There is no <code>filterNotNull</code> or <code>filterIsInstance</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).filterNot { it &gt; 2 })   // [1, 2]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-6">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-6">#</a> <code>forEach</code></h3>
+          <pre><code class="lang-kotlin">forEach(action: (T) -&gt; Unit): Unit</code></pre>
+          <p>Runs the lambda once per element for its side effect and yields <code>Unit</code>.</p>
+          <pre><code class="lang-kotlin">listOf(1, 2).forEach { print(it) }   // 12</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-7">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-7">#</a> <code>fold</code></h3>
+          <pre><code class="lang-kotlin">fold(initial: R, operation: (R, T) -&gt; R): R</code></pre>
+          <p>Threads an accumulator through the sequence left to right, starting from the given initial value. The lambda takes the accumulator first. It is the one higher-order function here that takes a non-lambda argument as well.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).fold(0) { acc, n -&gt; acc + n })   // 6</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-8">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-8">#</a> <code>reduce</code></h3>
+          <pre><code class="lang-kotlin">reduce(operation: (T, T) -&gt; T): T</code></pre>
+          <p>Like <code>fold</code> but seeded with the first element instead of an explicit initial. An empty receiver raises <code>UnsupportedOperationException: Empty collection can't be reduced.</code></p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).reduce { a, b -&gt; a * b })   // 6</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-9">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-9">#</a> <code>any</code></h3>
+          <pre><code class="lang-kotlin">any(predicate: (T) -&gt; Boolean): Boolean</code></pre>
+          <p>True as soon as one element satisfies the predicate, short-circuiting on the first hit. The no-argument <code>any()</code> overload is not implemented — use <code>isNotEmpty()</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).any { it &gt; 2 })   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-10">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-10">#</a> <code>all</code></h3>
+          <pre><code class="lang-kotlin">all(predicate: (T) -&gt; Boolean): Boolean</code></pre>
+          <p>True when every element satisfies the predicate, short-circuiting on the first failure. Vacuously true for an empty receiver.</p>
+          <pre><code class="lang-kotlin">println(listOf(2, 4).all { it % 2 == 0 })   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-11">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-11">#</a> <code>none</code></h3>
+          <pre><code class="lang-kotlin">none(predicate: (T) -&gt; Boolean): Boolean</code></pre>
+          <p>True when no element satisfies the predicate, short-circuiting on the first hit.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2).none { it &gt; 5 })   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-12">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-12">#</a> <code>count</code></h3>
+          <pre><code class="lang-kotlin">count(predicate: (T) -&gt; Boolean): Int</code></pre>
+          <p>How many elements satisfy the predicate. Called with no argument, <code>count()</code> is instead the sequence member that reports <code>size</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).count { it &gt; 1 })   // 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-13">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-13">#</a> <code>sumOf</code></h3>
+          <pre><code class="lang-kotlin">sumOf(selector: (T) -&gt; Int): Int
+sumOf(selector: (T) -&gt; Double): Double</code></pre>
+          <p>Sums the lambda's results, yielding an <code>Int</code> when every one is integral and a <code>Double</code> otherwise — the same rule <code>sum()</code> uses.</p>
+          <pre><code class="lang-kotlin">println(listOf("ab", "c").sumOf { it.length })   // 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-14">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-14">#</a> <code>maxByOrNull</code></h3>
+          <pre><code class="lang-kotlin">maxByOrNull(selector: (T) -&gt; R): T?</code></pre>
+          <p>The element whose selector value is largest, or <code>null</code> when the receiver is empty. Ties keep the first such element. The selector runs once per element.</p>
+          <pre><code class="lang-kotlin">println(listOf("a", "abc").maxByOrNull { it.length })   // abc</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-15">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-15">#</a> <code>minByOrNull</code></h3>
+          <pre><code class="lang-kotlin">minByOrNull(selector: (T) -&gt; R): T?</code></pre>
+          <p>The element whose selector value is smallest, or <code>null</code> on an empty receiver, keeping the first of any tie.</p>
+          <pre><code class="lang-kotlin">println(listOf("abc", "a").minByOrNull { it.length })   // a</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-16">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-16">#</a> <code>sortedBy</code></h3>
+          <pre><code class="lang-kotlin">sortedBy(selector: (T) -&gt; R): List&lt;T&gt;</code></pre>
+          <p>Ascending sort by the selector's value, evaluated once per element and stable — equal keys keep their input order.</p>
+          <pre><code class="lang-kotlin">println(listOf("abc", "a").sortedBy { it.length })   // [a, abc]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-17">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-17">#</a> <code>sortedByDescending</code></h3>
+          <pre><code class="lang-kotlin">sortedByDescending(selector: (T) -&gt; R): List&lt;T&gt;</code></pre>
+          <p>Descending sort by the selector's value. The comparison is flipped rather than the result reversed, so ties still come out in input order as Kotlin requires.</p>
+          <pre><code class="lang-kotlin">println(listOf("a", "abc").sortedByDescending { it.length })   // [abc, a]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-18">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-18">#</a> <code>associate</code></h3>
+          <pre><code class="lang-kotlin">associate(transform: (T) -&gt; Pair&lt;K, V&gt;): Map&lt;K, V&gt;</code></pre>
+          <p>Builds a <code>Map</code> from the <code>Pair</code> each lambda call returns. A lambda result that is not a <code>Pair</code> raises <code>kotlin: associate expects a Pair</code>. Later duplicate keys overwrite earlier ones.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2).associate { it to it * it })   // {1=1, 2=4}</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-19">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-19">#</a> <code>associateBy</code></h3>
+          <pre><code class="lang-kotlin">associateBy(keySelector: (T) -&gt; K): Map&lt;K, T&gt;</code></pre>
+          <p>Builds a <code>Map</code> whose keys are the lambda's results and whose values are the elements — the mirror image of <code>associateWith</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf("ab", "c").associateBy { it.length })   // {2=ab, 1=c}</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-20">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-20">#</a> <code>associateWith</code></h3>
+          <pre><code class="lang-kotlin">associateWith(valueSelector: (T) -&gt; V): Map&lt;T, V&gt;</code></pre>
+          <p>Builds a <code>Map</code> keyed by the elements, with the lambda's results as the values.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).associateWith { it * 2 })   // {1=2, 2=4, 3=6}</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-21">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-21">#</a> <code>groupBy</code></h3>
+          <pre><code class="lang-kotlin">groupBy(keySelector: (T) -&gt; K): Map&lt;K, List&lt;T&gt;&gt;</code></pre>
+          <p>Buckets the elements by the lambda's result. Keys appear in first-encounter order and each bucket keeps its elements in input order. There is no <code>groupingBy</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3, 4).groupBy { it % 2 })   // {1=[1, 3], 0=[2, 4]}</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-scope-functions">
+        <h2>Scope Functions</h2>
+        <article class="doc-entry" id="doc-scope-functions-1">
+          <h3><a class="doc-anchor" href="#doc-scope-functions-1">#</a> <code>let</code></h3>
+          <pre><code class="lang-kotlin">T.let(block: (T) -&gt; R): R</code></pre>
+          <p>Runs the block with the receiver bound to <code>it</code> and yields the block's result. Works on any receiver, not just a collection. Paired with a safe call (<code>x?.let { … }</code>) it is the null-guard idiom.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2).let { it.size })   // 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-scope-functions-2">
+          <h3><a class="doc-anchor" href="#doc-scope-functions-2">#</a> <code>also</code></h3>
+          <pre><code class="lang-kotlin">T.also(block: (T) -&gt; Unit): T</code></pre>
+          <p>Runs the block with the receiver bound to <code>it</code> for its side effect and yields the **receiver**, not the block's result — which is what makes it chainable mid-expression.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2).also { print(it.size) })   // 2[1, 2]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-scope-functions-3">
+          <h3><a class="doc-anchor" href="#doc-scope-functions-3">#</a> <code>takeIf</code></h3>
+          <pre><code class="lang-kotlin">T.takeIf(predicate: (T) -&gt; Boolean): T?</code></pre>
+          <p>Yields the receiver when the predicate returns <code>true</code>, and <code>null</code> otherwise. <code>takeUnless</code> — its negation — is not implemented.</p>
+          <pre><code class="lang-kotlin">println(5.takeIf { it &gt; 3 })   // 5
+println(2.takeIf { it &gt; 3 })   // null</code></pre>
         </article>
       </section>
 

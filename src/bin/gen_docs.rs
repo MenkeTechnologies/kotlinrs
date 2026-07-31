@@ -18,7 +18,7 @@ fn main() {
     let corpus = kotlinrs::lsp::corpus();
     let chapter_count = {
         let mut seen: Vec<&str> = Vec::new();
-        for (_, c, _, _) in corpus {
+        for (_, c, _, _, _) in corpus {
             if !seen.contains(c) {
                 seen.push(c);
             }
@@ -47,12 +47,12 @@ fn main() {
     );
 }
 
-/// A reference-corpus entry: (name, chapter, doc, example).
-type CEntry<'a> = (&'a str, &'a str, &'a str, &'a str);
+/// A reference-corpus entry: (name, chapter, signature, doc, example).
+type CEntry<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str);
 
 /// Render one `<section>` per chapter (first-seen order), each holding one
-/// `<article class="doc-entry">` per name: name heading, one-line description,
-/// and a runnable usage example.
+/// `<article class="doc-entry">` per name: an anchored heading, the entry's
+/// signature, a description of what this runtime does, and a runnable example.
 fn build_body(corpus: &[CEntry]) -> String {
     let mut chapters: Vec<(&str, Vec<&CEntry>)> = Vec::new();
     for entry in corpus {
@@ -72,18 +72,20 @@ fn build_body(corpus: &[CEntry]) -> String {
             slug = slugify(chapter),
             title = html_escape(chapter),
         );
-        for (idx, (name, _chapter, doc, example)) in entries.iter().enumerate() {
+        for (idx, (name, _chapter, sig, doc, example)) in entries.iter().enumerate() {
             let anchor = format!("doc-{}-{}", slugify(chapter), idx + 1);
             let _ = write!(
                 out,
                 "        <article class=\"doc-entry\" id=\"{anchor}\">\n\
                  \x20         <h3><a class=\"doc-anchor\" href=\"#{anchor}\">#</a> <code>{name}</code></h3>\n\
+                 \x20         <pre><code class=\"lang-kotlin\">{sig}</code></pre>\n\
                  \x20         <p>{doc}</p>\n\
                  \x20         <pre><code class=\"lang-kotlin\">{example}</code></pre>\n\
                  \x20       </article>\n",
                 anchor = anchor,
                 name = html_escape(name),
-                doc = html_escape(doc),
+                sig = html_escape(sig),
+                doc = inline_code(doc),
                 example = html_escape(example),
             );
         }
@@ -96,6 +98,35 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// HTML-escape a description and turn its Markdown inline-code spans into real
+/// `<code>` elements.
+///
+/// Corpus descriptions are written with backticks because the LSP renders them
+/// as Markdown in hover. HTML has no such convention, and the PDF pipeline reads
+/// this page as *HTML* — a stray backtick would reach LaTeX and set as a curly
+/// open-quote. Converting the pairs here gives both consumers what they want
+/// from one source string. An unpaired trailing backtick is left as literal
+/// text, which is what Markdown does too.
+fn inline_code(s: &str) -> String {
+    let mut out = String::new();
+    let mut parts = s.split('`').peekable();
+    let mut in_code = false;
+    while let Some(part) = parts.next() {
+        let escaped = html_escape(part);
+        // The final segment of an unbalanced string is prose, not code.
+        if in_code && parts.peek().is_some() {
+            let _ = write!(out, "<code>{escaped}</code>");
+        } else {
+            if in_code {
+                out.push('`');
+            }
+            out.push_str(&escaped);
+        }
+        in_code = !in_code;
+    }
+    out
 }
 
 /// Lowercase, non-alphanumeric runs collapsed to a single `-`, edges trimmed.
@@ -162,7 +193,7 @@ const HEAD: &str = r#"<!DOCTYPE html>
 
     <main class="tutorial-main">
       <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>LANGUAGE REFERENCE</h2>
-      <p class="tutorial-subtitle">Every reserved keyword, built-in type, and builtin call the current kotlinrs build recognizes, grouped by keyword then type then builtin. This page is generated from the language-server corpus (<code>src/lsp.rs</code>) by the <code>gen-docs</code> binary, so it stays in sync with what the runtime and editor tooling actually know about. Keywords mirror <code>lexer.rs</code>, types mirror <code>ast::Type::from_name</code>, and each builtin mirrors a real arm in <code>compiler::compile_call</code>.</p>
+      <p class="tutorial-subtitle">Every keyword, operator, type, builtin call and stdlib member the current kotlinrs build recognizes, grouped into chapters and carrying a signature, a description and a runnable example. This page is generated from the language-server corpus (<code>src/lsp.rs</code>) by the <code>gen-docs</code> binary, so it stays in sync with what the runtime and editor tooling actually know about: keywords mirror <code>lexer.rs</code> and the <code>parser.rs</code> modifier table, operators mirror <code>lexer::operator</code>, types mirror <code>ast::Type::from_name</code>, builtins mirror the arms of <code>compiler::compile_call</code>, and each member mirrors an arm of <code>host::kt_method</code>, <code>char_method</code>, <code>obj_method</code>, <code>sequence_member</code> or <code>coll_hof</code>. Descriptions state what <em>this</em> runtime does; where the behaviour diverges from Kotlin proper, the entry says so.</p>
 "#;
 
 const FOOT: &str = r#"
