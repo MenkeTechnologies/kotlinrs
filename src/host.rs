@@ -1846,6 +1846,9 @@ fn run_sub(vm: &mut VM, entry: usize, stack_base: usize) -> Result<Value, String
         return_ip,
         stack_base,
         slots: Vec::new(),
+        // Same identity `Op::Call` records: this frame enters the subroutine
+        // at `entry`, so `Chunk::sub_slot_names` is reachable from it.
+        entry_ip: Some(entry),
     });
     let saved_ip = vm.ip;
     vm.ip = entry;
