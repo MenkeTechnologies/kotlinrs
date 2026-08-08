@@ -120,6 +120,11 @@ fn soft_keyword(t: &Tok) -> Option<&'static str> {
     }
 }
 
+/// Whether an identifier spells one of the bitwise infix member functions.
+fn is_bitwise_infix(w: &str) -> bool {
+    matches!(w, "and" | "or" | "xor" | "shl" | "shr" | "ushr")
+}
+
 /// Whether an identifier is one of the declaration modifiers (see [`Mods`]).
 fn is_modifier_word(w: &str) -> bool {
     matches!(
@@ -605,10 +610,11 @@ impl Parser {
             self.eat(&Tok::At)?;
             let kind = match self.peek() {
                 Tok::While => self.while_stmt(Some(label))?,
+                Tok::Do => self.do_while_stmt(Some(label))?,
                 Tok::For => self.for_stmt(Some(label))?,
                 other => {
                     return Err(format!(
-                        "a label must precede a loop (`for`/`while`), found {other:?}"
+                        "a label must precede a loop (`for`/`while`/`do`), found {other:?}"
                     ))
                 }
             };
@@ -618,6 +624,16 @@ impl Parser {
             Tok::Val | Tok::Var => self.let_decl()?,
             Tok::Return => {
                 self.bump();
+                // `return@label` — a LOCAL return from the lambda (or `fun`)
+                // carrying that label. Every lambda body here compiles to its
+                // own VM frame, so a local return IS a frame return and the
+                // label needs no lowering of its own; it is consumed and
+                // dropped. (Kotlin's non-local `return` from an inline
+                // function's lambda is a different construct and is unaffected.)
+                if self.at(&Tok::At) {
+                    self.bump();
+                    self.ident()?;
+                }
                 // A `return` with no expression (Unit) — the next token starts a
                 // new statement or closes the block.
                 if matches!(self.peek(), Tok::RBrace | Tok::Semi | Tok::Eof) {
@@ -627,6 +643,7 @@ impl Parser {
                 }
             }
             Tok::While => self.while_stmt(None)?,
+            Tok::Do => self.do_while_stmt(None)?,
             Tok::For => self.for_stmt(None)?,
             Tok::If => StmtKind::If(self.if_expr()?),
             Tok::When => StmtKind::When(self.when_expr()?),
@@ -698,6 +715,18 @@ impl Parser {
         Ok(StmtKind::While { cond, body, label })
     }
 
+    /// `do { … } while (cond)`. The body is a block or a single statement, the
+    /// same two forms `while` accepts.
+    fn do_while_stmt(&mut self, label: Option<String>) -> Result<StmtKind, String> {
+        self.eat(&Tok::Do)?;
+        let body = self.loop_body()?;
+        self.eat(&Tok::While)?;
+        self.eat(&Tok::LParen)?;
+        let cond = self.expr()?;
+        self.eat(&Tok::RParen)?;
+        Ok(StmtKind::DoWhile { cond, body, label })
+    }
+
     /// A loop body: a `{ … }` block or, as Kotlin also allows, a single
     /// statement (`for (i in 1..3) println(i)`).
     fn loop_body(&mut self) -> Result<Vec<Stmt>, String> {
@@ -716,7 +745,25 @@ impl Parser {
     fn for_stmt(&mut self, label: Option<String>) -> Result<StmtKind, String> {
         self.eat(&Tok::For)?;
         self.eat(&Tok::LParen)?;
-        let var = self.ident()?;
+        // `for ((k, v) in map)` destructures each element; the plain form binds
+        // it whole. The synthetic holder name carries a `$` so it can never
+        // collide with a name the loop body writes.
+        let mut parts = Vec::new();
+        let var = if self.at(&Tok::LParen) {
+            self.bump();
+            while !self.at(&Tok::RParen) {
+                parts.push(self.ident()?);
+                if self.at(&Tok::Comma) {
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+            self.eat(&Tok::RParen)?;
+            "$elem".to_string()
+        } else {
+            self.ident()?
+        };
         self.eat(&Tok::In)?;
         let iter = self.expr()?;
         self.eat(&Tok::RParen)?;
@@ -727,7 +774,9 @@ impl Parser {
             other => (other, None),
         };
         match range {
-            Expr::Range { start, end, kind } => Ok(StmtKind::For {
+            // A destructuring header always takes the indexed form: the counted
+            // range lowering binds one integer, which has no components.
+            Expr::Range { start, end, kind } if parts.is_empty() => Ok(StmtKind::For {
                 var,
                 start: *start,
                 end: *end,
@@ -748,6 +797,7 @@ impl Parser {
                 };
                 Ok(StmtKind::ForIn {
                     var,
+                    parts,
                     iter,
                     body,
                     label,
@@ -906,9 +956,35 @@ impl Parser {
     /// header rather than on an `is` operator continuing the current expression.
     fn at_when_is_arm(&self) -> bool {
         let off = usize::from(self.at(&Tok::Not));
-        matches!(self.peek_at(off), Tok::Is)
-            && matches!(self.peek_at(off + 1), Tok::Ident(_))
-            && matches!(self.peek_at(off + 2), Tok::Arrow)
+        if !matches!(self.peek_at(off), Tok::Is) || !matches!(self.peek_at(off + 1), Tok::Ident(_))
+        {
+            return false;
+        }
+        // Step over the type's own decorations (`is List<*> ->`, `is String? ->`)
+        // so the `->` that marks an arm is still found behind them.
+        let mut i = off + 2;
+        if matches!(self.peek_at(i), Tok::Lt) {
+            let mut depth = 0;
+            loop {
+                match self.peek_at(i) {
+                    Tok::Lt => depth += 1,
+                    Tok::Gt => {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    Tok::Eof => return false,
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
+        if matches!(self.peek_at(i), Tok::Question) {
+            i += 1;
+        }
+        matches!(self.peek_at(i), Tok::Arrow)
     }
 
     fn in_expr(&mut self) -> Result<Expr, String> {
@@ -994,6 +1070,23 @@ impl Parser {
         loop {
             let kind = match self.peek() {
                 Tok::Ident(n) if n == "to" => None,
+                // The bitwise operators are ordinary infix MEMBER functions in
+                // Kotlin (`Int.and`, `Int.shl`, …), which is exactly how they
+                // lower here — so they need no operator of their own, and they
+                // sit at this precedence level with the other named infix
+                // functions.
+                Tok::Ident(n) if is_bitwise_infix(n) => {
+                    let name = self.ident()?;
+                    let r = self.range_expr()?;
+                    l = Expr::MethodCall {
+                        recv: Box::new(l),
+                        name,
+                        args: vec![r],
+                        safe: false,
+                        line: self.line(),
+                    };
+                    continue;
+                }
                 Tok::Until => Some(RangeKind::Until),
                 Tok::DownTo => Some(RangeKind::DownTo),
                 Tok::Step => {
@@ -1154,7 +1247,7 @@ impl Parser {
                 is_call = true;
                 self.bump();
                 while !self.at(&Tok::RParen) {
-                    args.push(self.expr()?);
+                    args.push(self.call_arg()?);
                     if self.at(&Tok::Comma) {
                         self.bump();
                     } else {
@@ -1438,7 +1531,7 @@ impl Parser {
                     self.bump();
                     let mut args = Vec::new();
                     while !self.at(&Tok::RParen) {
-                        args.push(self.expr()?);
+                        args.push(self.call_arg()?);
                         if self.at(&Tok::Comma) {
                             self.bump();
                         } else {
@@ -1469,13 +1562,28 @@ impl Parser {
         }
     }
 
+    /// One call argument: `name = value` (a named argument) or a plain
+    /// expression. Kotlin has no assignment *expression*, so an identifier
+    /// followed by `=` inside an argument list can only be the named form.
+    fn call_arg(&mut self) -> Result<Expr, String> {
+        if matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Assign) {
+            let name = self.ident()?;
+            self.bump(); // `=`
+            return Ok(Expr::Named {
+                name,
+                value: Box::new(self.expr()?),
+            });
+        }
+        self.expr()
+    }
+
     /// The argument list of a parenthesized call whose callee name is already
     /// consumed, plus an optional trailing lambda.
     fn primary_call(&mut self, name: String, line: u32) -> Result<Expr, String> {
         self.eat(&Tok::LParen)?;
         let mut args = Vec::new();
         while !self.at(&Tok::RParen) {
-            args.push(self.expr()?);
+            args.push(self.call_arg()?);
             if self.at(&Tok::Comma) {
                 self.bump();
             } else {
@@ -1568,8 +1676,20 @@ impl Parser {
     fn when_expr(&mut self) -> Result<WhenExpr, String> {
         let line = self.line();
         self.eat(&Tok::When)?;
+        // `when (val n = subject)` names the subject for the arm bodies; the
+        // plain form is the same thing without the name.
+        let mut binding = None;
         let subject = if self.at(&Tok::LParen) {
             self.bump();
+            if self.at(&Tok::Val) {
+                self.bump();
+                binding = Some(self.ident()?);
+                if self.at(&Tok::Colon) {
+                    self.bump();
+                    self.type_name()?;
+                }
+                self.eat(&Tok::Assign)?;
+            }
             let e = self.expr()?;
             self.eat(&Tok::RParen)?;
             Some(Box::new(e))
@@ -1602,6 +1722,7 @@ impl Parser {
         self.eat(&Tok::RBrace)?;
         Ok(WhenExpr {
             subject,
+            binding,
             arms,
             line,
         })
@@ -1619,7 +1740,7 @@ impl Parser {
                 }
                 Tok::Is => {
                     self.bump();
-                    let ty = self.ident()?;
+                    let ty = self.is_type()?;
                     return Ok(WhenCond::Is { negated: false, ty });
                 }
                 // `!in` / `!is` — a `!` immediately followed by `in`/`is`.
@@ -1631,13 +1752,26 @@ impl Parser {
                 Tok::Not if matches!(self.peek_at(1), Tok::Is) => {
                     self.bump();
                     self.bump();
-                    let ty = self.ident()?;
+                    let ty = self.is_type()?;
                     return Ok(WhenCond::Is { negated: true, ty });
                 }
                 _ => {}
             }
         }
         Ok(WhenCond::Expr(self.expr()?))
+    }
+
+    /// The type after `is`/`!is`: a name, optionally with type arguments
+    /// (`List<*>`) and a nullable marker (`String?`). The check is by erased
+    /// class, so both decorations are consumed and discarded — matching the JVM,
+    /// where `is List<String>` can only test that the value is a `List`.
+    fn is_type(&mut self) -> Result<String, String> {
+        let ty = self.ident()?;
+        self.skip_type_args();
+        if self.at(&Tok::Question) {
+            self.bump();
+        }
+        Ok(ty)
     }
 
     /// The range after `in`/`!in` in a `when` arm — `a..b`, `a until b`, or

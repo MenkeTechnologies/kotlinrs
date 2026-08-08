@@ -1681,6 +1681,8 @@ fn iter_len(recv: &Value) -> Option<i64> {
             Some(items.len() as i64)
         }
         HeapObj::Range(r) => Some(r.count()),
+        // `for (e in map)` walks the entries.
+        HeapObj::Map(entries) => Some(entries.len() as i64),
         _ => None,
     })
     .flatten()
@@ -1697,6 +1699,19 @@ fn iter_at(recv: &Value, i: i64) -> Value {
             .and_then(|i| s.encode_utf16().nth(i))
             .map(|u| char_of(u as i64))
             .unwrap_or(Value::Undef);
+    }
+    // A `Map` yields one `Map.Entry` per step, carried as a `Pair`. The entry is
+    // cloned out from under the shared borrow first: `alloc` takes the heap
+    // mutably, so building the pair inside `with_obj` would re-borrow it.
+    let entry = with_obj(recv, |o| match o {
+        HeapObj::Map(entries) => usize::try_from(i)
+            .ok()
+            .and_then(|i| entries.get(i).cloned()),
+        _ => None,
+    })
+    .flatten();
+    if let Some((k, v)) = entry {
+        return alloc(HeapObj::Pair(k, v));
     }
     with_obj(recv, |o| match o {
         HeapObj::List(items) | HeapObj::Set(items) | HeapObj::Array { items, .. } => {
@@ -1752,15 +1767,28 @@ fn array_desc(items: &[Value]) -> String {
 /// returns a `Long` (`Math.round(2.5) == 3`).
 fn math_call(name: &str, args: &[Value]) -> Result<Value, String> {
     let a = args.first().cloned().unwrap_or(Value::Int(0));
-    let b = args.get(1).cloned().unwrap_or(Value::Int(0));
-    let both_int = is_int(&a) && args.get(1).map(is_int).unwrap_or(true);
     match name {
         "abs" if is_int(&a) => Ok(Value::Int(a.to_int().wrapping_abs())),
         "abs" => Ok(Value::Float(a.to_float().abs())),
-        "max" if both_int => Ok(Value::Int(a.to_int().max(b.to_int()))),
-        "max" => Ok(Value::Float(a.to_float().max(b.to_float()))),
-        "min" if both_int => Ok(Value::Int(a.to_int().min(b.to_int()))),
-        "min" => Ok(Value::Float(a.to_float().min(b.to_float()))),
+        // `kotlin.math.min`/`max` take two, but `minOf`/`maxOf` also have a
+        // three-argument overload and a vararg one, so every argument counts —
+        // `maxOf(1, 2, 3)` is 3, not the two-argument answer 2.
+        "max" | "min" => {
+            let want_max = name == "max";
+            if args.iter().all(is_int) {
+                let seed = a.to_int();
+                Ok(Value::Int(args.iter().map(|v| v.to_int()).fold(
+                    seed,
+                    |acc, x| if (x > acc) == want_max { x } else { acc },
+                )))
+            } else {
+                let seed = a.to_float();
+                Ok(Value::Float(args.iter().map(|v| v.to_float()).fold(
+                    seed,
+                    |acc, x| if (x > acc) == want_max { x } else { acc },
+                )))
+            }
+        }
         "sqrt" => Ok(Value::Float(a.to_float().sqrt())),
         "floor" => Ok(Value::Float(a.to_float().floor())),
         "ceil" => Ok(Value::Float(a.to_float().ceil())),
@@ -2048,6 +2076,23 @@ fn b_scope_fn(vm: &mut VM, _argc: u8) -> Value {
 /// `(1..3).map { … }` work. `Map`/`Pair` receivers aren't iterable by these
 /// methods here.
 fn list_snapshot(recv: &Value) -> Option<Vec<Value>> {
+    // A `Map` iterates as its entries, so `m.map { it.key }` and `m.any { … }`
+    // see one `Map.Entry` per element — carried here as a `Pair`, whose
+    // `key`/`value` members are the entry's accessors. The pairs are allocated
+    // AFTER the borrow is released: `alloc` takes the heap mutably.
+    let entries = with_obj(recv, |o| match o {
+        HeapObj::Map(entries) => Some(entries.clone()),
+        _ => None,
+    })
+    .flatten();
+    if let Some(entries) = entries {
+        return Some(
+            entries
+                .into_iter()
+                .map(|(k, v)| alloc(HeapObj::Pair(k, v)))
+                .collect(),
+        );
+    }
     with_obj(recv, |o| match o {
         HeapObj::List(items) | HeapObj::Set(items) | HeapObj::Array { items, .. } => {
             Some(items.clone())
@@ -2083,6 +2128,37 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
 
 /// The higher-order collection methods, over a snapshot of `recv`'s elements,
 /// invoking `clo` per element. Mirrors the Kotlin stdlib signatures faithfully.
+/// Re-wrap the surviving elements of a `filter`-family call in the receiver's
+/// own container kind. Kotlin's `filter` is declared per receiver type — a
+/// `Map` filters to a `Map` (`{b=2}`) and a `Set` to a `Set`, where a `List`
+/// filters to a `List`. The elements of a filtered `Map` are the `Pair`s
+/// [`list_snapshot`] produced, so they fold straight back into entries.
+fn same_kind_as(recv: &Value, out: Vec<Value>) -> Value {
+    let kind = with_obj(recv, |o| match o {
+        HeapObj::Map(_) => 2u8,
+        HeapObj::Set(_) => 1,
+        _ => 0,
+    })
+    .unwrap_or(0);
+    match kind {
+        2 => {
+            let entries = out
+                .iter()
+                .filter_map(|p| {
+                    with_obj(p, |o| match o {
+                        HeapObj::Pair(k, v) => Some((k.clone(), v.clone())),
+                        _ => None,
+                    })
+                    .flatten()
+                })
+                .collect();
+            alloc(HeapObj::Map(entries))
+        }
+        1 => alloc(HeapObj::Set(out)),
+        _ => alloc(HeapObj::List(out)),
+    }
+}
+
 fn coll_hof(
     vm: &mut VM,
     name: &str,
@@ -2107,7 +2183,7 @@ fn coll_hof(
                     out.push(it);
                 }
             }
-            Ok(alloc(HeapObj::List(out)))
+            Ok(same_kind_as(recv, out))
         }
         "forEach" => {
             for it in items {
@@ -2222,7 +2298,54 @@ fn coll_hof(
                     out.push(it);
                 }
             }
+            Ok(same_kind_as(recv, out))
+        }
+        // `partition` returns a `Pair(matching, rest)` — one pass, predicate
+        // applied to every element exactly once.
+        "partition" => {
+            let (mut yes, mut no) = (Vec::new(), Vec::new());
+            for it in items {
+                if truthy(&invoke_closure(vm, clo, std::slice::from_ref(&it))?) {
+                    yes.push(it);
+                } else {
+                    no.push(it);
+                }
+            }
+            Ok(alloc(HeapObj::Pair(
+                alloc(HeapObj::List(yes)),
+                alloc(HeapObj::List(no)),
+            )))
+        }
+        // `takeWhile`/`dropWhile` cut at the FIRST element failing the
+        // predicate — later matches do not rejoin, unlike `filter`.
+        "takeWhile" | "dropWhile" => {
+            let mut cut = items.len();
+            for (i, it) in items.iter().enumerate() {
+                if !truthy(&invoke_closure(vm, clo, std::slice::from_ref(it))?) {
+                    cut = i;
+                    break;
+                }
+            }
+            let out = if name == "takeWhile" {
+                items[..cut].to_vec()
+            } else {
+                items[cut..].to_vec()
+            };
             Ok(alloc(HeapObj::List(out)))
+        }
+        // `firstOrNull`/`lastOrNull` with a predicate: the matching element, or
+        // null when none matches.
+        "firstOrNull" | "lastOrNull" => {
+            let mut found = Value::Undef;
+            for it in items {
+                if truthy(&invoke_closure(vm, clo, std::slice::from_ref(&it))?) {
+                    found = it;
+                    if name == "firstOrNull" {
+                        break;
+                    }
+                }
+            }
+            Ok(found)
         }
         "flatMap" => {
             // Each result is itself iterable; its elements are spliced in.
@@ -2332,6 +2455,187 @@ fn arg_str(args: &[Value], i: usize) -> String {
     args.get(i).map(kotlin_string).unwrap_or_default()
 }
 
+/// `x` with exactly `prec` fraction digits, rounded the way
+/// `java.util.Formatter`'s `%f` rounds: HALF_UP applied to the value's SHORTEST
+/// round-tripping decimal form, not to the exact binary value.
+///
+/// The distinction is visible at every tie. The `double` nearest 2.5 is exactly
+/// 2.5, and Java's `%.0f` gives `3` where Rust's `{:.0}` gives `2` (it rounds
+/// half-to-even). The `double` nearest 0.15 is slightly BELOW 0.15, so rounding
+/// the exact value gives `0.1` while Java — rounding the shortest form `0.15` —
+/// gives `0.2`. Rust's `{}` yields that same shortest form, always positional
+/// and never in exponent notation, so the digits can be rounded as a string.
+fn format_fixed(x: f64, prec: usize) -> String {
+    if !x.is_finite() {
+        return format_double(x);
+    }
+    let neg = x.is_sign_negative();
+    let shortest = format!("{}", x.abs());
+    let (int_part, frac_part) = match shortest.split_once('.') {
+        Some((i, f)) => (i.to_string(), f.to_string()),
+        None => (shortest, String::new()),
+    };
+    let mut digits: Vec<u8> = int_part.bytes().chain(frac_part.bytes()).collect();
+    let mut int_len = int_part.len();
+    if frac_part.len() > prec {
+        // Drop the excess, then carry when the first dropped digit is >= 5.
+        let round_up = frac_part.as_bytes()[prec] >= b'5';
+        digits.truncate(int_len + prec);
+        if round_up {
+            let mut i = digits.len();
+            loop {
+                if i == 0 {
+                    digits.insert(0, b'1');
+                    int_len += 1;
+                    break;
+                }
+                i -= 1;
+                if digits[i] == b'9' {
+                    digits[i] = b'0';
+                } else {
+                    digits[i] += 1;
+                    break;
+                }
+            }
+        }
+    } else {
+        digits.resize(int_len + prec, b'0');
+    }
+    let text = String::from_utf8(digits).expect("ASCII digits");
+    let (i, f) = text.split_at(int_len);
+    let body = if prec == 0 {
+        i.to_string()
+    } else {
+        format!("{i}.{f}")
+    };
+    if neg {
+        format!("-{body}")
+    } else {
+        body
+    }
+}
+
+/// `String.format(args…)` / `java.util.Formatter`, over the conversions a
+/// Kotlin program actually reaches for: `%d %s %f %e %x %X %o %c %b %%`, each
+/// accepting the `-` (left-justify), `0` (zero-pad), `+` and space flags, a
+/// width, and a precision. `%f` defaults to 6 fraction digits, as the JVM does.
+///
+/// An unknown conversion is an error rather than a silent pass-through, so a
+/// format this does not model surfaces instead of quietly diverging.
+fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
+    let mut out = String::new();
+    let mut argi = 0usize;
+    let mut it = fmt.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        let (mut left, mut zero, mut plus, mut space) = (false, false, false, false);
+        while let Some(f) = it.peek() {
+            match f {
+                '-' => left = true,
+                '0' => zero = true,
+                '+' => plus = true,
+                ' ' => space = true,
+                _ => break,
+            }
+            it.next();
+        }
+        let mut width = String::new();
+        while it.peek().is_some_and(|d| d.is_ascii_digit()) {
+            width.push(it.next().expect("peeked"));
+        }
+        let width: usize = width.parse().unwrap_or(0);
+        let mut prec: Option<usize> = None;
+        if it.peek() == Some(&'.') {
+            it.next();
+            let mut p = String::new();
+            while it.peek().is_some_and(|d| d.is_ascii_digit()) {
+                p.push(it.next().expect("peeked"));
+            }
+            prec = Some(p.parse().unwrap_or(0));
+        }
+        let conv = it
+            .next()
+            .ok_or_else(|| "java.util.UnknownFormatConversionException".to_string())?;
+        if conv == '%' {
+            out.push('%');
+            continue;
+        }
+        let arg = args.get(argi).cloned().unwrap_or(Value::Undef);
+        argi += 1;
+        let mut body = match conv {
+            'd' => format!("{}", arg.to_int()),
+            'x' => format!("{:x}", arg.to_int()),
+            'X' => format!("{:X}", arg.to_int()),
+            'o' => format!("{:o}", arg.to_int()),
+            'f' => format_fixed(arg.to_float(), prec.unwrap_or(6)),
+            'e' | 'E' => {
+                let s = format!("{:.*e}", prec.unwrap_or(6), arg.to_float());
+                // Rust writes `1.5e2`; the JVM writes `1.500000e+02`.
+                let s = match s.split_once('e') {
+                    Some((m, x)) => {
+                        let (sign, digits) = match x.strip_prefix('-') {
+                            Some(d) => ('-', d),
+                            None => ('+', x),
+                        };
+                        format!("{m}e{sign}{digits:0>2}")
+                    }
+                    None => s,
+                };
+                if conv == 'E' {
+                    s.to_uppercase()
+                } else {
+                    s
+                }
+            }
+            'c' => char_string(num_of(&arg)),
+            'b' => format!("{}", truthy(&arg)),
+            's' | 'S' => {
+                let s = kotlin_string(&arg);
+                let s = match prec {
+                    Some(p) => s.chars().take(p).collect(),
+                    None => s,
+                };
+                if conv == 'S' {
+                    s.to_uppercase()
+                } else {
+                    s
+                }
+            }
+            other => {
+                return Err(format!(
+                    "java.util.UnknownFormatConversionException: Conversion = '{other}'"
+                ))
+            }
+        };
+        // The sign flags apply to the numeric conversions only, and `+` wins
+        // over ` ` when both are given (as in the JVM).
+        if matches!(conv, 'd' | 'f' | 'e' | 'E') && !body.starts_with('-') {
+            if plus {
+                body.insert(0, '+');
+            } else if space {
+                body.insert(0, ' ');
+            }
+        }
+        let pad = width.saturating_sub(body.chars().count());
+        if pad > 0 {
+            if left {
+                body.push_str(&" ".repeat(pad));
+            } else if zero && matches!(conv, 'd' | 'f' | 'e' | 'E' | 'x' | 'X' | 'o') {
+                // Zero padding goes after any sign, not before it.
+                let at = usize::from(body.starts_with(['-', '+', ' ']));
+                body.insert_str(at, &"0".repeat(pad));
+            } else {
+                body.insert_str(0, &" ".repeat(pad));
+            }
+        }
+        out.push_str(&body);
+    }
+    Ok(out)
+}
+
 /// UTF-16 offset of `needle` in `hay`, or -1 — matching `String.indexOf` and
 /// the UTF-16 basis `length` already uses.
 fn utf16_index_of(hay: &str, needle: &str) -> i64 {
@@ -2403,9 +2707,270 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
                 )))
             }
         }
+        (Value::Str(s), "lastIndexOf") => {
+            let needle = arg_str(args, 0);
+            Ok(Value::Int(match s.rfind(&needle) {
+                Some(off) => s[..off].encode_utf16().count() as i64,
+                None => -1,
+            }))
+        }
+        (Value::Str(s), "trimStart") => Ok(Value::str(s.trim_start().to_string())),
+        (Value::Str(s), "trimEnd") => Ok(Value::str(s.trim_end().to_string())),
+        (Value::Str(s), "removePrefix") => {
+            let p = arg_str(args, 0);
+            Ok(Value::str(s.strip_prefix(&p).unwrap_or(s).to_string()))
+        }
+        (Value::Str(s), "removeSuffix") => {
+            let p = arg_str(args, 0);
+            Ok(Value::str(s.strip_suffix(&p).unwrap_or(s).to_string()))
+        }
+        // `substringBefore`/`substringAfter` yield the whole receiver when the
+        // delimiter is absent — Kotlin's default `missingDelimiterValue`.
+        (Value::Str(s), "substringBefore") => {
+            let d = arg_str(args, 0);
+            Ok(Value::str(match s.split_once(&d) {
+                Some((head, _)) => head.to_string(),
+                None => s.to_string(),
+            }))
+        }
+        (Value::Str(s), "substringAfter") => {
+            let d = arg_str(args, 0);
+            Ok(Value::str(match s.split_once(&d) {
+                Some((_, tail)) => tail.to_string(),
+                None => s.to_string(),
+            }))
+        }
+        // `String.reversed()` reverses whole characters, not code units — the
+        // JVM's `StringBuilder.reverse` keeps surrogate pairs intact.
+        (Value::Str(s), "reversed") => Ok(Value::str(s.chars().rev().collect::<String>())),
+        // `split(vararg delimiters)` on literal delimiters (no regex overload
+        // here). An empty delimiter splits between every character AND at both
+        // ends, which is what both Kotlin and Rust's `str::split("")` produce.
+        // With several delimiters, the earliest match in the string wins at
+        // each position — Kotlin scans left to right, not delimiter by
+        // delimiter, so `"a1b2c".split("1", "2")` is `[a, b, c]`.
+        (Value::Str(s), "split") => {
+            let delims: Vec<String> = args.iter().map(kotlin_string).collect();
+            let mut parts: Vec<Value> = Vec::new();
+            if delims.len() <= 1 {
+                let d = delims.first().cloned().unwrap_or_default();
+                parts.extend(s.split(&d as &str).map(|p| Value::str(p.to_string())));
+            } else {
+                let mut rest = s.as_str();
+                'scan: loop {
+                    let hit = delims
+                        .iter()
+                        .filter(|d| !d.is_empty())
+                        .filter_map(|d| rest.find(d.as_str()).map(|at| (at, d.len())))
+                        .min();
+                    match hit {
+                        Some((at, len)) => {
+                            parts.push(Value::str(rest[..at].to_string()));
+                            rest = &rest[at + len..];
+                        }
+                        None => {
+                            parts.push(Value::str(rest.to_string()));
+                            break 'scan;
+                        }
+                    }
+                }
+            }
+            Ok(alloc(HeapObj::List(parts)))
+        }
+        (Value::Str(s), "lines") => Ok(alloc(HeapObj::List(
+            s.split('\n')
+                .map(|l| Value::str(l.strip_suffix('\r').unwrap_or(l).to_string()))
+                .collect(),
+        ))),
+        (Value::Str(s), "toCharArray") => {
+            let items: Vec<Value> = s.encode_utf16().map(|u| char_of(u as i64)).collect();
+            Ok(alloc(HeapObj::Array {
+                items,
+                desc: "[C".to_string(),
+            }))
+        }
+        // `first()`/`last()` are `Char`; both throw on an empty receiver.
+        (Value::Str(s), "first" | "last") => {
+            let units: Vec<u16> = s.encode_utf16().collect();
+            let pick = if name == "first" {
+                units.first()
+            } else {
+                units.last()
+            };
+            match pick {
+                Some(u) => Ok(char_of(*u as i64)),
+                None => {
+                    Err("java.util.NoSuchElementException: Char sequence is empty.".to_string())
+                }
+            }
+        }
+        (Value::Str(s), "get") => {
+            let units: Vec<u16> = s.encode_utf16().collect();
+            let i = args.first().map(|v| v.to_int()).unwrap_or(0);
+            match usize::try_from(i).ok().and_then(|i| units.get(i)) {
+                Some(u) => Ok(char_of(*u as i64)),
+                None => Err(format!(
+                    "java.lang.StringIndexOutOfBoundsException: \
+                     index {i}, length {}",
+                    units.len()
+                )),
+            }
+        }
+        // `take`/`drop` clamp an oversized count and fault on a negative one,
+        // matching the `List` overloads.
+        (Value::Str(s), "take" | "drop") => {
+            let units: Vec<u16> = s.encode_utf16().collect();
+            let n = args.first().map(|v| v.to_int()).unwrap_or(0);
+            if n < 0 {
+                return Err(format!(
+                    "java.lang.IllegalArgumentException: Requested character count {n} is less than zero."
+                ));
+            }
+            let n = (n as usize).min(units.len());
+            let cut = if name == "take" {
+                &units[..n]
+            } else {
+                &units[n..]
+            };
+            Ok(Value::str(String::from_utf16_lossy(cut)))
+        }
+        // `padStart`/`padEnd` pad to a UTF-16 length with a `Char` (default
+        // space); a receiver already that long is returned unchanged.
+        (Value::Str(s), "padStart" | "padEnd") => {
+            let want = args.first().map(|v| v.to_int()).unwrap_or(0);
+            if want < 0 {
+                return Err(format!(
+                    "java.lang.IllegalArgumentException: Desired length {want} is less than zero."
+                ));
+            }
+            let have = s.encode_utf16().count() as i64;
+            let fill = match args.get(1).and_then(char_code) {
+                Some(c) => char::from_u32(c as u32).unwrap_or(' '),
+                None => ' ',
+            };
+            let pad = fill.to_string().repeat((want - have).max(0) as usize);
+            Ok(Value::str(if name == "padStart" {
+                format!("{pad}{s}")
+            } else {
+                format!("{s}{pad}")
+            }))
+        }
+        // `String.compareTo` is the JVM's: the code-unit difference at the
+        // first mismatch, else the length difference — NOT clamped to -1/0/1.
+        (Value::Str(s), "compareTo") => {
+            let other = arg_str(args, 0);
+            let (a, b): (Vec<u16>, Vec<u16>) =
+                (s.encode_utf16().collect(), other.encode_utf16().collect());
+            let d = a
+                .iter()
+                .zip(b.iter())
+                .find(|(x, y)| x != y)
+                .map(|(x, y)| *x as i64 - *y as i64)
+                .unwrap_or(a.len() as i64 - b.len() as i64);
+            Ok(Value::Int(d))
+        }
+        // `String.format(args…)` — the receiver is the format string.
+        (Value::Str(s), "format") => format_string(s, args).map(Value::str),
+        // Numeric parses. The `…OrNull` forms answer null where the plain ones
+        // throw, which is the only difference between the pairs.
+        (Value::Str(s), "toInt" | "toLong") => s
+            .trim()
+            .parse::<i64>()
+            .map(Value::Int)
+            .map_err(|_| format!("java.lang.NumberFormatException: For input string: \"{s}\"")),
+        (Value::Str(s), "toIntOrNull" | "toLongOrNull") => Ok(s
+            .trim()
+            .parse::<i64>()
+            .map(Value::Int)
+            .unwrap_or(Value::Undef)),
+        (Value::Str(s), "toDouble" | "toFloat") => s
+            .trim()
+            .parse::<f64>()
+            .map(Value::Float)
+            .map_err(|_| format!("java.lang.NumberFormatException: For input string: \"{s}\"")),
+        (Value::Str(s), "toDoubleOrNull" | "toFloatOrNull") => Ok(s
+            .trim()
+            .parse::<f64>()
+            .map(Value::Float)
+            .unwrap_or(Value::Undef)),
 
         // `Int.toChar()` → the `Char` for the low 16 bits of the receiver.
         (Value::Int(n), "toChar") => Ok(char_of(*n)),
+        // The bitwise member functions, which the parser reaches through their
+        // infix spelling (`a and b`, `x shl 4`). `and`/`or`/`xor` are
+        // width-agnostic for in-range values, but the shifts and `inv` are not:
+        // Kotlin's are `Int` operations that mask the shift count to 5 bits and
+        // complement 32 bits, so those go through `i32`. (A `Long` receiver is
+        // the documented Int/Long-width gap — every integer here is one `i64`.)
+        (Value::Int(a), "and") => Ok(Value::Int(
+            a & args.first().map(|v| v.to_int()).unwrap_or(0),
+        )),
+        (Value::Int(a), "or") => Ok(Value::Int(
+            a | args.first().map(|v| v.to_int()).unwrap_or(0),
+        )),
+        (Value::Int(a), "xor") => Ok(Value::Int(
+            a ^ args.first().map(|v| v.to_int()).unwrap_or(0),
+        )),
+        (Value::Int(a), "inv") => Ok(Value::Int(!(*a as i32) as i64)),
+        (Value::Int(a), "shl" | "shr" | "ushr") => {
+            let bits = (args.first().map(|v| v.to_int()).unwrap_or(0) & 31) as u32;
+            let a = *a as i32;
+            Ok(Value::Int(match name {
+                "shl" => a.wrapping_shl(bits) as i64,
+                "shr" => a.wrapping_shr(bits) as i64,
+                _ => ((a as u32).wrapping_shr(bits)) as i32 as i64,
+            }))
+        }
+        // `coerceIn`/`coerceAtLeast`/`coerceAtMost` clamp to a bound. The result
+        // stays integral only when receiver and bounds all are.
+        (Value::Int(_) | Value::Float(_), "coerceIn" | "coerceAtLeast" | "coerceAtMost") => {
+            let ints = is_int(recv) && args.iter().all(is_int);
+            let lo = match name {
+                "coerceAtMost" => None,
+                _ => args.first(),
+            };
+            let hi = match name {
+                "coerceIn" => args.get(1),
+                "coerceAtMost" => args.first(),
+                _ => None,
+            };
+            if ints {
+                let mut v = recv.to_int();
+                if let Some(lo) = lo {
+                    v = v.max(lo.to_int());
+                }
+                if let Some(hi) = hi {
+                    v = v.min(hi.to_int());
+                }
+                Ok(Value::Int(v))
+            } else {
+                let mut v = recv.to_float();
+                if let Some(lo) = lo {
+                    v = v.max(lo.to_float());
+                }
+                if let Some(hi) = hi {
+                    v = v.min(hi.to_float());
+                }
+                Ok(Value::Float(v))
+            }
+        }
+        // `kotlin.math` members in their receiver spelling: `2.0.pow(3.0)`,
+        // `(-1.5).absoluteValue`, `2.6.roundToInt()`.
+        (Value::Int(_) | Value::Float(_), "pow") => Ok(Value::Float(
+            recv.to_float()
+                .powf(args.first().map(|v| v.to_float()).unwrap_or(0.0)),
+        )),
+        (Value::Int(_) | Value::Float(_), "absoluteValue") => {
+            if is_int(recv) {
+                Ok(Value::Int(recv.to_int().wrapping_abs()))
+            } else {
+                Ok(Value::Float(recv.to_float().abs()))
+            }
+        }
+        // `roundToInt` is half-up, like `Math.round`.
+        (Value::Int(_) | Value::Float(_), "roundToInt" | "roundToLong") => {
+            Ok(Value::Int((recv.to_float() + 0.5).floor() as i64))
+        }
 
         // ── the arithmetic operators in their method spelling ──
         // `a.plus(b)` is what `a + b` compiles to on the JVM, and the method
@@ -2604,6 +3169,28 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             .flatten();
             return out.ok_or_else(|| "java.lang.IndexOutOfBoundsException".to_string());
         }
+        // `entries` is the `Map.Entry` sequence, each entry a `Pair` whose
+        // `key`/`value` members are the entry's accessors — the same
+        // representation `for (e in map)` and `map.map { … }` iterate.
+        "entries" => {
+            let out = with_obj(recv, |o| match o {
+                HeapObj::Map(entries) => Some(entries.clone()),
+                _ => None,
+            })
+            .flatten();
+            return match out {
+                Some(entries) => Ok(alloc(HeapObj::List(
+                    entries
+                        .into_iter()
+                        .map(|(k, v)| alloc(HeapObj::Pair(k, v)))
+                        .collect(),
+                ))),
+                None => Err(format!(
+                    "unresolved reference: entries on {}",
+                    obj_label(recv)
+                )),
+            };
+        }
         "keys" | "values" => {
             // Snapshot the entries under a shared borrow, then allocate the
             // result list separately (allocating inside `with_obj` would re-borrow
@@ -2695,8 +3282,11 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                 .unwrap_or(Value::Undef),
         ),
         // ── Pair ──
-        (HeapObj::Pair(a, _), "first") => Some(a.clone()),
-        (HeapObj::Pair(_, b), "second") => Some(b.clone()),
+        // `key`/`value` alias `first`/`second`: iterating a `Map` yields
+        // `Map.Entry`, which is carried as a `Pair` here, and an entry is read
+        // through `it.key`/`it.value`.
+        (HeapObj::Pair(a, _), "first" | "key") => Some(a.clone()),
+        (HeapObj::Pair(_, b), "second" | "value") => Some(b.clone()),
         // ── Instance property read (dynamic fallback when the compiler couldn't
         // statically resolve the receiver's class, e.g. `list[i].field`) ──
         (HeapObj::Instance { fields, .. }, _) => fields
@@ -2745,11 +3335,42 @@ fn sequence_member(
             Some((_, last)) => last,
             None => return Some(need(items.last().cloned())),
         },
-        "get" => {
+        // `get`/`elementAt` throw out of range; `getOrNull`/`elementAtOrNull`
+        // answer null there. `first`/`last` above draw the same distinction
+        // against their `…OrNull` forms.
+        "get" | "elementAt" => {
             let i = args.first().map(|v| v.to_int()).unwrap_or(0);
             return Some(need(
                 usize::try_from(i).ok().and_then(|i| items.get(i).cloned()),
             ));
+        }
+        "getOrNull" | "elementAtOrNull" => {
+            let i = args.first().map(|v| v.to_int()).unwrap_or(0);
+            usize::try_from(i)
+                .ok()
+                .and_then(|i| items.get(i).cloned())
+                .unwrap_or(Value::Undef)
+        }
+        "firstOrNull" => items.first().cloned().unwrap_or(Value::Undef),
+        "lastOrNull" => items.last().cloned().unwrap_or(Value::Undef),
+        // `subList(from, to)` is the half-open slice, and unlike `take`/`drop`
+        // it does NOT clamp — an out-of-range bound throws.
+        "subList" | "slice" => {
+            let from = args.first().map(|v| v.to_int()).unwrap_or(0);
+            let to = args
+                .get(1)
+                .map(|v| v.to_int())
+                .unwrap_or(items.len() as i64);
+            if from < 0 || to > items.len() as i64 || from > to {
+                return Some(Err(format!(
+                    "java.lang.IndexOutOfBoundsException: \
+                     fromIndex: {from}, toIndex: {to}, length {}",
+                    items.len()
+                )));
+            }
+            return Some(Ok(alloc(HeapObj::List(
+                items[from as usize..to as usize].to_vec(),
+            ))));
         }
         "contains" => Value::Bool(
             args.first()
@@ -2766,16 +3387,67 @@ fn sequence_member(
         "average" => {
             Value::Float(items.iter().map(|v| v.to_float()).sum::<f64>() / items.len() as f64)
         }
-        "max" | "min" => {
-            let want_max = name == "max";
-            return Some(need(items.iter().cloned().reduce(|a, b| {
+        // `max`/`min` throw on an empty sequence (via `need`); the `…OrNull`
+        // pair answers null instead. That is the only difference between them.
+        "max" | "min" | "maxOrNull" | "minOrNull" => {
+            let want_max = name.starts_with("max");
+            let best = items.iter().cloned().reduce(|a, b| {
                 let take_b = (value_cmp(&b, &a) == std::cmp::Ordering::Greater) == want_max;
                 if take_b {
                     b
                 } else {
                     a
                 }
-            })));
+            });
+            if name.ends_with("OrNull") {
+                return Some(Ok(best.unwrap_or(Value::Undef)));
+            }
+            return Some(need(best));
+        }
+        // `flatten()` concatenates one nesting level; a non-iterable element has
+        // no `Iterable` receiver in Kotlin, so it cannot occur here.
+        "flatten" => {
+            let mut out = Vec::new();
+            for it in items {
+                out.extend(sequence_items(it));
+            }
+            return Some(Ok(alloc(HeapObj::List(out))));
+        }
+        // `zip(other)` pairs element-wise and stops at the shorter sequence.
+        "zip" => {
+            let other = args.first().map(sequence_items).unwrap_or_default();
+            let out: Vec<Value> = items
+                .iter()
+                .zip(other)
+                .map(|(a, b)| alloc(HeapObj::Pair(a.clone(), b)))
+                .collect();
+            return Some(Ok(alloc(HeapObj::List(out))));
+        }
+        // `chunked(n)` splits into consecutive groups, the last one possibly
+        // short; `windowed(n)` slides by one and — with the default
+        // `partialWindows = false` — emits only full-length windows.
+        "chunked" | "windowed" => {
+            let n = args.first().map(|v| v.to_int()).unwrap_or(0);
+            if n <= 0 {
+                return Some(Err(format!(
+                    "java.lang.IllegalArgumentException: size {n} must be greater than zero."
+                )));
+            }
+            let n = n as usize;
+            let groups: Vec<Value> = if name == "chunked" {
+                items
+                    .chunks(n)
+                    .map(|c| alloc(HeapObj::List(c.to_vec())))
+                    .collect()
+            } else if items.len() >= n {
+                items
+                    .windows(n)
+                    .map(|w| alloc(HeapObj::List(w.to_vec())))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            return Some(Ok(alloc(HeapObj::List(groups))));
         }
         "toList" | "toMutableList" | "toTypedArray" | "asList" => {
             return Some(Ok(alloc(HeapObj::List(items.to_vec()))))
@@ -3272,6 +3944,23 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         "String" | "CharSequence" => matches!(v, Value::Str(_)),
         // `Any` matches any non-null value; unknown names never match.
         "Any" => !matches!(v, Value::Undef),
+        // The built-in container types. Type arguments are erased on the JVM,
+        // so `is List<String>` can only ever test the container kind — which is
+        // why the parser drops them.
+        //
+        // A `Set` is a `Collection` but NOT a `List`, so the two names cannot
+        // share an arm: `setOf(1) is List<*>` is `false` in Kotlin.
+        "List" | "MutableList" => with_obj(v, |o| matches!(o, HeapObj::List(_))).unwrap_or(false),
+        "Iterable" | "Collection" => with_obj(v, |o| {
+            matches!(o, HeapObj::List(_) | HeapObj::Set(_) | HeapObj::Range(_))
+        })
+        .unwrap_or(false),
+        "Set" | "MutableSet" => with_obj(v, |o| matches!(o, HeapObj::Set(_))).unwrap_or(false),
+        "Map" | "MutableMap" => with_obj(v, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false),
+        "Pair" => with_obj(v, |o| matches!(o, HeapObj::Pair(_, _))).unwrap_or(false),
+        "Array" | "IntArray" | "DoubleArray" | "CharArray" | "BooleanArray" => {
+            with_obj(v, |o| matches!(o, HeapObj::Array { .. })).unwrap_or(false)
+        }
         other => {
             // A class instance matches its own class and every supertype it
             // registered — the `is Dog` / `is Animal` / `is Greeter` chain.

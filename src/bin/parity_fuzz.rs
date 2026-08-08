@@ -21,6 +21,16 @@
 //! claims a throw, what a `finally` runs, what a partially-evaluated statement
 //! is allowed to print, and what a `try` evaluates to.
 //!
+//! The later modes target the constructs whose LOWERING differs from a nearby
+//! one that already works, which is where a frontend quietly reuses the wrong
+//! path: `dowhile` (the body precedes the test and `continue` targets the test),
+//! `strfmt` (`%f` is HALF_UP over the shortest decimal form, where Rust's
+//! formatter is half-to-even), `bitwise` (32-bit shifts and `inv` under a 64-bit
+//! integer representation), `safecall` (`?.` must reach every routing `.` does,
+//! and must still print `null`), `mapcoll` (a `Map` iterates as entries and
+//! `filter` re-wraps into a `Map`), and `finexit` (a `break`/`continue` leaving
+//! a `try` has to run its `finally` first).
+//!
 //! Scope + determinism invariants (mirroring the javars/scalars harnesses):
 //!   * Only constructs kotlinrs actually implements are emitted — an unsupported
 //!     construct would be a known gap, not a parity signal.
@@ -546,6 +556,176 @@ fn g_nullsafe(r: &mut Rng, idx: usize) -> String {
     }
 }
 
+/// `do { … } while (cond)`, whose body always runs once and whose `continue`
+/// targets the CONDITION rather than the loop top — the two things that make it
+/// a different lowering from `while`, not a rewrite of it. Every generated loop
+/// has a bounded counter so a mis-lowered exit shows up as a divergence rather
+/// than a hang.
+fn g_dowhile(r: &mut Rng, idx: usize) -> String {
+    let n = 1 + r.below(5);
+    let m = 1 + r.below(4);
+    match r.below(6) {
+        0 => format!(
+            "var d{idx} = 0; do {{ d{idx}++ }} while (d{idx} < {n}); println(d{idx})"
+        ),
+        // A condition that is already false on entry: the body still runs once.
+        1 => format!(
+            "var d{idx} = {n}; do {{ d{idx}++; println(d{idx}) }} while (d{idx} < 0)"
+        ),
+        2 => format!(
+            "var d{idx} = 0; do {{ d{idx}++; if (d{idx} % {m} == 0) continue; println(d{idx}) }} while (d{idx} < {n})"
+        ),
+        3 => format!(
+            "var d{idx} = 0; do {{ d{idx}++; if (d{idx} == {m}) break; println(d{idx}) }} while (d{idx} < 9); println(\"e$d{idx}\")"
+        ),
+        4 => format!(
+            "var d{idx} = 0; var t{idx} = 0; do {{ var j{idx} = 0; do {{ j{idx}++; t{idx}++ }} while (j{idx} < {m}); d{idx}++ }} while (d{idx} < {n}); println(t{idx})"
+        ),
+        _ => format!(
+            "var d{idx} = 0; L{idx}@ do {{ d{idx}++; for (k{idx} in 1..3) {{ if (k{idx} == {m}) continue@L{idx}; println(\"$d{idx}/$k{idx}\") }} }} while (d{idx} < {n})"
+        ),
+    }
+}
+
+/// `String.format` — the JVM `Formatter` conversions and their flags. `%f`
+/// rounds HALF_UP over the value's shortest decimal form, which differs from
+/// Rust's half-to-even at every tie, so the tie values are generated on purpose.
+fn g_strfmt(r: &mut Rng) -> String {
+    const TIES: &[&str] = &[
+        "0.5", "1.5", "2.5", "-0.5", "-1.5", "0.15", "0.25", "2.45", "9.95", "1.005", "2.675",
+        "3.14159", "1e10", "0.0",
+    ];
+    match r.below(8) {
+        0 => p(format!("\"%.{}f\".format({})", r.below(4), pick(r, TIES))),
+        1 => p(format!("\"%f\".format({})", pick(r, TIES))),
+        2 => p(format!(
+            "\"%{}{}d|\".format({})",
+            pick(r, &["", "-", "0", "+"]),
+            1 + r.below(8),
+            pick(r, INTS)
+        )),
+        3 => p(format!(
+            "\"%{}{}s|\".format({})",
+            pick(r, &["", "-"]),
+            1 + r.below(8),
+            pick(r, STRS)
+        )),
+        4 => p(format!(
+            "\"%{}\".format({})",
+            pick(r, &["x", "X", "o"]),
+            pick(r, &["0", "1", "8", "10", "255", "4095"])
+        )),
+        5 => p(format!(
+            "\"%s=%d\".format({}, {})",
+            pick(r, STRS),
+            pick(r, INTS)
+        )),
+        6 => p(format!(
+            "\"%0{}.{}f\".format({})",
+            2 + r.below(8),
+            r.below(3),
+            pick(r, TIES)
+        )),
+        _ => p(format!("\"%b/%%\".format({})", pick(r, BOOLS))),
+    }
+}
+
+/// The bitwise infix member functions. `and`/`or`/`xor` are width-agnostic over
+/// these operands; `shl`/`shr`/`ushr`/`inv` are `Int` (32-bit) operations, which
+/// is where a naive 64-bit lowering would show.
+fn g_bitwise(r: &mut Rng) -> String {
+    const BITS: &[&str] = &[
+        "0", "1", "0xF", "0xFF", "0x10", "0b1010", "255", "-1", "-256",
+    ];
+    let a = pick(r, BITS);
+    let b = pick(r, BITS);
+    match r.below(6) {
+        0 => p(format!("{a} and {b}")),
+        1 => p(format!("{a} or {b}")),
+        2 => p(format!("{a} xor {b}")),
+        3 => p(format!("({a}).inv()")),
+        4 => p(format!("{a} shl {}", r.below(8))),
+        _ => p(format!("{a} {} {}", pick(r, &["shr", "ushr"]), r.below(8))),
+    }
+}
+
+/// A safe call `?.` on a receiver that may be null, over the member kinds the
+/// lowering routes differently: a stdlib member, a collection higher-order
+/// function, and an `it`-form scope function. A null receiver must short-circuit
+/// in every one of them.
+fn g_safecall(r: &mut Rng, idx: usize) -> String {
+    let s = pick(r, &["null", "\"abc\"", "\"\"", "\"Hi\""]);
+    let l = pick(r, &["null", "listOf(1, 2, 3)", "listOf(7)", "emptyList()"]);
+    match r.below(8) {
+        0 => format!("val q{idx}: String? = {s}; println(q{idx}?.uppercase())"),
+        1 => format!("val q{idx}: String? = {s}; println(q{idx}?.let {{ it + \"!\" }})"),
+        2 => format!("val q{idx}: String? = {s}; println(q{idx}?.take(2)?.length)"),
+        3 => format!("val q{idx}: List<Int>? = {l}; println(q{idx}?.map {{ it * 2 }})"),
+        4 => format!("val q{idx}: List<Int>? = {l}; println(q{idx}?.filter {{ it > 1 }})"),
+        5 => format!("val q{idx}: List<Int>? = {l}; println(q{idx}?.sum())"),
+        6 => {
+            format!("val q{idx}: List<Int>? = {l}; println(q{idx}?.sorted()?.joinToString(\"|\"))")
+        }
+        _ => format!("val q{idx}: List<Int>? = {l}; println(q{idx}?.fold(10) {{ a, b -> a + b }})"),
+    }
+}
+
+/// `Map` as an iterable: its higher-order functions see one `Map.Entry` per
+/// element, `filter` re-wraps into a `Map` (where `map` yields a `List`), and
+/// `for ((k, v) in m)` destructures the entry. Map literals keep insertion
+/// order on both sides, so the printed forms are deterministic.
+fn g_mapcoll(r: &mut Rng, idx: usize) -> String {
+    let m = pick(
+        r,
+        &[
+            "mapOf(\"a\" to 1, \"b\" to 2)",
+            "mapOf(1 to \"x\", 2 to \"y\")",
+            "mapOf(\"k\" to 9)",
+        ],
+    );
+    match r.below(9) {
+        0 => p(format!("{m}.map {{ it.key }}")),
+        1 => p(format!("{m}.map {{ it.value }}")),
+        2 => p(format!("{m}.entries.size")),
+        3 => p(format!("{m}.keys.toList()")),
+        4 => p(format!("{m}.values.toList()")),
+        5 => p(format!("{m}.any {{ true }}")),
+        6 => p(format!("{m}.count {{ true }}")),
+        7 => format!("for ((k{idx}, v{idx}) in {m}) {{ println(\"$k{idx}=$v{idx}\") }}"),
+        _ => format!("for (e{idx} in {m}) {{ println(e{idx}.key) }}"),
+    }
+}
+
+/// A `break`/`continue` that leaves a `try` owning a `finally`: the finalizer
+/// has to run on the way out, and every finalizer between the jump and its
+/// target has to run innermost-first. The labeled form whose `break` sits in a
+/// loop NESTED inside the `try` is included because it crosses the `try`
+/// without appearing in its body.
+fn g_finexit(r: &mut Rng, idx: usize) -> String {
+    let n = 2 + r.below(3);
+    let m = 1 + r.below(3);
+    match r.below(6) {
+        0 => format!(
+            "for (x{idx} in 1..{n}) {{ try {{ if (x{idx} == {m}) break; println(\"b$x{idx}\") }} finally {{ println(\"f$x{idx}\") }} }}"
+        ),
+        1 => format!(
+            "for (x{idx} in 1..{n}) {{ try {{ if (x{idx} == {m}) continue; println(\"c$x{idx}\") }} finally {{ println(\"g$x{idx}\") }} }}"
+        ),
+        2 => format!(
+            "O{idx}@ for (x{idx} in 1..{n}) {{ try {{ for (y{idx} in 1..3) {{ if (y{idx} == {m}) break@O{idx} }} }} finally {{ println(\"n$x{idx}\") }} }}"
+        ),
+        3 => format!(
+            "for (x{idx} in 1..{n}) {{ try {{ try {{ if (x{idx} == {m}) continue }} finally {{ println(\"i$x{idx}\") }} }} finally {{ println(\"o$x{idx}\") }} ; println(\"t$x{idx}\") }}"
+        ),
+        4 => format!(
+            "var z{idx} = 0; do {{ z{idx}++; try {{ if (z{idx} == {m}) break; println(\"d$z{idx}\") }} finally {{ println(\"h$z{idx}\") }} }} while (z{idx} < {n})"
+        ),
+        _ => format!(
+            "O{idx}@ for (x{idx} in 1..{n}) {{ for (y{idx} in 1..3) {{ try {{ if (y{idx} == {m}) continue@O{idx}; println(\"$x{idx}.$y{idx}\") }} finally {{ println(\"F$x{idx}$y{idx}\") }} }} }}"
+        ),
+    }
+}
+
 /// `data class` members and `when` as an expression, over the `Pt` declaration
 /// [`build_program`] always emits.
 fn g_datawhen(r: &mut Rng, idx: usize) -> String {
@@ -727,6 +907,12 @@ enum Mode {
     Class,
     DataInherit,
     Coll,
+    DoWhile,
+    StrFmt,
+    Bitwise,
+    SafeCall,
+    MapColl,
+    FinExit,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -757,6 +943,12 @@ const CONCRETE: &[Mode] = &[
     Mode::Class,
     Mode::DataInherit,
     Mode::Coll,
+    Mode::DoWhile,
+    Mode::StrFmt,
+    Mode::Bitwise,
+    Mode::SafeCall,
+    Mode::MapColl,
+    Mode::FinExit,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -789,6 +981,12 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Class => "class",
         Mode::DataInherit => "datainherit",
         Mode::Coll => "coll",
+        Mode::DoWhile => "dowhile",
+        Mode::StrFmt => "strfmt",
+        Mode::Bitwise => "bitwise",
+        Mode::SafeCall => "safecall",
+        Mode::MapColl => "mapcoll",
+        Mode::FinExit => "finexit",
     }
 }
 
@@ -833,6 +1031,12 @@ fn gen_probe(r: &mut Rng, mode: Mode, idx: usize) -> String {
         Mode::Class => g_class(r, idx),
         Mode::DataInherit => g_datainherit(r, idx),
         Mode::Coll => g_coll(r, idx),
+        Mode::DoWhile => g_dowhile(r, idx),
+        Mode::StrFmt => g_strfmt(r),
+        Mode::Bitwise => g_bitwise(r),
+        Mode::SafeCall => g_safecall(r, idx),
+        Mode::MapColl => g_mapcoll(r, idx),
+        Mode::FinExit => g_finexit(r, idx),
         Mode::All => unreachable!("resolved above"),
     }
 }

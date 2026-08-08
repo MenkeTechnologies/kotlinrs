@@ -173,6 +173,9 @@ struct FnSig {
     ret: Type,
     ret_class: Option<String>,
     arity: usize,
+    /// Parameter names, in declaration order — what a named argument
+    /// (`f(count = 3)`) binds against.
+    params: Vec<String>,
 }
 
 /// Compile-time metadata for a `class` / `data class` / `object` / `interface`,
@@ -258,6 +261,12 @@ fn ctor_sub_name(class: &str) -> String {
 /// display form both work.
 const MESSAGE_FIELD: &str = "message";
 
+/// The binding [`Compiler::compile_safe_member`] parks a `?.` receiver in so the
+/// not-null path can re-enter the ordinary member lowering with a slot standing
+/// in for the receiver. The `$` cannot appear in a lexed identifier, so this can
+/// never shadow a name the program itself declares.
+const SAFE_RECV: &str = "$safe";
+
 /// Depth-first supertype order for `name`: the type itself, then each direct
 /// parent's own order, keeping the first occurrence of a repeat. This is the
 /// order an override resolves in — the class before what it inherits from, and
@@ -338,6 +347,7 @@ pub struct Compiler {
     /// Cleared on entry to a `fun`/lambda body: a `return` belongs to its own
     /// frame.
     finally_returns: Vec<FinallyReturn>,
+    finally_exits: Vec<FinallyExit>,
 }
 
 /// One enclosing `try`-with-`finally`'s return path: the slot a pending return
@@ -345,6 +355,19 @@ pub struct Compiler {
 struct FinallyReturn {
     slot: u16,
     jumps: Vec<usize>,
+}
+
+/// The parked `break`/`continue` jumps of a `try` that owns a `finally`, for
+/// exits whose target loop lies OUTSIDE that `try` — leaving it has to run the
+/// finalizer first. An exit to a loop *inside* the `try` crosses nothing and is
+/// never parked here.
+struct FinallyExit {
+    /// `self.loops.len()` when the `try` was entered. A target loop at a lower
+    /// index is outside the `try`, which is exactly the crossing test.
+    loops_at_entry: usize,
+    /// `(jump site, is_break, label)` — the label decides which loop the exit
+    /// resumes at once the finalizer has run.
+    jumps: Vec<(usize, bool, Option<String>)>,
 }
 
 /// Where the unwind check emitted after a statement jumps when an exception is
@@ -623,6 +646,7 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
                     ret: m.ret,
                     ret_class: m.ret_class.clone(),
                     arity: m.params.len(),
+                    params: m.params.iter().map(|p| p.name.clone()).collect(),
                 });
             }
         }
@@ -724,6 +748,7 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
                 ret: f.ret,
                 ret_class: f.ret_class.clone(),
                 arity: f.params.len(),
+                params: f.params.iter().map(|p| p.name.clone()).collect(),
             },
         );
     }
@@ -755,6 +780,7 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
         has_try: uses_exceptions(program),
         unwind: Vec::new(),
         finally_returns: Vec::new(),
+        finally_exits: Vec::new(),
     };
     (c.math_scope, c.math_star) = math_scope(&program.imports);
 
@@ -1002,6 +1028,7 @@ impl Compiler {
         // return path (from a lambda's definition site) must not capture it.
         self.push_unwind(UnwindKind::Frame);
         let outer_returns = std::mem::take(&mut self.finally_returns);
+        let outer_exits = std::mem::take(&mut self.finally_exits);
         let res: Result<(), String> = (|| {
             for s in &f.body {
                 self.compile_stmt(&mut sc, s)?;
@@ -1010,6 +1037,7 @@ impl Compiler {
         })();
         self.cur_class = None;
         self.finally_returns = outer_returns;
+        self.finally_exits = outer_exits;
         let here = self.b.current_pos();
         self.pop_unwind_to(here);
         res?;
@@ -1249,6 +1277,42 @@ impl Compiler {
                     self.b.patch_jump(*j, end);
                 }
             }
+            // `do { … } while (cond)` — the body first, then the test jumping
+            // back. `continue` targets the *test*, not the loop top, so the
+            // condition still runs on the iteration it skipped out of.
+            StmtKind::DoWhile { cond, body, label } => {
+                let start = self.b.current_pos();
+                self.loops.push(LoopCtx {
+                    label: label.clone(),
+                    breaks: Vec::new(),
+                    continues: Vec::new(),
+                });
+                self.push_unwind(UnwindKind::Loop);
+                let mark = sc.enter();
+                for s in body {
+                    self.compile_stmt(sc, s)?;
+                }
+                sc.exit(mark);
+                let ctx = self.loops.pop().unwrap();
+                let test = self.b.current_pos();
+                for j in &ctx.continues {
+                    self.b.patch_jump(*j, test);
+                }
+                self.compile_expr(sc, cond)?;
+                let jf = self.b.emit(Op::JumpIfFalse(0), 0);
+                // The repeat path. A raise while evaluating the condition would
+                // otherwise spin here forever, so the check goes between the
+                // test and the back-jump; a false condition exits to `end`,
+                // where the statement's own check carries the raise outward.
+                self.unwind_check();
+                self.b.emit(Op::Jump(start), 0);
+                let end = self.b.current_pos();
+                self.b.patch_jump(jf, end);
+                self.pop_unwind_to(end);
+                for j in &ctx.breaks {
+                    self.b.patch_jump(*j, end);
+                }
+            }
             StmtKind::For {
                 var,
                 start,
@@ -1262,19 +1326,20 @@ impl Compiler {
             }
             StmtKind::ForIn {
                 var,
+                parts,
                 iter,
                 body,
                 label,
             } => {
-                self.compile_for_in(sc, var, iter, body, label)?;
+                self.compile_for_in(sc, var, parts, iter, body, label)?;
             }
             StmtKind::Break(label) => {
                 let j = self.b.emit(Op::Jump(0), 0);
-                self.loop_for_label(label, s.line)?.breaks.push(j);
+                self.route_loop_exit(j, true, label, s.line)?;
             }
             StmtKind::Continue(label) => {
                 let j = self.b.emit(Op::Jump(0), 0);
-                self.loop_for_label(label, s.line)?.continues.push(j);
+                self.route_loop_exit(j, false, label, s.line)?;
             }
             StmtKind::If(ie) => {
                 self.compile_if(sc, ie)?;
@@ -1295,24 +1360,51 @@ impl Compiler {
     /// Resolve the [`LoopCtx`] a `break`/`continue` targets: the innermost loop
     /// for a bare form, or the nearest enclosing loop carrying `label`. Errors if
     /// used outside a loop or the label is unknown (both Kotlin compile errors).
-    fn loop_for_label(
-        &mut self,
-        label: &Option<String>,
-        line: u32,
-    ) -> Result<&mut LoopCtx, String> {
-        let idx = match label {
+    /// The index in `self.loops` of the loop a `break`/`continue` targets: the
+    /// nearest one carrying `label`, or the innermost when unlabeled.
+    fn loop_index(&self, label: &Option<String>, line: u32) -> Result<usize, String> {
+        match label {
             Some(l) => self
                 .loops
                 .iter()
                 .rposition(|c| c.label.as_deref() == Some(l.as_str()))
-                .ok_or_else(|| format!("unresolved label: {l} (line {line})"))?,
+                .ok_or_else(|| format!("unresolved label: {l} (line {line})")),
             None => self
                 .loops
                 .len()
                 .checked_sub(1)
-                .ok_or_else(|| format!("break/continue outside a loop (line {line})"))?,
-        };
-        Ok(&mut self.loops[idx])
+                .ok_or_else(|| format!("break/continue outside a loop (line {line})")),
+        }
+    }
+
+    /// Send an emitted `break`/`continue` jump to its destination.
+    ///
+    /// Normally that is the target loop's own jump list. But when the exit
+    /// leaves a `try` that owns a `finally`, the finalizer must run first, so
+    /// the jump is parked on that `try` instead and [`Compiler::compile_try`]
+    /// re-dispatches it after emitting a copy of the finalizer. The test is
+    /// positional: a target loop opened BEFORE the `try` is outside it.
+    fn route_loop_exit(
+        &mut self,
+        jump: usize,
+        is_break: bool,
+        label: &Option<String>,
+        line: u32,
+    ) -> Result<(), String> {
+        let target = self.loop_index(label, line)?;
+        if let Some(f) = self.finally_exits.last_mut() {
+            if target < f.loops_at_entry {
+                f.jumps.push((jump, is_break, label.clone()));
+                return Ok(());
+            }
+        }
+        let ctx = &mut self.loops[target];
+        if is_break {
+            ctx.breaks.push(jump);
+        } else {
+            ctx.continues.push(jump);
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1415,6 +1507,7 @@ impl Compiler {
         &mut self,
         sc: &mut Scope,
         var: &str,
+        parts: &[String],
         iter: &Expr,
         body: &[Stmt],
         label: &Option<String>,
@@ -1452,6 +1545,25 @@ impl Compiler {
         self.b.emit(Op::GetSlot(islot), 0);
         self.b.emit(Op::Extended(KT_ITER_GET, 0), 0);
         self.b.emit(Op::SetSlot(vslot), 0);
+        // `for ((k, v) in map)` — split the element into its components. This
+        // runs per iteration, so the names are declared once (outside the loop
+        // body's own scope) and only re-stored here.
+        let part_slots: Vec<u16> = parts
+            .iter()
+            .map(|nm| sc.declare(nm, Type::Unknown, false))
+            .collect();
+        for (i, (nm, slot)) in parts.iter().zip(&part_slots).enumerate() {
+            if nm == "_" {
+                continue; // `_` discards the component
+            }
+            self.b.emit(Op::GetSlot(vslot), 0);
+            let cidx = self
+                .b
+                .add_constant(Value::str(format!("component{}", i + 1)));
+            self.b.emit(Op::LoadConst(cidx), 0);
+            self.b.emit(Op::Extended(KT_METHOD, 0), 0);
+            self.b.emit(Op::SetSlot(*slot), 0);
+        }
 
         self.loops.push(LoopCtx {
             label: label.clone(),
@@ -1491,6 +1603,12 @@ impl Compiler {
             // before it can be compiled on its own, so reaching here means the
             // program wrote it somewhere Kotlin does not allow it either.
             Expr::Super { .. } => Err("`super` is not an expression".to_string()),
+            // A named argument is bound by the callee (see [`bind_args`]).
+            // Reaching here means it was written where no parameter names are
+            // known — a stdlib member or a lambda invocation.
+            Expr::Named { name, .. } => Err(format!(
+                "named argument `{name}` is not supported for this callee"
+            )),
             Expr::Int(n) => {
                 self.b.emit(Op::LoadInt(*n), 0);
                 Ok(Type::Int)
@@ -1695,17 +1813,11 @@ impl Compiler {
     /// propagating — the JVM's ordering. The `finally` body is emitted once, on
     /// the single path both exits converge to.
     fn compile_try(&mut self, sc: &mut Scope, t: &TryExpr) -> Result<Type, String> {
-        // A `return` out of a `try` that owns a `finally` is honoured (it routes
-        // through the return path below), but a `break`/`continue` is not: it
-        // would leave the loop without running the finalizer, and silently
-        // skipping a cleanup block is worse than not accepting the program.
+        // A `return`, `break` or `continue` that leaves a `try` owning a
+        // `finally` all route the same way: park the jump, run the finalizer on
+        // a dedicated copy, then resume the exit. See the return path and the
+        // loop-exit path at the end of this function.
         let has_finally = !t.finally_body.is_empty();
-        if has_finally && (body_breaks(&t.body) || t.catches.iter().any(|c| body_breaks(&c.body))) {
-            return Err(format!(
-                "`break`/`continue` out of a `try` with a `finally` is not supported (line {})",
-                t.line
-            ));
-        }
         let mark = sc.enter();
         let res = sc.temp();
         let depth = sc.temp();
@@ -1713,6 +1825,10 @@ impl Compiler {
             let slot = sc.temp();
             self.finally_returns.push(FinallyReturn {
                 slot,
+                jumps: Vec::new(),
+            });
+            self.finally_exits.push(FinallyExit {
+                loops_at_entry: self.loops.len(),
                 jumps: Vec::new(),
             });
         }
@@ -1770,11 +1886,14 @@ impl Compiler {
         for j in handled {
             self.b.patch_jump(j, fin);
         }
-        let pending_ret = if has_finally {
+        let (pending_ret, pending_exit) = if has_finally {
             self.emit_finally(sc, &t.finally_body)?;
-            self.finally_returns.pop()
+            // Both frames pop BEFORE their paths are emitted, so a parked exit
+            // that is itself inside an enclosing `finally` re-parks there rather
+            // than on this one.
+            (self.finally_returns.pop(), self.finally_exits.pop())
         } else {
-            None
+            (None, None)
         };
         self.b.emit(Op::GetSlot(res), 0);
 
@@ -1808,6 +1927,36 @@ impl Compiler {
                 None => {
                     self.b.emit(Op::ReturnValue, 0);
                 }
+            }
+            let after = self.b.current_pos();
+            self.b.patch_jump(over, after);
+        }
+
+        // ── loop-exit path ──
+        // A `break`/`continue` whose target loop is outside this `try` parked
+        // its jump; the finalizer runs here and the exit then resumes. Exits
+        // sharing a target share one copy of the finalizer, so the common case
+        // (a single `break`) emits it exactly once.
+        if let Some(exit) = pending_exit.filter(|e| !e.jumps.is_empty()) {
+            let over = self.b.emit(Op::Jump(0), 0);
+            let mut groups: Vec<(bool, Option<String>, Vec<usize>)> = Vec::new();
+            for (j, is_break, label) in exit.jumps {
+                match groups
+                    .iter_mut()
+                    .find(|(b, l, _)| *b == is_break && *l == label)
+                {
+                    Some(g) => g.2.push(j),
+                    None => groups.push((is_break, label, vec![j])),
+                }
+            }
+            for (is_break, label, jumps) in groups {
+                let path = self.b.current_pos();
+                for j in jumps {
+                    self.b.patch_jump(j, path);
+                }
+                self.emit_finally(sc, &t.finally_body)?;
+                let resume = self.b.emit(Op::Jump(0), 0);
+                self.route_loop_exit(resume, is_break, &label, t.line)?;
             }
             let after = self.b.current_pos();
             self.b.patch_jump(over, after);
@@ -1987,6 +2136,29 @@ impl Compiler {
                 "round" => return self.compile_math(sc, "jround", args, line),
                 _ if is_math_fn(name) => return self.compile_math(sc, name, args, line),
                 _ => return Err(format!("unresolved reference: Math.{name}")),
+            }
+        }
+        // A companion constant on a primitive type (`Int.MAX_VALUE`,
+        // `Double.NaN`). These are compile-time literals, so they fold here
+        // rather than paying a host dispatch — and the receiver is a *type*
+        // name, which has no runtime value to dispatch on at all.
+        if args.is_empty() {
+            if let Expr::Var(ty) = recv {
+                if self.is_type_ref(sc, ty) {
+                    if let Some(v) = primitive_const(ty, name) {
+                        return Ok(match v {
+                            Value::Int(n) => {
+                                self.b.emit(Op::LoadInt(n), line);
+                                Type::Int
+                            }
+                            Value::Float(f) => {
+                                self.b.emit(Op::LoadFloat(f), line);
+                                Type::Double
+                            }
+                            _ => unreachable!("primitive_const yields only Int/Float"),
+                        });
+                    }
+                }
             }
         }
         // `Char.toString()` must render the character, not its code. The runtime
@@ -2298,19 +2470,16 @@ impl Compiler {
         args: &[Expr],
         line: u32,
     ) -> Result<Type, String> {
-        if args.len() > meta.ctor_params.len() {
-            return Err(format!(
-                "{}.copy takes at most {} argument(s)",
-                meta.name,
-                meta.ctor_params.len()
-            ));
-        }
+        // `copy` is where named arguments earn their keep — `p.copy(y = 2)`
+        // rewrites one property and inherits the rest.
+        let names: Vec<String> = meta.ctor_params.iter().map(|p| p.name.clone()).collect();
+        let slots = bind_args(&format!("{}.copy", meta.name), &names, args)?;
         let mark = sc.enter();
         self.compile_expr(sc, recv)?; // [recv]
         let rslot = sc.temp();
         self.b.emit(Op::SetSlot(rslot), 0);
         for (i, p) in meta.ctor_params.iter().enumerate() {
-            match args.get(i) {
+            match slots[i] {
                 Some(a) => {
                     self.compile_expr(sc, a)?;
                 }
@@ -2412,9 +2581,11 @@ impl Compiler {
         // suppresses any further invocation while the exception is in flight.
         self.push_unwind(UnwindKind::Frame);
         let outer_returns = std::mem::take(&mut self.finally_returns);
+        let outer_exits = std::mem::take(&mut self.finally_exits);
         let res = self.compile_block_value(&mut sc, &pl.body);
         self.cur_class = saved;
         self.finally_returns = outer_returns;
+        self.finally_exits = outer_exits;
         let here = self.b.current_pos();
         self.pop_unwind_to(here);
         res?;
@@ -2555,8 +2726,17 @@ impl Compiler {
     }
 
     /// Lower a safe member/method access `recv?.member(args)`. Evaluates the
-    /// receiver into a temp slot; if it is null the whole access is null,
-    /// otherwise it dispatches the member as usual.
+    /// receiver into a slot; if it is null the whole access is null, otherwise
+    /// the member dispatches on the not-null path.
+    ///
+    /// That not-null path re-enters [`Compiler::compile_member`] with the slot
+    /// standing in as the receiver, so `?.` reaches every routing the plain `.`
+    /// does — collection higher-order functions (`xs?.map { … }`), the `it`-form
+    /// scope functions (`s?.let { … }`), user-class virtual dispatch and
+    /// property reads — instead of only the `KT_METHOD` stdlib table. The
+    /// stand-in name carries a `$`, which the lexer never produces, so it cannot
+    /// collide with a user binding, and it is declared inside this scope so
+    /// nested safe calls each get their own slot.
     fn compile_safe_member(
         &mut self,
         sc: &mut Scope,
@@ -2566,8 +2746,9 @@ impl Compiler {
         line: u32,
     ) -> Result<Type, String> {
         let mark = sc.enter();
-        self.compile_expr(sc, recv)?; // [recv]
-        let rslot = sc.temp();
+        let rty = self.compile_expr(sc, recv)?; // [recv]
+        let rclass = self.infer_class(sc, recv);
+        let rslot = sc.declare_obj(SAFE_RECV, rty, false, rclass);
         self.b.emit(Op::SetSlot(rslot), 0); // []
         self.b.emit(Op::GetSlot(rslot), 0); // [recv]
         self.b.emit(Op::Extended(KT_ISNULL, 0), 0); // [isNull]
@@ -2577,17 +2758,14 @@ impl Compiler {
         let jend = self.b.emit(Op::Jump(0), 0);
         let call_pos = self.b.current_pos();
         self.b.patch_jump(jf, call_pos);
-        self.b.emit(Op::GetSlot(rslot), 0); // [recv]
-        for a in args {
-            self.compile_expr(sc, a)?;
-        }
-        let nidx = self.b.add_constant(Value::str(name.to_string()));
-        self.b.emit(Op::LoadConst(nidx), line);
-        self.b.emit(Op::Extended(KT_METHOD, args.len() as u8), line);
+        let stand_in = Expr::Var(SAFE_RECV.to_string());
+        let ty = self.compile_member(sc, &stand_in, name, args, false, line)?;
         let end = self.b.current_pos();
         self.b.patch_jump(jend, end);
         sc.exit(mark);
-        Ok(method_ret_type(name))
+        // The whole point of `?.` is that the result may be null, so the static
+        // type has to be the nullable one.
+        Ok(nullable_if_safe(ty, true))
     }
 
     fn compile_str(&mut self, sc: &mut Scope, parts: &[StrExpr]) -> Result<(), String> {
@@ -2940,14 +3118,11 @@ impl Compiler {
                 }
                 // A free user function.
                 if let Some(sig) = self.fun_sig.get(name).cloned() {
-                    if args.len() != sig.arity {
-                        return Err(format!(
-                            "function {name} expects {} argument(s), got {}",
-                            sig.arity,
-                            args.len()
-                        ));
-                    }
-                    for a in args {
+                    let slots = bind_args(&format!("function {name}"), &sig.params, args)?;
+                    for (i, slot) in slots.iter().enumerate() {
+                        let a = slot.ok_or_else(|| {
+                            format!("function {name} has no argument for `{}`", sig.params[i])
+                        })?;
                         self.compile_expr(sc, a)?;
                     }
                     let idx = self.b.add_name(name);
@@ -3036,6 +3211,13 @@ impl Compiler {
             && !self.classes.contains_key("Math")
     }
 
+    /// Whether `name` names a built-in type (rather than a value) in this
+    /// program — the receiver position of a companion constant. A local binding
+    /// or a user class of the same name shadows it, exactly as with `Math`.
+    fn is_type_ref(&self, sc: &Scope, name: &str) -> bool {
+        sc.slot(name).is_none() && !self.classes.contains_key(name)
+    }
+
     /// `Math.PI` / `kotlin.math.PI` — a literal `Double` constant, so it folds at
     /// compile time rather than paying a host dispatch.
     fn compile_math_const(&mut self, name: &str, line: u32) -> Result<Type, String> {
@@ -3089,19 +3271,19 @@ impl Compiler {
             };
             return Err(format!("cannot construct {what} {}", meta.name));
         }
-        if args.len() != meta.ctor_params.len() {
-            return Err(format!(
-                "constructor {} expects {} argument(s), got {}",
-                meta.name,
-                meta.ctor_params.len(),
-                args.len()
-            ));
-        }
-        for a in args {
+        let names: Vec<String> = meta.ctor_params.iter().map(|p| p.name.clone()).collect();
+        let slots = bind_args(&format!("constructor {}", meta.name), &names, args)?;
+        for (i, slot) in slots.iter().enumerate() {
+            let a = slot.ok_or_else(|| {
+                format!(
+                    "constructor {} has no argument for `{}`",
+                    meta.name, names[i]
+                )
+            })?;
             self.compile_expr(sc, a)?;
         }
         let idx = self.b.add_name(&ctor_sub_name(&meta.name));
-        self.b.emit(Op::Call(idx, args.len() as u8), line);
+        self.b.emit(Op::Call(idx, names.len() as u8), line);
         Ok(Type::Obj)
     }
 
@@ -3134,7 +3316,12 @@ impl Compiler {
         // Evaluate the subject once; remember its static type for `==` op choice.
         let subj = if let Some(subject) = &w.subject {
             let t = self.compile_expr(sc, subject)?;
-            let slot = sc.temp();
+            // The `when (val n = …)` form names that same slot, so an arm body
+            // reads the subject through the binding with no second evaluation.
+            let slot = match &w.binding {
+                Some(n) => sc.declare_obj(n, t, false, self.infer_class(sc, subject)),
+                None => sc.temp(),
+            };
             self.b.emit(Op::SetSlot(slot), 0);
             Some((slot, t))
         } else {
@@ -3304,6 +3491,8 @@ impl Compiler {
     fn infer(&self, sc: &Scope, e: &Expr) -> Type {
         match e {
             Expr::Super { .. } => Type::Unknown,
+            // A named argument types as the value it carries.
+            Expr::Named { value, .. } => self.infer(sc, value),
             Expr::Int(_) => Type::Int,
             Expr::Float(_) => Type::Double,
             Expr::Bool(_) => Type::Boolean,
@@ -3407,20 +3596,26 @@ impl Compiler {
             // `Double` for display and `/` dispatch.
             Expr::IncDec { target, .. } => self.infer(sc, target),
             Expr::Lambda { .. } => Type::Unknown,
-            Expr::Member { recv, name, .. } => {
+            Expr::Member {
+                recv, name, safe, ..
+            } => {
                 if self.is_java_math(sc, recv) {
                     return Type::Double; // `Math.PI` / `Math.E`
                 }
                 // A property read on a known class yields the property's type.
                 if let Some(cls) = self.infer_class(sc, recv) {
                     if let Some(p) = self.classes.get(&cls).and_then(|m| m.prop(name)) {
-                        return p.ty;
+                        return nullable_if_safe(p.ty, *safe);
                     }
                 }
-                method_ret_type(name)
+                nullable_if_safe(method_ret_type(name), *safe)
             }
             Expr::MethodCall {
-                recv, name, args, ..
+                recv,
+                name,
+                args,
+                safe,
+                ..
             } => {
                 // `Math.round` returns a `Long`; the rest follow the shared
                 // math overload rule.
@@ -3433,14 +3628,14 @@ impl Compiler {
                 }
                 // A higher-order collection method's result type is fixed.
                 if is_coll_hof(name) {
-                    return hof_ret_type(name);
+                    return nullable_if_safe(hof_ret_type(name), *safe);
                 }
                 if let Some(cls) = self.infer_class(sc, recv) {
                     if let Some(sig) = self.classes.get(&cls).and_then(|m| m.methods.get(name)) {
-                        return sig.ret;
+                        return nullable_if_safe(sig.ret, *safe);
                     }
                 }
-                method_ret_type(name)
+                nullable_if_safe(method_ret_type(name), *safe)
             }
             Expr::Elvis { left, right } => {
                 let lt = self.infer(sc, left);
@@ -3653,6 +3848,107 @@ fn join_ty(prev: Option<Type>, next: Type) -> Type {
 /// Static return type of a Kotlin stdlib member/method, mirroring the runtime
 /// dispatch in [`crate::host::kt_method`]. Members not modeled here fall back to
 /// `Unknown` (they still dispatch; only static typing of the result is coarse).
+/// Bind a call's arguments to `params` by position and by name, yielding one
+/// slot per parameter: `Some(expr)` where an argument supplied it, `None` where
+/// none did. Whether a `None` is legal is the caller's call — `copy` keeps the
+/// receiver's value there, a constructor or `fun` requires every slot filled.
+///
+/// Kotlin's rule is that positional arguments come first and every named one
+/// binds a distinct parameter, both of which are enforced here: a mixed-up order
+/// or a duplicate/unknown name is a compile error, never a silent misbinding.
+fn bind_args<'a>(
+    callee: &str,
+    params: &[String],
+    args: &'a [Expr],
+) -> Result<Vec<Option<&'a Expr>>, String> {
+    let mut slots: Vec<Option<&Expr>> = vec![None; params.len()];
+    let mut seen_named = false;
+    for (i, a) in args.iter().enumerate() {
+        let Expr::Named { name, value } = a else {
+            if seen_named {
+                return Err(format!(
+                    "{callee}: a positional argument cannot follow a named one"
+                ));
+            }
+            match slots.get_mut(i) {
+                Some(slot) => *slot = Some(a),
+                None => {
+                    return Err(format!(
+                        "{callee} takes at most {} argument(s), got {}",
+                        params.len(),
+                        args.len()
+                    ))
+                }
+            }
+            continue;
+        };
+        seen_named = true;
+        let at = params
+            .iter()
+            .position(|p| p == name)
+            .ok_or_else(|| format!("{callee} has no parameter named `{name}`"))?;
+        if slots[at].is_some() {
+            return Err(format!("{callee}: argument for `{name}` given twice"));
+        }
+        slots[at] = Some(value);
+    }
+    Ok(slots)
+}
+
+/// The companion constant `ty.name` (`Int.MAX_VALUE`, `Double.NaN`), or `None`
+/// when the pair is not one of them.
+///
+/// `Double.MIN_VALUE` and the `Float` bounds are deliberately absent: they are
+/// the shortest decimal that round-trips a subnormal `Double` / a 32-bit
+/// `Float`, and this frontend carries every floating value as an `f64` and
+/// renders it with the `f64` shortest-repr — so it would print
+/// `5.0E-324`/`3.4028234663852886E38` where Kotlin prints `4.9E-324`/
+/// `3.4028235E38`. Leaving them unresolved keeps the divergence out of running
+/// programs.
+fn primitive_const(ty: &str, name: &str) -> Option<Value> {
+    let v = match (ty, name) {
+        ("Byte", "MAX_VALUE") => Value::Int(i8::MAX as i64),
+        ("Byte", "MIN_VALUE") => Value::Int(i8::MIN as i64),
+        ("Short", "MAX_VALUE") => Value::Int(i16::MAX as i64),
+        ("Short", "MIN_VALUE") => Value::Int(i16::MIN as i64),
+        ("Int", "MAX_VALUE") => Value::Int(i32::MAX as i64),
+        ("Int", "MIN_VALUE") => Value::Int(i32::MIN as i64),
+        ("Long", "MAX_VALUE") => Value::Int(i64::MAX),
+        ("Long", "MIN_VALUE") => Value::Int(i64::MIN),
+        ("Double", "MAX_VALUE") => Value::Float(f64::MAX),
+        ("Double" | "Float", "POSITIVE_INFINITY") => Value::Float(f64::INFINITY),
+        ("Double" | "Float", "NEGATIVE_INFINITY") => Value::Float(f64::NEG_INFINITY),
+        ("Double" | "Float", "NaN") => Value::Float(f64::NAN),
+        _ => return None,
+    };
+    Some(v)
+}
+
+/// Widen a member's result type for a safe call `recv?.m()`, which yields null
+/// whenever the receiver is null.
+///
+/// It matters for exactly the two types whose display skips the Kotlin
+/// stringifier: a `String` renders through fusevm's native concat, which writes
+/// an absent value as the EMPTY string rather than `null`, and a `Char` renders
+/// through the code-unit op. Both widen to a type that stringifies through the
+/// host, where `null` is spelled out. Every other type already routes there, so
+/// they are returned unchanged and keep their sharper op selection.
+///
+/// Both the lowering ([`Compiler::compile_safe_member`]) and the coarse
+/// inference ([`Compiler::infer`]) go through this, because a `+` picks its
+/// display coercion from the INFERRED type of each side — so widening in only
+/// one of the two would still print `"v=" + s?.uppercase()` without the `null`.
+fn nullable_if_safe(t: Type, safe: bool) -> Type {
+    if !safe {
+        return t;
+    }
+    match t {
+        Type::String => Type::NullableString,
+        Type::Char => Type::Unknown,
+        other => other,
+    }
+}
+
 fn method_ret_type(name: &str) -> Type {
     match name {
         "length" | "code" => Type::Int,
@@ -3675,6 +3971,11 @@ fn is_coll_hof(name: &str) -> bool {
             | "flatMap"
             | "filter"
             | "filterNot"
+            | "partition"
+            | "takeWhile"
+            | "dropWhile"
+            | "firstOrNull"
+            | "lastOrNull"
             | "forEach"
             | "fold"
             | "reduce"
@@ -3699,10 +4000,9 @@ fn is_coll_hof(name: &str) -> bool {
 /// coarse (`Unknown` display routes through the generic Kotlin stringifier).
 fn hof_ret_type(name: &str) -> Type {
     match name {
-        "map" | "mapIndexed" | "flatMap" | "filter" | "filterNot" | "sortedBy"
-        | "sortedByDescending" | "associate" | "associateBy" | "associateWith" | "groupBy" => {
-            Type::Obj
-        }
+        "map" | "mapIndexed" | "flatMap" | "filter" | "filterNot" | "partition" | "takeWhile"
+        | "dropWhile" | "sortedBy" | "sortedByDescending" | "associate" | "associateBy"
+        | "associateWith" | "groupBy" => Type::Obj,
         "forEach" => Type::Unit,
         "any" | "all" | "none" => Type::Boolean,
         "count" => Type::Int,
@@ -3729,7 +4029,9 @@ fn body_any(body: &[Stmt], f: &dyn Fn(&Expr) -> bool) -> bool {
         StmtKind::Destructure { init, .. } => expr_any(init, f),
         StmtKind::Return(Some(e)) => expr_any(e, f),
         StmtKind::Return(None) => false,
-        StmtKind::While { cond, body, .. } => expr_any(cond, f) || body_any(body, f),
+        StmtKind::While { cond, body, .. } | StmtKind::DoWhile { cond, body, .. } => {
+            expr_any(cond, f) || body_any(body, f)
+        }
         StmtKind::For {
             start,
             end,
@@ -3783,6 +4085,7 @@ fn expr_any(e: &Expr, f: &dyn Fn(&Expr) -> bool) -> bool {
         Expr::MethodCall { recv, args, .. } => {
             expr_any(recv, f) || args.iter().any(|a| expr_any(a, f))
         }
+        Expr::Named { value, .. } => expr_any(value, f),
         Expr::Unary { expr, .. } => expr_any(expr, f),
         Expr::Binary { l, r, .. } => expr_any(l, f) || expr_any(r, f),
         Expr::Elvis { left, right } => expr_any(left, f) || expr_any(right, f),
@@ -3838,30 +4141,4 @@ pub fn uses_exceptions(program: &Program) -> bool {
             .classes
             .iter()
             .any(|c| c.methods.iter().any(|m| has(&m.body)))
-}
-
-/// True when `body` can leave its enclosing loop by a `break`/`continue` — the
-/// one shape a `try` with a `finally` cannot honour, because the jump would
-/// bypass the finalizer. A `break`/`continue` inside a *nested* loop is absorbed
-/// by that loop and does not count. (A `return` is honoured: it routes through
-/// the `try`'s return path, which runs the finalizer first.)
-fn body_breaks(body: &[Stmt]) -> bool {
-    body.iter().any(|s| match &s.kind {
-        StmtKind::Break(_) | StmtKind::Continue(_) => true,
-        StmtKind::If(ie) => body_breaks(&ie.then) || ie.els.as_deref().is_some_and(body_breaks),
-        StmtKind::When(w) => w.arms.iter().any(|a| body_breaks(&a.body)),
-        StmtKind::Expr(e) => expr_breaks(e),
-        // A nested loop absorbs its own `break`/`continue`.
-        _ => false,
-    })
-}
-
-/// An `if`/`when` used as an *expression* can still hold a `break` in a branch
-/// (`val x = if (c) break else 1`), so the scan follows those too.
-fn expr_breaks(e: &Expr) -> bool {
-    match e {
-        Expr::If(ie) => body_breaks(&ie.then) || ie.els.as_deref().is_some_and(body_breaks),
-        Expr::When(w) => w.arms.iter().any(|a| body_breaks(&a.body)),
-        _ => false,
-    }
 }

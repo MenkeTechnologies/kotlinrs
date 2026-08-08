@@ -117,9 +117,19 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `fun main()` entry (with or without `args`).
 - **Expressions** — `+ - * / %`, unary `-`/`!`, comparisons `== != < > <= >=`,
   short-circuit `&&`/`||`, parentheses. `Int/Int` truncates toward zero;
-  `Double` division is IEEE.
+  `Double` division is IEEE. The bitwise operations are Kotlin's infix member
+  functions — `and`, `or`, `xor`, `shl`, `shr`, `ushr` and `inv()`.
+- **Literals** — decimal, hexadecimal (`0xFF`) and binary (`0b1010`) integers,
+  each accepting `_` separators and an `L` suffix; and the companion constants
+  `Int.MAX_VALUE`/`MIN_VALUE` (likewise `Long`/`Short`/`Byte`),
+  `Double.MAX_VALUE`, and `Double`/`Float` `POSITIVE_INFINITY`/
+  `NEGATIVE_INFINITY`/`NaN`.
 - **Strings** — literals with `\n`/`\t`/`\\`/`\"`/`\$` escapes and `$name` /
   `${expr}` templates; `+` concatenates when either side is a `String`.
+- **Call arguments** — positional and named (`f(count = 3)`, `p.copy(y = 2)`)
+  for user functions, constructors and the `data class` `copy`, with Kotlin's
+  rules enforced: positional arguments come first and each name binds a distinct
+  parameter exactly once.
 - **`Char`** — a runtime type of its own, not an `Int` in disguise, so it stays
   a character in *every* position, including the ones where the compiler can see
   no type: `println(listOf('a'))` is `[a]`, a `Map` key prints as `{a=1}`, and
@@ -135,8 +145,20 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `isLowerCase`/`uppercaseChar`/`lowercaseChar`/`uppercase`/`lowercase`/
   `digitToInt`/`compareTo`/`equals`/`hashCode`/`toString`.
 - **Member access** — chainable postfix `.`: `String.length`,
-  `.uppercase()`/`.lowercase()`, `.trim()`, `.isEmpty()`/`.isNotEmpty()`,
-  `Char.code`, `Int.toChar()`, and `Any.toString()`.
+  `.uppercase()`/`.lowercase()`, `.trim()`/`.trimStart()`/`.trimEnd()`,
+  `.isEmpty()`/`.isNotEmpty()`, `.split()` (one delimiter or several),
+  `.lines()`, `.reversed()`, `.take()`/`.drop()`, `.first()`/`.last()`,
+  `.padStart()`/`.padEnd()`, `.substringBefore()`/`.substringAfter()`,
+  `.removePrefix()`/`.removeSuffix()`, `.lastIndexOf()`, `.toCharArray()`,
+  `.compareTo()` (the JVM's code-unit difference, not a clamped sign), the
+  parses `.toInt()`/`.toLong()`/`.toDouble()` and their `…OrNull` forms, and
+  `.format(args…)` — the `java.util.Formatter` conversions `%d %s %f %e %x %X
+  %o %c %b %%` with the `-`/`0`/`+`/space flags, a width and a precision, where
+  `%f` rounds HALF_UP over the value's shortest decimal form exactly as the JVM
+  does (so `"%.0f".format(2.5)` is `3`, not `2`). Numerically,
+  `.coerceIn()`/`.coerceAtLeast()`/`.coerceAtMost()`, `.pow()`,
+  `.absoluteValue`, `.roundToInt()`; plus `Char.code`, `Int.toChar()`, and
+  `Any.toString()`.
 - **Classes** — `class C(val x: Int, var y: Int) { fun m() {…} }`: primary-
   constructor properties (`val`/`var`), plain constructor parameters (a
   parameter with no `val`/`var` is forwarded, not stored), instance methods
@@ -185,12 +207,16 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 - **Collections** — `listOf`/`mutableListOf`, `setOf`/`mutableSetOf`, and
   `mapOf`/`mutableMapOf` (with `k to v` `Pair`s), indexing `xs[i]` / `m[k]` (and
   indexed assignment), `.size`, `.add`/`.remove`/`.get`/`.contains`/`.indexOf`/
-  `.sum` on lists, `.containsKey`/`.keys`/`.values`/`.put` on maps. `List`s,
-  `Set`s, arrays, and ranges share one sequence-member table: `.count()`,
-  `.first()`/`.last()`, `.max()`/`.min()`, `.average()`, `.toList()`/`.toSet()`,
-  `.distinct()`, `.sorted()`/`.sortedDescending()`, `.take(n)`/`.drop(n)`
-  (both clamp rather than fault), `.union`/`.intersect`/`.subtract`,
-  `.joinToString(sep)`, `.reversed()`.
+  `.sum` on lists, `.containsKey`/`.keys`/`.values`/`.entries`/`.put` on maps.
+  `List`s, `Set`s, arrays, and ranges share one sequence-member table:
+  `.count()`, `.first()`/`.last()`, `.max()`/`.min()`, `.average()`,
+  `.toList()`/`.toSet()`, `.distinct()`, `.sorted()`/`.sortedDescending()`,
+  `.take(n)`/`.drop(n)` (both clamp rather than fault), `.flatten()`,
+  `.zip(other)`, `.chunked(n)`/`.windowed(n)`, `.subList(from, to)`,
+  `.union`/`.intersect`/`.subtract`, `.joinToString(sep)`, `.reversed()`. The
+  `…OrNull` members answer `null` where their plain counterparts throw:
+  `.maxOrNull()`/`.minOrNull()`, `.firstOrNull()`/`.lastOrNull()`,
+  `.getOrNull(i)`/`.elementAtOrNull(i)` beside `.elementAt(i)`.
 - **`Set`** — `setOf`/`mutableSetOf` build a `LinkedHashSet`, so iteration and
   display follow *insertion* order (`setOf(3, 1, 2, 3)` prints `[3, 1, 2]`) while
   equality ignores it (`setOf(1, 2) == setOf(2, 1)`). `MutableSet.add` answers
@@ -225,21 +251,30 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   compiler inlining and no fusevm-core change.
 - **Higher-order stdlib** — the lambda-taking collection functions operate on
   real lambda values: `.map`/`.mapIndexed`/`.flatMap`, `.filter`/`.filterNot`,
+  `.partition`, `.takeWhile`/`.dropWhile`, `.firstOrNull`/`.lastOrNull`,
   `.forEach`, `.fold`/`.reduce`, `.any`/`.all`/`.none`/`.count`, `.sumOf`,
   `.maxByOrNull`/`.minByOrNull`, `.sortedBy`/`.sortedByDescending`,
   `.associate`/`.associateBy`/`.associateWith`, `.groupBy`. `it` is the implicit
-  parameter, and `mapIndexed` takes `(index, element)`.
+  parameter, and `mapIndexed` takes `(index, element)`. A `Map` receiver feeds
+  them one `Map.Entry` per element (`m.map { it.key }`), and `filter` re-wraps
+  into the receiver's own kind — a filtered `Map` is a `Map`, a filtered `Set` a
+  `Set` — as Kotlin's per-receiver overloads do.
 - **Scope functions** — the `it`-form `.let`/`.also`/`.takeIf` on any receiver.
 - **Control flow** — `if`/`else` (statement **and** expression, incl.
   `else if`); `when` (statement **and** expression) in subject and subjectless
-  forms, with literal, comma-grouped, `in`/`!in` range, `is`/`!is` type, and
-  `else` arms; `while`, and `for` — over a literal range (`a..b`, `a until b`,
-  `a downTo b`, with optional `step`), which lowers to a counted native-op loop,
-  or over any iterable value (a `List`, an array, a range held in a variable, or
-  a `String` — `for (c in "abc")` walks its `Char`s).
+  forms, with literal, comma-grouped, `in`/`!in` range, `is`/`!is` type (incl.
+  the erased generic form `is List<*>`), and `else` arms; the subject may name
+  itself for the arm bodies (`when (val n = f()) { … }`). `while`,
+  `do { … } while (cond)` — whose body always runs once and whose `continue`
+  targets the condition, not the loop top — and `for`, over a literal range
+  (`a..b`, `a until b`, `a downTo b`, with optional `step`), which lowers to a
+  counted native-op loop, or over any iterable value (a `List`, a `Map`, an
+  array, a range held in a variable, or a `String` — `for (c in "abc")` walks its
+  `Char`s), with the destructuring header `for ((k, v) in map)`.
   A loop body may be a block or a single statement;
   `break`/`continue`, including labeled `outer@ for (…)` with
-  `break@outer` / `continue@outer`. Blocks are lexically scoped: bindings
+  `break@outer` / `continue@outer`, and the local `return@label` out of a
+  lambda. Blocks are lexically scoped: bindings
   declared in a nested block (and the `for` variable) drop at the block's end;
   shadowing is restored. A `when` over a `sealed` hierarchy's `is` arms needs no
   `else` — the arms cover every subtype, so the fallthrough is unreachable.
@@ -300,12 +335,18 @@ comparison (a `toString()` override *is* honoured everywhere). And method
 overloading is not supported — two `fun f` at different arities in one class is
 a compile error here.
 
-A `return` out of a `try` that owns a `finally` is honoured — the finalizer runs
-first, nesting outward — but a `break`/`continue` out of one is refused at
-compile time, because kotlinrs would run the jump without the finalizer and
-silently skipping a cleanup block is worse than not accepting the program. A
-`try` with neither a `catch` nor a `finally` is refused too (Kotlin rejects it
-as well).
+A `return`, `break` or `continue` out of a `try` that owns a `finally` is
+honoured: the finalizer runs first, and every finalizer between the jump and its
+target runs innermost-first. That includes a labeled `break@outer` from a loop
+nested *inside* the `try`, which crosses the `try` without appearing in its body.
+A `try` with neither a `catch` nor a `finally` is refused (Kotlin rejects it as
+well).
+
+`Int` is carried as a 64-bit integer, so 32-bit wraparound is not modeled:
+`2147483647 + 1` gives `2147483648` where Kotlin gives `-2147483648`. The
+`Int`-width operations that *are* faithful are the ones where the width is the
+whole point — `shl`/`shr`/`ushr` mask the shift count to 5 bits and `inv()`
+complements 32 bits, as Kotlin's do.
 
 ## [0x04] COMMAND-LINE FLAGS
 
@@ -431,11 +472,25 @@ properties, with its derived members taken from the primary constructor alone.
 that both supply `m` can say which one it means. And the inheritance modifiers
 are now enforced rather than merely recorded.
 
-Next: the collection functions on a `String` receiver (`"abc".map { … }`,
-`toCharArray`), generics, the `this`-receiver scope functions (`apply`/`run`),
-lambda element-type inference, named/default arguments, `as` casts, class body
-property initializers, and a growing standard-library surface — alongside the
-sibling parity tooling (LSP/DAP, reference generator, differential harness).
+Also landed, all pinned by the differential harness against the reference
+toolchain: `do { … } while (cond)`; the `when (val n = …)` subject binding and
+the erased generic `is List<*>`; hexadecimal/binary integer literals and the
+primitive companion constants; **named arguments** for functions, constructors
+and `copy`; the bitwise infix members (`and`/`shl`/`inv`/…); `String.format`
+with the JVM's HALF_UP `%f` rounding; a `Map` as an iterable (its higher-order
+functions, `entries`, `for ((k, v) in m)`, and `filter` re-wrapping into a
+`Map`); `break`/`continue` out of a `try` that owns a `finally`; and the local
+`return@label`. Two correctness fixes came with them: a non-ASCII string literal
+was being lexed byte-per-character (`"café".length` read 5), and a safe call
+returning a `String` displayed a null result as the empty string rather than
+`null`.
+
+Next: the collection functions on a `String` receiver (`"abc".map { … }`),
+generics, the `this`-receiver scope functions (`apply`/`run`), lambda
+element-type inference, default arguments, `as` casts, class body property
+initializers, a 32-bit `Int` (wraparound is not modeled today), and a growing
+standard-library surface — alongside the sibling parity tooling (LSP/DAP,
+reference generator, differential harness).
 
 ## [0xFF] LICENSE
 

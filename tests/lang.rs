@@ -1596,14 +1596,33 @@ fun main() {
 }
 
 #[test]
-fn a_break_out_of_a_try_with_a_finally_is_rejected() {
-    // Unlike `return`, a `break` has no path that could run the finalizer here;
-    // refusing the program beats silently skipping a cleanup block.
-    let err =
-        prog_err("fun main() { for (i in 1..3) { try { break } finally { println(\"fin\") } } }");
-    assert!(
-        err.contains("out of a `try` with a `finally` is not supported"),
-        "stderr was: {err}"
+fn a_break_or_continue_out_of_a_try_runs_its_finally_first() {
+    // A `break`/`continue` leaving a `try` that owns a `finally` must run the
+    // finalizer on the way out, exactly as `return` does. The four shapes below
+    // are the ones that differ in lowering:
+    //   * `break` — the loop ends, so the finalizer runs once and nothing after
+    //     the `try` in that iteration does;
+    //   * `continue` — the finalizer runs, then the NEXT iteration starts (the
+    //     `println` after the `try` is skipped for that one);
+    //   * a labeled `break` out of a loop nested INSIDE the `try` — the jump
+    //     crosses the `try` even though the `break` is not lexically in its
+    //     body, which is the shape a purely syntactic check misses;
+    //   * nested `try`s — every finalizer between the jump and its target runs,
+    //     innermost first.
+    // Output captured from the reference `kotlinc` + `kotlin` toolchain.
+    let src = "\
+fun main() {
+    for (i in 1..3) { try { if (i == 2) break; println(\"b$i\") } finally { println(\"fin$i\") } }
+    for (i in 1..3) { try { if (i == 2) continue; println(\"c$i\") } finally { println(\"f$i\") } }
+    outer@ for (i in 1..3) { try { for (j in 1..3) { if (j == 2) break@outer } } finally { println(\"nest$i\") } }
+    for (i in 1..3) { try { try { if (i == 2) continue } finally { println(\"in$i\") } } finally { println(\"out$i\") } ; println(\"tail$i\") }
+}";
+    assert_eq!(
+        prog(src),
+        "b1\nfin1\nfin2\n\
+         c1\nf1\nf2\nc3\nf3\n\
+         nest1\n\
+         in1\nout1\ntail1\nin2\nout2\nin3\nout3\ntail3\n"
     );
 }
 

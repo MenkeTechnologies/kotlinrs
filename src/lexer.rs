@@ -173,6 +173,39 @@ impl<'a> Lexer<'a> {
 
     fn number(&mut self) -> Tok {
         let start = self.pos;
+        // `0x…` / `0b…` — a radix literal, which has no fraction, no exponent
+        // and only a `L` suffix. Handled before the decimal scan because that
+        // scan would stop at the `x`/`b` and leave it to start an identifier.
+        if self.peek() == b'0' && matches!(self.peek2(), b'x' | b'X' | b'b' | b'B') {
+            let radix = if matches!(self.peek2(), b'x' | b'X') {
+                16
+            } else {
+                2
+            };
+            self.bump();
+            self.bump();
+            let digits_at = self.pos;
+            // Only digits valid in this radix (plus `_`) — so the `L` suffix of
+            // `0xFFL` stays a suffix instead of being read as a hex digit.
+            while (self.peek() as char).is_digit(radix) || self.peek() == b'_' {
+                self.bump();
+            }
+            let raw: String = std::str::from_utf8(&self.src[digits_at..self.pos])
+                .unwrap()
+                .chars()
+                .filter(|&ch| ch != '_')
+                .collect();
+            if self.peek() == b'L' {
+                self.bump();
+            }
+            // A radix literal is parsed unsigned so `0xFFFFFFFFFFFFFFFF` reads
+            // as the JVM's `-1` rather than saturating.
+            return Tok::Int(
+                u64::from_str_radix(&raw, radix)
+                    .map(|u| u as i64)
+                    .unwrap_or(0),
+            );
+        }
         while self.peek().is_ascii_digit() || self.peek() == b'_' {
             self.bump();
         }
@@ -231,6 +264,7 @@ impl<'a> Lexer<'a> {
             "if" => Tok::If,
             "else" => Tok::Else,
             "while" => Tok::While,
+            "do" => Tok::Do,
             "for" => Tok::For,
             "in" => Tok::In,
             "return" => Tok::Return,
@@ -330,7 +364,18 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 _ => {
-                    cur.push(self.bump() as char);
+                    // A whole UTF-8 scalar, not one byte: `"café"` is four
+                    // characters, and pushing `b'\xc3' as char` would make it
+                    // five mojibake ones (which `length`, `reversed()` and
+                    // every index then read back wrong).
+                    let start = self.pos;
+                    for _ in 0..utf8_len(c) {
+                        self.bump();
+                    }
+                    match std::str::from_utf8(&self.src[start..self.pos]) {
+                        Ok(s) => cur.push_str(s),
+                        Err(_) => return Err("invalid UTF-8 in string literal".into()),
+                    }
                 }
             }
         }

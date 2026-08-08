@@ -247,6 +247,15 @@ pub enum StmtKind {
         /// Optional loop label (`outer@ while (…)`) for `break@outer`.
         label: Option<String>,
     },
+    /// `do { … } while (cond)` — the body runs before the first test, so it
+    /// always executes at least once. Kept distinct from [`StmtKind::While`]
+    /// because `continue` targets the *condition* here, not the loop top.
+    DoWhile {
+        cond: Expr,
+        body: Vec<Stmt>,
+        /// Optional loop label (`outer@ do { … } while (…)`).
+        label: Option<String>,
+    },
     /// `for (v in start..end)` / `until` / `downTo`, optional `step`.
     For {
         var: String,
@@ -265,6 +274,10 @@ pub enum StmtKind {
     /// of paying a host indexing call per iteration.
     ForIn {
         var: String,
+        /// The names of the destructuring form `for ((k, v) in map)`, read off
+        /// the element via `componentN`. Empty for the plain `for (e in xs)`
+        /// form, where `var` alone binds the element.
+        parts: Vec<String>,
         iter: Expr,
         body: Vec<Stmt>,
         label: Option<String>,
@@ -308,6 +321,10 @@ pub struct WhenExpr {
     /// The subject in `when (subject) { … }`; `None` for the subjectless form,
     /// where each arm guard is a standalone boolean expression.
     pub subject: Option<Box<Expr>>,
+    /// The name bound by the `when (val n = subject) { … }` form, visible to
+    /// every arm body. The subject is evaluated once either way; this only
+    /// gives the resulting value a name.
+    pub binding: Option<String>,
     pub arms: Vec<WhenArm>,
     pub line: u32,
 }
@@ -419,6 +436,14 @@ pub enum Expr {
         args: Vec<Expr>,
         safe: bool,
         line: u32,
+    },
+    /// A named call argument, `f(count = 3)`. Kotlin has no assignment
+    /// *expression*, so `name = value` inside an argument list is unambiguously
+    /// this; the compiler binds it to the callee's parameter of that name and
+    /// rejects it where no parameter names are known.
+    Named {
+        name: String,
+        value: Box<Expr>,
     },
     /// Elvis `left ?: right` — `right` when `left` is null, else `left`.
     Elvis {
