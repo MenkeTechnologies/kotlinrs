@@ -651,16 +651,18 @@ println(n)   // 1</code></pre>
         <article class="doc-entry" id="doc-types-1">
           <h3><a class="doc-anchor" href="#doc-types-1">#</a> <code>Int</code></h3>
           <pre><code class="lang-kotlin">Int</code></pre>
-          <p>Signed integer. It is 64-bit at run time — kotlinrs has one integer representation, so <code>Int</code> and <code>Long</code> are the same value and <code>Int</code> arithmetic does not overflow at 32 bits the way the JVM's does. <code>/</code> and <code>%</code> truncate toward zero.</p>
+          <p>Signed 32-bit integer. Values are carried in a 64-bit slot at run time, so every <code>Int</code> arithmetic result is narrowed back to 32 bits at the point it is produced: <code>Int.MAX_VALUE + 1</code> wraps to <code>Int.MIN_VALUE</code>, exactly as on the JVM. <code>/</code> and <code>%</code> truncate toward zero.</p>
           <pre><code class="lang-kotlin">val n: Int = 7 / 2
-println(n)   // 3</code></pre>
+println(n)              // 3
+println(Int.MAX_VALUE + 1)   // -2147483648</code></pre>
         </article>
         <article class="doc-entry" id="doc-types-2">
           <h3><a class="doc-anchor" href="#doc-types-2">#</a> <code>Long</code></h3>
           <pre><code class="lang-kotlin">Long</code></pre>
-          <p>Signed 64-bit integer, sharing <code>Int</code>'s representation and division rules. An <code>L</code> literal suffix is accepted and prints without it, so <code>println(10L)</code> writes <code>10</code>.</p>
+          <p>Signed 64-bit integer, sharing <code>Int</code>'s division rules. An <code>L</code> literal suffix marks a value as 64-bit and prints without it, so <code>println(10L)</code> writes <code>10</code>. A <code>Long</code> operand keeps the whole expression at 64 bits, so it is not narrowed the way an <code>Int</code> result is: <code>2147483647L + 1L</code> is <code>2147483648</code>.</p>
           <pre><code class="lang-kotlin">val big: Long = 10L
-println(big)   // 10</code></pre>
+println(big)                 // 10
+println(2147483647L + 1L)    // 2147483648</code></pre>
         </article>
         <article class="doc-entry" id="doc-types-3">
           <h3><a class="doc-anchor" href="#doc-types-3">#</a> <code>Double</code></h3>
@@ -1743,19 +1745,36 @@ Double.toDouble(): Double</code></pre>
         <article class="doc-entry" id="doc-numeric-members-7">
           <h3><a class="doc-anchor" href="#doc-numeric-members-7">#</a> <code>toInt</code></h3>
           <pre><code class="lang-kotlin">Int.toInt(): Int
-Double.toInt(): Int</code></pre>
-          <p>Truncates a <code>Double</code> toward zero; on an integer it is the identity. There is no <code>String.toInt</code> — parsing text to a number is not implemented.</p>
-          <pre><code class="lang-kotlin">println(3.9.toInt())   // 3</code></pre>
+Long.toInt(): Int
+Double.toInt(): Int
+String.toInt(): Int</code></pre>
+          <p>Narrows to 32 bits. From a <code>Long</code> that is a truncation of the low 32 bits (<code>2147483648L.toInt()</code> is <code>-2147483648</code>); from a <code>Double</code> it truncates toward zero and then saturates at the <code>Int</code> bounds; from a <code>String</code> it parses the text.</p>
+          <pre><code class="lang-kotlin">println(3.9.toInt())            // 3
+println(2147483648L.toInt())    // -2147483648</code></pre>
         </article>
         <article class="doc-entry" id="doc-numeric-members-8">
           <h3><a class="doc-anchor" href="#doc-numeric-members-8">#</a> <code>toLong</code></h3>
           <pre><code class="lang-kotlin">Int.toLong(): Long
-Double.toLong(): Long</code></pre>
-          <p>The same conversion <code>toInt</code> performs, since <code>Int</code> and <code>Long</code> share one 64-bit representation here.</p>
-          <pre><code class="lang-kotlin">println(3.9.toLong())   // 3</code></pre>
+Double.toLong(): Long
+String.toLong(): Long</code></pre>
+          <p>Widens to 64 bits, which stops the surrounding arithmetic from being narrowed back to <code>Int</code>. From a <code>Double</code> it truncates toward zero and saturates at the <code>Long</code> bounds.</p>
+          <pre><code class="lang-kotlin">println(3.9.toLong())                // 3
+println(2147483647.toLong() + 1L)    // 2147483648</code></pre>
         </article>
         <article class="doc-entry" id="doc-numeric-members-9">
-          <h3><a class="doc-anchor" href="#doc-numeric-members-9">#</a> <code>toChar</code></h3>
+          <h3><a class="doc-anchor" href="#doc-numeric-members-9">#</a> <code>toShort</code></h3>
+          <pre><code class="lang-kotlin">Int.toShort(): Short</code></pre>
+          <p>Truncates to the low 16 bits, signed — so <code>70000.toShort()</code> is <code>4464</code>. The result promotes back to <code>Int</code> for arithmetic, as Kotlin's does.</p>
+          <pre><code class="lang-kotlin">println(32768.toShort())   // -32768</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-numeric-members-10">
+          <h3><a class="doc-anchor" href="#doc-numeric-members-10">#</a> <code>toByte</code></h3>
+          <pre><code class="lang-kotlin">Int.toByte(): Byte</code></pre>
+          <p>Truncates to the low 8 bits, signed — so <code>200.toByte()</code> is <code>-56</code>. The result promotes back to <code>Int</code> for arithmetic, as Kotlin's does.</p>
+          <pre><code class="lang-kotlin">println(200.toByte())   // -56</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-numeric-members-11">
+          <h3><a class="doc-anchor" href="#doc-numeric-members-11">#</a> <code>toChar</code></h3>
           <pre><code class="lang-kotlin">Int.toChar(): Char</code></pre>
           <p>The <code>Char</code> for the low 16 bits of the receiver — the inverse of <code>Char.code</code>.</p>
           <pre><code class="lang-kotlin">println(65.toChar())   // A</code></pre>

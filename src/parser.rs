@@ -1451,6 +1451,10 @@ impl Parser {
                 self.bump();
                 Ok(Expr::Int(n))
             }
+            Tok::Long(n) => {
+                self.bump();
+                Ok(Expr::Long(n))
+            }
             Tok::Float(f) => {
                 self.bump();
                 Ok(Expr::Float(f))

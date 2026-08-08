@@ -17,6 +17,12 @@ pub enum StrPart {
 pub enum Tok {
     // Literals
     Int(i64),
+    /// An `L`-suffixed integer literal (`1L`, `0xFFL`). Distinct from
+    /// [`Tok::Int`] because the suffix is what makes the literal 64-bit: it is
+    /// the only place a Kotlin source file can *state* `Long` width inside an
+    /// expression, and the compiler needs that width to decide whether the
+    /// surrounding arithmetic narrows back to 32 bits.
+    Long(i64),
     Float(f64),
     Str(Vec<StrPart>),
     Bool(bool),

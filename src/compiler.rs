@@ -1613,6 +1613,10 @@ impl Compiler {
                 self.b.emit(Op::LoadInt(*n), 0);
                 Ok(Type::Int)
             }
+            Expr::Long(n) => {
+                self.b.emit(Op::LoadInt(*n), 0);
+                Ok(Type::Long)
+            }
             Expr::Float(f) => {
                 self.b.emit(Op::LoadFloat(*f), 0);
                 Ok(Type::Double)
@@ -1679,11 +1683,17 @@ impl Compiler {
                 match op {
                     UnOp::Neg => {
                         self.b.emit(Op::Negate, 0);
-                        Ok(if t == Type::Double {
-                            Type::Double
-                        } else {
-                            Type::Int
-                        })
+                        let ty = match t {
+                            Type::Double => Type::Double,
+                            Type::Long => Type::Long,
+                            _ => Type::Int,
+                        };
+                        // `-Int.MIN_VALUE` is `Int.MIN_VALUE`: negation is the
+                        // one unary operator that can leave the `Int` range.
+                        if ty == Type::Int && is_int_width(t) {
+                            self.emit_wrap32();
+                        }
+                        Ok(ty)
                     }
                     UnOp::Not => {
                         self.b.emit(Op::LogNot, 0);
@@ -1713,17 +1723,11 @@ impl Compiler {
                 Ok(t)
             }
             Expr::Index { recv, index, line } => {
-                let rt = self.infer(sc, recv);
+                let ty = self.index_elem_ty(sc, recv);
                 self.compile_expr(sc, recv)?;
                 self.compile_expr(sc, index)?;
                 self.b.emit(Op::Extended(KT_INDEX_GET, 0), *line);
-                // `s[i]` on a String is a `Char`; every other receiver's element
-                // type is beyond the coarse inference.
-                Ok(if rt.is_str() {
-                    Type::Char
-                } else {
-                    Type::Unknown
-                })
+                Ok(ty)
             }
             Expr::Pair { first, second } => {
                 self.compile_expr(sc, first)?;
@@ -2145,18 +2149,13 @@ impl Compiler {
         if args.is_empty() {
             if let Expr::Var(ty) = recv {
                 if self.is_type_ref(sc, ty) {
-                    if let Some(v) = primitive_const(ty, name) {
-                        return Ok(match v {
-                            Value::Int(n) => {
-                                self.b.emit(Op::LoadInt(n), line);
-                                Type::Int
-                            }
-                            Value::Float(f) => {
-                                self.b.emit(Op::LoadFloat(f), line);
-                                Type::Double
-                            }
+                    if let Some((v, vty)) = primitive_const(ty, name) {
+                        match v {
+                            Value::Int(n) => self.b.emit(Op::LoadInt(n), line),
+                            Value::Float(f) => self.b.emit(Op::LoadFloat(f), line),
                             _ => unreachable!("primitive_const yields only Int/Float"),
-                        });
+                        };
+                        return Ok(vty);
                     }
                 }
             }
@@ -2262,6 +2261,41 @@ impl Compiler {
             if !cands.is_empty() {
                 self.emit_virtual_call(sc, recv, name, args, &cands, line)?;
                 return Ok(self.virtual_ret_type(&cands, name));
+            }
+        }
+        // The bitwise members (reached from their infix spelling, `x shl 4`).
+        // `and`/`or`/`xor` cannot widen a value, so they only need a static
+        // result type; the shifts and `inv` also need the RECEIVER'S WIDTH,
+        // because Kotlin masks an `Int` shift count at 31 and truncates the
+        // result to 32 bits where a `Long` masks at 63 and keeps all 64 (`1 shl
+        // 32` is 1, `1L shl 32` is 4294967296). Every integer is one `i64` at
+        // runtime, so the width cannot be recovered there — it is pushed as a
+        // trailing argument and one host arm serves both.
+        if matches!(name, "shl" | "shr" | "ushr" | "inv" | "and" | "or" | "xor")
+            && args.len() == usize::from(name != "inv")
+        {
+            let rt = self.infer(sc, recv);
+            if matches!(rt, Type::Int | Type::Long | Type::Unknown) {
+                let ty = if rt == Type::Long {
+                    Type::Long
+                } else {
+                    Type::Int
+                };
+                if matches!(name, "shl" | "shr" | "ushr" | "inv") {
+                    self.compile_expr(sc, recv)?;
+                    for a in args {
+                        self.compile_expr(sc, a)?;
+                    }
+                    self.b
+                        .emit(Op::LoadInt(if ty == Type::Long { 64 } else { 32 }), line);
+                    let nidx = self.b.add_constant(Value::str(name.to_string()));
+                    self.b.emit(Op::LoadConst(nidx), line);
+                    self.b
+                        .emit(Op::Extended(KT_METHOD, args.len() as u8 + 1), line);
+                } else {
+                    self.emit_kt_method(sc, recv, name, args, line)?;
+                }
+                return Ok(ty);
             }
         }
         self.emit_kt_method(sc, recv, name, args, line)
@@ -2866,11 +2900,7 @@ impl Compiler {
 
         let both_int = lt.is_int() && rt.is_int();
         let both_str = lt.is_str() && rt.is_str();
-        let num_ty = if lt == Type::Double || rt == Type::Double {
-            Type::Double
-        } else {
-            Type::Int
-        };
+        let num_ty = promote(lt, rt);
         // Kotlin `Char` arithmetic: `Char + Int` / `Char - Int` → `Char`,
         // `Char - Char` → `Int`. Backed by the same integer ops; only the
         // result type (hence display) differs.
@@ -2900,7 +2930,7 @@ impl Compiler {
             BinOp::Div => {
                 if both_int {
                     self.b.emit(Op::Extended(KT_IDIV, 0), 0);
-                    Type::Int
+                    num_ty
                 } else {
                     // IEEE division, not the native op: Kotlin's `x / 0.0` is a
                     // signed infinity and `0.0 / 0.0` is NaN, where `Op::Div`
@@ -2912,7 +2942,7 @@ impl Compiler {
             BinOp::Mod => {
                 self.b.emit(Op::Extended(KT_IMOD, 0), 0);
                 if both_int {
-                    Type::Int
+                    num_ty
                 } else {
                     Type::Double
                 }
@@ -2943,7 +2973,36 @@ impl Compiler {
             }
             BinOp::And | BinOp::Or => unreachable!("handled above"),
         };
+        // An `Int`-precision arithmetic result wraps at 32 bits. A comparison
+        // yields a Boolean, a `Char` result is truncated to 16 bits by the host's
+        // `char_of`, and a `Long`/`Double` result keeps its full width — so this
+        // fires only for the arithmetic operators on two `Int`-width operands.
+        if ty == Type::Int
+            && matches!(
+                op,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+            )
+            && narrows_to_int(lt, rt)
+        {
+            self.emit_wrap32();
+        }
         Ok(ty)
+    }
+
+    /// Narrow the value on top of the stack to a signed 32-bit `Int` — Kotlin's
+    /// `Int` overflow wrap.
+    ///
+    /// `Shl 32` then `Shr 32` sign-extends the low 32 bits, because fusevm's
+    /// `Shr` is an ARITHMETIC shift in the interpreter, the tracing JIT and the
+    /// AOT backend alike. Two native ops rather than a host call is what keeps a
+    /// hot `Int` loop traceable: a `CallBuiltin`/`Extended` here would abort
+    /// trace recording and cost the loop its JIT. The pair is a no-op for a value
+    /// already inside the `Int` range.
+    fn emit_wrap32(&mut self) {
+        self.b.emit(Op::LoadInt(32), 0);
+        self.b.emit(Op::Shl, 0);
+        self.b.emit(Op::LoadInt(32), 0);
+        self.b.emit(Op::Shr, 0);
     }
 
     fn compile_call(
@@ -3247,7 +3306,14 @@ impl Compiler {
         let nidx = self.b.add_constant(Value::str(name.to_string()));
         self.b.emit(Op::LoadConst(nidx), line);
         self.b.emit(Op::Extended(KT_MATH, args.len() as u8), line);
-        Ok(math_ret_type(name, &tys))
+        let ty = math_ret_type(name, &tys);
+        // `abs(Int.MIN_VALUE)` is the one integral math result that leaves the
+        // `Int` range — negating `Int.MIN_VALUE` does not fit — and the host has
+        // no argument width to narrow it with, so it happens here.
+        if ty == Type::Int && tys.iter().copied().all(is_int_width) {
+            self.emit_wrap32();
+        }
+        Ok(ty)
     }
 
     /// Lower a constructor call `Class(args)`: push the class metadata string,
@@ -3494,6 +3560,7 @@ impl Compiler {
             // A named argument types as the value it carries.
             Expr::Named { value, .. } => self.infer(sc, value),
             Expr::Int(_) => Type::Int,
+            Expr::Long(_) => Type::Long,
             Expr::Float(_) => Type::Double,
             Expr::Bool(_) => Type::Boolean,
             Expr::Char(_) => Type::Char,
@@ -3508,13 +3575,11 @@ impl Compiler {
             }
             Expr::Unary { op, expr } => match op {
                 UnOp::Not => Type::Boolean,
-                UnOp::Neg => {
-                    if self.infer(sc, expr) == Type::Double {
-                        Type::Double
-                    } else {
-                        Type::Int
-                    }
-                }
+                UnOp::Neg => match self.infer(sc, expr) {
+                    Type::Double => Type::Double,
+                    Type::Long => Type::Long,
+                    _ => Type::Int,
+                },
             },
             Expr::Binary { op, l, r } => match op {
                 BinOp::Eq
@@ -3532,10 +3597,8 @@ impl Compiler {
                         Type::String
                     } else if lt == Type::Char || rt == Type::Char {
                         Type::Char // Char + Int → Char
-                    } else if lt == Type::Double || rt == Type::Double {
-                        Type::Double
                     } else {
-                        Type::Int
+                        promote(lt, rt)
                     }
                 }
                 BinOp::Sub => {
@@ -3545,18 +3608,12 @@ impl Compiler {
                         Type::Int // Char - Char → Int
                     } else if lt == Type::Char || rt == Type::Char {
                         Type::Char // Char - Int → Char
-                    } else if lt == Type::Double || rt == Type::Double {
-                        Type::Double
                     } else {
-                        Type::Int
+                        promote(lt, rt)
                     }
                 }
                 BinOp::Mul | BinOp::Div | BinOp::Mod => {
-                    if self.infer(sc, l) == Type::Double || self.infer(sc, r) == Type::Double {
-                        Type::Double
-                    } else {
-                        Type::Int
-                    }
+                    promote(self.infer(sc, l), self.infer(sc, r))
                 }
             },
             Expr::Call { name, args, .. } => match name.as_str() {
@@ -3579,15 +3636,7 @@ impl Compiler {
                     .map(|s| s.ret)
                     .unwrap_or(Type::Unknown),
             },
-            // `s[i]` yields a `Char`; other element types are past the coarse
-            // inference and stay `Unknown`.
-            Expr::Index { recv, .. } => {
-                if self.infer(sc, recv).is_str() {
-                    Type::Char
-                } else {
-                    Type::Unknown
-                }
-            }
+            Expr::Index { recv, .. } => self.index_elem_ty(sc, recv),
             Expr::Pair { .. } => Type::Obj,
             // A range and an array are heap objects; `in` is a predicate.
             Expr::Range { .. } | Expr::Step { .. } => Type::Obj,
@@ -3601,6 +3650,17 @@ impl Compiler {
             } => {
                 if self.is_java_math(sc, recv) {
                     return Type::Double; // `Math.PI` / `Math.E`
+                }
+                // A companion constant on a primitive type. It has to agree with
+                // the type `compile_member` returns for the same node, or
+                // `Int.MAX_VALUE + 1` would be inferred `Unknown` and skip the
+                // 32-bit narrowing the emitted code needs.
+                if let Expr::Var(tyname) = &**recv {
+                    if self.is_type_ref(sc, tyname) {
+                        if let Some((_, vty)) = primitive_const(tyname, name) {
+                            return vty;
+                        }
+                    }
                 }
                 // A property read on a known class yields the property's type.
                 if let Some(cls) = self.infer_class(sc, recv) {
@@ -3625,6 +3685,19 @@ impl Compiler {
                     }
                     let tys: Vec<Type> = args.iter().map(|a| self.infer(sc, a)).collect();
                     return math_ret_type(name, &tys);
+                }
+                // A bitwise member keeps the receiver's width, so it must agree
+                // with the type `compile_member` returns for the same node.
+                if matches!(
+                    name.as_str(),
+                    "shl" | "shr" | "ushr" | "inv" | "and" | "or" | "xor"
+                ) && args.len() == usize::from(name != "inv")
+                {
+                    match self.infer(sc, recv) {
+                        Type::Long => return Type::Long,
+                        Type::Int | Type::Unknown => return Type::Int,
+                        _ => {}
+                    }
                 }
                 // A higher-order collection method's result type is fixed.
                 if is_coll_hof(name) {
@@ -3706,6 +3779,25 @@ impl Compiler {
         }
     }
 
+    /// The static element type of `recv[i]`.
+    ///
+    /// A `String` indexes to a `Char`, and the primitive array factories carry
+    /// their element type in their name — which is what makes `ia[0] + 1` wrap
+    /// at 32 bits and `ia[0] / 2` divide as integers. A `List`/`Map`/`Array`
+    /// element can be anything, so it stays `Unknown` and skips both.
+    fn index_elem_ty(&self, sc: &Scope, recv: &Expr) -> Type {
+        if self.infer(sc, recv).is_str() {
+            return Type::Char;
+        }
+        match self.infer_class(sc, recv).as_deref() {
+            Some("IntArray") => Type::Int,
+            Some("DoubleArray") => Type::Double,
+            Some("CharArray") => Type::Char,
+            Some("BooleanArray") => Type::Boolean,
+            _ => Type::Unknown,
+        }
+    }
+
     /// The class/container name of an expression's value, when statically known:
     /// a bound variable's class, a constructor call, `this`, a class-typed
     /// function return, or a class-typed property/method result. Drives method
@@ -3744,6 +3836,13 @@ impl Compiler {
                     "mapOf" | "mutableMapOf" | "hashMapOf" | "emptyMap" => {
                         return Some("Map".to_string())
                     }
+                    // The primitive array factories, whose name states the
+                    // element type. `arrayOf`/`Array` are deliberately absent:
+                    // their elements are unconstrained.
+                    "intArrayOf" | "IntArray" => return Some("IntArray".to_string()),
+                    "doubleArrayOf" | "DoubleArray" => return Some("DoubleArray".to_string()),
+                    "charArrayOf" | "CharArray" => return Some("CharArray".to_string()),
+                    "booleanArrayOf" | "BooleanArray" => return Some("BooleanArray".to_string()),
                     _ => {}
                 }
                 self.fun_sig.get(name).and_then(|s| s.ret_class.clone())
@@ -3821,6 +3920,9 @@ fn math_ret_type(name: &str, args: &[Type]) -> Type {
         // `java.lang.Math.round` is the odd one out: `Long`, not `Double`.
         "jround" => Type::Long,
         _ if args.contains(&Type::Double) => Type::Double,
+        // `abs`/`max`/`min` keep their argument's width, so a `Long` argument
+        // selects the `Long` overload and the result must not narrow.
+        _ if args.contains(&Type::Long) => Type::Long,
         _ if args.iter().all(|t| t.is_int()) => Type::Int,
         _ => Type::Unknown,
     }
@@ -3905,23 +4007,68 @@ fn bind_args<'a>(
 /// `5.0E-324`/`3.4028234663852886E38` where Kotlin prints `4.9E-324`/
 /// `3.4028235E38`. Leaving them unresolved keeps the divergence out of running
 /// programs.
-fn primitive_const(ty: &str, name: &str) -> Option<Value> {
+/// The constant's static type rides along with its value: `Long.MAX_VALUE` is a
+/// `Long`, and the difference decides whether the arithmetic around it narrows
+/// to 32 bits (`Int.MAX_VALUE + 1` is `-2147483648`, `Long.MAX_VALUE + 1L` is
+/// `-9223372036854775808`).
+fn primitive_const(ty: &str, name: &str) -> Option<(Value, Type)> {
     let v = match (ty, name) {
-        ("Byte", "MAX_VALUE") => Value::Int(i8::MAX as i64),
-        ("Byte", "MIN_VALUE") => Value::Int(i8::MIN as i64),
-        ("Short", "MAX_VALUE") => Value::Int(i16::MAX as i64),
-        ("Short", "MIN_VALUE") => Value::Int(i16::MIN as i64),
-        ("Int", "MAX_VALUE") => Value::Int(i32::MAX as i64),
-        ("Int", "MIN_VALUE") => Value::Int(i32::MIN as i64),
-        ("Long", "MAX_VALUE") => Value::Int(i64::MAX),
-        ("Long", "MIN_VALUE") => Value::Int(i64::MIN),
-        ("Double", "MAX_VALUE") => Value::Float(f64::MAX),
-        ("Double" | "Float", "POSITIVE_INFINITY") => Value::Float(f64::INFINITY),
-        ("Double" | "Float", "NEGATIVE_INFINITY") => Value::Float(f64::NEG_INFINITY),
-        ("Double" | "Float", "NaN") => Value::Float(f64::NAN),
+        ("Byte", "MAX_VALUE") => (Value::Int(i8::MAX as i64), Type::Int),
+        ("Byte", "MIN_VALUE") => (Value::Int(i8::MIN as i64), Type::Int),
+        ("Short", "MAX_VALUE") => (Value::Int(i16::MAX as i64), Type::Int),
+        ("Short", "MIN_VALUE") => (Value::Int(i16::MIN as i64), Type::Int),
+        ("Int", "MAX_VALUE") => (Value::Int(i32::MAX as i64), Type::Int),
+        ("Int", "MIN_VALUE") => (Value::Int(i32::MIN as i64), Type::Int),
+        ("Long", "MAX_VALUE") => (Value::Int(i64::MAX), Type::Long),
+        ("Long", "MIN_VALUE") => (Value::Int(i64::MIN), Type::Long),
+        ("Double", "MAX_VALUE") => (Value::Float(f64::MAX), Type::Double),
+        ("Double" | "Float", "POSITIVE_INFINITY") => (Value::Float(f64::INFINITY), Type::Double),
+        ("Double" | "Float", "NEGATIVE_INFINITY") => {
+            (Value::Float(f64::NEG_INFINITY), Type::Double)
+        }
+        ("Double" | "Float", "NaN") => (Value::Float(f64::NAN), Type::Double),
         _ => return None,
     };
     Some(v)
+}
+
+// ── Integer width ──────────────────────────────────────────────────────────
+//
+// Every Kotlin integer runs as one fusevm `i64`, so a 32-bit `Int` result has
+// to be narrowed back after each arithmetic op or `Int.MAX_VALUE + 1` would
+// print 2147483648 where Kotlin prints -2147483648. The narrowing is emitted
+// PER SITE from the operands' static types, which is what lets `Int` and `Long`
+// arithmetic coexist in one chunk: a `Long` operand simply skips it and keeps
+// the full 64-bit i64 result.
+
+/// Kotlin's binary numeric promotion for `+ - * / %`: a `Double` operand makes
+/// the result `Double`, otherwise a `Long` operand makes it a 64-bit `Long`,
+/// and everything else is a 32-bit `Int`.
+fn promote(lt: Type, rt: Type) -> Type {
+    if lt == Type::Double || rt == Type::Double {
+        Type::Double
+    } else if lt == Type::Long || rt == Type::Long {
+        Type::Long
+    } else {
+        Type::Int
+    }
+}
+
+/// True when `t` is a statically known operand of `Int` width. `Char` counts —
+/// it is a 16-bit code unit, so `Char - Char` is inside `Int` either way.
+///
+/// [`Type::Unknown`] is deliberately excluded: a value whose type the frontend
+/// could not resolve may well be a `Long`, and truncating one to 32 bits would
+/// be a far worse error than leaving a rare `Int` overflow unwrapped.
+fn is_int_width(t: Type) -> bool {
+    matches!(t, Type::Int | Type::Char)
+}
+
+/// True when an operation on operands of these types produces a value that must
+/// be narrowed to 32 bits: both operands are `Int`-width, so Kotlin computed the
+/// result at `Int` precision.
+fn narrows_to_int(lt: Type, rt: Type) -> bool {
+    is_int_width(lt) && is_int_width(rt)
 }
 
 /// Widen a member's result type for a safe call `recv?.m()`, which yields null
@@ -3952,6 +4099,12 @@ fn nullable_if_safe(t: Type, safe: bool) -> Type {
 fn method_ret_type(name: &str) -> Type {
     match name {
         "length" | "code" => Type::Int,
+        // The width conversions. `toByte`/`toShort` narrow the VALUE, but their
+        // result still takes part in arithmetic at `Int` width (Kotlin promotes
+        // both before every operator), so `Int` is their arithmetic type here.
+        "toInt" | "toByte" | "toShort" => Type::Int,
+        "toLong" => Type::Long,
+        "toDouble" | "toFloat" => Type::Double,
         "isEmpty" | "isNotEmpty" => Type::Boolean,
         "toChar" => Type::Char,
         "uppercase" | "toUpperCase" | "lowercase" | "toLowerCase" | "trim" | "toString" => {
@@ -4113,6 +4266,7 @@ fn expr_any(e: &Expr, f: &dyn Fn(&Expr) -> bool) -> bool {
             StrExpr::Text(_) => false,
         }),
         Expr::Int(_)
+        | Expr::Long(_)
         | Expr::Float(_)
         | Expr::Bool(_)
         | Expr::Char(_)

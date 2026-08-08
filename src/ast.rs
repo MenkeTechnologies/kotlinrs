@@ -51,7 +51,13 @@ impl Type {
     /// Parse a type annotation name (`Int`, `Double`, `String`, …).
     pub fn from_name(s: &str) -> Type {
         match s {
-            "Int" => Type::Int,
+            // `Byte` and `Short` are narrower storage types, but Kotlin promotes
+            // both to `Int` before every arithmetic operation (`b + b` on two
+            // `Byte`s is an `Int`), and a literal that does not fit the declared
+            // width is a compile error — so `Int` is their exact arithmetic
+            // width here. Their `MIN_VALUE`/`MAX_VALUE` constants and the
+            // `toByte()`/`toShort()` conversions carry the narrower behaviour.
+            "Int" | "Byte" | "Short" => Type::Int,
             "Long" => Type::Long,
             "Double" | "Float" => Type::Double,
             "Boolean" => Type::Boolean,
@@ -384,6 +390,10 @@ pub enum UnOp {
 #[derive(Debug, Clone)]
 pub enum Expr {
     Int(i64),
+    /// An `L`-suffixed literal (`1L`). Carries the same `i64` as [`Expr::Int`];
+    /// the node exists so the value's static width is `Long`, which is what
+    /// keeps the surrounding arithmetic 64-bit instead of narrowing to `Int`.
+    Long(i64),
     Float(f64),
     Bool(bool),
     /// A `Char` literal, carrying its UTF-16 code unit.

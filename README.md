@@ -342,11 +342,31 @@ nested *inside* the `try`, which crosses the `try` without appearing in its body
 A `try` with neither a `catch` nor a `finally` is refused (Kotlin rejects it as
 well).
 
-`Int` is carried as a 64-bit integer, so 32-bit wraparound is not modeled:
-`2147483647 + 1` gives `2147483648` where Kotlin gives `-2147483648`. The
-`Int`-width operations that *are* faithful are the ones where the width is the
-whole point — `shl`/`shr`/`ushr` mask the shift count to 5 bits and `inv()`
-complements 32 bits, as Kotlin's do.
+`Int` and `Long` are both carried as a 64-bit integer at runtime, and the
+difference is restored **per site** from the operands' static types: an `Int`
+result is narrowed back to 32 bits by a `Shl 32; Shr 32` pair (fusevm's `Shr` is
+an arithmetic shift, so that is a two's-complement sign-extend), and a `Long`
+result is left alone. So `2147483647 + 1` is `-2147483648` and
+`2147483647L + 1L` is `2147483648`, in the same program and the same chunk. The
+narrowing is two native ops rather than a host call, which keeps a hot `Int`
+loop traceable by the JIT, and it is a no-op for a value already in range.
+
+It covers `+ - * / %`, unary minus, `++`/`--`, compound assignment, and
+`abs(Int.MIN_VALUE)`. `Byte` and `Short` follow Kotlin in promoting to `Int`
+before every operator, while `toByte()`/`toShort()`/`toInt()` truncate to their
+own width and `Double.toInt()` saturates. The shifts take the receiver's width
+too: `shl`/`shr`/`ushr` mask the count at 31 and truncate to 32 bits on an `Int`
+receiver, at 63 and 64 bits on a `Long` one (`1 shl 32` is 1, `1L shl 32` is
+4294967296), and `inv()` complements the matching width.
+
+The primitive array factories name their element type, so an `IntArray` element
+takes part in all of it — `ia[0] + 1` wraps and `ia[0] / 2` divides as integers,
+where a `List` element (which could hold anything) does neither.
+
+What is *not* narrowed is an expression whose static type this frontend cannot
+resolve — an untyped lambda parameter, a `List` or `Map` element. Those keep the
+64-bit result, on the reasoning that silently truncating a value that may be a
+`Long` is worse than an unwrapped overflow.
 
 ## [0x04] COMMAND-LINE FLAGS
 
@@ -488,9 +508,8 @@ returning a `String` displayed a null result as the empty string rather than
 Next: the collection functions on a `String` receiver (`"abc".map { … }`),
 generics, the `this`-receiver scope functions (`apply`/`run`), lambda
 element-type inference, default arguments, `as` casts, class body property
-initializers, a 32-bit `Int` (wraparound is not modeled today), and a growing
-standard-library surface — alongside the sibling parity tooling (LSP/DAP,
-reference generator, differential harness).
+initializers, and a growing standard-library surface — alongside the sibling
+parity tooling (LSP/DAP, reference generator, differential harness).
 
 ## [0xFF] LICENSE
 

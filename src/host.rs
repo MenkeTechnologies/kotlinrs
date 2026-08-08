@@ -2645,6 +2645,17 @@ fn utf16_index_of(hay: &str, needle: &str) -> i64 {
     }
 }
 
+/// The receiver width (32 or 64) the compiler appended at index `at` to a
+/// width-sensitive bitwise member. An absent or unexpected value falls back to
+/// 32 — Kotlin's `Int`, the width every such call had before the argument
+/// existed.
+fn trailing_width(args: &[Value], at: usize) -> i64 {
+    match args.get(at).map(|v| v.to_int()) {
+        Some(64) => 64,
+        _ => 32,
+    }
+}
+
 fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     // A `Char` shares the `Value::Obj` variant with the heap but is not a heap
     // object, so its members resolve first.
@@ -2897,11 +2908,8 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
         // `Int.toChar()` → the `Char` for the low 16 bits of the receiver.
         (Value::Int(n), "toChar") => Ok(char_of(*n)),
         // The bitwise member functions, which the parser reaches through their
-        // infix spelling (`a and b`, `x shl 4`). `and`/`or`/`xor` are
-        // width-agnostic for in-range values, but the shifts and `inv` are not:
-        // Kotlin's are `Int` operations that mask the shift count to 5 bits and
-        // complement 32 bits, so those go through `i32`. (A `Long` receiver is
-        // the documented Int/Long-width gap — every integer here is one `i64`.)
+        // infix spelling (`a and b`, `x shl 4`). `and`/`or`/`xor` cannot widen a
+        // value, so they operate on the `i64` directly.
         (Value::Int(a), "and") => Ok(Value::Int(
             a & args.first().map(|v| v.to_int()).unwrap_or(0),
         )),
@@ -2911,14 +2919,33 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
         (Value::Int(a), "xor") => Ok(Value::Int(
             a ^ args.first().map(|v| v.to_int()).unwrap_or(0),
         )),
-        (Value::Int(a), "inv") => Ok(Value::Int(!(*a as i32) as i64)),
+        // `inv` and the shifts DO depend on the receiver's width, which every
+        // integer being one `i64` hides at runtime — so the compiler pushes it
+        // as the last argument (32 for an `Int` receiver, 64 for a `Long`).
+        // Kotlin masks the shift count at `width - 1` and truncates the result
+        // to `width`: `1 shl 32` is 1, `1L shl 32` is 4294967296.
+        (Value::Int(a), "inv") => Ok(Value::Int(if trailing_width(args, 0) == 64 {
+            !*a
+        } else {
+            !(*a as i32) as i64
+        })),
         (Value::Int(a), "shl" | "shr" | "ushr") => {
-            let bits = (args.first().map(|v| v.to_int()).unwrap_or(0) & 31) as u32;
-            let a = *a as i32;
-            Ok(Value::Int(match name {
-                "shl" => a.wrapping_shl(bits) as i64,
-                "shr" => a.wrapping_shr(bits) as i64,
-                _ => ((a as u32).wrapping_shr(bits)) as i32 as i64,
+            let width = trailing_width(args, 1);
+            let count = args.first().map(|v| v.to_int()).unwrap_or(0);
+            let bits = (count & (width - 1)) as u32;
+            Ok(Value::Int(if width == 64 {
+                match name {
+                    "shl" => a.wrapping_shl(bits),
+                    "shr" => a.wrapping_shr(bits),
+                    _ => (*a as u64).wrapping_shr(bits) as i64,
+                }
+            } else {
+                let a = *a as i32;
+                match name {
+                    "shl" => a.wrapping_shl(bits) as i64,
+                    "shr" => a.wrapping_shr(bits) as i64,
+                    _ => ((a as u32).wrapping_shr(bits)) as i32 as i64,
+                }
             }))
         }
         // `coerceIn`/`coerceAtLeast`/`coerceAtMost` clamp to a bound. The result
@@ -3001,10 +3028,22 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
                 }))
             }
         }
-        (Value::Int(n), "toDouble") => Ok(Value::Float(*n as f64)),
-        (Value::Int(n), "toInt" | "toLong") => Ok(Value::Int(*n)),
-        (Value::Float(f), "toDouble") => Ok(Value::Float(*f)),
-        (Value::Float(f), "toInt" | "toLong") => Ok(Value::Int(*f as i64)),
+        (Value::Int(n), "toDouble" | "toFloat") => Ok(Value::Float(*n as f64)),
+        // Integer-to-integer conversions TRUNCATE to the target width (they are
+        // the JVM's `i2b`/`i2s`/`l2i`), so `2147483648L.toInt()` is
+        // `-2147483648` and `200.toByte()` is `-56`. `toLong` is the identity:
+        // every integer already runs as an `i64`.
+        (Value::Int(n), "toInt") => Ok(Value::Int(*n as i32 as i64)),
+        (Value::Int(n), "toShort") => Ok(Value::Int(*n as i16 as i64)),
+        (Value::Int(n), "toByte") => Ok(Value::Int(*n as i8 as i64)),
+        (Value::Int(n), "toLong") => Ok(Value::Int(*n)),
+        (Value::Float(f), "toDouble" | "toFloat") => Ok(Value::Float(*f)),
+        // A floating-to-integer conversion SATURATES at the target width and
+        // maps NaN to zero — Rust's `as` cast has exactly those semantics.
+        (Value::Float(f), "toInt") => Ok(Value::Int(*f as i32 as i64)),
+        (Value::Float(f), "toShort") => Ok(Value::Int(*f as i32 as i16 as i64)),
+        (Value::Float(f), "toByte") => Ok(Value::Int(*f as i32 as i8 as i64)),
+        (Value::Float(f), "toLong") => Ok(Value::Int(*f as i64)),
 
         // ── kotlin.Any.toString() — defined on every type ──
         (_, "toString") => Ok(Value::str(kotlin_string(recv))),

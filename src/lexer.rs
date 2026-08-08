@@ -195,16 +195,16 @@ impl<'a> Lexer<'a> {
                 .chars()
                 .filter(|&ch| ch != '_')
                 .collect();
-            if self.peek() == b'L' {
+            let long = self.peek() == b'L';
+            if long {
                 self.bump();
             }
             // A radix literal is parsed unsigned so `0xFFFFFFFFFFFFFFFF` reads
             // as the JVM's `-1` rather than saturating.
-            return Tok::Int(
-                u64::from_str_radix(&raw, radix)
-                    .map(|u| u as i64)
-                    .unwrap_or(0),
-            );
+            let n = u64::from_str_radix(&raw, radix)
+                .map(|u| u as i64)
+                .unwrap_or(0);
+            return if long { Tok::Long(n) } else { Tok::Int(n) };
         }
         while self.peek().is_ascii_digit() || self.peek() == b'_' {
             self.bump();
@@ -238,7 +238,7 @@ impl<'a> Lexer<'a> {
         let suffix = self.peek();
         if suffix == b'L' {
             self.bump();
-            return Tok::Int(raw.parse().unwrap_or(0));
+            return Tok::Long(raw.parse().unwrap_or(0));
         }
         if matches!(suffix, b'f' | b'F') {
             self.bump();
