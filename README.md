@@ -771,8 +771,8 @@ which compares equal to our own failure and used to count as agreement. Such
 programs are now reported and counted separately, and they fail the run — which
 is how the two generator name-collisions above were found rather than absorbed.
 
-Also landed, closing a silent wrong answer of the worst kind: the **operator
-conventions**. Kotlin's operators are not instructions bound to primitive
+Also landed, with a new `operator` harness mode, closing a silent wrong answer
+of the worst kind: the **operator conventions**. Kotlin's operators are not instructions bound to primitive
 types — `a + b` *means* `a.plus(b)`, resolved against the left operand like any
 other member — and lowering one to an arithmetic op coerced the receiver's
 object handle to a number, so `listOf(1, 2, 3) - 2` evaluated to `-2.0`: a
@@ -782,7 +782,10 @@ the in-place `plusAssign`, `in` through `contains`, `..` through `rangeTo`,
 `[]`/`[]=` through `get`/`set`, unary `-`/`!`, and `++`/`--` through
 `inc`/`dec`), against a user class statically and against a `List`/`Set`/`Map`
 at run time. An operator the stdlib does not define on a collection now fails
-loudly rather than answering a coerced number. Two inference gaps surfaced with
+loudly rather than answering a coerced number. The generator had reached none
+of this — it produced the arithmetic operators only between numbers and
+strings, and named `hashMapOf`/`hashSetOf`/`sortedSetOf`/`groupingBy` not at
+all — so the harness had stayed clean over a surface it never visited. Two inference gaps surfaced with
 it, both a node the emitter typed one way and inference another: a bare
 property read inside a method, and `super<T>.m()`.
 

@@ -1583,6 +1583,7 @@ enum Mode {
     Invoke,
     StrColl,
     Equality,
+    Operator,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -1640,7 +1641,78 @@ const CONCRETE: &[Mode] = &[
     Mode::Invoke,
     Mode::StrColl,
     Mode::Equality,
+    Mode::Operator,
 ];
+
+/// The **operator conventions** on a collection receiver, plus the iteration
+/// order of the JVM collections and the `Grouping` terminal operations.
+///
+/// The generator reached NONE of this: it produced the arithmetic operators
+/// only between numbers and strings, and named
+/// `hashMapOf`/`hashSetOf`/`sortedSetOf`/`groupingBy` not at all. So the
+/// harness stayed clean at 240 probes while `listOf(1, 2, 3) - 2` evaluated to
+/// `-2.0` and `hashMapOf` answered in insertion order. A clean number over a
+/// surface the generator never visits proves nothing about that surface, which
+/// is the reason this mode exists.
+///
+/// A user class declaring its own conventions is NOT generated here — the
+/// `extra_declarations` preamble would have to carry an operator class per
+/// probe shape. Those are pinned by the `lang` tests and the frozen corpus
+/// instead.
+///
+/// Determinism: every probe prints a value whose order is fixed by the
+/// collection's own discipline (bucket order for the hash kinds, ascending for
+/// `sortedSetOf`, insertion for the rest), so repeated runs agree.
+fn g_operator(r: &mut Rng) -> String {
+    const INTKEYS: &[&str] = &["1", "3", "7", "10", "25", "42"];
+    const STRKEYS: &[&str] = &["\"apple\"", "\"banana\"", "\"cherry\"", "\"zebra\""];
+    let a = pick(r, INTKEYS);
+    let b = pick(r, INTKEYS);
+    let s = pick(r, STRKEYS);
+    let t = pick(r, STRKEYS);
+    match r.below(24) {
+        // Collection `plus`/`minus`, in both the operator and the member form,
+        // and across the element/Iterable overload pair.
+        0 => p(format!("listOf({a}, {b}, {a}) - {a}")),
+        1 => p(format!("listOf({a}, {b}) + {a}")),
+        2 => p(format!("listOf({a}, {b}, {a}) - listOf({a})")),
+        3 => p(format!("listOf({a}, {b}) + listOf({a}, {b})")),
+        4 => p(format!("setOf({a}, {b}) - {a}")),
+        5 => p(format!("setOf({a}, {b}) + {a}")),
+        6 => p(format!("listOf({a}, {b}).plus({a})")),
+        7 => p(format!("listOf({a}, {b}, {a}).minus({a})")),
+        8 => p(format!("listOf({a}, {b}).plusElement(listOf({a}))")),
+        9 => p(format!("mapOf({s} to {a}, {t} to {b}) - {s}")),
+        10 => p(format!("mapOf({s} to {a}) + ({t} to {b})")),
+        11 => p(format!("mapOf({s} to {a}) + mapOf({t} to {b})")),
+        12 => p(format!("(1..3) + {a}")),
+        13 => p(format!("listOf({s}) + {t}")),
+        // The compound forms: `plus` rebinding a `var` against `plusAssign`
+        // mutating a `val`, which differ only through an alias.
+        14 => p(format!(
+            "run {{ var l = listOf({a}); val k = l; l += {b}; \"$l/$k\" }}"
+        )),
+        15 => p(format!(
+            "run {{ val m = mutableListOf({a}); val k = m; m += {b}; \"$m/$k\" }}"
+        )),
+        16 => p(format!(
+            "run {{ val m = mutableMapOf({s} to {a}); m += ({t} to {b}); m }}"
+        )),
+        // Iteration order of the JVM collections.
+        17 => p(format!("hashSetOf({a}, {b}, 7, 25, 10)")),
+        18 => p(format!("hashMapOf({s} to {a}, {t} to {b}, \"kiwi\" to 3)")),
+        19 => p(format!("sortedSetOf({s}, {t}, \"kiwi\")")),
+        20 => p(format!("linkedSetOf({s}, {t}, \"kiwi\")")),
+        21 => p(format!(
+            "run {{ val h = HashMap<Int, Int>(); for (i in listOf({a}, {b}, 7, 25, 10)) h[i] = i; h }}"
+        )),
+        22 => p(format!("HashSet(listOf({s}, {t}, \"kiwi\"))")),
+        // `Grouping`, whose keys come out in first-encounter order.
+        _ => p(format!(
+            "listOf({s}, {t}, \"kiwi\").groupingBy {{ it.length }}.eachCount()"
+        )),
+    }
+}
 
 /// Instance **equality** — `==` between class instances, and the three rules
 /// Kotlin picks between.
@@ -1774,6 +1846,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Invoke => "invoke",
         Mode::StrColl => "strcoll",
         Mode::Equality => "equality",
+        Mode::Operator => "operator",
     }
 }
 
@@ -1845,6 +1918,7 @@ fn gen_probe(r: &mut Rng, mode: Mode, idx: usize) -> String {
         Mode::Invoke => g_invoke(r, idx),
         Mode::StrColl => g_strcoll(r, idx),
         Mode::Equality => g_equality(r, idx),
+        Mode::Operator => g_operator(r),
         Mode::All => unreachable!("resolved above"),
     }
 }
