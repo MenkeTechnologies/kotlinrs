@@ -58,6 +58,15 @@ struct Binding {
     /// STATIC TYPE, so an untyped lambda parameter is a place the frontend gave
     /// up, not a place the information was absent.
     elem: Type,
+    /// The RESULT type when this binding holds a function value declared with a
+    /// function type (`val f: (Int) -> Int`). `Unknown` for everything else,
+    /// including a lambda whose type was inferred rather than written down.
+    ///
+    /// A call through the binding has this width, and Kotlin's integer width is
+    /// a property of the STATIC type: without it `f(7) / f(2)` took the IEEE
+    /// division path and answered `3.5` where the reference toolchain truncates
+    /// to `3`, and `f(a) + f(b)` skipped the 32-bit wrap.
+    fn_ret: Type,
     /// This `var` lives in a one-element heap cell rather than directly in its
     /// slot, because a lambda in the same frame ASSIGNS to it. A closure
     /// captures by value, so the only way a write inside the lambda can be seen
@@ -128,6 +137,7 @@ impl Scope {
                 mutable,
                 class,
                 elem,
+                fn_ret: Type::Unknown,
                 boxed: false,
             },
         );
@@ -178,6 +188,21 @@ impl Scope {
     /// The element type recorded for a sequence-valued binding.
     fn elem_of(&self, name: &str) -> Type {
         self.map.get(name).map(|b| b.elem).unwrap_or(Type::Unknown)
+    }
+    /// Record the declared RESULT type of a function-typed binding — see
+    /// [`Binding::fn_ret`].
+    fn set_fn_ret(&mut self, name: &str, ret: Type) {
+        if let Some(b) = self.map.get_mut(name) {
+            b.fn_ret = ret;
+        }
+    }
+    /// The declared result type of a call through `name`, `Unknown` when the
+    /// binding is not a function value with a written-down type.
+    fn fn_ret_of(&self, name: &str) -> Type {
+        self.map
+            .get(name)
+            .map(|b| b.fn_ret)
+            .unwrap_or(Type::Unknown)
     }
     /// Whether `name` is currently bound as a reassignable `var`.
     fn is_mutable(&self, name: &str) -> Option<bool> {
@@ -235,6 +260,9 @@ struct PropMeta {
 struct FnSig {
     ret: Type,
     ret_class: Option<String>,
+    /// See [`crate::ast::FunDecl::ret_type_param_of`] — the argument index a
+    /// type-variable result reads its width from.
+    ret_type_param_of: Option<usize>,
     arity: usize,
     /// The parameters in declaration order. Names are what a named argument
     /// (`f(count = 3)`) binds against; the defaults and the `vararg` marker are
@@ -247,6 +275,7 @@ impl FnSig {
         FnSig {
             ret: f.ret,
             ret_class: f.ret_class.clone(),
+            ret_type_param_of: f.ret_type_param_of,
             arity: f.params.len(),
             params: f.params.clone(),
         }
@@ -1884,6 +1913,7 @@ impl Compiler {
                 name,
                 ty,
                 fn_params,
+                fn_ret,
                 init,
                 mutable,
             } => {
@@ -1915,6 +1945,9 @@ impl Compiler {
                     self.b.emit(Op::Extended(KT_LIST, 1), 0);
                 }
                 let slot = sc.declare_full(name, vty, *mutable, class, elem);
+                if let Some(r) = fn_ret {
+                    sc.set_fn_ret(name, *r);
+                }
                 if boxed {
                     sc.box_binding(name);
                 }
@@ -4190,8 +4223,11 @@ impl Compiler {
         self.compile_expr(sc, l)?;
         self.compile_expr(sc, r)?;
 
-        let both_int = lt.is_int() && rt.is_int();
         let both_str = lt.is_str() && rt.is_str();
+        // A statically known `Double` on either side is the only thing that
+        // forces IEEE division/remainder; every other combination is decided
+        // from the runtime values by `KT_IDIV`/`KT_IMOD`.
+        let known_double = lt == Type::Double || rt == Type::Double;
         let num_ty = promote(lt, rt);
         // Kotlin `Char` arithmetic: `Char + Int` / `Char - Int` → `Char`,
         // `Char - Char` → `Int`. Backed by the same integer ops; only the
@@ -4220,23 +4256,33 @@ impl Compiler {
                 num_ty
             }
             BinOp::Div => {
-                if both_int {
-                    self.b.emit(Op::Extended(KT_IDIV, 0), 0);
-                    num_ty
-                } else {
+                if known_double {
                     // IEEE division, not the native op: Kotlin's `x / 0.0` is a
                     // signed infinity and `0.0 / 0.0` is NaN, where `Op::Div`
                     // yields `Undef` (which printed as `null`).
                     self.b.emit(Op::Extended(KT_DDIV, 0), 0);
                     Type::Double
+                } else {
+                    // `KT_IDIV` picks truncating or IEEE division from the
+                    // RUNTIME values, so it is also the right op when an operand
+                    // went untyped: an integral value at run time means Kotlin
+                    // gave that expression an integral static type, and the two
+                    // integral widths both truncate. Committing to IEEE instead
+                    // made `f(10) / f(3)` answer `3.3333333333333335` for a
+                    // `val f: (Int) -> Int`, and turned `x / 0` from an
+                    // ArithmeticException into `Infinity`.
+                    self.b.emit(Op::Extended(KT_IDIV, 0), 0);
+                    num_ty
                 }
             }
             BinOp::Mod => {
+                // `KT_IMOD` is value-directed in the same way, so only the
+                // RESULT type is in question here.
                 self.b.emit(Op::Extended(KT_IMOD, 0), 0);
-                if both_int {
-                    num_ty
-                } else {
+                if known_double {
                     Type::Double
+                } else {
+                    num_ty
                 }
             }
             BinOp::Eq => {
@@ -4371,7 +4417,11 @@ impl Compiler {
             }
             self.b
                 .emit(Op::CallBuiltin(KT_CLOSURE_CALL, args.len() as u8), line);
-            return Ok(Type::Unknown);
+            // The declared result type of the annotation, when there was one.
+            // It has to agree with what `infer` answers for the same node, or
+            // the two disagree on whether a result needs the 32-bit wrap:
+            // `-f(Int.MIN_VALUE)` narrows only if this says `Int`.
+            return Ok(sc.fn_ret_of(name));
         }
         match name {
             "println" | "print" => {
@@ -4582,7 +4632,7 @@ impl Compiler {
                     let sub = self.local_funs.get(name).cloned();
                     let idx = self.b.add_name(sub.as_deref().unwrap_or(name));
                     self.b.emit(Op::Call(idx, sig.arity as u8), line);
-                    return Ok(sig.ret);
+                    return Ok(self.call_ret(sc, &sig, args));
                 }
                 // An extension on the enclosing receiver, called without a
                 // qualifier from inside a method or another extension.
@@ -5334,6 +5384,17 @@ impl Compiler {
                     math_ret_type(&self.resolve_math_fn(name).unwrap(), &tys)
                 }
                 _ => {
+                    // A call through a binding whose function type was written
+                    // down yields that type. Checked before the `fun` tables
+                    // because a local of the same name shadows them, and it is
+                    // the only place the result width survives — the value
+                    // itself is an untyped closure handle.
+                    if sc.slot(name).is_some() {
+                        let r = sc.fn_ret_of(name);
+                        if r != Type::Unknown {
+                            return r;
+                        }
+                    }
                     // An unqualified call inside an extension body is a call on
                     // its receiver (`fun Int.quad() = dbl().dbl()`).
                     if !self.fun_sig.contains_key(name) && sc.slot("this").is_some() {
@@ -5343,11 +5404,10 @@ impl Compiler {
                             return t.0;
                         }
                     }
-                    self.local_sigs
-                        .get(name)
-                        .or_else(|| self.fun_sig.get(name))
-                        .map(|s| s.ret)
-                        .unwrap_or(Type::Unknown)
+                    match self.local_sigs.get(name).or_else(|| self.fun_sig.get(name)) {
+                        Some(s) => self.call_ret(sc, s, args),
+                        None => Type::Unknown,
+                    }
                 }
             },
             Expr::Index { recv, .. } => self.index_elem_ty(sc, recv),
@@ -5797,6 +5857,30 @@ impl Compiler {
     /// built-in collection tags [`Compiler::infer_class`] also answers
     /// (`"List"`, `"Map"`, …) are not user classes and never match here; they
     /// reach their conventions through the runtime dispatch instead.
+    /// The type a call to `sig` yields, resolving a type-variable result from
+    /// the argument that supplies the type argument (see
+    /// [`crate::ast::FunDecl::ret_type_param_of`]).
+    ///
+    /// Both the emitter and [`Compiler::infer`] go through this, because they
+    /// must agree on the result's width: the emitter's answer decides whether
+    /// `-id(x)` narrows to 32 bits, and `infer`'s decides whether `id(a) + id(b)`
+    /// does.
+    ///
+    /// A NAMED argument is not resolved — `f(b = 1, a = "x")` does not carry its
+    /// types positionally, and guessing from the wrong one would be worse than
+    /// leaving the call untyped.
+    fn call_ret(&self, sc: &Scope, sig: &FnSig, args: &[Expr]) -> Type {
+        if sig.ret != Type::Unknown {
+            return sig.ret;
+        }
+        match sig.ret_type_param_of {
+            Some(i) if i < args.len() && !args.iter().any(|a| matches!(a, Expr::Named { .. })) => {
+                self.infer(sc, &args[i])
+            }
+            _ => sig.ret,
+        }
+    }
+
     fn declares_operator(&self, sc: &Scope, e: &Expr, name: &str) -> bool {
         self.infer_class(sc, e)
             .and_then(|c| self.classes.get(&c))
@@ -6322,8 +6406,17 @@ fn operator_assign_fn(op: BinOp) -> Option<&'static str> {
 /// Kotlin's binary numeric promotion for `+ - * / %`: a `Double` operand makes
 /// the result `Double`, otherwise a `Long` operand makes it a 64-bit `Long`,
 /// and everything else is a 32-bit `Int`.
+///
+/// An operand the frontend could not type leaves the RESULT untyped rather than
+/// defaulting it to `Int`. The default is a claim about DISPLAY — an `Int` result
+/// renders through the integer coercion — and a type variable instantiated at
+/// `Double` then printed `4` where the reference toolchain prints `4.0`.
+/// `Unknown` routes the display through the runtime-tagged stringifier, which
+/// reads the width off the value instead of guessing it.
 fn promote(lt: Type, rt: Type) -> Type {
-    if lt == Type::Double || rt == Type::Double {
+    if lt == Type::Unknown || rt == Type::Unknown {
+        Type::Unknown
+    } else if lt == Type::Double || rt == Type::Double {
         Type::Double
     } else if lt == Type::Long || rt == Type::Long {
         Type::Long

@@ -42,6 +42,18 @@ pub struct Parser {
     /// return value because a function type may nest inside a generic argument
     /// several `type_ref` frames down, where the caller has nowhere to put it.
     fn_param_types: Vec<Type>,
+    /// The RESULT types of the function types seen since the last checkpoint,
+    /// appended by the same [`Parser::type_ref`] frames that fill
+    /// `fn_param_types`. A nested function type (`(Int) -> (Int) -> Int`)
+    /// finishes parsing before its enclosing one, so the OUTERMOST annotation is
+    /// the last entry — which is the one a call through the binding yields.
+    fn_ret_types: Vec<Type>,
+    /// The type-variable name the most recent [`Parser::type_ref`] resolved, or
+    /// `None` if that annotation named a real type. Every exit path of
+    /// `type_ref` sets it, so a caller reads it immediately after the call to
+    /// learn WHICH variable an annotation used — which is what pairs a return
+    /// type with the parameter that supplies it.
+    last_type_param: Option<String>,
     /// The type-parameter names of the `fun` whose body is being parsed
     /// (`fun <T> f(…)`). A runtime test against one of them — `x is T`, `x as T`
     /// — needs a `reified` type argument the coarse type system cannot carry, so
@@ -110,6 +122,8 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
         toks,
         pos: 0,
         fn_param_types: Vec::new(),
+        fn_ret_types: Vec::new(),
+        last_type_param: None,
         type_params: Vec::new(),
         no_trailing_lambda: false,
         pending_classes: Vec::new(),
@@ -311,6 +325,10 @@ fn expand_interface_delegation(prog: &mut Program) -> Result<(), String> {
                     params: m.params.clone(),
                     ret: m.ret,
                     ret_class: m.ret_class.clone(),
+                    // The forwarder takes the delegate's parameters verbatim, so
+                    // the argument that supplies a type-variable result is at
+                    // the same index.
+                    ret_type_param_of: m.ret_type_param_of,
                     body: vec![Stmt::new(m.line, StmtKind::Return(Some(call)))],
                     line: m.line,
                     is_abstract: false,
@@ -517,7 +535,11 @@ impl Parser {
         // keeps no type variables, so the list is consumed and only the NAMES
         // are kept — a `T`-typed parameter reads as `Unknown`, which is how the
         // frontend already handles a value it cannot type.
-        let tps = self.type_params_decl();
+        // A method's own parameters ADD to the enclosing class's rather than
+        // replacing them: inside `class Box<T> { fun <U> f(a: T, b: U) }` both
+        // `T` and `U` are type variables.
+        let mut tps = self.type_params.clone();
+        tps.extend(self.type_params_decl());
         let outer_tps = std::mem::replace(&mut self.type_params, tps);
         // `fun Recv.name(…)` — an extension. The first identifier is the
         // receiver type only when a `.` follows it.
@@ -548,6 +570,8 @@ impl Parser {
         };
         self.eat(&Tok::LParen)?;
         let mut params = Vec::new();
+        // The type variable each parameter was declared with, positionally.
+        let mut param_tps: Vec<Option<String>> = Vec::new();
         while !self.at(&Tok::RParen) {
             let is_vararg = matches!(self.peek(), Tok::Ident(w) if w == "vararg");
             if is_vararg {
@@ -558,8 +582,16 @@ impl Parser {
                 self.bump();
                 self.type_ref()?
             } else {
+                self.last_type_param = None;
                 (Type::Unknown, None)
             };
+            // A `vararg T` arrives as an array, so the result of a call is not
+            // the parameter's own type — it cannot supply a type argument.
+            param_tps.push(if is_vararg {
+                None
+            } else {
+                self.last_type_param.take()
+            });
             // A default value, `fun f(a: Int, b: Int = 10)`.
             let default = if self.at(&Tok::Assign) {
                 self.bump();
@@ -584,13 +616,19 @@ impl Parser {
             }
         }
         self.eat(&Tok::RParen)?;
-        let (ret_annot, ret_class) = if self.at(&Tok::Colon) {
+        let (ret_annot, ret_class, ret_tp) = if self.at(&Tok::Colon) {
             self.bump();
             let (t, c) = self.type_ref()?;
-            (Some(t), c)
+            (Some(t), c, self.last_type_param.take())
         } else {
-            (None, None)
+            (None, None, None)
         };
+        // Pair the result's type variable with the parameter that carries it.
+        let ret_type_param_of = ret_tp.and_then(|r| {
+            param_tps
+                .iter()
+                .position(|p| p.as_deref() == Some(r.as_str()))
+        });
         // Body is either a block `{ … }` or a single-expression body `= expr`
         // (Kotlin `fun f(...) = expr`), which desugars to `{ return expr }`.
         // An `abstract`/`interface` member has NO body: the declaration ends
@@ -622,6 +660,7 @@ impl Parser {
             params,
             ret,
             ret_class,
+            ret_type_param_of,
             body,
             line,
             is_abstract: bodyless,
@@ -686,8 +725,11 @@ impl Parser {
             None => self.ident()?,
         };
         // A generic class keeps only its head name; the coarse type system
-        // carries no type variables.
-        self.skip_type_args();
+        // carries no type variables. The parameter NAMES are still recorded, so
+        // an annotation that mentions one (`val v: T`) resolves to the unknown
+        // type rather than to a heap class called `T` — see [`Parser::type_ref`].
+        let tps = self.type_params_decl();
+        let outer_tps = std::mem::replace(&mut self.type_params, tps);
 
         // Primary constructor (classes only). `object`s and `interface`s have
         // none.
@@ -946,6 +988,7 @@ impl Parser {
             ));
         }
 
+        self.type_params = outer_tps;
         Ok(ClassDecl {
             name,
             params,
@@ -1195,6 +1238,9 @@ impl Parser {
             params: Vec::new(),
             ret: Type::Obj,
             ret_class: None,
+            // A synthesized member of a concrete enum: its result is an array of
+            // that enum, never a type variable.
+            ret_type_param_of: None,
             body: vec![Stmt::new(
                 line,
                 StmtKind::Return(Some(Expr::Call {
@@ -1253,6 +1299,8 @@ impl Parser {
             }],
             ret: Type::Obj,
             ret_class: Some(cls.to_string()),
+            // Likewise: `valueOf` answers the enum itself.
+            ret_type_param_of: None,
             body: vec![Stmt::new(
                 line,
                 StmtKind::Return(Some(Expr::When(WhenExpr {
@@ -1409,6 +1457,10 @@ impl Parser {
             params: Vec::new(),
             ret: ty,
             ret_class: class,
+            // A computed property's getter takes no arguments, so even when the
+            // declared type IS a type variable there is nothing at the call site
+            // to resolve it from.
+            ret_type_param_of: None,
             body,
             line,
             is_abstract: false,
@@ -1654,10 +1706,17 @@ impl Parser {
             }
             self.fn_param_types.extend(params);
             self.eat(&Tok::Arrow)?;
-            let _ret = self.type_ref()?; // return type (may itself be a fn type)
+            // The return type (which may itself be a function type). Published
+            // on the side channel AFTER the recursive call, so a nested arrow
+            // leaves the outermost result last — see `fn_ret_types`.
+            let ret = self.type_ref()?;
+            self.fn_ret_types.push(ret.0);
             if self.at(&Tok::Question) {
                 self.bump(); // nullable function type `((Int) -> Int)?`
             }
+            // The annotation is a function type, NOT the type variable its
+            // result may have mentioned — clear what the recursive call left.
+            self.last_type_param = None;
             return Ok((Type::Unknown, Some("Function".to_string())));
         }
         let name = self.ident()?;
@@ -1692,6 +1751,20 @@ impl Parser {
         } else {
             ty
         };
+        // A TYPE VARIABLE names no class at all. `Obj` would be a claim the
+        // value is a heap object, which sends `+` down the operator-convention
+        // dispatch (a `List`/`Map`/user-class `plus`) and fails at run time on
+        // the `Int` or `String` a type argument actually supplied — so
+        // `fun <T> id(x: T): T = x; id(1) + id(2)` reported `plus` unresolved
+        // where the reference toolchain answers `3`. `Unknown` is the honest
+        // width: it selects the value-directed ops and the runtime-tagged
+        // display, and it is excluded from the 32-bit narrowing (see
+        // `is_int_width`) precisely because the concrete type is not known.
+        if self.type_params.contains(&name) {
+            self.last_type_param = Some(name);
+            return Ok((Type::Unknown, None));
+        }
+        self.last_type_param = None;
         // A non-primitive annotation names a heap object (a user class or a
         // container like `List`/`Map`); keep its name for dispatch.
         if ty == Type::Unknown {
@@ -1807,13 +1880,18 @@ impl Parser {
             return Ok(StmtKind::Destructure { names, init });
         }
         let name = self.ident()?;
-        let (ty, fn_params) = if self.at(&Tok::Colon) {
+        let (ty, fn_params, fn_ret) = if self.at(&Tok::Colon) {
             self.bump();
             let before = self.fn_param_types.len();
+            let ret_before = self.fn_ret_types.len();
             let t = self.type_name()?;
-            (Some(t), self.fn_param_types.split_off(before))
+            (
+                Some(t),
+                self.fn_param_types.split_off(before),
+                self.fn_ret_types.split_off(ret_before).pop(),
+            )
         } else {
-            (None, Vec::new())
+            (None, Vec::new(), None)
         };
         self.eat(&Tok::Assign)?;
         let init = self.expr()?;
@@ -1821,6 +1899,7 @@ impl Parser {
             name,
             ty,
             fn_params,
+            fn_ret,
             init,
             mutable,
         })
@@ -3028,6 +3107,8 @@ impl Parser {
                         toks,
                         pos: 0,
                         fn_param_types: Vec::new(),
+                        fn_ret_types: Vec::new(),
+                        last_type_param: None,
                         no_trailing_lambda: false,
                         // A string template holds an expression, which can
                         // never declare a class.

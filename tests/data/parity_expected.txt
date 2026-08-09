@@ -464,3 +464,23 @@ class Plain(val rgb: Int) {\n    fun half(): Int = rgb / 2\n    fun third(): Int
 interface Left {\n    fun pick(): String = "L"\n}\ninterface Right { fun pick(): String = "R" }\nclass Both(val k: Int) : Left, Right {\n    override fun pick(): String = super<Left>.pick() + super<Right>.pick() + k\n}\nfun main() {\n    val bt: Left = Both(5)\n    println(bt.pick())\n}	LR5\n
 fun main() {\n    println(255.toString(16))\n    println(255.toString(2))\n    println((-255).toString(16))\n    println(255.toString())\n    println("ff".toInt(16))\n    println("1010".toInt(2))\n    println("-ff".toInt(16))\n    println("zz".toIntOrNull(16))\n    println(255L.toString(16))\n    println("7fffffffffffffff".toLong(16))\n}	ff\n11111111\n-ff\n255\n255\n10\n-255\nnull\nff\n9223372036854775807\n
 enum class Color(val rgb: Int) {\n    RED(0xFF0000), GREEN(0x00FF00), BLUE(0x0000FF);\n    fun hex(): String = "#" + rgb.toString(16)\n}\nfun main() {\n    for (c in Color.values()) println("${c.name} ${c.ordinal} ${c.hex()}")\n}	RED 0 #ff0000\nGREEN 1 #ff00\nBLUE 2 #ff\n
+fun <T> id(x: T): T = x\nfun main() {\n    println(id("a") + id("b"))\n}	ab\n
+fun <T> id(x: T): T = x\nfun main() {\n    println(id(2) + id(3))\n}	5\n
+fun <T> id(x: T): T = x\nfun main() {\n    println(id(7) / id(2))\n}	3\n
+fun <T> id(x: T): T = x\nfun main() {\n    println(id(5) / 2)\n}	2\n
+fun <T> id(x: T): T = x\nfun main() {\n    println(id(7) % id(2))\n}	1\n
+fun <T> id(x: T): T = x\nfun main() {\n    println(id(1.5) + id(2.5))\n}	4.0\n
+fun <T> id(x: T): T = x\nfun main() {\n    println(id(2000000000) + id(2000000000))\n}	-294967296\n
+fun <T> id(x: T): T = x\nfun main() {\n    println(id(7.0) / id(2.0))\n}	3.5\n
+class Box<T>(val v: T)\nfun main() {\n    println(Box("p").v + Box("q").v)\n}	pq\n
+class Box<T>(val v: T)\nfun main() {\n    println(Box(9).v / Box(2).v)\n}	4\n
+class Box<T>(val v: T) {\n    fun get(): T = v\n}\nfun main() {\n    println(Box(9).get() / Box(4).get())\n}	2\n
+class Two<A, B>(val a: A, val b: B)\nfun main() {\n    println("" + Two(7, "x").a + Two(7, "x").b)\n}	7x\n
+fun main() {\n    val f: (Int) -> Int = { it * 3 }\n    println(f(10) / f(3))\n}	3\n
+fun main() {\n    val f: (Int) -> Int = { it }\n    println(f(2000000000) + f(2000000000))\n}	-294967296\n
+fun main() {\n    val f: (Int) -> Int = { it }\n    println(-f(-2147483648))\n}	-2147483648\n
+fun main() {\n    val f: (Int) -> Int = { it }\n    println(f(100000) * f(100000))\n}	1410065408\n
+fun main() {\n    val f: (Int) -> Int = { it }\n    println(f(7) % f(2))\n}	1\n
+fun main() {\n    val f: (Double) -> Double = { it }\n    println(f(7.0) / f(2.0))\n}	3.5\n
+fun main() {\n    val f: (Int) -> (Int) -> Int = { a -> { b -> a + b } }\n    println(f(2)(5))\n}	7\n
+fun main() {\n    println(listOf(1, 2, 3).sum() / 2)\n}	3\n

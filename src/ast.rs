@@ -144,6 +144,16 @@ pub struct FunDecl {
     pub ret: Type,
     /// The return class name when `ret == Type::Obj` and it named a user class.
     pub ret_class: Option<String>,
+    /// The index of the parameter that a type-variable return type is shared
+    /// with — `fun <T> id(x: T): T` records `Some(0)`.
+    ///
+    /// A type variable has no width of its own, but a call SITE supplies one:
+    /// the type argument is whatever the matching argument's type is, so
+    /// `id(2_000_000_000) + id(2_000_000_000)` is `Int` arithmetic and wraps.
+    /// Without this the result stayed untyped and the sum widened past 32 bits.
+    /// `None` when the return type is not a type variable, or names one that no
+    /// parameter carries (there is nothing at the call site to read it from).
+    pub ret_type_param_of: Option<usize>,
     pub body: Vec<Stmt>,
     pub line: u32,
     /// `abstract fun m(): T` (or an `interface` member with no body) — the
@@ -378,6 +388,12 @@ pub enum StmtKind {
         /// from exactly this annotation — and an integer's width is part of the
         /// type, so dropping it left the lambda body's arithmetic untyped.
         fn_params: Vec<Type>,
+        /// The RESULT type when the annotation is a function type, `None`
+        /// otherwise. Recorded for the same reason as `fn_params`: a call
+        /// through the binding (`f(7)`) has the width of this type, and without
+        /// it `val f: (Int) -> Int` made `f(7) / f(2)` an untyped division —
+        /// answering `3.5` where Kotlin truncates to `3`.
+        fn_ret: Option<Type>,
         init: Expr,
         mutable: bool,
     },
