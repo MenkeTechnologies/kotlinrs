@@ -1584,6 +1584,7 @@ enum Mode {
     StrColl,
     Equality,
     Operator,
+    Generic,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -1642,6 +1643,7 @@ const CONCRETE: &[Mode] = &[
     Mode::StrColl,
     Mode::Equality,
     Mode::Operator,
+    Mode::Generic,
 ];
 
 /// The **operator conventions** on a collection receiver, plus the iteration
@@ -1663,6 +1665,67 @@ const CONCRETE: &[Mode] = &[
 /// Determinism: every probe prints a value whose order is fixed by the
 /// collection's own discipline (bucket order for the hash kinds, ascending for
 /// `sortedSetOf`, insertion for the rest), so repeated runs agree.
+/// Calls whose result type is a TYPE VARIABLE — a generic function, a generic
+/// class property, a generic method.
+///
+/// The generator reached none of this: it declared no `fun <T>` at all, so a
+/// clean run said nothing about the surface while `gid(1) + gid(2)` failed
+/// outright with an unresolved `plus`, and `gid(7) / gid(2)` answered `3.5`.
+/// Kotlin resolves the type argument from the CALL SITE, so every probe here
+/// has an answer the source spells out — the width, the division discipline and
+/// the display all follow the argument that was passed in.
+///
+/// The `Double` and `String` instantiations are deliberately mixed with the
+/// `Int` ones: they must NOT truncate or wrap, so a frontend that fixes the
+/// `Int` case by always narrowing fails these instead.
+fn g_generic(r: &mut Rng, idx: usize) -> String {
+    let big = pick(r, BIGINTS);
+    let op = pick(r, AOPS);
+    match r.below(10) {
+        0 => format!("println(gid({}) {op} gid({}))", pick(r, BIGINTS), big),
+        1 => format!("println(gid({}) / gid({}))", pick(r, INTS), pick(r, DIVS)),
+        2 => format!("println(gid({}) % gid({}))", pick(r, INTS), pick(r, DIVS)),
+        3 => format!(
+            "println(gid({}) {op} gid({}))",
+            pick(r, DBLS),
+            pick(r, DBLS)
+        ),
+        4 => format!("println(gid({}) + gid({}))", pick(r, STRS), pick(r, STRS)),
+        5 => format!("println(-gid({}))", pick(r, BIGINTS)),
+        // `INTS`, not `BIGINTS`, and that is a KNOWN BOUNDARY rather than a
+        // preference: a generic CLASS's type argument is not propagated, so
+        // `GBox(65536).v * GBox(2000000000).v` reads as untyped and does not
+        // wrap at 32 bits (it answers `131072000000000` for the reference
+        // toolchain's `-1811939328`). A generic FUNCTION does propagate it —
+        // that is what shape `0` covers with `BIGINTS`. Widen these to `BIGINTS`
+        // once a class instantiation carries its type argument.
+        6 => format!(
+            "println(GBox({}).v {op} GBox({}).v)",
+            pick(r, INTS),
+            pick(r, INTS)
+        ),
+        7 => format!(
+            "println(GBox({}).get() / GBox({}).get())",
+            pick(r, INTS),
+            pick(r, DIVS)
+        ),
+        8 => format!(
+            "val gv{idx} = gfirst({}, {}); println(gv{idx} {op} {})",
+            pick(r, INTS),
+            pick(r, INTS),
+            pick(r, INTS)
+        ),
+        // The leading `""` is required, not cosmetic: `+` is resolved against
+        // the LEFT operand, and `Double.plus` has no `String` overload — so
+        // `gid(2.5) + "|"` is a compile error in Kotlin, not a parity probe.
+        _ => format!(
+            "println(\"\" + gid({}) + \"|\" + gid({}))",
+            pick(r, DBLS),
+            pick(r, INTS)
+        ),
+    }
+}
+
 fn g_operator(r: &mut Rng) -> String {
     const INTKEYS: &[&str] = &["1", "3", "7", "10", "25", "42"];
     const STRKEYS: &[&str] = &["\"apple\"", "\"banana\"", "\"cherry\"", "\"zebra\""];
@@ -1847,6 +1910,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::StrColl => "strcoll",
         Mode::Equality => "equality",
         Mode::Operator => "operator",
+        Mode::Generic => "generic",
     }
 }
 
@@ -1919,6 +1983,7 @@ fn gen_probe(r: &mut Rng, mode: Mode, idx: usize) -> String {
         Mode::StrColl => g_strcoll(r, idx),
         Mode::Equality => g_equality(r, idx),
         Mode::Operator => g_operator(r),
+        Mode::Generic => g_generic(r, idx),
         Mode::All => unreachable!("resolved above"),
     }
 }
@@ -1981,6 +2046,18 @@ fn extra_declarations(probes: &[String]) -> String {
              \x20   fun tot(): Int = n + doubled\n\
              }\n",
         );
+    }
+    // The generic helpers — see `g_generic`. Each is emitted only when a probe
+    // names it, so a reduced program still compiles under the reference
+    // toolchain.
+    if named("gid(") {
+        out.push_str("fun <T> gid(x: T): T = x\n");
+    }
+    if named("gfirst(") {
+        out.push_str("fun <T> gfirst(a: T, b: T): T = a\n");
+    }
+    if named("GBox(") {
+        out.push_str("class GBox<T>(val v: T) {\n\x20   fun get(): T = v\n}\n");
     }
     if named("DBody(") {
         out.push_str("data class DBody(val a: Int) {\n\x20   val extra = a + 1\n}\n");
