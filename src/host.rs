@@ -232,6 +232,23 @@ pub const KT_INDEX_GET_VM: u16 = 128;
 pub const KT_INDEX_SET_VM: u16 = 129;
 pub const KT_MAP_VM: u16 = 130;
 
+/// A Kotlin operator CONVENTION applied to a heap receiver. Stack:
+/// `[lhs, rhs, nameStr]`, where `nameStr` is `plus`/`minus` (or the
+/// `plusAssign`/`minusAssign` in-place forms).
+///
+/// Kotlin's operators are not instructions. `a + b` *means* `a.plus(b)`,
+/// resolved against the left operand's type, so a `List`/`Set`/`Map` receiver
+/// answers with a collection. Emitting `Op::Add` for one instead coerces the
+/// object HANDLE to a number: that is what made `listOf(1, 2, 3) - 2` evaluate
+/// to `-2.0`, a silent wrong answer of the worst kind, since a collection
+/// operation came back as arithmetic. The `operator_apply` routine below holds
+/// the per-receiver semantics.
+///
+/// A builtin rather than an `Op::Extended` for the same reason as its
+/// neighbours above: element equality can run a user `equals`/`hashCode`
+/// through a nested `vm.run()`, which an extension handler cannot host.
+pub const KT_OPER_VM: u16 = 131;
+
 /// Kotlin `==` over heap objects. Stack: `[a, b]`; pushes a `Bool`.
 ///
 /// A **builtin**, not an `Op::Extended`, for one reason: a user `equals` body
@@ -1815,6 +1832,7 @@ fn register_builtins(vm: &mut VM) {
     vm.register_builtin(KT_INDEX_GET_VM, b_index_get);
     vm.register_builtin(KT_INDEX_SET_VM, b_index_set);
     vm.register_builtin(KT_MAP_VM, b_map_new);
+    vm.register_builtin(KT_OPER_VM, b_operator);
     vm.register_builtin(KT_EXC_NEW, b_exc_new);
     vm.register_builtin(KT_EXC_THROW, b_exc_throw);
     vm.register_builtin(KT_EXC_PENDING, b_exc_pending);
@@ -2522,6 +2540,242 @@ fn b_index_set(vm: &mut VM, _argc: u8) -> Value {
         fault(vm, e);
     }
     Value::Undef
+}
+
+/// `KT_OPER_VM` — see [`KT_OPER_VM`]. Stack: `[lhs, rhs, nameStr]`.
+fn b_operator(vm: &mut VM, _argc: u8) -> Value {
+    let name = vm.pop().to_str();
+    let rhs = vm.pop();
+    let lhs = vm.pop();
+    match operator_apply(vm, &lhs, &name, &rhs) {
+        Ok(v) => v,
+        Err(e) => {
+            fault(vm, e);
+            Value::Undef
+        }
+    }
+}
+
+/// The elements of `v` when it is a Kotlin `Iterable` — a `List`, a `Set`, a
+/// range or an array; `None` for anything else.
+///
+/// A `String` is deliberately not one, unlike in [`sequence_items`]. Kotlin's
+/// `CharSequence` does not implement `Iterable`, so `listOf("x") + "y"` picks
+/// the `plus(element)` overload and appends the string whole — `[x, y]`, where
+/// treating it as a sequence would have appended its characters.
+fn as_iterable(v: &Value) -> Option<Vec<Value>> {
+    with_obj(v, |o| match o {
+        HeapObj::List(items) | HeapObj::Set(items) => Some(items.clone()),
+        HeapObj::Array { items, .. } => Some(items.clone()),
+        HeapObj::Range(r) => Some(r.to_vec()),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// The key/value couples of `v` when it is a `Map`, a `Pair` or a `Map.Entry` —
+/// the operand shapes `Map.plus` accepts.
+fn as_couples(v: &Value) -> Option<Vec<(Value, Value)>> {
+    if let Some(entries) = with_obj(v, |o| match o {
+        HeapObj::Map(entries) => Some(entries.clone()),
+        HeapObj::Pair(k, val) | HeapObj::Entry(k, val) => Some(vec![(k.clone(), val.clone())]),
+        _ => None,
+    })
+    .flatten()
+    {
+        return Some(entries);
+    }
+    // `map + listOf("a" to 1, "b" to 2)` — an iterable OF pairs.
+    let items = as_iterable(v)?;
+    let mut out = Vec::with_capacity(items.len());
+    for it in &items {
+        let couple = with_obj(it, |o| match o {
+            HeapObj::Pair(k, val) | HeapObj::Entry(k, val) => Some((k.clone(), val.clone())),
+            _ => None,
+        })
+        .flatten()?;
+        out.push(couple);
+    }
+    Some(out)
+}
+
+/// Insert or overwrite `k` in `entries`, keeping a pre-existing key in place.
+///
+/// Kotlin's `Map.plus` is `LinkedHashMap(this).apply { putAll(other) }`, and
+/// `put` on an existing key replaces the VALUE without moving the entry, so
+/// `mapOf("a" to 1, "b" to 2) + ("a" to 9)` is `{a=9, b=2}` — not `{b=2, a=9}`.
+fn map_upsert(vm: &mut VM, entries: &mut Vec<(Value, Value)>, k: Value, v: Value) {
+    for slot in entries.iter_mut() {
+        if hash_eq_vm(vm, &slot.0, &k) {
+            slot.1 = v;
+            return;
+        }
+    }
+    entries.push((k, v));
+}
+
+/// Apply a Kotlin operator convention to a heap receiver — see [`KT_OPER_VM`].
+///
+/// `plus`/`minus` answer a NEW collection of the receiver's kind;
+/// `plusAssign`/`minusAssign` mutate the receiver in place and answer `Undef`.
+/// That split is Kotlin's, and it is observable through an alias: `var l =
+/// listOf(1, 2); l += 3` rebinds `l` to a fresh list and leaves an alias at
+/// `[1, 2]`, while `val m = mutableListOf(1, 2); m += 3` mutates the one object
+/// an alias also sees.
+///
+/// Element removal follows the reference collections exactly: `minus(element)`
+/// drops only the FIRST match (`listOf(1, 2, 2, 3) - 2` is `[1, 2, 3]`), while
+/// `minus(elements)` drops every occurrence of every listed element.
+fn operator_apply(vm: &mut VM, lhs: &Value, name: &str, rhs: &Value) -> Result<Value, String> {
+    // Only `plus`/`minus` are conventions the built-in collections define.
+    // `times`/`div`/`rem` are NOT, so `listOf(1) * 2` has to fail the way the
+    // reference compiler fails it — matching a prefix instead would have made
+    // every unlisted operator behave as `minus`, trading one silent wrong
+    // answer for another.
+    let (adding, assign) = match name {
+        "plus" => (true, false),
+        "minus" => (false, false),
+        "plusAssign" => (true, true),
+        "minusAssign" => (false, true),
+        _ => {
+            return Err(format!(
+                "unresolved reference: {name} on {}",
+                obj_label(lhs)
+            ))
+        }
+    };
+
+    // A `Map` receiver keys on entries rather than elements, so it resolves
+    // first: `map + pair` upserts, `map - key` removes.
+    if let Some(mut entries) = with_obj(lhs, |o| match o {
+        HeapObj::Map(entries) => Some(entries.clone()),
+        _ => None,
+    })
+    .flatten()
+    {
+        if adding {
+            let add = as_couples(rhs).ok_or_else(|| {
+                format!(
+                    "unresolved reference: {name} on Map with {}",
+                    obj_label(rhs)
+                )
+            })?;
+            for (k, v) in add {
+                map_upsert(vm, &mut entries, k, v);
+            }
+        } else {
+            // `map - keys` takes a key or an iterable OF keys — never a map.
+            let drop = as_iterable(rhs).unwrap_or_else(|| vec![rhs.clone()]);
+            let mut kept: Vec<(Value, Value)> = Vec::with_capacity(entries.len());
+            for (k, v) in entries {
+                let mut hit = false;
+                for d in &drop {
+                    if hash_eq_vm(vm, &k, d) {
+                        hit = true;
+                        break;
+                    }
+                }
+                if !hit {
+                    kept.push((k, v));
+                }
+            }
+            entries = kept;
+        }
+        if assign {
+            with_obj_mut(lhs, |o| {
+                if let HeapObj::Map(slot) = o {
+                    *slot = entries;
+                }
+            });
+            return Ok(Value::Undef);
+        }
+        return Ok(alloc(HeapObj::Map(entries)));
+    }
+
+    // A `List`/`Set`/range/array receiver. A range answers a `List`, which is
+    // what `(1..3) + 4` evaluates to on the reference toolchain.
+    let is_set = with_obj(lhs, |o| matches!(o, HeapObj::Set(_))).unwrap_or(false);
+    let Some(items) = as_iterable(lhs) else {
+        return Err(format!(
+            "unresolved reference: {name} on {}",
+            obj_label(lhs)
+        ));
+    };
+
+    let mut out: Vec<Value> = Vec::with_capacity(items.len() + 1);
+    match (adding, as_iterable(rhs)) {
+        (true, Some(more)) => {
+            out.extend(items);
+            out.extend(more);
+        }
+        (true, None) => {
+            out.extend(items);
+            out.push(rhs.clone());
+        }
+        // `minus(elements)` — drop every occurrence of every listed element.
+        (false, Some(drop)) => {
+            for it in items {
+                let mut hit = false;
+                for d in &drop {
+                    if elem_eq(vm, is_set, &it, d) {
+                        hit = true;
+                        break;
+                    }
+                }
+                if !hit {
+                    out.push(it);
+                }
+            }
+        }
+        // `minus(element)` — drop the first match only.
+        (false, None) => {
+            let mut dropped = false;
+            for it in items {
+                if !dropped && elem_eq(vm, is_set, &it, rhs) {
+                    dropped = true;
+                    continue;
+                }
+                out.push(it);
+            }
+        }
+    }
+
+    let result = if is_set {
+        HeapObj::Set(distinct(vm, &out))
+    } else {
+        HeapObj::List(out)
+    };
+    if assign {
+        with_obj_mut(lhs, |o| match (o, result) {
+            (HeapObj::Set(slot), HeapObj::Set(v)) => *slot = v,
+            (HeapObj::List(slot), HeapObj::List(v)) => *slot = v,
+            (HeapObj::Array { items: slot, .. }, HeapObj::List(v)) => *slot = v,
+            _ => {}
+        });
+        return Ok(Value::Undef);
+    }
+    Ok(alloc(result))
+}
+
+/// The index of the first element of `items` equal to `want`, by `equals` —
+/// `ArrayList.indexOf`, which is what `minusElement` removes at.
+fn position_eq(vm: &mut VM, items: &[Value], want: &Value) -> Option<usize> {
+    (0..items.len()).find(|&i| equal_vm(vm, &items[i], want))
+}
+
+/// Element equality for collection `minus`.
+///
+/// A `Set` is a `LinkedHashSet`, whose lookup is hash-gated — a class that
+/// overrides `equals` without `hashCode` keeps its "duplicates" there. A `List`
+/// is an `ArrayList`, whose `remove(Object)`/`indexOf` walk calls `equals`
+/// directly with no hash gate, so the same class DOES match there. The two
+/// disagree, so they cannot share one predicate.
+fn elem_eq(vm: &mut VM, is_set: bool, a: &Value, b: &Value) -> bool {
+    if is_set {
+        hash_eq_vm(vm, a, b)
+    } else {
+        equal_vm(vm, a, b)
+    }
 }
 
 /// `KT_OBJEQ_VM` — see [`KT_OBJEQ_VM`].
@@ -4380,6 +4634,26 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         "toString" => return Ok(Value::str(kotlin_string(recv))),
         "hashCode" => return Ok(Value::Int(hash_vm(vm, recv, false) as i64)),
         "equals" => return Ok(Value::Bool(args.first().is_some_and(|o| value_eq(recv, o)))),
+        // The operator conventions are ordinary members too, so `a.plus(b)` and
+        // `a + b` are the same call and must answer the same thing. The
+        // `…Element` forms pin the `plus(element)` overload for a collection
+        // argument that would otherwise pick `plus(elements)`.
+        "plus" | "minus" | "plusAssign" | "minusAssign" => {
+            let rhs = args.first().cloned().unwrap_or(Value::Undef);
+            return operator_apply(vm, recv, name, &rhs);
+        }
+        "plusElement" | "minusElement" => {
+            let rhs = args.first().cloned().unwrap_or(Value::Undef);
+            let items = as_iterable(recv)
+                .ok_or_else(|| format!("unresolved reference: {name} on {}", obj_label(recv)))?;
+            let mut out = items;
+            if name == "plusElement" {
+                out.push(rhs);
+            } else if let Some(i) = position_eq(vm, &out, &rhs) {
+                out.remove(i);
+            }
+            return Ok(alloc(HeapObj::List(out)));
+        }
         _ => {}
     }
 

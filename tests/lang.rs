@@ -2666,3 +2666,156 @@ fun main() {
         "0\n-1\n115\n994\n0\n7\n1\n[1]\nB7\ntrue\ntrue\ntrue\n"
     );
 }
+
+#[test]
+fn collection_operators_are_conventions_not_arithmetic() {
+    // Kotlin's `+`/`-` on a collection resolve to `plus`/`minus` and answer a
+    // COLLECTION. Lowering them to the native arithmetic ops coerced the object
+    // handle to a number, so `listOf(1, 2, 3) - 2` evaluated to `-2.0` — a
+    // collection operation silently answering with arithmetic.
+    assert_eq!(
+        prog("fun main() { println(listOf(1, 2, 3) - 2) }"),
+        "[1, 3]\n"
+    );
+    assert_eq!(
+        prog("fun main() { println(listOf(1, 2, 3) + 4) }"),
+        "[1, 2, 3, 4]\n"
+    );
+    // `minus(element)` drops the FIRST match only; `minus(elements)` drops all.
+    assert_eq!(
+        prog("fun main() { println(listOf(1, 2, 2, 3) - 2) }"),
+        "[1, 2, 3]\n"
+    );
+    assert_eq!(
+        prog("fun main() { println(listOf(1, 2, 2, 3) - listOf(2)) }"),
+        "[1, 3]\n"
+    );
+    // The `Iterable` overload wins whenever the argument is one, even where the
+    // receiver's own elements are collections.
+    assert_eq!(
+        prog("fun main() { println(listOf(listOf(1)) + listOf(2)) }"),
+        "[[1], 2]\n"
+    );
+    // A String argument is not an Iterable — `CharSequence` does not implement
+    // it — so this appends the string whole rather than its characters.
+    assert_eq!(
+        prog(r#"fun main() { println(listOf("x") + "y") }"#),
+        "[x, y]\n"
+    );
+}
+
+#[test]
+fn a_collection_operator_the_stdlib_lacks_fails_loudly() {
+    // `times`/`div`/`rem` are not collection conventions. The point of routing
+    // `+`/`-` away from the arithmetic ops is that everything else must now
+    // REFUSE rather than answer with a coerced handle: a loud failure is the
+    // whole improvement over `listOf(1, 2) * 2` quietly being a number.
+    let err = prog_err("fun main() { println(listOf(1, 2) * 2) }");
+    assert!(err.contains("unresolved reference"), "stderr was: {err}");
+    assert!(err.contains("times"), "stderr was: {err}");
+    let err = prog_err(r#"fun main() { println(mapOf("a" to 1) / 2) }"#);
+    assert!(err.contains("unresolved reference"), "stderr was: {err}");
+}
+
+#[test]
+fn plus_assign_mutates_where_plus_rebinds() {
+    // The `val`/`var` split is Kotlin's, and it is observable only through an
+    // alias. `var l: List` takes `plus` and REBINDS the name to a fresh list,
+    // leaving an alias behind; `val m: MutableList` takes `plusAssign` and
+    // mutates the one object the alias also sees. Answering both with the same
+    // lowering would be right on the receiver and wrong on every alias.
+    let src = "\
+fun main() {
+    val m = mutableListOf(1, 2)
+    val shared = m
+    m += 3
+    println(shared)
+    var l = listOf(1, 2)
+    val snapshot = l
+    l += 3
+    println(snapshot)
+    println(l)
+}";
+    assert_eq!(prog(src), "[1, 2, 3]\n[1, 2]\n[1, 2, 3]\n");
+}
+
+#[test]
+fn user_declared_operator_conventions_dispatch_to_their_methods() {
+    // Every operator Kotlin defines as a convention resolves to the class's own
+    // method, not to an instruction — including the ones whose operands or
+    // result are not the receiver's type (`contains` flips them, `compareTo`
+    // answers a Boolean about the method's SIGN).
+    let src = "\
+class V(val x: Int) {
+    operator fun plus(o: V) = V(x + o.x)
+    operator fun div(o: V) = V(x / o.x)
+    operator fun unaryMinus() = V(-x)
+    operator fun not() = V(x * 100)
+    operator fun contains(v: Int) = v == x
+    operator fun get(i: Int) = x + i
+    operator fun compareTo(o: V) = x.compareTo(o.x)
+    operator fun inc() = V(x + 10)
+    override fun toString() = \"V(\" + x + \")\"
+}
+fun main() {
+    println(V(7) + V(2))
+    println(V(7) / V(2))
+    println(-V(7))
+    println(!V(7))
+    println(7 in V(7))
+    println(9 in V(7))
+    println(V(7)[5])
+    println(V(7) < V(2))
+    println(V(7) >= V(2))
+    var c = V(1)
+    c++
+    println(c)
+}";
+    assert_eq!(
+        prog(src),
+        "V(9)\nV(3)\nV(-7)\nV(700)\ntrue\nfalse\n12\nfalse\ntrue\nV(11)\n"
+    );
+}
+
+#[test]
+fn a_bare_property_read_keeps_its_declared_type() {
+    // `infer` has to agree with what the emitter produces for the same node.
+    // A bare `x` inside a method is an implicit-`this` property read, and
+    // inferring it `Unknown` sent `x / 2` down the Double division path while
+    // `this.x / 2` and `o.x / 2` truncated — the same expression answering two
+    // different numbers depending on how the receiver was spelled.
+    let src = "\
+class V(val x: Int) {
+    fun bare() = x / 2
+    fun qualified() = this.x / 2
+    fun other(o: V) = o.x / 2
+}
+fun main() {
+    println(V(7).bare())
+    println(V(7).qualified())
+    println(V(7).other(V(7)))
+}";
+    assert_eq!(prog(src), "3\n3\n3\n");
+}
+
+#[test]
+fn a_super_call_keeps_its_declared_return_type() {
+    // `super<T>.m()` inferred `Unknown`, so concatenating two String-returning
+    // super calls compiled as ARITHMETIC. That stayed invisible because
+    // fusevm's `Op::Add` concatenates two strings anyway — until an Int operand
+    // joined the expression and earned it the 32-bit narrowing, which coerced
+    // the built string to 0.
+    let src = "\
+interface Left { fun pick(): String = \"L\" }
+interface Right { fun pick(): String = \"R\" }
+class Both(val k: Int) : Left, Right {
+    fun joined(): String = super<Left>.pick() + super<Right>.pick() + 5
+    fun withProp(): String = super<Left>.pick() + k
+    override fun pick(): String = \"x\"
+}
+fun main() {
+    println(Both(5).joined())
+    println(Both(5).withProp())
+}";
+    assert_eq!(prog(src), "LR5\nL5\n");
+}

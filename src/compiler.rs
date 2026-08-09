@@ -27,8 +27,8 @@ use crate::host::{
     KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND, KT_FFI_CALL, KT_FFI_COMPILE, KT_GETFIELD, KT_HASH_REG,
     KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET,
     KT_ITER_SIZE, KT_JOIN, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH,
-    KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_PAIR, KT_PRINT, KT_PRINTLN, KT_RANGE,
-    KT_RANGE_STEP, KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN, KT_SETFIELD, KT_SET_VM,
+    KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OPER_VM, KT_PAIR, KT_PRINT, KT_PRINTLN,
+    KT_RANGE, KT_RANGE_STEP, KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN, KT_SETFIELD, KT_SET_VM,
     KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
@@ -1826,6 +1826,30 @@ impl Compiler {
                 // A `val` (write-once) binding cannot be reassigned — Kotlin
                 // reports this at compile time.
                 if sc.is_mutable(name) == Some(false) {
+                    // …but `val c = mutableListOf(1); c += 2` is not a
+                    // reassignment. It is the `plusAssign` convention, which
+                    // MUTATES the object the name is bound to and leaves the
+                    // binding itself alone (see `operator_assign_fn`).
+                    if let Some(fname) = op.and_then(operator_assign_fn) {
+                        let recv = Expr::Var(name.clone());
+                        if self.declares_operator(sc, &recv, fname) {
+                            self.compile_member(
+                                sc,
+                                &recv,
+                                fname,
+                                std::slice::from_ref(value),
+                                false,
+                                0,
+                            )?;
+                            self.b.emit(Op::Pop, 0);
+                            return Ok(());
+                        }
+                        if self.infer(sc, &recv) == Type::Obj {
+                            self.emit_operator_call(sc, &recv, value, fname)?;
+                            self.b.emit(Op::Pop, 0);
+                            return Ok(());
+                        }
+                    }
                     return Err(format!("val cannot be reassigned: {name}"));
                 }
                 // A bare `name = …` that is not a local but is a property of the
@@ -2434,6 +2458,16 @@ impl Compiler {
                 Err(format!("unresolved reference: {name}"))
             }
             Expr::Unary { op, expr } => {
+                // `-x` is the `unaryMinus` convention and `!x` the `not` one, so
+                // a class declaring either gets its own method rather than the
+                // numeric/boolean instruction.
+                let fname = match op {
+                    UnOp::Neg => "unaryMinus",
+                    UnOp::Not => "not",
+                };
+                if self.declares_operator(sc, expr, fname) {
+                    return self.compile_member(sc, expr, fname, &[], false, 0);
+                }
                 let t = self.compile_expr(sc, expr)?;
                 match op {
                     UnOp::Neg => {
@@ -2479,6 +2513,17 @@ impl Compiler {
                 Ok(t)
             }
             Expr::Index { recv, index, line } => {
+                // `a[i]` is the `get` convention.
+                if self.declares_operator(sc, recv, "get") {
+                    return self.compile_member(
+                        sc,
+                        recv,
+                        "get",
+                        std::slice::from_ref(index),
+                        false,
+                        *line,
+                    );
+                }
                 let ty = self.index_elem_ty(sc, recv);
                 self.compile_expr(sc, recv)?;
                 self.compile_expr(sc, index)?;
@@ -2492,6 +2537,20 @@ impl Compiler {
                 Ok(Type::Obj)
             }
             Expr::Range { start, end, kind } => {
+                // `a..b` is the `rangeTo` convention. Only the `..` form is one:
+                // `until`/`downTo` are ordinary infix functions, so a class
+                // wanting those declares them by name and reaches them as
+                // methods.
+                if *kind == RangeKind::Inclusive && self.declares_operator(sc, start, "rangeTo") {
+                    return self.compile_member(
+                        sc,
+                        start,
+                        "rangeTo",
+                        std::slice::from_ref(end),
+                        false,
+                        0,
+                    );
+                }
                 self.compile_expr(sc, start)?;
                 self.compile_expr(sc, end)?;
                 self.b.emit(Op::Extended(KT_RANGE, range_form(*kind)), 0);
@@ -2508,6 +2567,22 @@ impl Compiler {
                 container,
                 negated,
             } => {
+                // `a in b` is the `contains` convention on the CONTAINER, with
+                // the operands the other way round: it is `b.contains(a)`.
+                if self.declares_operator(sc, container, "contains") {
+                    self.compile_member(
+                        sc,
+                        container,
+                        "contains",
+                        std::slice::from_ref(value),
+                        false,
+                        0,
+                    )?;
+                    if *negated {
+                        self.b.emit(Op::LogNot, 0);
+                    }
+                    return Ok(Type::Boolean);
+                }
                 self.compile_expr(sc, value)?;
                 self.compile_expr(sc, container)?;
                 self.b.emit(Op::CallBuiltin(KT_IN_VM, 2), 0);
@@ -2773,6 +2848,19 @@ impl Compiler {
     ) -> Result<Type, String> {
         let ty = self.infer(sc, target);
         let op = if inc { BinOp::Add } else { BinOp::Sub };
+        // `x++` is the `inc` convention, NOT `x = x + 1`: a class declaring
+        // `operator fun inc()` is stepped by that method, and it need not agree
+        // with any `plus` the class also declares.
+        let step = if inc { "inc" } else { "dec" };
+        let conv = self
+            .declares_operator(sc, target, step)
+            .then(|| Expr::MethodCall {
+                recv: Box::new(target.clone()),
+                name: step.to_string(),
+                args: Vec::new(),
+                safe: false,
+                line: 0,
+            });
         let mark = sc.enter();
         // Postfix yields the value from BEFORE the update, so capture it first.
         let saved = if prefix {
@@ -2783,11 +2871,17 @@ impl Compiler {
             self.b.emit(Op::SetSlot(slot), 0);
             Some(slot)
         };
+        // With an `inc`/`dec` convention the update is a plain `=` of the
+        // method's result; without one it is the `+= 1` the primitive types use.
+        let (upd_op, upd_value) = match conv {
+            Some(call) => (None, call),
+            None => (Some(op), Expr::Int(1)),
+        };
         let update = match target {
             Expr::Var(name) => StmtKind::Assign {
                 name: name.clone(),
-                op: Some(op),
-                value: Expr::Int(1),
+                op: upd_op,
+                value: upd_value,
             },
             Expr::Member {
                 recv,
@@ -2797,14 +2891,14 @@ impl Compiler {
             } => StmtKind::SetMember {
                 recv: (**recv).clone(),
                 name: name.clone(),
-                op: Some(op),
-                value: Expr::Int(1),
+                op: upd_op,
+                value: upd_value,
             },
             Expr::Index { recv, index, .. } => StmtKind::SetIndex {
                 recv: (**recv).clone(),
                 index: (**index).clone(),
-                op: Some(op),
-                value: Expr::Int(1),
+                op: upd_op,
+                value: upd_value,
             },
             _ => {
                 return Err("the operand of ++/-- must be a variable, property, or element".into())
@@ -3714,6 +3808,15 @@ impl Compiler {
         op: &Option<BinOp>,
         value: &Expr,
     ) -> Result<(), String> {
+        // `a[i] = v` is the `set` convention. The compound `a[i] += v` reads
+        // through `compound_value`, whose `Expr::Index` reaches `get`.
+        if self.declares_operator(sc, recv, "set") {
+            let store = self.compound_value(recv, "", Some(index), op, value);
+            let args = [index.clone(), store];
+            self.compile_member(sc, recv, "set", &args, false, 0)?;
+            self.b.emit(Op::Pop, 0);
+            return Ok(());
+        }
         self.compile_expr(sc, recv)?; // [recv]
         self.compile_expr(sc, index)?; // [recv, index]
         let store = self.compound_value(recv, "", Some(index), op, value);
@@ -3911,6 +4014,44 @@ impl Compiler {
             if op == BinOp::Ne {
                 self.b.emit(Op::LogNot, 0);
             }
+            return Ok(Type::Boolean);
+        }
+
+        // The arithmetic operators are CONVENTIONS resolved against the LEFT
+        // operand (see `operator_fn`), so this precedes the string rule below:
+        // `listOf(1, 2) + "a"` is a List's `plus` and answers `[1, 2, a]`, while
+        // `"a" + listOf(1, 2)` is a String's and answers `a[1, 2]`.
+        if let Some(fname) = operator_fn(op) {
+            // A user class that declares the convention. Resolved statically,
+            // like every other member call on a known class.
+            if self.declares_operator(sc, l, fname) {
+                return self.compile_member(sc, l, fname, std::slice::from_ref(r), false, 0);
+            }
+            // Any other heap receiver — a `List`, `Set`, `Map` or range.
+            // Dispatched at run time because the frontend tracks these as one
+            // `Type::Obj` and only the value knows which it is.
+            if lt == Type::Obj {
+                self.emit_operator_call(sc, l, r, fname)?;
+                return Ok(Type::Obj);
+            }
+        }
+
+        // `<`/`>`/`<=`/`>=` on a class declaring `compareTo` are that
+        // convention: the operator tests the SIGN of `a.compareTo(b)`.
+        if matches!(op, BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge)
+            && self.declares_operator(sc, l, "compareTo")
+        {
+            self.compile_member(sc, l, "compareTo", std::slice::from_ref(r), false, 0)?;
+            self.b.emit(Op::LoadInt(0), 0);
+            self.b.emit(
+                match op {
+                    BinOp::Lt => Op::NumLt,
+                    BinOp::Gt => Op::NumGt,
+                    BinOp::Le => Op::NumLe,
+                    _ => Op::NumGe,
+                },
+                0,
+            );
             return Ok(Type::Boolean);
         }
 
@@ -4945,8 +5086,36 @@ impl Compiler {
             Expr::Str(_) => Type::String,
             Expr::Var(n) => {
                 if sc.slot(n).is_some() {
-                    sc.ty(n)
-                } else if let Some(p) = self.globals.get(n) {
+                    return sc.ty(n);
+                }
+                // A bare name that is a property of the enclosing class, or of
+                // its companion. This mirrors the resolution order the emitter
+                // uses for the same node (local, then implicit `this`, then
+                // companion, then global) and MUST agree with it: inferring
+                // `Unknown` for a property the emitter reads as an `Int` sent
+                // `x / 2` inside a method down the `Double` division path, so
+                // `class V(val x: Int) { fun a() = x / 2 }` answered `3.5`
+                // where the reference toolchain truncates to `3`.
+                if let Some(t) = self
+                    .cur_class
+                    .as_ref()
+                    .and_then(|c| self.classes.get(c))
+                    .and_then(|m| m.prop(n))
+                    .map(|p| p.ty)
+                {
+                    return t;
+                }
+                if let Some(t) = self
+                    .cur_class
+                    .as_ref()
+                    .and_then(|c| self.companion_of(c))
+                    .and_then(|c| self.classes.get(&c))
+                    .and_then(|m| m.prop(n))
+                    .map(|p| p.ty)
+                {
+                    return t;
+                }
+                if let Some(p) = self.globals.get(n) {
                     p.ty
                 } else if self.resolve_math_const(n).is_some() {
                     Type::Double
@@ -5080,6 +5249,14 @@ impl Compiler {
                 safe,
                 ..
             } => {
+                // `super.m()` / `super<T>.m()` — see `super_ret`. Resolved
+                // before the member rules below, which have no notion of the
+                // `super` receiver and would answer `Unknown` for it.
+                if let Expr::Super { qualifier } = &**recv {
+                    if let Some(t) = self.super_ret(qualifier.as_deref(), name) {
+                        return nullable_if_safe(t, *safe);
+                    }
+                }
                 // An extension function's declared return type. Checked with
                 // the same member-first rule `compile_member` applies, so the
                 // two agree on the node — an `Int` extension returning `Int` has
@@ -5370,6 +5547,68 @@ impl Compiler {
     /// a bound variable's class, a constructor call, `this`, a class-typed
     /// function return, or a class-typed property/method result. Drives method
     /// dispatch and property typing.
+    /// The declared return type of the supertype implementation that
+    /// `super.m()` / `super<T>.m()` resolves to, by the same owner rule
+    /// [`Compiler::compile_super_call`] emits with.
+    ///
+    /// `infer` must agree with what the emitter produces for the node. Without
+    /// this a `super` call inferred `Unknown`, so `super<Left>.pick() +
+    /// super<Right>.pick()` on two `String`-returning members compiled as
+    /// ARITHMETIC rather than concatenation. That went unnoticed because
+    /// fusevm's `Op::Add` concatenates two strings anyway — until a genuinely
+    /// `Int` operand joined the expression, which earned the whole thing the
+    /// 32-bit narrowing and coerced the built string to `0`.
+    fn super_ret(&self, qualifier: Option<&str>, name: &str) -> Option<Type> {
+        let meta = self.classes.get(self.cur_class.as_ref()?)?;
+        let owner = match qualifier {
+            Some(t) => t.to_string(),
+            None => meta.mro[1..]
+                .iter()
+                .find(|a| {
+                    self.classes
+                        .get(*a)
+                        .is_some_and(|m| m.own_methods.contains(name))
+                })
+                .cloned()?,
+        };
+        self.classes
+            .get(&owner)
+            .and_then(|m| m.methods.get(name))
+            .map(|s| s.ret)
+    }
+
+    /// Whether `e`'s static class declares the operator-convention method
+    /// `name` — `operator fun plus`, `contains`, `get`, `compareTo`, …
+    ///
+    /// `ClassMeta::methods` is flattened over the MRO, so a convention a
+    /// supertype declares counts for the subclass, as it does in Kotlin. The
+    /// built-in collection tags [`Compiler::infer_class`] also answers
+    /// (`"List"`, `"Map"`, …) are not user classes and never match here; they
+    /// reach their conventions through the runtime dispatch instead.
+    fn declares_operator(&self, sc: &Scope, e: &Expr, name: &str) -> bool {
+        self.infer_class(sc, e)
+            .and_then(|c| self.classes.get(&c))
+            .is_some_and(|m| m.methods.contains_key(name))
+    }
+
+    /// Emit the runtime operator-convention dispatch for a heap receiver whose
+    /// class the frontend could not name — a `List`/`Set`/`Map`/range.
+    /// Stack: `[lhs, rhs, nameStr]`; see [`KT_OPER_VM`].
+    fn emit_operator_call(
+        &mut self,
+        sc: &mut Scope,
+        l: &Expr,
+        r: &Expr,
+        name: &str,
+    ) -> Result<(), String> {
+        self.compile_expr(sc, l)?;
+        self.compile_expr(sc, r)?;
+        let n = self.b.add_constant(Value::str(name));
+        self.b.emit(Op::LoadConst(n), 0);
+        self.b.emit(Op::CallBuiltin(KT_OPER_VM, 3), 0);
+        Ok(())
+    }
+
     fn infer_class(&self, sc: &Scope, e: &Expr) -> Option<String> {
         match e {
             Expr::Var(n) => {
@@ -5781,6 +6020,47 @@ fn primitive_const(ty: &str, name: &str) -> Option<(Value, Type)> {
 // PER SITE from the operands' static types, which is what lets `Int` and `Long`
 // arithmetic coexist in one chunk: a `Long` operand simply skips it and keeps
 // the full 64-bit i64 result.
+
+/// The Kotlin function a binary operator is a CONVENTION for.
+///
+/// Kotlin's operators are not instructions bound to primitive types: `a + b`
+/// *means* `a.plus(b)`, resolved as an ordinary member/extension against the
+/// LEFT operand. The compiler emits the arithmetic op when it can prove both
+/// sides are primitive numbers, and must resolve the convention otherwise —
+/// emitting `Op::Sub` for `listOf(1, 2, 3) - 2` coerced the list HANDLE to a
+/// number and answered `-2.0`.
+///
+/// Only the five arithmetic operators are named here. The comparison operators
+/// are the separate `compareTo` convention (they answer a `Boolean` about its
+/// sign, not the method's own value), and `==` is `equals`, already routed
+/// through [`KT_OBJEQ_VM`].
+fn operator_fn(op: BinOp) -> Option<&'static str> {
+    Some(match op {
+        BinOp::Add => "plus",
+        BinOp::Sub => "minus",
+        BinOp::Mul => "times",
+        BinOp::Div => "div",
+        BinOp::Mod => "rem",
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => return None,
+        BinOp::And | BinOp::Or => return None,
+    })
+}
+
+/// The in-place `op=` convention paired with an arithmetic operator.
+///
+/// Kotlin resolves `a += b` two ways, and the choice is observable through an
+/// alias. Against a `var` it is `a = a.plus(b)`, which REBINDS the name to a
+/// fresh object; against a `val` holding a mutable collection it is
+/// `a.plusAssign(b)`, which mutates the one object every alias shares. Only the
+/// second is legal on a `val`, which is why `val m = mutableListOf(1, 2); m +=
+/// 3` compiles at all.
+fn operator_assign_fn(op: BinOp) -> Option<&'static str> {
+    Some(match op {
+        BinOp::Add => "plusAssign",
+        BinOp::Sub => "minusAssign",
+        _ => return None,
+    })
+}
 
 /// Kotlin's binary numeric promotion for `+ - * / %`: a `Double` operand makes
 /// the result `Double`, otherwise a `Long` operand makes it a 64-bit `Long`,

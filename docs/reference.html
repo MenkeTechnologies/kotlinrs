@@ -1569,56 +1569,80 @@ sum(): Double</code></pre>
           <pre><code class="lang-kotlin">println(listOf(3, 1, 3).distinct())   // [3, 1]</code></pre>
         </article>
         <article class="doc-entry" id="doc-sequence-members-23">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-23">#</a> <code>union</code></h3>
+          <h3><a class="doc-anchor" href="#doc-sequence-members-23">#</a> <code>plus</code></h3>
+          <pre><code class="lang-kotlin">plus(element: T): List&lt;T&gt; / plus(elements: Iterable&lt;T&gt;): List&lt;T&gt;</code></pre>
+          <p>The receiver's elements followed by the argument's, as a collection of the receiver's own kind. Spelled <code>+</code> as an operator. The <code>Iterable</code> overload wins whenever the argument is one, so <code>listOf(listOf(1)) + listOf(2)</code> is <code>[[1], 2]</code>; use <code>plusElement</code> to append a collection whole. A <code>Map</code> receiver takes a <code>Pair</code>, another <code>Map</code>, or an iterable of pairs, and an existing key keeps its position while its value is replaced.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2) + 3)   // [1, 2, 3]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-24">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-24">#</a> <code>minus</code></h3>
+          <pre><code class="lang-kotlin">minus(element: T): List&lt;T&gt; / minus(elements: Iterable&lt;T&gt;): List&lt;T&gt;</code></pre>
+          <p>The receiver without the argument's elements, as a collection of the receiver's own kind. Spelled <code>-</code> as an operator. The element form drops only the FIRST match — <code>listOf(1, 2, 2, 3) - 2</code> is <code>[1, 2, 3]</code> — while the <code>Iterable</code> form drops every occurrence of every listed element. A <code>Map</code> receiver takes a key or an iterable of keys.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3) - 2)   // [1, 3]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-25">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-25">#</a> <code>plusElement</code></h3>
+          <pre><code class="lang-kotlin">plusElement(element: T): List&lt;T&gt;</code></pre>
+          <p>The receiver's elements followed by the argument as ONE element, pinning the overload <code>plus</code> would otherwise resolve to the <code>Iterable</code> form for a collection argument.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2).plusElement(listOf(3)))   // [1, 2, [3]]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-26">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-26">#</a> <code>minusElement</code></h3>
+          <pre><code class="lang-kotlin">minusElement(element: T): List&lt;T&gt;</code></pre>
+          <p>The receiver without the first element equal to the argument, treating it as one element rather than a sequence to subtract.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 2).minusElement(2))   // [1, 2]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-27">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-27">#</a> <code>union</code></h3>
           <pre><code class="lang-kotlin">union(other: Iterable&lt;T&gt;): Set&lt;T&gt;</code></pre>
           <p>Distinct elements of the receiver followed by those of the argument, as a <code>Set</code>. Defined on any iterable receiver, and always returning a <code>Set</code> whatever kind the receiver was. Only the method form parses — <code>a union b</code> as an infix call is a syntax error.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2).union(listOf(2, 3)))   // [1, 2, 3]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-24">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-24">#</a> <code>intersect</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-28">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-28">#</a> <code>intersect</code></h3>
           <pre><code class="lang-kotlin">intersect(other: Iterable&lt;T&gt;): Set&lt;T&gt;</code></pre>
           <p>Distinct receiver elements that also appear in the argument, as a <code>Set</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).intersect(listOf(2, 3, 4)))   // [2, 3]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-25">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-25">#</a> <code>subtract</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-29">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-29">#</a> <code>subtract</code></h3>
           <pre><code class="lang-kotlin">subtract(other: Iterable&lt;T&gt;): Set&lt;T&gt;</code></pre>
           <p>Distinct receiver elements that do not appear in the argument, as a <code>Set</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).subtract(listOf(2)))   // [1, 3]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-26">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-26">#</a> <code>sorted</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-30">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-30">#</a> <code>sorted</code></h3>
           <pre><code class="lang-kotlin">sorted(): List&lt;T&gt;</code></pre>
           <p>Ascending sort into a new <code>List</code> — strings lexicographically, chars by code unit, everything else numerically. There is no <code>sortedWith</code> and no in-place <code>sort</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(3, 1, 2).sorted())   // [1, 2, 3]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-27">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-27">#</a> <code>sortedDescending</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-31">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-31">#</a> <code>sortedDescending</code></h3>
           <pre><code class="lang-kotlin">sortedDescending(): List&lt;T&gt;</code></pre>
           <p>Descending sort into a new <code>List</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(3, 1, 2).sortedDescending())   // [3, 2, 1]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-28">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-28">#</a> <code>take</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-32">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-32">#</a> <code>take</code></h3>
           <pre><code class="lang-kotlin">take(n: Int): List&lt;T&gt;</code></pre>
           <p>The first <code>n</code> elements as a <code>List</code>. An oversized <code>n</code> clamps to the whole sequence; a negative one raises <code>IllegalArgumentException: Requested element count N is less than zero.</code> There is no <code>takeWhile</code> and no <code>takeLast</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).take(2))   // [1, 2]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-29">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-29">#</a> <code>drop</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-33">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-33">#</a> <code>drop</code></h3>
           <pre><code class="lang-kotlin">drop(n: Int): List&lt;T&gt;</code></pre>
           <p>Everything after the first <code>n</code> elements, as a <code>List</code>. An oversized <code>n</code> yields an empty list; a negative one raises <code>IllegalArgumentException</code>. There is no <code>dropWhile</code> and no <code>dropLast</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).drop(1))   // [2, 3]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-30">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-30">#</a> <code>joinToString</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-34">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-34">#</a> <code>joinToString</code></h3>
           <pre><code class="lang-kotlin">joinToString(): String
 joinToString(separator: Any): String</code></pre>
           <p>Renders the elements with the same stringifier <code>println</code> uses, joined by a separator that defaults to <code>", "</code>. Only the separator parameter exists — there is no <code>prefix</code>, <code>postfix</code>, <code>limit</code> or <code>transform</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).joinToString("-"))   // 1-2-3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-31">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-31">#</a> <code>reversed</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-35">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-35">#</a> <code>reversed</code></h3>
           <pre><code class="lang-kotlin">reversed(): List&lt;T&gt;
 IntRange.reversed(): IntProgression</code></pre>
           <p>Reverses the order. On a list, set or array the result is a reversed <code>List</code>; on a range it is instead a descending <code>IntProgression</code>, which prints in its <code>b downTo a step 1</code> form.</p>
