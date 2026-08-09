@@ -266,6 +266,31 @@ thread_local! {
     /// published by [`KT_TOSTRING_REG`]. Consulted by [`KT_DISPLAY`].
     static TOSTRING_SUBS: RefCell<std::collections::HashMap<String, u16>> =
         RefCell::new(std::collections::HashMap::new());
+
+    /// Class tag → one character per OWN property, `'l'` where that property is
+    /// declared `Long` and `'.'` otherwise, as published in the `KT_NEW` /
+    /// `KT_EXTEND` metadata string. It exists for one job: a `data class`'s
+    /// generated `hashCode` folds `Long` fields with a different formula than
+    /// `Int` ones, and every Kotlin integer is the same `i64` at run time (see
+    /// [`int_hash`]). The compiler knows the declared type, so it says so.
+    static LONG_FIELDS: RefCell<std::collections::HashMap<String, String>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// The registered `Long`-field mask for a class tag (see [`LONG_FIELDS`]).
+fn long_fields(class: String) -> Option<String> {
+    LONG_FIELDS.with(|f| f.borrow().get(&class).cloned())
+}
+
+/// Record a class's `Long`-field mask. Registration rides on construction
+/// rather than on class declaration because the mask travels in the same
+/// metadata string the fields do; it is idempotent, so re-registering on every
+/// `C(...)` costs one map write and keeps the emitter to a single token.
+fn register_widths(class: &str, widths: &str) {
+    if widths.is_empty() {
+        return;
+    }
+    LONG_FIELDS.with(|f| f.borrow_mut().insert(class.to_string(), widths.to_string()));
 }
 
 /// Whether the declared type `class` is `ty` itself or lists it as a supertype.
@@ -313,6 +338,13 @@ enum HeapObj {
     /// Insertion-ordered key/value pairs (Kotlin `mapOf` preserves order).
     Map(Vec<(Value, Value)>),
     Pair(Value, Value),
+    /// A `Map.Entry`. Structurally a key/value couple like [`HeapObj::Pair`],
+    /// but Kotlin keeps the two types apart and they OBSERVABLY differ: an entry
+    /// renders as `k=v` where a pair renders as `(k, v)`, its `hashCode` is
+    /// `key xor value` where a pair folds like the `data class` it is, and
+    /// `mapOf(1 to "a").entries.first() == (1 to "a")` is `false`. Sharing one
+    /// variant made all three wrong.
+    Entry(Value, Value),
     /// A first-class lambda: the body's chunk name-pool index (resolved to an
     /// entry via `Chunk::find_sub` at call time), its parameter count, and the
     /// values captured from the enclosing frame at creation (its upvalues, stored
@@ -1192,6 +1224,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let mut it = meta.split('\u{1f}');
             let class = it.next().unwrap_or("").to_string();
             let is_data = it.next() == Some("d");
+            register_widths(&class, it.next().unwrap_or(""));
             let fields: Vec<(String, Value)> = it.map(|s| s.to_string()).zip(vals).collect();
             vm.push(alloc(HeapObj::Instance {
                 class,
@@ -1225,6 +1258,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let mut it = meta.split('\u{1f}');
             let class = it.next().unwrap_or("").to_string();
             let is_data = it.next() == Some("d");
+            register_widths(&class, it.next().unwrap_or(""));
             // The base's fields come first, so a subclass's record reads
             // base-most first — the order the compiler's flattened property
             // table assumes.
@@ -1711,7 +1745,7 @@ fn iter_at(recv: &Value, i: i64) -> Value {
     })
     .flatten();
     if let Some((k, v)) = entry {
-        return alloc(HeapObj::Pair(k, v));
+        return alloc(HeapObj::Entry(k, v));
     }
     with_obj(recv, |o| match o {
         HeapObj::List(items) | HeapObj::Set(items) | HeapObj::Array { items, .. } => {
@@ -1942,12 +1976,14 @@ fn display_vm(vm: &mut VM, v: &Value) -> String {
         List(Vec<Value>),
         Map(Vec<(Value, Value)>),
         Pair(Value, Value),
+        Entry(Value, Value),
         Plain,
     }
     let shape = with_obj(v, |o| match o {
         HeapObj::List(items) | HeapObj::Set(items) => Shape::List(items.clone()),
         HeapObj::Map(entries) => Shape::Map(entries.clone()),
         HeapObj::Pair(a, b) => Shape::Pair(a.clone(), b.clone()),
+        HeapObj::Entry(k, v) => Shape::Entry(k.clone(), v.clone()),
         _ => Shape::Plain,
     })
     .unwrap_or(Shape::Plain);
@@ -1964,6 +2000,7 @@ fn display_vm(vm: &mut VM, v: &Value) -> String {
             format!("{{{}}}", body.join(", "))
         }
         Shape::Pair(a, b) => format!("({}, {})", display_vm(vm, &a), display_vm(vm, &b)),
+        Shape::Entry(k, val) => format!("{}={}", display_vm(vm, &k), display_vm(vm, &val)),
         Shape::Plain => kotlin_string(v),
     }
 }
@@ -1988,6 +2025,74 @@ fn b_join(vm: &mut VM, argc: u8) -> Value {
 }
 
 /// The elements of any iterable receiver — a `List`, an array, or a range.
+/// The `windowed`/`chunked` walk: groups of `size`, advancing by `step`.
+///
+/// With `partial` set, a trailing group shorter than `size` is still emitted and
+/// the walk runs until the start index passes the end — which is what makes
+/// `chunked` (`step = size`, `partial = true`) and `windowed(size, step, true)`
+/// one function. Without it, only full-length groups appear.
+fn windows_of(items: &[Value], size: usize, step: usize, partial: bool) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while at < items.len() {
+        let end = (at + size).min(items.len());
+        if end - at < size && !partial {
+            break;
+        }
+        out.push(alloc(HeapObj::List(items[at..end].to_vec())));
+        at += step;
+    }
+    out
+}
+
+/// The per-element renderer `joinToString(…) { … }` supplies. It can fail,
+/// because the lambda it wraps runs Kotlin code that may raise.
+type JoinTransform<'a> = dyn FnMut(&Value) -> Result<String, String> + 'a;
+
+/// `joinToString(separator, prefix, postfix, limit, truncated)` over `items`,
+/// reading the arguments from `args` starting at `at`.
+///
+/// A non-negative `limit` caps how many elements are rendered and appends
+/// `truncated` (default `"..."`) in place of the rest. `transform` renders one
+/// element when supplied; otherwise an element goes through the Kotlin
+/// stringifier.
+fn join_to_string(
+    items: &[Value],
+    args: &[Value],
+    at: usize,
+    mut transform: Option<&mut JoinTransform<'_>>,
+) -> String {
+    let text = |i: usize, dflt: &str| -> String {
+        args.get(at + i)
+            .filter(|v| !matches!(v, Value::Undef))
+            .map(kotlin_string)
+            .unwrap_or_else(|| dflt.to_string())
+    };
+    let sep = text(0, ", ");
+    let prefix = text(1, "");
+    let postfix = text(2, "");
+    let limit = args.get(at + 3).map(|v| v.to_int()).unwrap_or(-1);
+    let truncated = text(4, "...");
+
+    let mut body: Vec<String> = Vec::new();
+    for (i, v) in items.iter().enumerate() {
+        if limit >= 0 && i as i64 >= limit {
+            body.push(truncated);
+            break;
+        }
+        body.push(match transform.as_mut() {
+            Some(f) => match f(v) {
+                Ok(s) => s,
+                // A raise inside the transform is reported by the invoking
+                // builtin; rendering stops with what it produced.
+                Err(_) => break,
+            },
+            None => kotlin_string(v),
+        });
+    }
+    format!("{prefix}{}{postfix}", body.join(&sep))
+}
+
 fn sequence_items(v: &Value) -> Vec<Value> {
     with_obj(v, |o| match o {
         HeapObj::List(items) | HeapObj::Set(items) => items.clone(),
@@ -2089,7 +2194,7 @@ fn list_snapshot(recv: &Value) -> Option<Vec<Value>> {
         return Some(
             entries
                 .into_iter()
-                .map(|(k, v)| alloc(HeapObj::Pair(k, v)))
+                .map(|(k, v)| alloc(HeapObj::Entry(k, v)))
                 .collect(),
         );
     }
@@ -2146,7 +2251,7 @@ fn same_kind_as(recv: &Value, out: Vec<Value>) -> Value {
                 .iter()
                 .filter_map(|p| {
                     with_obj(p, |o| match o {
-                        HeapObj::Pair(k, v) => Some((k.clone(), v.clone())),
+                        HeapObj::Pair(k, v) | HeapObj::Entry(k, v) => Some((k.clone(), v.clone())),
                         _ => None,
                     })
                     .flatten()
@@ -2335,18 +2440,6 @@ fn coll_hof(
         }
         // `firstOrNull`/`lastOrNull` with a predicate: the matching element, or
         // null when none matches.
-        "firstOrNull" | "lastOrNull" => {
-            let mut found = Value::Undef;
-            for it in items {
-                if truthy(&invoke_closure(vm, clo, std::slice::from_ref(&it))?) {
-                    found = it;
-                    if name == "firstOrNull" {
-                        break;
-                    }
-                }
-            }
-            Ok(found)
-        }
         "flatMap" => {
             // Each result is itself iterable; its elements are spliced in.
             let mut out = Vec::new();
@@ -2433,6 +2526,229 @@ fn coll_hof(
                 .map(|(k, v)| (k, alloc(HeapObj::List(v))))
                 .collect();
             Ok(alloc(HeapObj::Map(entries)))
+        }
+        // The searching predicates. `first`/`last`/`single` FAULT when nothing
+        // matches, where `find`/`findLast`/`singleOrNull` answer null — that is
+        // the only difference between the two families. Each used to reach the
+        // no-argument member instead, so the predicate was evaluated never and
+        // `listOf(1, 2, 3).first { it > 1 }` answered 1.
+        "first" | "last" | "find" | "findLast" | "firstOrNull" | "lastOrNull" => {
+            let back = matches!(name, "last" | "findLast" | "lastOrNull");
+            let mut hit = None;
+            for it in items {
+                if truthy(&invoke_closure(vm, clo, std::slice::from_ref(&it))?) {
+                    hit = Some(it);
+                    if !back {
+                        break;
+                    }
+                }
+            }
+            match (hit, name) {
+                (Some(v), _) => Ok(v),
+                (None, "first" | "last") => Err(
+                    "java.util.NoSuchElementException: Collection contains no element \
+                     matching the predicate."
+                        .to_string(),
+                ),
+                (None, _) => Ok(Value::Undef),
+            }
+        }
+        "single" | "singleOrNull" => {
+            let mut hits = Vec::new();
+            for it in items {
+                if truthy(&invoke_closure(vm, clo, std::slice::from_ref(&it))?) {
+                    hits.push(it);
+                }
+            }
+            match (hits.len(), name) {
+                (1, _) => Ok(hits.remove(0)),
+                (_, "singleOrNull") => Ok(Value::Undef),
+                (0, _) => Err("java.util.NoSuchElementException: \
+                     Collection contains no element matching the predicate."
+                    .to_string()),
+                _ => Err("java.lang.IllegalArgumentException: \
+                     Collection contains more than one matching element."
+                    .to_string()),
+            }
+        }
+        "indexOfFirst" | "indexOfLast" => {
+            let mut hit = -1i64;
+            for (i, it) in items.into_iter().enumerate() {
+                if truthy(&invoke_closure(vm, clo, std::slice::from_ref(&it))?) {
+                    hit = i as i64;
+                    if name == "indexOfFirst" {
+                        break;
+                    }
+                }
+            }
+            Ok(Value::Int(hit))
+        }
+        // The indexed pair of `filter`/`forEach`: the lambda takes the position
+        // first, then the element.
+        "filterIndexed" | "forEachIndexed" => {
+            let filtering = name == "filterIndexed";
+            let mut out = Vec::new();
+            for (i, it) in items.into_iter().enumerate() {
+                let r = invoke_closure(vm, clo, &[Value::Int(i as i64), it.clone()])?;
+                if filtering && truthy(&r) {
+                    out.push(it);
+                }
+            }
+            if filtering {
+                Ok(alloc(HeapObj::List(out)))
+            } else {
+                Ok(Value::Undef)
+            }
+        }
+        // `maxOf`/`minOf` take a SELECTOR and answer the extreme selected value
+        // (not the element); they fault on an empty receiver where the
+        // `…OrNull` forms answer null.
+        "maxOf" | "minOf" | "maxOfOrNull" | "minOfOrNull" => {
+            let want_max = name.starts_with("maxOf");
+            let mut best: Option<Value> = None;
+            for it in items {
+                let sel = invoke_closure(vm, clo, &[it])?;
+                let take = match &best {
+                    None => true,
+                    Some(b) => (value_cmp(&sel, b) == std::cmp::Ordering::Greater) == want_max,
+                };
+                if take {
+                    best = Some(sel);
+                }
+            }
+            match (best, name.ends_with("OrNull")) {
+                (Some(v), _) => Ok(v),
+                (None, true) => Ok(Value::Undef),
+                (None, false) => {
+                    Err("java.util.NoSuchElementException: Collection is empty.".to_string())
+                }
+            }
+        }
+        // `Map.mapValues { }` — the lambda sees each ENTRY and its result
+        // replaces that entry's value; the keys and their order are kept.
+        "mapValues" | "mapKeys" => {
+            let keys = name == "mapKeys";
+            let mut entries: Vec<(Value, Value)> = Vec::new();
+            for it in items {
+                let (k, v) = match with_obj(&it, |o| match o {
+                    HeapObj::Entry(k, v) | HeapObj::Pair(k, v) => Some((k.clone(), v.clone())),
+                    _ => None,
+                })
+                .flatten()
+                {
+                    Some(kv) => kv,
+                    None => {
+                        return Err(format!(
+                            "unresolved reference: {name} on {}",
+                            obj_label(recv)
+                        ))
+                    }
+                };
+                let r = invoke_closure(vm, clo, std::slice::from_ref(&it))?;
+                let (k, v) = if keys { (r, v) } else { (k, r) };
+                if let Some(slot) = entries.iter_mut().find(|(ek, _)| value_eq(ek, &k)) {
+                    slot.1 = v;
+                } else {
+                    entries.push((k, v));
+                }
+            }
+            Ok(alloc(HeapObj::Map(entries)))
+        }
+        // `getOrElse(index) { default }` — the lambda supplies the fallback and
+        // receives the out-of-range index.
+        "getOrElse" => {
+            let i = extras.first().map(|v| v.to_int()).unwrap_or(0);
+            match usize::try_from(i).ok().and_then(|i| items.get(i)) {
+                Some(v) => Ok(v.clone()),
+                None => invoke_closure(vm, clo, &[Value::Int(i)]),
+            }
+        }
+        // `sortedWith(comparator)` / `sortedBy`-with-a-comparator: the closure
+        // answers a negative/zero/positive `Int` for a pair of elements.
+        "sortedWith" => {
+            // A comparison that raises must not be swallowed by `sort_by`, so
+            // the ordering is computed up front over an index permutation.
+            let mut order: Vec<usize> = (0..items.len()).collect();
+            let mut err = None;
+            // Insertion sort keeps the comparison count small and the sort
+            // stable, which Kotlin's `sortedWith` guarantees.
+            for i in 1..order.len() {
+                let mut j = i;
+                while j > 0 {
+                    let r = invoke_closure(
+                        vm,
+                        clo,
+                        &[items[order[j - 1]].clone(), items[order[j]].clone()],
+                    );
+                    match r {
+                        Ok(v) if v.to_int() > 0 => order.swap(j - 1, j),
+                        Ok(_) => break,
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                    j -= 1;
+                }
+                if err.is_some() {
+                    break;
+                }
+            }
+            match err {
+                Some(e) => Err(e),
+                None => Ok(same_kind_as(
+                    recv,
+                    order.into_iter().map(|i| items[i].clone()).collect(),
+                )),
+            }
+        }
+        // The transform-taking forms of the grouping/rendering members. Each has
+        // a no-lambda spelling that already worked; the lambda was dropped, so
+        // `chunked(2) { it.sum() }` answered the raw groups.
+        "chunked" | "windowed" => {
+            let size = extras.first().map(|v| v.to_int()).unwrap_or(0);
+            let chunking = name == "chunked";
+            let step = if chunking {
+                size
+            } else {
+                extras.get(1).map(|v| v.to_int()).unwrap_or(1)
+            };
+            if size <= 0 || step <= 0 {
+                return Err(format!(
+                    "java.lang.IllegalArgumentException: \
+                     size {size} and step {step} must be greater than zero."
+                ));
+            }
+            let partial = chunking || extras.get(2).is_some_and(truthy);
+            let groups = windows_of(&items, size as usize, step as usize, partial);
+            let mut out = Vec::with_capacity(groups.len());
+            for g in groups {
+                out.push(invoke_closure(vm, clo, &[g])?);
+            }
+            Ok(alloc(HeapObj::List(out)))
+        }
+        "zip" => {
+            let other = extras.first().map(sequence_items).unwrap_or_default();
+            let mut out = Vec::new();
+            for (a, b) in items.iter().zip(other) {
+                out.push(invoke_closure(vm, clo, &[a.clone(), b])?);
+            }
+            Ok(alloc(HeapObj::List(out)))
+        }
+        "joinToString" => {
+            let mut raised = None;
+            let mut render = |v: &Value| match invoke_closure(vm, clo, std::slice::from_ref(v)) {
+                Ok(r) => Ok(kotlin_string(&r)),
+                Err(e) => {
+                    raised = Some(e.clone());
+                    Err(e)
+                }
+            };
+            let s = join_to_string(&items, extras, 0, Some(&mut render));
+            match raised {
+                Some(e) => Err(e),
+                None => Ok(Value::str(s)),
+            }
         }
         _ => Err(format!(
             "unresolved reference: {name} on {}",
@@ -2638,6 +2954,23 @@ fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
 
 /// UTF-16 offset of `needle` in `hay`, or -1 — matching `String.indexOf` and
 /// the UTF-16 basis `length` already uses.
+/// The tail of `s` starting at UTF-16 offset `at`, or `None` when `at` is past
+/// the end. The `String` search members index in UTF-16 units, matching
+/// `length`.
+fn utf16_slice_from(s: &str, at: i64) -> Option<String> {
+    let units: Vec<u16> = s.encode_utf16().collect();
+    if at < 0 || at > units.len() as i64 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&units[at as usize..]))
+}
+
+/// Whether the optional flag argument at `i` was supplied and true — the
+/// `ignoreCase` parameter the `String` comparisons take.
+fn truthy_arg(args: &[Value], i: usize) -> bool {
+    args.get(i).is_some_and(truthy)
+}
+
 fn utf16_index_of(hay: &str, needle: &str) -> i64 {
     match hay.find(needle) {
         Some(byte_off) => hay[..byte_off].encode_utf16().count() as i64,
@@ -2681,12 +3014,25 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
         // `kotlin_string` so a `Char` (carried as an integer code unit) or a
         // number reads the way Kotlin would print it.
         (Value::Str(s), "contains") => Ok(Value::Bool(s.contains(&arg_str(args, 0)))),
-        (Value::Str(s), "startsWith") => Ok(Value::Bool(s.starts_with(&arg_str(args, 0)))),
+        // `startsWith(prefix, startIndex)` tests at an OFFSET, not from 0 —
+        // `"abc".startsWith("b", 1)` is true. `endsWith` has no such overload.
+        (Value::Str(s), "startsWith") => {
+            let at = args.get(1).map(|v| v.to_int()).unwrap_or(0);
+            Ok(Value::Bool(match utf16_slice_from(s, at) {
+                Some(tail) => tail.starts_with(&arg_str(args, 0)),
+                None => false,
+            }))
+        }
         (Value::Str(s), "endsWith") => Ok(Value::Bool(s.ends_with(&arg_str(args, 0)))),
         (Value::Str(s), "plus") => Ok(Value::str(format!("{s}{}", arg_str(args, 0)))),
         (Value::Str(s), "replace") => {
             Ok(Value::str(s.replace(&arg_str(args, 0), &arg_str(args, 1))))
         }
+        (Value::Str(s), "replaceFirst") => Ok(Value::str(s.replacen(
+            &arg_str(args, 0),
+            &arg_str(args, 1),
+            1,
+        ))),
         (Value::Str(s), "repeat") => {
             let n = args.first().map(|v| v.to_int()).unwrap_or(0);
             if n < 0 {
@@ -2698,7 +3044,22 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
             }
         }
         // Index and slice positions are UTF-16 offsets, matching `length` above.
-        (Value::Str(s), "indexOf") => Ok(Value::Int(utf16_index_of(s, &arg_str(args, 0)))),
+        // `indexOf(needle, startIndex)` searches FROM an offset and still
+        // answers an absolute index, so a match before `startIndex` is not a
+        // match at all. `startIndex` is CLAMPED to `0..length` rather than
+        // rejected, which is observable for an empty needle:
+        // `"abc".indexOf("", 9)` is 3, not -1.
+        (Value::Str(s), "indexOf") => {
+            let len = s.encode_utf16().count() as i64;
+            let at = args.get(1).map(|v| v.to_int()).unwrap_or(0).clamp(0, len);
+            Ok(Value::Int(match utf16_slice_from(s, at) {
+                Some(tail) => match utf16_index_of(&tail, &arg_str(args, 0)) {
+                    -1 => -1,
+                    found => found + at,
+                },
+                None => -1,
+            }))
+        }
         (Value::Str(s), "substring") => {
             let units: Vec<u16> = s.encode_utf16().collect();
             let start = args.first().map(|v| v.to_int()).unwrap_or(0);
@@ -2718,12 +3079,27 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
                 )))
             }
         }
+        // `lastIndexOf(needle, startIndex)` answers the LAST position at which
+        // the needle STARTS at or before `startIndex` — the match itself may run
+        // past it. Kotlin's default `startIndex` is `lastIndex`, NOT the Java
+        // `String.lastIndexOf`'s `length`, which is observable only for an empty
+        // needle: `"abc".lastIndexOf("")` is 2 on Kotlin and 3 on Java.
         (Value::Str(s), "lastIndexOf") => {
-            let needle = arg_str(args, 0);
-            Ok(Value::Int(match s.rfind(&needle) {
-                Some(off) => s[..off].encode_utf16().count() as i64,
-                None => -1,
-            }))
+            let units: Vec<u16> = s.encode_utf16().collect();
+            let needle: Vec<u16> = arg_str(args, 0).encode_utf16().collect();
+            let last_start = units.len() as i64 - needle.len() as i64;
+            let mut at = args
+                .get(1)
+                .map(|v| v.to_int())
+                .unwrap_or(units.len() as i64 - 1)
+                .min(last_start);
+            while at >= 0 {
+                if units[at as usize..at as usize + needle.len()] == needle[..] {
+                    return Ok(Value::Int(at));
+                }
+                at -= 1;
+            }
+            Ok(Value::Int(-1))
         }
         (Value::Str(s), "trimStart") => Ok(Value::str(s.trim_start().to_string())),
         (Value::Str(s), "trimEnd") => Ok(Value::str(s.trim_end().to_string())),
@@ -2868,8 +3244,27 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
         }
         // `String.compareTo` is the JVM's: the code-unit difference at the
         // first mismatch, else the length difference — NOT clamped to -1/0/1.
+        // `equals(other, ignoreCase)` is the only `String` `equals` that is not
+        // plain structural equality, so it needs its own arm ahead of the
+        // universal one.
+        (Value::Str(s), "equals") => {
+            let other = arg_str(args, 0);
+            Ok(Value::Bool(if truthy_arg(args, 1) {
+                s.to_lowercase() == other.to_lowercase()
+            } else {
+                args.first().is_some_and(|o| value_eq(recv, o))
+            }))
+        }
         (Value::Str(s), "compareTo") => {
             let other = arg_str(args, 0);
+            // `compareTo(other, ignoreCase = true)` compares case-folded, which
+            // makes `"a".compareTo("A", true)` 0 rather than 32.
+            let (s, other) = if truthy_arg(args, 1) {
+                (s.to_lowercase(), other.to_lowercase())
+            } else {
+                (s.to_string(), other)
+            };
+            let s = &s;
             let (a, b): (Vec<u16>, Vec<u16>) =
                 (s.encode_utf16().collect(), other.encode_utf16().collect());
             let d = a
@@ -3045,8 +3440,25 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
         (Value::Float(f), "toByte") => Ok(Value::Int(*f as i32 as i8 as i64)),
         (Value::Float(f), "toLong") => Ok(Value::Int(*f as i64)),
 
-        // ── kotlin.Any.toString() — defined on every type ──
+        // ── kotlin.Any — defined on every type ──
         (_, "toString") => Ok(Value::str(kotlin_string(recv))),
+        // `hashCode()` needs the receiver's WIDTH, because `Int` and `Long` fold
+        // differently and share one runtime representation. The compiler
+        // appends 32/64 the way it does for the shifts; see [`int_hash`].
+        (_, "hashCode") => Ok(Value::Int(
+            value_hash(recv, trailing_width(args, 0) == 64) as i64
+        )),
+        (_, "equals") => Ok(Value::Bool(args.first().is_some_and(|o| value_eq(recv, o)))),
+        // `compareTo` on the primitives answers the sign, unlike `String`'s
+        // (handled above), which answers the code-unit difference.
+        (Value::Int(_) | Value::Float(_) | Value::Bool(_), "compareTo") => {
+            let other = args.first().cloned().unwrap_or(Value::Int(0));
+            Ok(Value::Int(match value_cmp(recv, &other) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            }))
+        }
 
         _ => Err(format!(
             "unresolved reference: {name} on {}",
@@ -3131,7 +3543,7 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
     }
     match name {
         "toString" => return Ok(Value::str(kotlin_string(recv))),
-        "hashCode" => return Ok(Value::Int(obj_hash(recv))),
+        "hashCode" => return Ok(Value::Int(value_hash(recv, false) as i64)),
         "equals" => return Ok(Value::Bool(args.first().is_some_and(|o| value_eq(recv, o)))),
         _ => {}
     }
@@ -3208,9 +3620,11 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             .flatten();
             return out.ok_or_else(|| "java.lang.IndexOutOfBoundsException".to_string());
         }
-        // `entries` is the `Map.Entry` sequence, each entry a `Pair` whose
-        // `key`/`value` members are the entry's accessors — the same
-        // representation `for (e in map)` and `map.map { … }` iterate.
+        // `entries` is the `Map.Entry` SET — a `Set`, not a list, which is what
+        // makes `entries.hashCode()` the sum of the entry hashes rather than a
+        // 31-fold and `keys == setOf(…)` order-insensitive. Each entry is a
+        // [`HeapObj::Entry`], the same representation `for (e in map)` and
+        // `map.map { … }` iterate.
         "entries" => {
             let out = with_obj(recv, |o| match o {
                 HeapObj::Map(entries) => Some(entries.clone()),
@@ -3218,10 +3632,10 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             })
             .flatten();
             return match out {
-                Some(entries) => Ok(alloc(HeapObj::List(
+                Some(entries) => Ok(alloc(HeapObj::Set(
                     entries
                         .into_iter()
-                        .map(|(k, v)| alloc(HeapObj::Pair(k, v)))
+                        .map(|(k, v)| alloc(HeapObj::Entry(k, v)))
                         .collect(),
                 ))),
                 None => Err(format!(
@@ -3234,6 +3648,10 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             // Snapshot the entries under a shared borrow, then allocate the
             // result list separately (allocating inside `with_obj` would re-borrow
             // the heap).
+            // `keys` is a `Set`; `values` is a plain `Collection`, whose
+            // `equals`/`hashCode` the JVM leaves as identity (and whose answer
+            // even varies with the map implementation `mapOf` picked), so only
+            // the key side gets set semantics here.
             let want_keys = name == "keys";
             let out = with_obj(recv, |o| match o {
                 HeapObj::Map(entries) => Some(
@@ -3246,6 +3664,7 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             })
             .flatten();
             return match out {
+                Some(items) if want_keys => Ok(alloc(HeapObj::Set(items))),
                 Some(items) => Ok(alloc(HeapObj::List(items))),
                 None => Err(format!(
                     "unresolved reference: {name} on {}",
@@ -3326,6 +3745,10 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         // through `it.key`/`it.value`.
         (HeapObj::Pair(a, _), "first" | "key") => Some(a.clone()),
         (HeapObj::Pair(_, b), "second" | "value") => Some(b.clone()),
+        // A `Map.Entry` has `key`/`value` and — unlike a `Pair` — no
+        // `first`/`second`.
+        (HeapObj::Entry(k, _), "key") => Some(k.clone()),
+        (HeapObj::Entry(_, v), "value") => Some(v.clone()),
         // ── Instance property read (dynamic fallback when the compiler couldn't
         // statically resolve the receiver's class, e.g. `list[i].field`) ──
         (HeapObj::Instance { fields, .. }, _) => fields
@@ -3394,7 +3817,29 @@ fn sequence_member(
         "lastOrNull" => items.last().cloned().unwrap_or(Value::Undef),
         // `subList(from, to)` is the half-open slice, and unlike `take`/`drop`
         // it does NOT clamp — an out-of-range bound throws.
-        "subList" | "slice" => {
+        // `slice(indices)` takes ONE argument — a range or any index sequence —
+        // and picks those positions, where `subList(from, to)` takes two bounds.
+        // Sharing an arm read the range as `from` and dropped the upper bound,
+        // so `slice(0..1)` answered the whole receiver.
+        "slice" => {
+            let idx = args.first().map(sequence_items).unwrap_or_default();
+            let mut out = Vec::with_capacity(idx.len());
+            for i in idx {
+                let i = i.to_int();
+                match usize::try_from(i).ok().and_then(|i| items.get(i)) {
+                    Some(v) => out.push(v.clone()),
+                    None => {
+                        return Some(Err(format!(
+                            "java.lang.IndexOutOfBoundsException: \
+                             Index: {i}, Size: {}",
+                            items.len()
+                        )))
+                    }
+                }
+            }
+            return Some(Ok(alloc(HeapObj::List(out))));
+        }
+        "subList" => {
             let from = args.first().map(|v| v.to_int()).unwrap_or(0);
             let to = args
                 .get(1)
@@ -3465,28 +3910,31 @@ fn sequence_member(
         // `chunked(n)` splits into consecutive groups, the last one possibly
         // short; `windowed(n)` slides by one and — with the default
         // `partialWindows = false` — emits only full-length windows.
+        // `chunked(size)` is `windowed(size, step = size, partialWindows = true)`
+        // — Kotlin defines it that way, and sharing the walk here is what keeps
+        // the two consistent once `step`/`partialWindows` are honoured. Dropping
+        // them silently re-ran the defaults: `windowed(2, 2)` slid by one.
         "chunked" | "windowed" => {
             let n = args.first().map(|v| v.to_int()).unwrap_or(0);
-            if n <= 0 {
+            let chunking = name == "chunked";
+            let step = if chunking {
+                n
+            } else {
+                args.get(1).map(|v| v.to_int()).unwrap_or(1)
+            };
+            if n <= 0 || step <= 0 {
                 return Some(Err(format!(
-                    "java.lang.IllegalArgumentException: size {n} must be greater than zero."
+                    "java.lang.IllegalArgumentException: \
+                     size {n} and step {step} must be greater than zero."
                 )));
             }
-            let n = n as usize;
-            let groups: Vec<Value> = if name == "chunked" {
-                items
-                    .chunks(n)
-                    .map(|c| alloc(HeapObj::List(c.to_vec())))
-                    .collect()
-            } else if items.len() >= n {
-                items
-                    .windows(n)
-                    .map(|w| alloc(HeapObj::List(w.to_vec())))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            return Some(Ok(alloc(HeapObj::List(groups))));
+            let partial = chunking || args.get(2).is_some_and(truthy);
+            return Some(Ok(alloc(HeapObj::List(windows_of(
+                items,
+                n as usize,
+                step as usize,
+                partial,
+            )))));
         }
         "toList" | "toMutableList" | "toTypedArray" | "asList" => {
             return Some(Ok(alloc(HeapObj::List(items.to_vec()))))
@@ -3540,20 +3988,10 @@ fn sequence_member(
             };
             return Some(Ok(alloc(HeapObj::List(out))));
         }
-        // `joinToString(separator)` — the separator defaults to `", "`.
-        "joinToString" => {
-            let sep = match args.first() {
-                Some(v) => kotlin_string(v),
-                None => ", ".to_string(),
-            };
-            Value::str(
-                items
-                    .iter()
-                    .map(kotlin_string)
-                    .collect::<Vec<_>>()
-                    .join(&sep),
-            )
-        }
+        // `joinToString(separator, prefix, postfix, limit, truncated)`. Only
+        // the separator used to be read, so every affix was silently dropped
+        // and `joinToString("-", "<", ">")` printed `1-2-3`.
+        "joinToString" => Value::str(join_to_string(items, args, 0, None)),
         "reversed" => {
             // `IntRange.reversed()` is an `IntProgression` counting down; a
             // list's is a plain reversed list.
@@ -3585,7 +4023,9 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
         HeapObj::List(items) | HeapObj::Set(items) | HeapObj::Array { items, .. } => {
             items.get(n - 1).cloned()
         }
-        HeapObj::Pair(a, b) => match n {
+        // `for ((k, v) in map)` destructures an entry exactly as it does a
+        // pair — the two differ in display and equality, not in arity.
+        HeapObj::Pair(a, b) | HeapObj::Entry(a, b) => match n {
             1 => Some(a.clone()),
             2 => Some(b.clone()),
             _ => None,
@@ -3765,6 +4205,9 @@ fn heap_eq(a: &HeapObj, b: &HeapObj) -> bool {
             xa.len() == xb.len() && xa.iter().all(|x| xb.iter().any(|y| value_eq(x, y)))
         }
         (HeapObj::Pair(a1, a2), HeapObj::Pair(b1, b2)) => value_eq(a1, b1) && value_eq(a2, b2),
+        // An entry equals an entry, never a pair: `mapOf(1 to "a").entries
+        // .first() == (1 to "a")` is `false` in Kotlin.
+        (HeapObj::Entry(k1, v1), HeapObj::Entry(k2, v2)) => value_eq(k1, k2) && value_eq(v1, v2),
         (HeapObj::Map(ea), HeapObj::Map(eb)) => {
             ea.len() == eb.len()
                 && ea
@@ -3786,66 +4229,152 @@ fn heap_eq(a: &HeapObj, b: &HeapObj) -> bool {
     }
 }
 
-/// A simple order-independent hash for a heap object (data-class `hashCode`).
-fn obj_hash(recv: &Value) -> i64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    with_obj(recv, |o| {
-        let mut h = DefaultHasher::new();
-        match o {
-            // A `data class` hashes over exactly what its `equals` compares.
-            HeapObj::Instance {
-                class,
-                fields,
-                data_from,
-                is_data,
-            } => {
-                class.hash(&mut h);
-                for (n, v) in &fields[if *is_data { *data_from } else { 0 }..] {
-                    n.hash(&mut h);
-                    kotlin_string(v).hash(&mut h);
-                }
-            }
-            HeapObj::List(items) | HeapObj::Array { items, .. } => {
-                for v in items {
-                    kotlin_string(v).hash(&mut h);
-                }
-            }
-            HeapObj::Range(r) => {
-                r.first.hash(&mut h);
-                r.last().hash(&mut h);
-                r.step.hash(&mut h);
-            }
-            HeapObj::Pair(a, b) => {
-                kotlin_string(a).hash(&mut h);
-                kotlin_string(b).hash(&mut h);
-            }
-            HeapObj::Map(entries) => {
-                for (k, v) in entries {
-                    kotlin_string(k).hash(&mut h);
-                    kotlin_string(v).hash(&mut h);
-                }
-            }
-            HeapObj::Set(items) => {
-                // Order-independent: two equal sets built in different insertion
-                // orders must agree, so the per-element hashes are summed.
-                let mut sum: u64 = 0;
-                for v in items {
-                    let mut e = DefaultHasher::new();
-                    kotlin_string(v).hash(&mut e);
-                    sum = sum.wrapping_add(e.finish());
-                }
-                sum.hash(&mut h);
-            }
-            HeapObj::Closure { name_idx, .. } => name_idx.hash(&mut h),
-            HeapObj::Exc { class, msg } => {
-                class.hash(&mut h);
-                msg.hash(&mut h);
+/// Kotlin `Int.hashCode()` — the value itself — and `Long.hashCode()`, the
+/// JVM's `(int)(v ^ (v >>> 32))` fold of the two 32-bit halves.
+///
+/// Every Kotlin integer is one `i64` at run time, so the two cannot be told
+/// apart from the value alone. They only DISAGREE for a negative number inside
+/// `Int` range (`(-1).hashCode()` is `-1`, `(-1L).hashCode()` is `0`): a
+/// non-negative one folds against a zero high half, and one outside `Int` range
+/// can only be a `Long`. `long` therefore carries the static answer wherever the
+/// compiler had one — a direct `x.hashCode()` pushes its receiver width, and a
+/// `data class` field consults its declared type — and falls back to the
+/// magnitude, which is exact except in that one case.
+fn int_hash(n: i64, long: bool) -> i32 {
+    if long || i32::try_from(n).is_err() {
+        (n ^ ((n as u64) >> 32) as i64) as i32
+    } else {
+        n as i32
+    }
+}
+
+/// `String.hashCode()` — the JVM's `s[0]*31^(n-1) + s[1]*31^(n-2) + …` over
+/// UTF-16 code units, so a non-BMP character contributes its surrogate pair.
+fn string_hash(s: &str) -> i32 {
+    s.encode_utf16()
+        .fold(0i32, |h, u| h.wrapping_mul(31).wrapping_add(u as i32))
+}
+
+/// `Double.hashCode()` — the JVM folds the two halves of `doubleToLongBits`,
+/// which canonicalizes every NaN to one bit pattern and keeps `-0.0` distinct
+/// from `0.0`.
+fn double_hash(f: f64) -> i32 {
+    let bits = if f.is_nan() {
+        0x7ff8_0000_0000_0000u64
+    } else {
+        f.to_bits()
+    };
+    (bits ^ (bits >> 32)) as u32 as i32
+}
+
+/// Kotlin's `hashCode()` for any value, following the JVM contract exactly so a
+/// hash is reproducible across runs and matches the reference toolchain.
+///
+/// `long` resolves the `Int`/`Long` ambiguity for the RECEIVER only (see
+/// [`int_hash`]); nested values fall back to the magnitude rule.
+///
+/// The identity-hashed kinds — a non-`data` class instance, an array, a
+/// throwable, a lambda — inherit `Object.hashCode`, which is the JVM's
+/// per-object identity value and is not reproducible in Kotlin either. They
+/// answer their heap handle: deterministic within a run, and never equal for two
+/// distinct objects, which is all the contract requires.
+fn value_hash(v: &Value, long: bool) -> i32 {
+    if let Some(code) = char_code(v) {
+        return code as i32;
+    }
+    match v {
+        Value::Undef => 0,
+        Value::Bool(b) => {
+            if *b {
+                1231
+            } else {
+                1237
             }
         }
-        h.finish() as i64
+        Value::Int(n) => int_hash(*n, long),
+        Value::Float(f) => double_hash(*f),
+        Value::Str(s) => string_hash(s),
+        Value::Obj(id) => obj_hash(v).unwrap_or(*id as i32),
+        _ => 0,
+    }
+}
+
+/// The `hashCode()` of a heap object, or `None` when the object is one of the
+/// identity-hashed kinds (see [`value_hash`]).
+fn obj_hash(recv: &Value) -> Option<i32> {
+    let widths = instance_tag(recv).and_then(long_fields);
+    with_obj(recv, |o| match o {
+        // A `data class` hashes over exactly what its `equals` compares — its
+        // own (primary-constructor) properties, folded `h = h * 31 + field`.
+        // A declared-`Long` field takes the `Long` fold; `widths` carries the
+        // per-property answer the compiler registered at class declaration.
+        HeapObj::Instance {
+            fields,
+            data_from,
+            is_data,
+            ..
+        } => {
+            if !*is_data {
+                return None;
+            }
+            let own = &fields[*data_from..];
+            let mut h: i32 = 0;
+            for (i, (_, v)) in own.iter().enumerate() {
+                let long = widths
+                    .as_ref()
+                    .and_then(|w| w.as_bytes().get(i))
+                    .is_some_and(|c| *c == b'l');
+                let e = value_hash(v, long);
+                h = if i == 0 {
+                    e
+                } else {
+                    h.wrapping_mul(31).wrapping_add(e)
+                };
+            }
+            Some(h)
+        }
+        // `List.hashCode()` seeds at 1 and folds `h = h * 31 + element`.
+        HeapObj::List(items) => Some(items.iter().fold(1i32, |h, v| {
+            h.wrapping_mul(31).wrapping_add(value_hash(v, false))
+        })),
+        // A `Set` hashes order-independently: the SUM of its element hashes, so
+        // two equal sets built in different insertion orders agree.
+        HeapObj::Set(items) => Some(
+            items
+                .iter()
+                .fold(0i32, |h, v| h.wrapping_add(value_hash(v, false))),
+        ),
+        // A `Map` sums its entry hashes, and an entry's is `key ^ value`.
+        HeapObj::Map(entries) => Some(entries.iter().fold(0i32, |h, (k, v)| {
+            h.wrapping_add(value_hash(k, false) ^ value_hash(v, false))
+        })),
+        // `Map.Entry.hashCode()` is `key ^ value`; a `Pair` is a `data class`,
+        // so it folds like one.
+        HeapObj::Entry(k, v) => Some(value_hash(k, false) ^ value_hash(v, false)),
+        HeapObj::Pair(a, b) => Some(
+            value_hash(a, false)
+                .wrapping_mul(31)
+                .wrapping_add(value_hash(b, false)),
+        ),
+        // An empty progression hashes to -1. `IntRange` folds `31 * first +
+        // last`; `IntProgression` adds the step, `31 * (31 * first + last) +
+        // step`. `last` is the last ELEMENT, not the written endpoint.
+        HeapObj::Range(r) => Some(if r.count() == 0 {
+            -1
+        } else {
+            let base = (r.first as i32)
+                .wrapping_mul(31)
+                .wrapping_add(r.last() as i32);
+            if r.progression {
+                base.wrapping_mul(31).wrapping_add(r.step as i32)
+            } else {
+                base
+            }
+        }),
+        // Identity-hashed: `Object.hashCode`.
+        HeapObj::Array { .. } | HeapObj::Closure { .. } | HeapObj::Exc { .. } => None,
     })
-    .unwrap_or(0)
+    .flatten()
 }
 
 /// A coarse label for a heap object, for `unresolved reference` diagnostics.
@@ -3862,6 +4391,7 @@ fn obj_label(recv: &Value) -> String {
         HeapObj::Set(_) => "Set".to_string(),
         HeapObj::Map(_) => "Map".to_string(),
         HeapObj::Pair(_, _) => "Pair".to_string(),
+        HeapObj::Entry(_, _) => "Map.Entry".to_string(),
         HeapObj::Closure { .. } => "Function".to_string(),
         HeapObj::Range(r) => match (r.is_char, r.progression) {
             (true, true) => "CharProgression",
@@ -3930,6 +4460,9 @@ fn display_obj(id: u32) -> String {
                 format!("{{{body}}}")
             }
             HeapObj::Pair(a, b) => format!("({}, {})", kotlin_string(a), kotlin_string(b)),
+            // `Map.Entry.toString()` is `key=value` — the form a printed `Map`
+            // is built from, and NOT the pair's `(key, value)`.
+            HeapObj::Entry(k, v) => format!("{}={}", kotlin_string(k), kotlin_string(v)),
             // Kotlin renders a lambda as an opaque `Function` reference; the exact
             // JVM form is `(kotlin.jvm.functions.FunctionN)…`, which we don't
             // reproduce — a stable placeholder is enough (lambdas are rarely

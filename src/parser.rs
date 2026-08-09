@@ -35,6 +35,22 @@ use crate::token::{Spanned, StrPart, Tok};
 pub struct Parser {
     toks: Vec<Spanned>,
     pos: usize,
+    /// Parameter types collected while scanning function-type annotations, in
+    /// source order. [`Parser::type_ref`] appends; the `val`/`var` rule takes
+    /// the slice its own annotation contributed. A side channel rather than a
+    /// return value because a function type may nest inside a generic argument
+    /// several `type_ref` frames down, where the caller has nowhere to put it.
+    fn_param_types: Vec<Type>,
+}
+
+/// The coarse type of one function-type parameter: a lone identifier reads as
+/// its named type, anything more (generic, nullable, nested function) is
+/// `Unknown`.
+fn fn_param_ty(words: &[String], plain: bool) -> Type {
+    match (plain, words) {
+        (true, [one]) => Type::from_name(one),
+        _ => Type::Unknown,
+    }
 }
 
 /// The declaration modifiers kotlinrs recognizes. All of them are Kotlin *soft*
@@ -52,7 +68,11 @@ struct Mods {
 /// `object` declarations, each optionally preceded by modifiers.
 pub fn parse_program(src: &str) -> Result<Program, String> {
     let toks = Lexer::new(src).tokenize()?;
-    let mut p = Parser { toks, pos: 0 };
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        fn_param_types: Vec::new(),
+    };
     let mut prog = Program::default();
     while !p.at(&Tok::Eof) {
         // A modifier run only starts a declaration; anything else keeps its
@@ -529,15 +549,49 @@ impl Parser {
         // binding as a callable value (its lowering is closure-invoke by slot).
         if self.at(&Tok::LParen) {
             self.bump();
+            // Record the parameter types as the list goes by. A parameter is
+            // typed only when it is ONE plain identifier (`Int`, `String`); a
+            // generic, nullable, or nested function type widens to `Unknown`,
+            // which is the same answer the coarse type would have given.
             let mut depth = 1i32;
-            while depth > 0 {
-                match self.bump() {
-                    Tok::LParen => depth += 1,
-                    Tok::RParen => depth -= 1,
+            let mut params: Vec<Type> = Vec::new();
+            let mut words: Vec<String> = Vec::new();
+            let mut plain = true;
+            let mut any = false;
+            loop {
+                let tok = self.peek().clone();
+                match tok {
+                    Tok::RParen if depth == 1 => {
+                        if any || !words.is_empty() {
+                            params.push(fn_param_ty(&words, plain));
+                        }
+                        self.bump();
+                        break;
+                    }
+                    Tok::Comma if depth == 1 => {
+                        params.push(fn_param_ty(&words, plain));
+                        words.clear();
+                        plain = true;
+                        any = true;
+                        self.bump();
+                    }
                     Tok::Eof => return Err("unterminated function type".into()),
-                    _ => {}
+                    _ => {
+                        match &tok {
+                            Tok::LParen | Tok::Lt => {
+                                depth += 1;
+                                plain = false;
+                            }
+                            Tok::RParen | Tok::Gt => depth -= 1,
+                            Tok::Ident(n) if depth == 1 => words.push(n.clone()),
+                            _ if depth == 1 => plain = false,
+                            _ => {}
+                        }
+                        self.bump();
+                    }
                 }
             }
+            self.fn_param_types.extend(params);
             self.eat(&Tok::Arrow)?;
             let _ret = self.type_ref()?; // return type (may itself be a fn type)
             if self.at(&Tok::Question) {
@@ -690,17 +744,20 @@ impl Parser {
             return Ok(StmtKind::Destructure { names, init });
         }
         let name = self.ident()?;
-        let ty = if self.at(&Tok::Colon) {
+        let (ty, fn_params) = if self.at(&Tok::Colon) {
             self.bump();
-            Some(self.type_name()?)
+            let before = self.fn_param_types.len();
+            let t = self.type_name()?;
+            (Some(t), self.fn_param_types.split_off(before))
         } else {
-            None
+            (None, Vec::new())
         };
         self.eat(&Tok::Assign)?;
         let init = self.expr()?;
         Ok(StmtKind::Let {
             name,
             ty,
+            fn_params,
             init,
             mutable,
         })
@@ -1831,7 +1888,11 @@ impl Parser {
                 StrPart::Text(t) => out.push(StrExpr::Text(t.clone())),
                 StrPart::Expr(src) => {
                     let toks = Lexer::new(src).tokenize()?;
-                    let mut sub = Parser { toks, pos: 0 };
+                    let mut sub = Parser {
+                        toks,
+                        pos: 0,
+                        fn_param_types: Vec::new(),
+                    };
                     let e = sub.expr()?;
                     out.push(StrExpr::Expr(Box::new(e)));
                 }

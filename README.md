@@ -149,8 +149,13 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `.isEmpty()`/`.isNotEmpty()`, `.split()` (one delimiter or several),
   `.lines()`, `.reversed()`, `.take()`/`.drop()`, `.first()`/`.last()`,
   `.padStart()`/`.padEnd()`, `.substringBefore()`/`.substringAfter()`,
-  `.removePrefix()`/`.removeSuffix()`, `.lastIndexOf()`, `.toCharArray()`,
-  `.compareTo()` (the JVM's code-unit difference, not a clamped sign), the
+  `.removePrefix()`/`.removeSuffix()`, `.toCharArray()`, `.replaceFirst()`,
+  the searching members in their overloaded spellings —
+  `.indexOf(s, startIndex)`, `.lastIndexOf(s, startIndex)` (whose default
+  `startIndex` is Kotlin's `lastIndex`, not Java's `length`, which shows for an
+  empty needle), and `.startsWith(prefix, startIndex)` —
+  `.compareTo()` (the JVM's code-unit difference, not a clamped sign) and
+  `.compareTo(other, ignoreCase)`/`.equals(other, ignoreCase)`, the
   parses `.toInt()`/`.toLong()`/`.toDouble()` and their `…OrNull` forms, and
   `.format(args…)` — the `java.util.Formatter` conversions `%d %s %f %e %x %X
   %o %c %b %%` with the `-`/`0`/`+`/space flags, a width and a precision, where
@@ -200,6 +205,26 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   calls the primary constructor — re-running the `: Super(args)` header, which
   is what makes `data class W(val s: String) : Base(s.length)` recompute its base
   field on a copy rather than carry the old one over.
+
+  `hashCode()` follows the **JVM contract exactly**, so the number a program
+  prints matches the reference toolchain rather than merely being consistent
+  within a run: `Int` hashes to itself and `Long` folds its two halves
+  (`(-1).hashCode()` is `-1`, `(-1L).hashCode()` is `0` — the width the compiler
+  saw travels with the call, and a `data class`'s `Long` field is recorded in its
+  class metadata), `Double` folds `doubleToLongBits`, `Boolean` is `1231`/`1237`,
+  `String` is the `31`-polynomial over UTF-16 units, a `List` folds `31`, a `Set`
+  and a `Map` SUM (so insertion order cannot matter), a `Map.Entry` is
+  `key xor value`, an `IntRange` is `31 * first + last` and an `IntProgression`
+  adds its step. The identity-hashed kinds — a non-`data` class instance, an
+  array, a lambda — answer their heap handle, which is what the JVM does too
+  (and is why no such value is fuzzed or frozen).
+- **`Map.Entry`** — a distinct type from `Pair`, because all three observable
+  members differ: an entry renders `k=v` where a pair renders `(k, v)`, its hash
+  is `key xor value` where a pair folds like the `data class` it is, and
+  `mapOf(1 to "a").entries.first() == (1 to "a")` is `false`. `keys` and
+  `entries` are `Set`s, so their hash sums and their equality ignores order;
+  `values` is a plain `Collection`, whose `equals`/`hashCode` the JVM leaves as
+  identity.
 - **`object`** — singleton declarations with `val`/`var` properties and methods,
   built once and reachable by name (`Counter.inc()`). An `object` may
   declare supertypes (`object Registry : Greeter`), which its own methods and
@@ -212,8 +237,10 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `.count()`, `.first()`/`.last()`, `.max()`/`.min()`, `.average()`,
   `.toList()`/`.toSet()`, `.distinct()`, `.sorted()`/`.sortedDescending()`,
   `.take(n)`/`.drop(n)` (both clamp rather than fault), `.flatten()`,
-  `.zip(other)`, `.chunked(n)`/`.windowed(n)`, `.subList(from, to)`,
-  `.union`/`.intersect`/`.subtract`, `.joinToString(sep)`, `.reversed()`. The
+  `.zip(other)`, `.chunked(n)`/`.windowed(n, step, partialWindows)`,
+  `.subList(from, to)`, `.slice(indices)`,
+  `.union`/`.intersect`/`.subtract`,
+  `.joinToString(sep, prefix, postfix, limit, truncated)`, `.reversed()`. The
   `…OrNull` members answer `null` where their plain counterparts throw:
   `.maxOrNull()`/`.minOrNull()`, `.firstOrNull()`/`.lastOrNull()`,
   `.getOrNull(i)`/`.elementAtOrNull(i)` beside `.elementAt(i)`.
@@ -254,7 +281,12 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `.partition`, `.takeWhile`/`.dropWhile`, `.firstOrNull`/`.lastOrNull`,
   `.forEach`, `.fold`/`.reduce`, `.any`/`.all`/`.none`/`.count`, `.sumOf`,
   `.maxByOrNull`/`.minByOrNull`, `.sortedBy`/`.sortedByDescending`,
-  `.associate`/`.associateBy`/`.associateWith`, `.groupBy`. `it` is the implicit
+  `.associate`/`.associateBy`/`.associateWith`, `.groupBy`,
+  `.first`/`.last`/`.find`/`.findLast`/`.single` and their `…OrNull` forms,
+  `.indexOfFirst`/`.indexOfLast`, `.filterIndexed`/`.forEachIndexed`,
+  `.maxOf`/`.minOf`, `.mapValues`/`.mapKeys`, `.getOrElse(i) { }`,
+  `.sortedWith { a, b -> … }`, and the transform-taking overloads of
+  `.joinToString`, `.chunked`, `.windowed`, and `.zip`. `it` is the implicit
   parameter, and `mapIndexed` takes `(index, element)`. A `Map` receiver feeds
   them one `Map.Entry` per element (`m.map { it.key }`), and `filter` re-wraps
   into the receiver's own kind — a filtered `Map` is a `Map`, a filtered `Set` a
@@ -363,10 +395,23 @@ The primitive array factories name their element type, so an `IntArray` element
 takes part in all of it — `ia[0] + 1` wraps and `ia[0] / 2` divides as integers,
 where a `List` element (which could hold anything) does neither.
 
-What is *not* narrowed is an expression whose static type this frontend cannot
-resolve — an untyped lambda parameter, a `List` or `Map` element. Those keep the
-64-bit result, on the reasoning that silently truncating a value that may be a
-`Long` is worse than an unwrapped overflow.
+An unannotated lambda parameter is typed from its CALL SITE, not left unknown:
+`listOf(1, 2).map { it * it }` types `it` from the receiver's elements, so the
+product narrows the way Kotlin's does, while `listOf(1L).map { it * 4 }` keeps
+64 bits. The element type is read from a collection or array literal, a range, a
+`val` initialized from one, the members that re-emit their receiver's elements
+(`filter`, `sorted`, `take`, …), and a declared function type
+(`val f: (Int) -> Int = { … }`). It reaches `for` variables, the two-parameter
+forms (`fold`'s accumulator, `reduce`, `mapIndexed`, `zip`, `sortedWith`), the
+group a `chunked`/`windowed` lambda receives, and the members that hand back one
+element (`first()`, `last()`, `xs[i]`).
+
+What still is *not* narrowed is an operand whose static type this frontend
+genuinely cannot resolve: the result of `map`/`flatMap` (its element type is the
+lambda's return type), a sequence reached through a function return, an element
+two levels down through a named binding, and a `Map` entry's `value`. Those keep
+the 64-bit result, on the reasoning that silently truncating a value that may be
+a `Long` is worse than an unwrapped overflow.
 
 ## [0x04] COMMAND-LINE FLAGS
 

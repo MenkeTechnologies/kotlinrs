@@ -218,6 +218,12 @@ pub enum StmtKind {
     Let {
         name: String,
         ty: Option<Type>,
+        /// The PARAMETER types when the annotation is a function type
+        /// (`val f: (Int) -> Int`), empty otherwise. The coarse [`Type`] cannot
+        /// carry a signature, but a lambda initializer takes its parameter types
+        /// from exactly this annotation — and an integer's width is part of the
+        /// type, so dropping it left the lambda body's arithmetic untyped.
+        fn_params: Vec<Type>,
         init: Expr,
         mutable: bool,
     },

@@ -45,6 +45,15 @@ struct Binding {
     /// The class/container name when `ty == Type::Obj` (e.g. `Person`, `List`),
     /// so member access on this binding can dispatch to the right method sub.
     class: Option<String>,
+    /// The ELEMENT type when this binding holds a sequence — the type of what a
+    /// `for` variable or a lambda parameter over it receives. `Unknown` for
+    /// everything else, and for a sequence whose elements do not agree.
+    ///
+    /// It exists so `listOf(1, 2).map { it * it }` can know `it` is an `Int` and
+    /// wrap the product at 32 bits: Kotlin's integer width is a property of the
+    /// STATIC TYPE, so an untyped lambda parameter is a place the frontend gave
+    /// up, not a place the information was absent.
+    elem: Type,
 }
 
 /// A checkpoint of scope state, taken on block entry and restored on block exit
@@ -83,6 +92,21 @@ impl Scope {
     }
     /// Declare a binding that may carry a class/container name (`Type::Obj`).
     fn declare_obj(&mut self, name: &str, ty: Type, mutable: bool, class: Option<String>) -> u16 {
+        self.declare_full(name, ty, mutable, class, Type::Unknown)
+    }
+    /// Declare a sequence-valued binding, recording its ELEMENT type so a
+    /// lambda or `for` over it can type its variable (see [`Binding::elem`]).
+    fn declare_elem(&mut self, name: &str, ty: Type, mutable: bool, elem: Type) -> u16 {
+        self.declare_full(name, ty, mutable, None, elem)
+    }
+    fn declare_full(
+        &mut self,
+        name: &str,
+        ty: Type,
+        mutable: bool,
+        class: Option<String>,
+        elem: Type,
+    ) -> u16 {
         let slot = self.next_slot;
         self.next_slot += 1;
         let prev = self.map.insert(
@@ -92,6 +116,7 @@ impl Scope {
                 ty,
                 mutable,
                 class,
+                elem,
             },
         );
         self.undo.push((name.to_string(), prev));
@@ -138,6 +163,10 @@ impl Scope {
     fn class_of(&self, name: &str) -> Option<String> {
         self.map.get(name).and_then(|b| b.class.clone())
     }
+    /// The element type recorded for a sequence-valued binding.
+    fn elem_of(&self, name: &str) -> Type {
+        self.map.get(name).map(|b| b.elem).unwrap_or(Type::Unknown)
+    }
     /// Whether `name` is currently bound as a reassignable `var`.
     fn is_mutable(&self, name: &str) -> Option<bool> {
         self.map.get(name).map(|b| b.mutable)
@@ -147,13 +176,13 @@ impl Scope {
     /// lambda closes over — capturing the whole visible set (by value) is always
     /// correct for reads and avoids a separate free-variable pass; unreferenced
     /// captures only cost an unused slot.
-    fn visible(&self) -> Vec<(String, u16, Type, Option<String>)> {
-        let mut out: Vec<(String, u16, Type, Option<String>)> = self
+    fn visible(&self) -> Vec<Captured> {
+        let mut out: Vec<Captured> = self
             .map
             .iter()
-            .map(|(n, b)| (n.clone(), b.slot, b.ty, b.class.clone()))
+            .map(|(n, b)| (n.clone(), b.slot, b.ty, b.class.clone(), b.elem))
             .collect();
-        out.sort_by_key(|(_, slot, _, _)| *slot);
+        out.sort_by_key(|(_, slot, _, _, _)| *slot);
         out
     }
 }
@@ -227,12 +256,23 @@ impl ClassMeta {
         self.props.iter().find(|p| p.name == name)
     }
     /// The `KT_NEW` / `KT_EXTEND` metadata string for this class's OWN fields:
-    /// `"Name\x1f(d|c)\x1ffield0\x1f…"`. A subclass's base fields ride on the
-    /// base instance `KT_EXTEND` builds from, so they are not repeated here.
+    /// `"Name\x1f(d|c)\x1fwidths\x1ffield0\x1f…"`. A subclass's base fields ride
+    /// on the base instance `KT_EXTEND` builds from, so they are not repeated
+    /// here.
+    ///
+    /// `widths` is one character per own property, `'l'` for a declared `Long`
+    /// and `'.'` otherwise. A `data class`'s generated `hashCode` needs it: the
+    /// `Long` fold differs from the `Int` one and the two types share a runtime
+    /// representation, so the declared width has to travel with the class (see
+    /// [`crate::host`]'s `LONG_FIELDS`).
     fn meta_string(&self) -> String {
         let mut s = self.name.clone();
         s.push('\u{1f}');
         s.push(if self.is_data { 'd' } else { 'c' });
+        s.push('\u{1f}');
+        for p in &self.own_props {
+            s.push(if p.ty == Type::Long { 'l' } else { '.' });
+        }
         for p in &self.own_props {
             s.push('\u{1f}');
             s.push_str(&p.name);
@@ -324,6 +364,19 @@ pub struct Compiler {
     pending_lambdas: Vec<PendingLambda>,
     /// Monotonic id for synthetic lambda sub names (`$lambda$0`, `$lambda$1`, …).
     lambdas_seen: u32,
+    /// Parameter types for the NEXT lambda literal to be lowered, published by
+    /// the call site that is about to consume it (see
+    /// [`Compiler::compile_coll_hof`]) and taken by [`Compiler::compile_lambda`].
+    ///
+    /// Kotlin infers a lambda parameter's type from the callee, and the width of
+    /// an integer is part of that type. Without this the frontend saw only
+    /// `it` — an operand of no known type — and had to keep every result 64 bits
+    /// wide in case it was a `Long`, which silently skipped the `Int` wrap that
+    /// `listOf(2000000000).map { it + it }` needs.
+    /// Each entry is `(type, element type)`: the parameter's own type, and —
+    /// when it is itself a sequence (a `windowed` group, a nested list) — the
+    /// type of ITS elements, so a second lambda one level down is typed too.
+    lambda_hint: Option<Vec<(Type, Type)>>,
     /// The `kotlin.math` names the program's imports brought into scope, as
     /// *visible spelling* → *runtime name*. Kotlin does NOT auto-import
     /// `kotlin.math`, so `abs`/`sqrt`/`PI` are compile errors without an import,
@@ -419,11 +472,18 @@ fn math_scope(imports: &[ImportDecl]) -> (HashMap<String, String>, bool) {
 /// defined inside a method can still reach `this`/fields.
 struct PendingLambda {
     name_idx: u16,
-    params: Vec<(String, Type)>,
-    captures: Vec<(String, Type, Option<String>)>,
+    /// `(name, type, element type)` per parameter — the element type is what a
+    /// lambda nested one level deeper types ITS parameter from.
+    params: Vec<(String, Type, Type)>,
+    captures: Vec<Captured>,
     body: Vec<Stmt>,
     class: Option<String>,
 }
+
+/// One captured binding as a lambda sees it: `(name, slot, type, class,
+/// element type)`. The slot is the ENCLOSING frame's, read at closure-creation
+/// time; the lambda body re-declares the name in its own frame.
+type Captured = (String, u16, Type, Option<String>, Type);
 
 /// Backpatch bookkeeping for one enclosing loop. `break`/`continue` emit a
 /// `Jump(0)` and stash its op index here; the loop patches them once its exit
@@ -775,6 +835,7 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
         loops: Vec::new(),
         pending_lambdas: Vec::new(),
         lambdas_seen: 0,
+        lambda_hint: None,
         math_scope: HashMap::new(),
         math_star: false,
         has_try: uses_exceptions(program),
@@ -1140,17 +1201,30 @@ impl Compiler {
             StmtKind::Let {
                 name,
                 ty,
+                fn_params,
                 init,
                 mutable,
             } => {
                 let class = self.infer_class(sc, init);
+                // Read the initializer's element type BEFORE lowering, while
+                // the initializer expression is still in hand: it is what a
+                // later `xs.map { … }` types its parameter from.
+                let elem = self.infer_elem(sc, init);
+                // `val f: (Int) -> Int = { it * 2 }` — the annotation IS the
+                // lambda's parameter list, so publish it the same way a
+                // collection HOF publishes its element type.
+                if !fn_params.is_empty() {
+                    self.lambda_hint =
+                        Some(fn_params.iter().map(|t| (*t, Type::Unknown)).collect());
+                }
                 let it = self.compile_expr(sc, init)?;
                 let mut vty = ty.unwrap_or(it);
                 // A binding with a known class/container is a heap object.
                 if class.is_some() {
                     vty = Type::Obj;
                 }
-                let slot = sc.declare_obj(name, vty, *mutable, class);
+                self.lambda_hint = None;
+                let slot = sc.declare_full(name, vty, *mutable, class, elem);
                 // A raise inside the initializer must not commit its garbage
                 // result to the new binding.
                 self.unwind_check_dropping(1);
@@ -1517,10 +1591,13 @@ impl Compiler {
         // code unit like every other kotlinrs `Char`, so the element type has to
         // be decided here — otherwise `println(c)` would print the code, not the
         // character.
+        // Every other iterable takes its element type from the receiver, so a
+        // `for` variable over `listOf(1, 2)` is an `Int` and arithmetic on it
+        // narrows to 32 bits like Kotlin's.
         let elem_ty = if self.infer(sc, iter).is_str() {
             Type::Char
         } else {
-            Type::Unknown
+            self.infer_elem(sc, iter)
         };
         // The iterable and the loop's index/length temporaries.
         let cslot = sc.temp();
@@ -1534,7 +1611,19 @@ impl Compiler {
         self.b.emit(Op::LoadInt(0), 0);
         self.b.emit(Op::SetSlot(islot), 0);
         // The element binding is a `val` (Kotlin's `for` variable is read-only).
-        let vslot = sc.declare(var, elem_ty, false);
+        // Iterating a list OF lists keeps the inner element type, so a nested
+        // `for` types its own variable too.
+        let inner = self.infer_elem(sc, iter);
+        let vslot = sc.declare_elem(
+            var,
+            elem_ty,
+            false,
+            if elem_ty == Type::Unknown {
+                inner
+            } else {
+                Type::Unknown
+            },
+        );
 
         let top = self.b.current_pos();
         self.b.emit(Op::GetSlot(islot), 0);
@@ -2185,7 +2274,10 @@ impl Compiler {
                 self.b.emit(Op::CallBuiltin(KT_DISPLAY, 1), line);
                 return Ok(Type::String);
             }
-            if name == "joinToString" && args.len() <= 1 {
+            // Only `joinToString()` / `joinToString(sep)` take this display
+            // fast path. Every longer form carries an affix, a limit, or a
+            // transform, and has to reach the full member (or the HOF) below.
+            if name == "joinToString" && args.len() <= 1 && !args.iter().any(is_lambda) {
                 self.compile_expr(sc, recv)?;
                 for a in args {
                     let t = self.compile_expr(sc, a)?;
@@ -2200,6 +2292,10 @@ impl Compiler {
         // trailing-lambda literal or a passed closure) and invoke it per element
         // at runtime via the `KT_COLL_HOF` builtin.
         if is_coll_hof(name) && !args.is_empty() {
+            return self.compile_coll_hof(sc, recv, name, args, line);
+        }
+        // The overloaded forms route by whether a lambda was actually written.
+        if is_optional_hof(name) && args.last().is_some_and(is_lambda) {
             return self.compile_coll_hof(sc, recv, name, args, line);
         }
         // `it`-form scope functions on any receiver: `x.let { … }` /
@@ -2271,6 +2367,20 @@ impl Compiler {
         // 32` is 1, `1L shl 32` is 4294967296). Every integer is one `i64` at
         // runtime, so the width cannot be recovered there — it is pushed as a
         // trailing argument and one host arm serves both.
+        // `hashCode()` folds an `Int` and a `Long` differently (`(-1).hashCode()`
+        // is -1, `(-1L).hashCode()` is 0) and the two share one runtime
+        // representation, so the receiver's static width rides along exactly as
+        // it does for the shifts below.
+        if name == "hashCode" && args.is_empty() {
+            let rt = self.infer(sc, recv);
+            self.compile_expr(sc, recv)?;
+            self.b
+                .emit(Op::LoadInt(if rt == Type::Long { 64 } else { 32 }), line);
+            let nidx = self.b.add_constant(Value::str(name.to_string()));
+            self.b.emit(Op::LoadConst(nidx), line);
+            self.b.emit(Op::Extended(KT_METHOD, 1), line);
+            return Ok(Type::Int);
+        }
         if matches!(name, "shl" | "shr" | "ushr" | "inv" | "and" | "or" | "xor")
             && args.len() == usize::from(name != "inv")
         {
@@ -2551,20 +2661,36 @@ impl Compiler {
         body: &[Stmt],
     ) -> Result<Type, String> {
         // An unparameterized lambda has the single implicit parameter `it`.
-        let effective: Vec<(String, Type)> = if params.is_empty() {
+        let declared: Vec<(String, Type)> = if params.is_empty() {
             vec![("it".to_string(), Type::Unknown)]
         } else {
             params.to_vec()
         };
+        // A parameter the source did not annotate takes its type from the call
+        // site (see [`Compiler::lambda_hint`]), which is what lets `it` inside
+        // `listOf(1, 2).map { … }` be an `Int` rather than a width the frontend
+        // has to play safe with.
+        let hint = self.lambda_hint.take().unwrap_or_default();
+        let effective: Vec<(String, Type, Type)> = declared
+            .into_iter()
+            .enumerate()
+            .map(|(i, (n, t))| {
+                let (ht, he) = hint
+                    .get(i)
+                    .copied()
+                    .unwrap_or((Type::Unknown, Type::Unknown));
+                (n, if t == Type::Unknown { ht } else { t }, he)
+            })
+            .collect();
         // Capture the whole visible enclosing environment (by value), minus names
         // the lambda's own parameters shadow. Captures use slots after the params
         // in the body; the push order here matches the body prologue's pop order.
-        let caps: Vec<(String, u16, Type, Option<String>)> = sc
+        let caps: Vec<Captured> = sc
             .visible()
             .into_iter()
-            .filter(|(n, _, _, _)| !effective.iter().any(|(p, _)| p == n))
+            .filter(|(n, _, _, _, _)| !effective.iter().any(|(p, _, _)| p == n))
             .collect();
-        for (_, slot, _, _) in &caps {
+        for (_, slot, _, _, _) in &caps {
             self.b.emit(Op::GetSlot(*slot), 0);
         }
         let id = self.lambdas_seen;
@@ -2573,10 +2699,7 @@ impl Compiler {
         self.pending_lambdas.push(PendingLambda {
             name_idx,
             params: effective.clone(),
-            captures: caps
-                .iter()
-                .map(|(n, _, ty, cl)| (n.clone(), *ty, cl.clone()))
-                .collect(),
+            captures: caps.clone(),
             body: body.to_vec(),
             class: self.cur_class.clone(),
         });
@@ -2597,11 +2720,11 @@ impl Compiler {
         self.b.add_sub_entry(pl.name_idx, entry);
 
         let mut sc = Scope::new();
-        for (p, ty) in &pl.params {
-            sc.declare(p, *ty, false);
+        for (p, ty, elem) in &pl.params {
+            sc.declare_elem(p, *ty, false, *elem);
         }
-        for (n, ty, cl) in &pl.captures {
-            sc.declare_obj(n, *ty, false, cl.clone());
+        for (n, _, ty, cl, elem) in &pl.captures {
+            sc.declare_full(n, *ty, false, cl.clone(), *elem);
         }
         let total = pl.params.len() + pl.captures.len();
         for i in (0..total).rev() {
@@ -2642,11 +2765,22 @@ impl Compiler {
         // The lambda is always the last argument (trailing-lambda syntax, or a
         // passed closure value); anything before it is a leading value arg.
         let (closure, extras) = args.split_last().unwrap();
+        // Publish the lambda's parameter types before lowering it, so an
+        // unannotated `it` picks up the receiver's element type instead of
+        // staying `Unknown` (see [`Compiler::lambda_hint`]).
+        let elem = self.infer_elem(sc, recv);
+        let hint = self.hof_param_types(sc, recv, name, elem, extras);
         self.compile_expr(sc, recv)?;
         for e in extras {
             self.compile_expr(sc, e)?;
         }
+        if !hint.is_empty() {
+            self.lambda_hint = Some(hint);
+        }
         self.compile_expr(sc, closure)?;
+        // A closure passed by NAME rather than written inline never reaches
+        // `compile_lambda`, so clear any hint it left behind.
+        self.lambda_hint = None;
         let nidx = self.b.add_constant(Value::str(name.to_string()));
         self.b.emit(Op::LoadConst(nidx), line);
         self.b
@@ -3699,6 +3833,30 @@ impl Compiler {
                         _ => {}
                     }
                 }
+                // The members that hand back one ELEMENT keep the receiver's
+                // element type, so arithmetic on `it.first()` narrows the same
+                // way arithmetic on the element itself does. Only the members
+                // that cannot answer `null` are listed: an `…OrNull` result is
+                // `T?`, whose display goes through the Kotlin stringifier.
+                if matches!(
+                    name.as_str(),
+                    "first"
+                        | "last"
+                        | "get"
+                        | "elementAt"
+                        | "single"
+                        | "random"
+                        | "max"
+                        | "min"
+                        | "reduce"
+                        | "maxBy"
+                        | "minBy"
+                ) {
+                    let elem = self.infer_elem(sc, recv);
+                    if elem != Type::Unknown {
+                        return nullable_if_safe(elem, *safe);
+                    }
+                }
                 // A higher-order collection method's result type is fixed.
                 if is_coll_hof(name) {
                     return nullable_if_safe(hof_ret_type(name), *safe);
@@ -3794,11 +3952,144 @@ impl Compiler {
             Some("DoubleArray") => Type::Double,
             Some("CharArray") => Type::Char,
             Some("BooleanArray") => Type::Boolean,
-            _ => Type::Unknown,
+            // `xs[i]` is one element, so it has the receiver's element type.
+            // A `Map` is excluded: `m[k]` is `V?`, not an element of the
+            // entry sequence `infer_elem` describes.
+            _ => self.infer_elem(sc, recv),
         }
     }
 
     /// The class/container name of an expression's value, when statically known:
+    /// The static ELEMENT type of a sequence-valued expression — what a lambda
+    /// over it, or a `for` variable bound to it, receives. `Unknown` when the
+    /// frontend cannot see the elements.
+    ///
+    /// This is the static answer to a question that has no runtime one: every
+    /// Kotlin integer is one `i64` at run time, so an `Int` element and a `Long`
+    /// element are indistinguishable once inside a lambda — but Kotlin decides
+    /// arithmetic width from the STATIC type, and that type is written right
+    /// there in the receiver. Reading it here is what lets the per-site 32-bit
+    /// narrowing fire inside a lambda instead of conservatively keeping 64 bits.
+    ///
+    /// Deliberately NOT covered: `map`/`flatMap`, whose element type is the
+    /// lambda's return type and would need the lambda lowered first, and any
+    /// receiver reached through a function return. Those keep `Unknown` and the
+    /// conservative width.
+    fn infer_elem(&self, sc: &Scope, e: &Expr) -> Type {
+        match e {
+            Expr::Var(n) => sc.elem_of(n),
+            // A range's elements are its endpoints' type: `Int`, or `Char` for
+            // `'a'..'e'`.
+            Expr::Range { start, .. } => match self.infer(sc, start) {
+                Type::Char => Type::Char,
+                Type::Long => Type::Long,
+                _ => Type::Int,
+            },
+            Expr::Step { recv, .. } => self.infer_elem(sc, recv),
+            Expr::Call { name, args, .. } => match name.as_str() {
+                "listOf" | "setOf" | "mutableListOf" | "mutableSetOf" | "arrayOf"
+                | "listOfNotNull" | "sequenceOf" => {
+                    elem_of_args(&args.iter().map(|a| self.infer(sc, a)).collect::<Vec<_>>())
+                }
+                "intArrayOf" => Type::Int,
+                "longArrayOf" => Type::Long,
+                "doubleArrayOf" | "floatArrayOf" => Type::Double,
+                "charArrayOf" => Type::Char,
+                "booleanArrayOf" => Type::Boolean,
+                _ => Type::Unknown,
+            },
+            // The members that re-emit their receiver's own elements. `sorted`
+            // and friends reorder, `filter`/`take`/`drop` select — none of them
+            // changes what an element IS.
+            Expr::MethodCall { recv, name, .. } => match name.as_str() {
+                "filter" | "filterNot" | "filterIndexed" | "filterNotNull" | "sorted"
+                | "sortedDescending" | "sortedBy" | "sortedByDescending" | "sortedWith"
+                | "reversed" | "asReversed" | "take" | "takeLast" | "takeWhile" | "drop"
+                | "dropLast" | "dropWhile" | "distinct" | "toList" | "toMutableList" | "toSet"
+                | "toMutableSet" | "shuffled" | "slice" | "subList" | "plus" | "minus"
+                | "union" | "intersect" | "subtract" => self.infer_elem(sc, recv),
+                _ => Type::Unknown,
+            },
+            _ => Type::Unknown,
+        }
+    }
+
+    /// The parameter types a collection HOF hands its lambda, given the
+    /// receiver's element type and the leading value arguments. Anything not
+    /// listed takes the element type for a single parameter, which is the shape
+    /// of nearly every `Iterable` member.
+    fn hof_param_types(
+        &self,
+        sc: &Scope,
+        recv: &Expr,
+        name: &str,
+        elem: Type,
+        extras: &[Expr],
+    ) -> Vec<(Type, Type)> {
+        let first_extra = || extras.first().map(|e| self.infer(sc, e));
+        // What an ELEMENT's own elements are, for a lambda that goes one level
+        // deeper (`listOf(listOf(1)).map { l -> l.map { … } }`).
+        let inner = self.infer_inner_elem(sc, recv);
+        let one = |t: Type| vec![(t, inner)];
+        match name {
+            // `fold(initial) { acc, e }` — the accumulator starts at the
+            // initial value's type and, for the fold to be well-typed, stays
+            // there.
+            "fold" => vec![
+                (first_extra().unwrap_or(Type::Unknown), Type::Unknown),
+                (elem, inner),
+            ],
+            "reduce" => vec![(elem, inner), (elem, inner)],
+            // The index-first pairs.
+            "mapIndexed" | "filterIndexed" | "forEachIndexed" => {
+                vec![(Type::Int, Type::Unknown), (elem, inner)]
+            }
+            // `zip(other) { a, b }` — one element from each side.
+            "zip" => vec![
+                (elem, inner),
+                (
+                    extras
+                        .first()
+                        .map(|e| self.infer_elem(sc, e))
+                        .unwrap_or(Type::Unknown),
+                    Type::Unknown,
+                ),
+            ],
+            // `sortedWith(comparator)`'s lambda compares two elements.
+            "sortedWith" => vec![(elem, inner), (elem, inner)],
+            // These hand the lambda a GROUP of the receiver's elements, so the
+            // group's ELEMENT type is the receiver's element type.
+            "chunked" | "windowed" => vec![(Type::Obj, elem)],
+            // `getOrElse` hands an index and `mapValues`/`mapKeys` an entry —
+            // neither is the element type, so neither is hinted.
+            "getOrElse" | "mapValues" | "mapKeys" => Vec::new(),
+            _ => one(elem),
+        }
+    }
+
+    /// The element type of this sequence's ELEMENTS — one level further than
+    /// [`Compiler::infer_elem`]. Only a literal spells it out; a sequence
+    /// reached through a name keeps a single element type, so a nested list
+    /// bound to a `val` answers `Unknown`.
+    fn infer_inner_elem(&self, sc: &Scope, e: &Expr) -> Type {
+        match e {
+            Expr::Call { name, args, .. }
+                if matches!(
+                    name.as_str(),
+                    "listOf" | "setOf" | "mutableListOf" | "mutableSetOf" | "arrayOf"
+                ) =>
+            {
+                elem_of_args(
+                    &args
+                        .iter()
+                        .map(|a| self.infer_elem(sc, a))
+                        .collect::<Vec<_>>(),
+                )
+            }
+            _ => Type::Unknown,
+        }
+    }
+
     /// a bound variable's class, a constructor call, `this`, a class-typed
     /// function return, or a class-typed property/method result. Drives method
     /// dispatch and property typing.
@@ -3935,6 +4226,17 @@ fn range_form(kind: RangeKind) -> u8 {
         RangeKind::Until => 1,
         RangeKind::DownTo => 2,
     }
+}
+
+/// The element type of an `Iterable`-shaped literal's arguments: the common
+/// type when they agree, `Unknown` when they do not (a heterogeneous
+/// `listOf(1, "a")` types as neither).
+fn elem_of_args(types: &[Type]) -> Type {
+    let mut acc: Option<Type> = None;
+    for t in types {
+        acc = Some(join_ty(acc, *t));
+    }
+    acc.unwrap_or(Type::Unknown)
 }
 
 /// Join two coarse branch types: identical types collapse to that type, an
@@ -4145,7 +4447,43 @@ fn is_coll_hof(name: &str) -> bool {
             | "associateBy"
             | "associateWith"
             | "groupBy"
+            // The searching predicates. Each also has a no-argument member
+            // spelling (`list.first()`), which the `!args.is_empty()` guard at
+            // the call site keeps on the plain path.
+            | "first"
+            | "last"
+            | "find"
+            | "findLast"
+            | "single"
+            | "singleOrNull"
+            | "indexOfFirst"
+            | "indexOfLast"
+            | "filterIndexed"
+            | "forEachIndexed"
+            | "maxOf"
+            | "minOf"
+            | "maxOfOrNull"
+            | "minOfOrNull"
+            | "mapValues"
+            | "mapKeys"
+            | "sortedWith"
     )
+}
+
+/// The collection methods that take a lambda in ONE of their overloads and a
+/// plain value in the others — `chunked(n)` vs `chunked(n) { … }`. They route to
+/// [`crate::host::coll_hof`] only when a lambda is actually written, so the
+/// no-lambda spelling keeps reaching the member dispatch.
+fn is_optional_hof(name: &str) -> bool {
+    matches!(
+        name,
+        "chunked" | "windowed" | "zip" | "joinToString" | "getOrElse"
+    )
+}
+
+/// Whether `e` is a lambda literal — what decides an [`is_optional_hof`] call.
+fn is_lambda(e: &Expr) -> bool {
+    matches!(e, Expr::Lambda { .. })
 }
 
 /// Static result type of a higher-order collection method, for display/`==` op
@@ -4156,9 +4494,12 @@ fn hof_ret_type(name: &str) -> Type {
         "map" | "mapIndexed" | "flatMap" | "filter" | "filterNot" | "partition" | "takeWhile"
         | "dropWhile" | "sortedBy" | "sortedByDescending" | "associate" | "associateBy"
         | "associateWith" | "groupBy" => Type::Obj,
-        "forEach" => Type::Unit,
+        "filterIndexed" | "mapValues" | "mapKeys" | "sortedWith" | "chunked" | "windowed"
+        | "zip" => Type::Obj,
+        "forEach" | "forEachIndexed" => Type::Unit,
         "any" | "all" | "none" => Type::Boolean,
-        "count" => Type::Int,
+        "count" | "indexOfFirst" | "indexOfLast" => Type::Int,
+        "joinToString" => Type::String,
         _ => Type::Unknown,
     }
 }

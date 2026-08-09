@@ -31,6 +31,24 @@
 //! `filter` re-wraps into a `Map`), and `finexit` (a `break`/`continue` leaving
 //! a `try` has to run its `finally` first).
 //!
+//! The newest modes target the two shapes a frontend gets wrong SILENTLY rather
+//! than loudly. First, an argument or a lambda that a shorter overload does not
+//! have, which a name-only dispatch drops on the floor and answers the shorter
+//! overload's result for: `collarg` (`joinToString`'s affixes and limit,
+//! `windowed`'s step and `partialWindows`, the transform-taking `chunked`/
+//! `windowed`/`zip`), `predicate` (`first`/`last`/`single`/`find` — each shares
+//! its name with a no-argument member, so running the wrong one answers the
+//! first ELEMENT rather than the first MATCH), and `strsearch` (`indexOf`'s
+//! `startIndex`, `compareTo`'s `ignoreCase`). Second, a value whose type is not
+//! written at the point it is used: `width` (Kotlin decides integer width from
+//! the STATIC type, so an `Int` overflow inside a lambda has a right answer only
+//! if the receiver's element type reaches the parameter — and `Long` receivers
+//! are mixed in, so always narrowing fails too), `hash` (the JVM's exact
+//! `hashCode` contract, where `Int` and `Long` fold differently from the same
+//! runtime representation), and `entry` (a `Map.Entry` is not a `Pair`, and
+//! `keys`/`entries` are `Set`s — three silent differences in display, hashing,
+//! and equality).
+//!
 //! Scope + determinism invariants (mirroring the javars/scalars harnesses):
 //!   * Only constructs kotlinrs actually implements are emitted — an unsupported
 //!     construct would be a known gap, not a parity signal.
@@ -38,9 +56,13 @@
 //!     unordered collections). Every probe's output is a pure function of source.
 //!     This is why an array is never printed directly: a JVM array inherits
 //!     `Object.toString`, so `println(arrayOf(1))` emits an identity hash. Array
-//!     probes read `size`/elements/`sum()`/`joinToString()` instead.
-//!   * Integer operands stay well inside range so 32-bit overflow — a documented
-//!     gap — is never the thing under test, and integer divisors are never zero
+//!     probes read `size`/elements/`sum()`/`joinToString()` instead. The same
+//!     rule keeps the identity-HASHED kinds out of `hash` (a non-`data` class,
+//!     an array, a lambda) and `Map.values` out of `entry`: `values` is a plain
+//!     `Collection` whose hash and equality the JVM leaves as identity, and
+//!     whose answer even changes with the map implementation `mapOf` picked.
+//!   * Integer operands stay well inside range EXCEPT in `width`, whose whole
+//!     subject is 32-bit overflow, and integer divisors are never zero
 //!     (Kotlin throws there; that is a fault-path test, not a value test).
 //!     Likewise ranges are never empty where a probe calls `max()`/`min()`,
 //!     which throw on an empty sequence.
@@ -877,6 +899,233 @@ fn g_coll(r: &mut Rng, idx: usize) -> String {
     }
 }
 
+/// Magnitudes that STRADDLE `Int` range: a product or sum of two of these
+/// overflows 32 bits, so the probe answers a wrapped value on Kotlin and a
+/// 64-bit one on any frontend that skipped the narrowing.
+const BIGINTS: &[&str] = &[
+    "100000",
+    "70000",
+    "2000000000",
+    "-2000000000",
+    "65536",
+    "46341",
+];
+
+/// The `Int` wraparound that reaches an operand whose type is not written down:
+/// a lambda parameter, a `for` variable, an element read back out of a
+/// sequence. Kotlin decides arithmetic width from the STATIC type, so every
+/// probe here has a right answer the source spells out — but only if the
+/// frontend propagates the receiver's element type into the lambda instead of
+/// treating an untyped parameter as possibly-`Long`.
+///
+/// The `Long` receivers are deliberately mixed in: they must NOT narrow, so a
+/// frontend that fixes the `Int` case by always narrowing fails these instead.
+fn g_width(r: &mut Rng, idx: usize) -> String {
+    let a = pick(r, BIGINTS);
+    let b = pick(r, BIGINTS);
+    let op = pick(r, AOPS);
+    match r.below(16) {
+        0 => p(format!("listOf({a}).map {{ it {op} {b} }}")),
+        1 => p(format!("listOf({a}, {b}).map {{ it * it }}")),
+        2 => p(format!("listOf({a}L).map {{ it {op} {b} }}")),
+        3 => p(format!("listOf({a}).sumOf {{ it {op} {b} }}")),
+        4 => p(format!("listOf({a}).filter {{ it {op} {b} > 0 }}")),
+        5 => p(format!("listOf({a}).fold(1) {{ acc, x -> acc {op} x }}")),
+        6 => p(format!("listOf({a}).fold(1L) {{ acc, x -> acc {op} x }}")),
+        7 => p(format!("listOf({a}, {b}).reduce {{ x, y -> x {op} y }}")),
+        8 => p(format!("listOf({a}).mapIndexed {{ i, x -> x {op} x + i }}")),
+        9 => p(format!("(1..3).map {{ it * {a} }}")),
+        10 => format!(
+            "var w{idx} = 0; for (x in listOf({a}, {b})) w{idx} = w{idx} {op} x; println(w{idx})"
+        ),
+        11 => format!(
+            "val wl{idx} = listOf({a}); println(wl{idx}.map {{ it {op} {b} }}); println(wl{idx}.first() * wl{idx}.first())"
+        ),
+        12 => format!(
+            "val wf{idx}: (Int) -> Int = {{ it {op} {b} }}; println(wf{idx}({a}))"
+        ),
+        13 => format!(
+            "val wg{idx}: (Long) -> Long = {{ it {op} {b}L }}; println(wg{idx}({a}L))"
+        ),
+        14 => p(format!("listOf(listOf({a})).map {{ g -> g.map {{ it * it }} }}")),
+        _ => p(format!("listOf({a}).windowed(1) {{ it.first() * it.first() }}")),
+    }
+}
+
+/// `hashCode()` across the whole value model. Every kind here has a hash the
+/// JVM specifies EXACTLY — `Int` is the value, `Long` folds its halves,
+/// `String` is the `31`-polynomial, a `List` folds, a `Set` and a `Map` sum —
+/// so the expected value is reproducible rather than an identity.
+///
+/// The identity-hashed kinds (a non-`data` class, an array, a lambda) are
+/// excluded: the JVM's own answer varies per run, so no frontend can match one.
+fn g_hash(r: &mut Rng, _idx: usize) -> String {
+    let a = pick(r, INTS);
+    let b = pick(r, STRS);
+    let d = pick(r, DBLS);
+    let c = pick(r, &["'a'", "'Z'", "'0'", "' '"]);
+    match r.below(16) {
+        0 => p(format!("{b}.hashCode()")),
+        1 => p(format!("({a}).hashCode()")),
+        2 => p(format!("({a}L).hashCode()")),
+        3 => p(format!("({d}).hashCode()")),
+        4 => p(format!("{c}.hashCode()")),
+        5 => p(format!("{}.hashCode()", pick(r, BOOLS))),
+        6 => p(format!("listOf({a}, {b}).hashCode()")),
+        7 => p("listOf<Int>().hashCode()".to_string()),
+        8 => p(format!("setOf({a}, {}).hashCode()", pick(r, INTS))),
+        9 => p(format!("mapOf({a} to {b}).hashCode()")),
+        10 => p(format!("({a} to {b}).hashCode()")),
+        11 => p(format!("Pt({a}, {b}).hashCode()")),
+        12 => p(format!(
+            "Pt({a}, {b}).hashCode() == Pt({a}, {b}).hashCode()"
+        )),
+        13 => p(format!(
+            "({}..{}).hashCode()",
+            pick(r, RINTS),
+            pick(r, RINTS)
+        )),
+        14 => p(format!(
+            "({}..{} step {}).hashCode()",
+            pick(r, RINTS),
+            pick(r, RINTS),
+            pick(r, STEPS)
+        )),
+        _ => p(format!(
+            "({} downTo {}).hashCode()",
+            pick(r, RINTS),
+            pick(r, RINTS)
+        )),
+    }
+}
+
+/// `Map.Entry` — the type a `Map` iterates as. It is NOT a `Pair`, and the
+/// three places that differ are all silent when one is used for the other: an
+/// entry renders `k=v` where a pair renders `(k, v)`, its hash is `key xor
+/// value` where a pair's folds, and the two are never equal.
+fn g_entry(r: &mut Rng, idx: usize) -> String {
+    let k = pick(r, INTS);
+    let v = pick(r, STRS);
+    let k2 = pick(r, INTS);
+    let v2 = pick(r, STRS);
+    let m = format!("mapOf({k} to {v}, {k2} to {v2})");
+    match r.below(16) {
+        0 => p(format!("{m}.entries")),
+        1 => p(format!("{m}.entries.first()")),
+        2 => p(format!("{m}.entries.first().hashCode()")),
+        3 => p(format!("{m}.entries.first() == ({k} to {v})")),
+        4 => p(format!("{m}.entries.joinToString()")),
+        5 => p(format!("{m}.entries.map {{ it.key }}")),
+        6 => p(format!("{m}.entries.map {{ it.value }}")),
+        7 => p(format!("{m}.map {{ \"${{it.key}}=${{it.value}}\" }}")),
+        8 => p(format!("{m}.mapValues {{ it.value + \"!\" }}")),
+        9 => p(format!("{m}.mapKeys {{ it.key * 2 }}")),
+        // `keys` and `entries` are SETS: their hash is the SUM of the element
+        // hashes and their equality ignores order, neither of which a list-like
+        // result reproduces. (`values` is deliberately absent — it is a plain
+        // `Collection` whose hash and equality the JVM leaves as identity, so no
+        // frontend can match it.)
+        10 => p(format!("{m}.keys.hashCode()")),
+        11 => p(format!("{m}.entries.hashCode()")),
+        12 => p(format!("{m}.keys == setOf({k2}, {k})")),
+        13 => p(format!("{m}.keys")),
+        14 => format!("for (e{idx} in {m}) print(e{idx}); println()"),
+        _ => format!("for ((ek{idx}, ev{idx}) in {m}) print(\"$ek{idx}/$ev{idx} \"); println()"),
+    }
+}
+
+/// The `String` search and comparison members in their OVERLOADED spellings —
+/// the `startIndex` and `ignoreCase` arguments. Each has a shorter form that
+/// already worked, so dropping the extra argument re-runs the default silently:
+/// `"abc".indexOf("b", 2)` answers 1 instead of -1.
+fn g_strsearch(r: &mut Rng, _idx: usize) -> String {
+    let hay = pick(
+        r,
+        &["\"abcabc\"", "\"aaa\"", "\"\"", "\"Hello\"", "\"abc\""],
+    );
+    let needle = pick(
+        r,
+        &["\"a\"", "\"bc\"", "\"\"", "\"z\"", "\"ABC\"", "\"abc\""],
+    );
+    let at = pick(r, &["0", "1", "2", "3", "9", "-1"]);
+    match r.below(10) {
+        0 => p(format!("{hay}.indexOf({needle})")),
+        1 => p(format!("{hay}.indexOf({needle}, {at})")),
+        2 => p(format!("{hay}.lastIndexOf({needle})")),
+        3 => p(format!("{hay}.lastIndexOf({needle}, {at})")),
+        4 => p(format!("{hay}.startsWith({needle})")),
+        5 => p(format!("{hay}.startsWith({needle}, {at})")),
+        6 => p(format!("{hay}.compareTo({needle})")),
+        7 => p(format!("{hay}.compareTo({needle}, true)")),
+        8 => p(format!("{hay}.equals({needle}, true)")),
+        _ => p(format!("{hay}.replaceFirst({needle}, \"-\")")),
+    }
+}
+
+/// The collection members whose LATER arguments are easy to drop: an affix, a
+/// step, a `partialWindows` flag, a transform. Every one of them has a shorter
+/// overload that behaves differently, which is what makes a dropped argument a
+/// wrong answer rather than an error.
+fn g_collarg(r: &mut Rng, _idx: usize) -> String {
+    let xs = pick(
+        r,
+        &[
+            "listOf(1, 2, 3, 4, 5)",
+            "listOf(1)",
+            "listOf<Int>()",
+            "listOf(3, 1, 2)",
+        ],
+    );
+    let n = pick(r, &["1", "2", "3", "5"]);
+    let step = pick(r, &["1", "2", "3"]);
+    match r.below(14) {
+        0 => p(format!("{xs}.joinToString(\"-\")")),
+        1 => p(format!("{xs}.joinToString(\"-\", \"<\")")),
+        2 => p(format!("{xs}.joinToString(\"-\", \"<\", \">\")")),
+        3 => p(format!(
+            "{xs}.joinToString(\"-\", \"<\", \">\", {n}, \"~\")"
+        )),
+        4 => p(format!("{xs}.joinToString(\"-\") {{ \"v$it\" }}")),
+        5 => p(format!(
+            "{xs}.joinToString(\"-\", \"<\", \">\") {{ \"v$it\" }}"
+        )),
+        6 => p(format!("{xs}.chunked({n})")),
+        7 => p(format!("{xs}.chunked({n}) {{ it.sum() }}")),
+        8 => p(format!("{xs}.windowed({n})")),
+        9 => p(format!("{xs}.windowed({n}, {step})")),
+        10 => p(format!("{xs}.windowed({n}, {step}, true)")),
+        11 => p(format!("{xs}.windowed({n}) {{ it.sum() }}")),
+        12 => p(format!("{xs}.zip(listOf(9, 8, 7)) {{ a, b -> a * b }}")),
+        _ => p(format!("{xs}.slice(0..{})", r.below(2))),
+    }
+}
+
+/// The searching predicates. Each shares its NAME with a no-argument member, so
+/// a frontend that routes on the name alone runs the wrong one and answers the
+/// first/last element rather than the first/last MATCH — silently, and only for
+/// inputs where the two differ.
+///
+/// The receivers always contain a match for the `first`/`last`/`single` forms,
+/// which throw on none; the `…OrNull` forms are probed with a predicate that
+/// matches nothing so the null path is covered too.
+fn g_predicate(r: &mut Rng, _idx: usize) -> String {
+    let xs = "listOf(1, 2, 3, 4)";
+    match r.below(12) {
+        0 => p(format!("{xs}.first {{ it > 1 }}")),
+        1 => p(format!("{xs}.last {{ it < 4 }}")),
+        2 => p(format!("{xs}.find {{ it > 2 }}")),
+        3 => p(format!("{xs}.find {{ it > 99 }}")),
+        4 => p(format!("{xs}.findLast {{ it < 3 }}")),
+        5 => p(format!("{xs}.single {{ it == 3 }}")),
+        6 => p(format!("{xs}.singleOrNull {{ it > 2 }}")),
+        7 => p(format!("{xs}.indexOfFirst {{ it > 2 }}")),
+        8 => p(format!("{xs}.indexOfLast {{ it < 3 }}")),
+        9 => p(format!("{xs}.indexOfFirst {{ it > 99 }}")),
+        10 => p(format!("{xs}.filterIndexed {{ i, x -> i == x }}")),
+        _ => p(format!("{xs}.maxOf {{ -it }}")),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     All,
@@ -913,6 +1162,12 @@ enum Mode {
     SafeCall,
     MapColl,
     FinExit,
+    Width,
+    Hash,
+    Entry,
+    StrSearch,
+    CollArg,
+    Predicate,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -949,6 +1204,12 @@ const CONCRETE: &[Mode] = &[
     Mode::SafeCall,
     Mode::MapColl,
     Mode::FinExit,
+    Mode::Width,
+    Mode::Hash,
+    Mode::Entry,
+    Mode::StrSearch,
+    Mode::CollArg,
+    Mode::Predicate,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -987,6 +1248,12 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::SafeCall => "safecall",
         Mode::MapColl => "mapcoll",
         Mode::FinExit => "finexit",
+        Mode::Width => "width",
+        Mode::Hash => "hash",
+        Mode::Entry => "entry",
+        Mode::StrSearch => "strsearch",
+        Mode::CollArg => "collarg",
+        Mode::Predicate => "predicate",
     }
 }
 
@@ -1037,6 +1304,12 @@ fn gen_probe(r: &mut Rng, mode: Mode, idx: usize) -> String {
         Mode::SafeCall => g_safecall(r, idx),
         Mode::MapColl => g_mapcoll(r, idx),
         Mode::FinExit => g_finexit(r, idx),
+        Mode::Width => g_width(r, idx),
+        Mode::Hash => g_hash(r, idx),
+        Mode::Entry => g_entry(r, idx),
+        Mode::StrSearch => g_strsearch(r, idx),
+        Mode::CollArg => g_collarg(r, idx),
+        Mode::Predicate => g_predicate(r, idx),
         Mode::All => unreachable!("resolved above"),
     }
 }
