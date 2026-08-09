@@ -3387,3 +3387,62 @@ fun main() {
 }"#;
     assert_eq!(stdout(src), "93\n124\n[93, 124]\n[E3, E4]\n93\n155\n");
 }
+#[test]
+fn identity_asks_a_different_question_than_structural_equality() {
+    // The pair that makes `===` worth having: two independently built lists are
+    // `==` and not `===`, and a `data class`'s generated `equals` moves only the
+    // first answer. Aliasing the SAME object flips it back.
+    let src = r#"
+data class P(val x: Int)
+fun main() {
+    val a = listOf(1, 2)
+    val b = listOf(1, 2)
+    println(a == b)
+    println(a === b)
+    println(a === a)
+    val p = P(1)
+    val q = P(1)
+    val r = p
+    println(p == q)
+    println(p === q)
+    println(p === r)
+    println(p !== q)
+}"#;
+    assert_eq!(stdout(src), "true\nfalse\ntrue\ntrue\nfalse\ntrue\ntrue\n");
+}
+
+#[test]
+fn identity_on_unboxed_values_is_value_comparison() {
+    // Nothing here is boxed, so identity on a number, `Char`, `Boolean`,
+    // `String` or `null` is value equality — which is the JVM's answer too for
+    // primitives at their declared type and for interned string literals.
+    assert_eq!(stdout("println(1 === 1)"), "true\n");
+    assert_eq!(stdout("println(1 !== 2)"), "true\n");
+    assert_eq!(stdout(r#"println("x" === "x")"#), "true\n");
+    assert_eq!(stdout("println('a' === 'a')"), "true\n");
+    assert_eq!(stdout("println(true === true)"), "true\n");
+    assert_eq!(
+        stdout("val a: String? = null; println(a === null)"),
+        "true\n"
+    );
+}
+
+#[test]
+fn the_three_character_operators_out_lex_the_two_character_ones() {
+    // `===` must be tested before the `==` it starts with: scanning greedily
+    // left to right would leave a stray `=` and report `unexpected token
+    // Assign`. Both spellings have to keep working side by side.
+    assert_eq!(
+        stdout("val a = listOf(1); val b = a; println(a == b && a === b)"),
+        "true\n"
+    );
+    assert_eq!(
+        stdout("val a = listOf(1); println(a != listOf(2) && a !== listOf(1))"),
+        "true\n"
+    );
+    // A genuine assignment after a comparison still parses as an assignment.
+    assert_eq!(
+        stdout("var n = 0; if (1 === 1) { n = 7 }; println(n)"),
+        "7\n"
+    );
+}

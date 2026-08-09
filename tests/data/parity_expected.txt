@@ -518,3 +518,13 @@ class CP(val k: Int) {\n    val d: Int get() = k\n    val e: Long get() = k.toLo
 class Own(val k: Int)\nclass CPO(val k: Int) {\n    val o: Own get() = Own(k * 3)\n}\nfun main() {\n    println(CPO(2).o.k * 2000000000)\n    println(CPO(2).o.k + 1)\n}	-884901888\n7\n
 class HB(val a: Int) {\n    override fun equals(other: Any?): Boolean = other is HB && other.a == a\n    override fun hashCode(): Int = a * 31\n    override fun toString(): String = "E" + a\n    fun uppercase(): String = "OVERRIDE"\n}\nfun main() {\n    println((-7L).hashCode())\n    println((-7).hashCode())\n    println((-1L).hashCode())\n    println("ab".hashCode())\n    println(true.hashCode())\n    println('a'.hashCode())\n    println(2.5.hashCode())\n    println("ab".uppercase())\n    println(listOf("ab").map { it.uppercase() })\n    println(1L shl 32)\n    println(1 shl 32)\n}	6\n-7\n0\n3105\n1231\n97\n1074003968\nAB\n[AB]\n4294967296\n1\n
 class HD(val a: Int) {\n    override fun hashCode(): Int = a * 31\n    override fun toString(): String = "E" + a\n}\nfun main() {\n    val xs = listOf(HD(3), HD(4))\n    for (x in xs) println(x.hashCode())\n    println(xs.map { it.hashCode() })\n    println(xs.map { it.toString() })\n    println(xs[0].hashCode())\n    println(HD(5).hashCode())\n    println(listOf(HD(3)).contains(HD(3)))\n}	93\n124\n[93, 124]\n[E3, E4]\n93\n155\nfalse\n
+fun main() {\n    println(1 === 1)\n}	true\n
+fun main() {\n    val a = "x"\n    val b = "x"\n    println(a === b)\n    println(a !== b)\n}	true\nfalse\n
+fun main() {\n    val a = listOf(1, 2)\n    val b = listOf(1, 2)\n    println(a === b)\n    println(a == b)\n    println(a !== b)\n}	false\ntrue\ntrue\n
+data class P(val x: Int)\nfun main() {\n    val a = P(1)\n    val b = P(1)\n    val c = a\n    println(a === b)\n    println(a == b)\n    println(a === c)\n}	false\ntrue\ntrue\n
+fun main() {\n    val a = mutableListOf(1)\n    val b = a\n    b.add(2)\n    println(a === b)\n    println(a)\n}	true\n[1, 2]\n
+fun main() {\n    val a: String? = null\n    println(a === null)\n    println(a !== null)\n}	true\nfalse\n
+fun main() {\n    println('a' === 'a')\n    println('a' !== 'b')\n}	true\ntrue\n
+fun main() {\n    val m = mapOf(1 to "a")\n    println(m === m)\n    println(m === mapOf(1 to "a"))\n}	true\nfalse\n
+fun main() {\n    val s = setOf(1, 2)\n    println(s !== setOf(1, 2))\n    println(s == setOf(1, 2))\n}	true\ntrue\n
+fun main() {\n    println(true === true)\n    println(true !== false)\n}	true\ntrue\n

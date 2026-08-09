@@ -400,6 +400,19 @@ impl<'a> Lexer<'a> {
             (b'*', b'=') => two(self, Tok::StarEq),
             (b'/', b'=') => two(self, Tok::SlashEq),
             (b'%', b'=') => two(self, Tok::PercentEq),
+            // `===`/`!==` are the only three-character operators, so they are
+            // the only place the scanner looks a third byte ahead. Both must be
+            // tested BEFORE the two-character `==`/`!=` they start with, or
+            // `a === b` lexes as `a == (= b)` and the parser reports the stray
+            // `Assign`.
+            (b'=', b'=') if self.peek2() == b'=' => {
+                self.bump();
+                two(self, Tok::EqEqEq)
+            }
+            (b'!', b'=') if self.peek2() == b'=' => {
+                self.bump();
+                two(self, Tok::NotEqEq)
+            }
             (b'=', b'=') => two(self, Tok::EqEq),
             (b'!', b'=') => two(self, Tok::NotEq),
             (b'<', b'=') => two(self, Tok::Le),

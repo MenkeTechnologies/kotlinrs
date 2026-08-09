@@ -170,6 +170,11 @@ pub const KT_HASH_REG: u16 = 39;
 /// `capacity()`, whose exact growth policy is a JVM implementation detail — so
 /// the int form just yields an empty builder.
 pub const KT_BUILDER: u16 = 40;
+/// Referential identity, `a === b`. Stack: `[a, b]`; pops both and pushes a
+/// `Bool`. An extension op rather than a builtin because — unlike `==`, which
+/// may re-enter the VM to run a user `equals` override — identity never calls
+/// back into Kotlin: it is a handle comparison and nothing more.
+pub const KT_IDENTITY: u16 = 41;
 
 // ── Builtin ids (`Op::CallBuiltin`) ─────────────────────────────────────────
 //
@@ -1944,6 +1949,11 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
         KT_ISNULL => {
             let v = vm.pop();
             vm.push(Value::Bool(matches!(v, Value::Undef)));
+        }
+        KT_IDENTITY => {
+            let b = vm.pop();
+            let a = vm.pop();
+            vm.push(Value::Bool(identical(&a, &b)));
         }
         KT_NOTNULL => {
             let v = vm.pop();
@@ -6228,6 +6238,33 @@ pub fn value_eq(a: &Value, b: &Value) -> bool {
             a.to_float() == b.to_float()
         }
         (Value::Undef, Value::Undef) => true,
+        _ => a == b,
+    }
+}
+
+/// Referential identity — `===`, which asks whether two expressions denote the
+/// SAME object rather than equal ones.
+///
+/// For a heap value that is the handle, full stop: `listOf(1, 2) === listOf(1,
+/// 2)` is `false` where `==` is `true`, and a `data class`'s `equals` override
+/// changes only the latter. `Char` rides in the reserved handle range and so
+/// falls out of the same comparison, its handle being its value.
+///
+/// Everything else is unboxed here — kotlinrs has no `java.lang.Integer` — so
+/// identity on a non-heap value is value equality. That agrees with the JVM
+/// wherever a Kotlin program can see the answer without boxing: `1 === 1` is
+/// `true` at declared `Int`, `null === null` is `true`, and a `String` literal
+/// is interned so `"x" === "x"` is `true`. It DIVERGES on the two answers that
+/// are artifacts of boxing rather than of the language — an `Any`-typed `1000`
+/// (outside the `Integer` cache, so `false` on the JVM) and a `String` built at
+/// run time (`false` on the JVM, since only constants are interned). Modelling
+/// either would mean modelling the box, which nothing else in this runtime has.
+fn identical(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Obj(ia), Value::Obj(ib)) => ia == ib,
+        (Value::Obj(_), _) | (_, Value::Obj(_)) => false,
+        // Not `value_eq`: that one crosses widths, and `1 === 1.0` does not
+        // even compile on Kotlin, so there is no cross-width answer to give.
         _ => a == b,
     }
 }

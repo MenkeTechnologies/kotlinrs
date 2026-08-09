@@ -512,6 +512,18 @@ but no `hashCode` is found by `listOf(...).contains(...)` and still keeps its
 duplicates in a `Set`. `Set` and `Map` *equality* is hash-gated too, because
 `AbstractSet.equals` is `containsAll` and `AbstractMap.equals` is `get`.
 
+`===` / `!==` ask the other question — whether both sides denote the **same
+object** — and never reach an `equals` override at all. `listOf(1) == listOf(1)`
+is `true` while `listOf(1) === listOf(1)` is `false`; `a === a` is `true` for
+every value. Values this runtime does not box (numbers, `Char`, `Boolean`,
+`String`, `null`) compare by value, which agrees with the JVM wherever a Kotlin
+program can observe the answer without boxing: `1 === 1` and `"x" === "x"` are
+`true`, the latter because the JVM interns literals. Two answers that *are*
+artifacts of boxing are not modelled — an `Any`-typed integer outside the
+`Integer` cache (`val a: Any = 1000; val b: Any = 1000; a === b` is `false` on
+the JVM) and a `String` assembled at run time rather than folded at compile
+time. Nothing else here models a box, so neither does this.
+
 `==` itself does not short-circuit on identity: it lowers to
 `Intrinsics.areEqual(a, b)`, so a declared `equals` runs even for `x == x`. A
 hash container does short-circuit (`HashMap.getNode` tests `k == key` first), so

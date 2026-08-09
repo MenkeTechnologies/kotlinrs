@@ -89,6 +89,11 @@ pub enum Tok {
     PercentEq,  // %=
     EqEq,       // ==
     NotEq,      // !=
+    /// `===` — referential identity, NOT the structural `==`. Distinct tokens
+    /// because the two answer differently on the same operands: two separately
+    /// built lists are `==` and not `===`.
+    EqEqEq,
+    NotEqEq, // !==
     Lt,
     Gt,
     Le,

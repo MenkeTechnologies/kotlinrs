@@ -25,8 +25,8 @@ use crate::host::{
     KT_AS, KT_BUILDER, KT_CHR_STRING, KT_CLASSOF, KT_CLOSURE_CALL, KT_COLL_HOF, KT_DBG_LINE,
     KT_DDIV, KT_DISPLAY, KT_ENUM_REG, KT_EQUALS_REG, KT_EXC_ABORT, KT_EXC_CUT, KT_EXC_DEPTH,
     KT_EXC_MATCH, KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW,
-    KT_EXC_UNSTASH, KT_EXTEND, KT_FFI_CALL, KT_FFI_COMPILE, KT_GETFIELD, KT_HASH_REG, KT_IDIV,
-    KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET,
+    KT_EXC_UNSTASH, KT_EXTEND, KT_FFI_CALL, KT_FFI_COMPILE, KT_GETFIELD, KT_HASH_REG, KT_IDENTITY,
+    KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET,
     KT_ITER_SIZE, KT_JOIN, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH,
     KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT,
     KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN, KT_SETFIELD,
@@ -4274,6 +4274,20 @@ impl Compiler {
             _ => {}
         }
 
+        // `===`/`!==` never consult a type, an `equals` override or an operator
+        // convention — they ask the host whether the two values are the same
+        // object. So they resolve before every rule below, all of which exist
+        // to pick a STRUCTURAL comparison.
+        if matches!(op, BinOp::RefEq | BinOp::RefNe) {
+            self.compile_expr(sc, l)?;
+            self.compile_expr(sc, r)?;
+            self.b.emit(Op::Extended(KT_IDENTITY, 0), 0);
+            if op == BinOp::RefNe {
+                self.b.emit(Op::LogNot, 0);
+            }
+            return Ok(Type::Boolean);
+        }
+
         let lt = self.infer(sc, l);
         let rt = self.infer(sc, r);
 
@@ -4444,7 +4458,9 @@ impl Compiler {
                 self.b.emit(if both_str { Op::StrGe } else { Op::NumGe }, 0);
                 Type::Boolean
             }
-            BinOp::And | BinOp::Or => unreachable!("handled above"),
+            BinOp::And | BinOp::Or | BinOp::RefEq | BinOp::RefNe => {
+                unreachable!("handled above")
+            }
         };
         // An `Int`-precision arithmetic result wraps at 32 bits. A comparison
         // yields a Boolean, a `Char` result is truncated to 16 bits by the host's
@@ -5553,6 +5569,8 @@ impl Compiler {
             Expr::Binary { op, l, r } => match op {
                 BinOp::Eq
                 | BinOp::Ne
+                | BinOp::RefEq
+                | BinOp::RefNe
                 | BinOp::Lt
                 | BinOp::Gt
                 | BinOp::Le
@@ -6841,7 +6859,8 @@ fn operator_fn(op: BinOp) -> Option<&'static str> {
         BinOp::Mul => "times",
         BinOp::Div => "div",
         BinOp::Mod => "rem",
-        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => return None,
+        BinOp::Eq | BinOp::Ne | BinOp::RefEq | BinOp::RefNe => return None,
+        BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => return None,
         BinOp::And | BinOp::Or => return None,
     })
 }

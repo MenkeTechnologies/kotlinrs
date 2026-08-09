@@ -2172,6 +2172,8 @@ impl Parser {
             let op = match self.peek() {
                 Tok::EqEq => BinOp::Eq,
                 Tok::NotEq => BinOp::Ne,
+                Tok::EqEqEq => BinOp::RefEq,
+                Tok::NotEqEq => BinOp::RefNe,
                 _ => break,
             };
             self.bump();

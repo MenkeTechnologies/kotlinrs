@@ -586,6 +586,13 @@ pub enum BinOp {
     Mod,
     Eq,
     Ne,
+    /// `===` — referential identity. Separate from [`BinOp::Eq`] because the
+    /// two disagree on the same operands: two independently built lists are
+    /// `==` and not `===`, and a class that overrides `equals` changes only the
+    /// former.
+    RefEq,
+    /// `!==`, the negation of [`BinOp::RefEq`].
+    RefNe,
     Lt,
     Gt,
     Le,
