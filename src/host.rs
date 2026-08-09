@@ -147,6 +147,14 @@ pub const KT_TOSTRING_REG: u16 = 35;
 /// exactly as [`KT_TOSTRING_REG`]. Consulted by [`equal_vm`], which is what
 /// makes `==` — and every equality-based collection member — run the user body
 /// instead of the built-in structural compare.
+/// Register a class tag as an `enum` constant's. Stack: `[tagStr]`.
+///
+/// The parser lowers an `enum class` to an ordinary class plus one singleton per
+/// constant, so almost nothing about it is special by the time it runs. Three
+/// things still are, and all three need the tag: an enum's `toString()` is its
+/// `name` (not `Class@hash`), it is `Comparable` by `ordinal`, and a constant
+/// with a body is a SUBCLASS whose own tag has to answer the same way.
+pub const KT_ENUM_REG: u16 = 37;
 pub const KT_EQUALS_REG: u16 = 38;
 /// Register a class's `hashCode()` override. Stack: `[tagStr, subNameIdx]`.
 /// Consulted by `hash_vm`, so a `List`/`Set`/`Map` fold over an instance
@@ -367,6 +375,11 @@ thread_local! {
     /// generated `hashCode` folds `Long` fields with a different formula than
     /// `Int` ones, and every Kotlin integer is the same `i64` at run time (see
     /// [`int_hash`]). The compiler knows the declared type, so it says so.
+    /// The class tags that are `enum` constants', as published by
+    /// [`KT_ENUM_REG`]. See that op for what still depends on knowing.
+    static ENUM_CLASSES: RefCell<std::collections::HashSet<String>> =
+        RefCell::new(std::collections::HashSet::new());
+
     static LONG_FIELDS: RefCell<std::collections::HashMap<String, String>> =
         RefCell::new(std::collections::HashMap::new());
 
@@ -1095,6 +1108,58 @@ fn thrown_class(v: &Value) -> Option<String> {
     .flatten()
 }
 
+/// Whether `class` is an `enum` constant's (see [`KT_ENUM_REG`]).
+fn is_enum_class(class: &str) -> bool {
+    ENUM_CLASSES.with(|s| s.borrow().contains(class))
+}
+
+/// The `ordinal` an enum constant carries, or `None` for anything else. Backs
+/// the `Comparable` ordering every enum has.
+fn enum_ordinal(v: &Value) -> Option<i64> {
+    with_obj(v, |o| match o {
+        HeapObj::Instance { class, fields, .. } if is_enum_class(class) => fields
+            .iter()
+            .find(|(n, _)| n == "ordinal")
+            .map(|(_, v)| num_of(v)),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// `String.toInt`/`toLong` and their `…OrNull` forms, honouring the optional
+/// radix argument. `None` is the parse failure the two pairs report differently.
+fn parse_radix(s: &str, args: &[Value]) -> Option<Value> {
+    let radix = match args.first() {
+        Some(v) => num_of(v) as u32,
+        None => 10,
+    };
+    if !(2..=36).contains(&radix) {
+        return None;
+    }
+    i64::from_str_radix(s.trim(), radix).ok().map(Value::Int)
+}
+
+/// An integer in `radix`, with the sign written out in front — the form
+/// `Int.toString(radix)` produces, where `(-255).toString(16)` is `-ff`.
+fn to_radix(n: i64, radix: u32) -> String {
+    if n == 0 {
+        return "0".to_string();
+    }
+    // Accumulated over the ABSOLUTE value as `i128`, so `Long.MIN_VALUE` (whose
+    // magnitude has no `i64`) is not a special case.
+    let neg = n < 0;
+    let mut m = (n as i128).abs();
+    let mut out = Vec::new();
+    while m > 0 {
+        out.push(std::char::from_digit((m % radix as i128) as u32, radix).unwrap_or('0'));
+        m /= radix as i128;
+    }
+    if neg {
+        out.push('-');
+    }
+    out.iter().rev().collect()
+}
+
 /// Whether the in-flight throwable `v` is an instance of the caught type `want`.
 /// A built-in walks the fixed [`THROWABLE_PARENTS`] chain; a user class walks the
 /// supertypes it registered at startup, which already end in that chain.
@@ -1627,6 +1692,10 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let idx = vm.pop().to_int() as u16;
             let tag = vm.pop().to_str();
             TOSTRING_SUBS.with(|t| t.borrow_mut().insert(tag, idx));
+        }
+        KT_ENUM_REG => {
+            let tag = vm.pop().to_str();
+            ENUM_CLASSES.with(|s| s.borrow_mut().insert(tag));
         }
         KT_EQUALS_REG => {
             // Stack: [tagStr, subNameIdx].
@@ -3358,9 +3427,22 @@ fn truthy(v: &Value) -> bool {
 /// lexicographically, everything else numerically. Used by `sortedBy` /
 /// `maxByOrNull` selector results.
 fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
+        // Every enum is `Comparable` by DECLARATION order, which is exactly what
+        // `ordinal` records — so `sorted()` on a `List<E>` restores the order the
+        // constants were written in, whatever their names sort like.
+        _ => match (enum_ordinal(a), enum_ordinal(b)) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            _ => value_cmp_scalar(a, b),
+        },
+    }
+}
+
+/// [`value_cmp`] for everything that is not an enum constant.
+fn value_cmp_scalar(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
         // `Char` is `Comparable<Char>` by code unit, so a `List<Char>` sorts and
         // reduces (`max`/`min`) like any other comparable element.
         _ if is_char(a) || is_char(b) => num_of(a).cmp(&num_of(b)),
@@ -4601,16 +4683,14 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         (Value::Str(s), "format") => format_string(s, args).map(Value::str),
         // Numeric parses. The `…OrNull` forms answer null where the plain ones
         // throw, which is the only difference between the pairs.
-        (Value::Str(s), "toInt" | "toLong") => s
-            .trim()
-            .parse::<i64>()
-            .map(Value::Int)
-            .map_err(|_| format!("java.lang.NumberFormatException: For input string: \"{s}\"")),
-        (Value::Str(s), "toIntOrNull" | "toLongOrNull") => Ok(s
-            .trim()
-            .parse::<i64>()
-            .map(Value::Int)
-            .unwrap_or(Value::Undef)),
+        // Both take an optional RADIX (`"ff".toInt(16)`). Dropping it would not
+        // fail loudly — it would answer the base-10 reading, or throw on a
+        // string that is perfectly valid in the base that was asked for.
+        (Value::Str(s), "toInt" | "toLong") => parse_radix(s, args)
+            .ok_or_else(|| format!("java.lang.NumberFormatException: For input string: \"{s}\"")),
+        (Value::Str(s), "toIntOrNull" | "toLongOrNull") => {
+            Ok(parse_radix(s, args).unwrap_or(Value::Undef))
+        }
         (Value::Str(s), "toDouble" | "toFloat") => s
             .trim()
             .parse::<f64>()
@@ -4762,6 +4842,17 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         (Value::Float(f), "toByte") => Ok(Value::Int(*f as i32 as i8 as i64)),
         (Value::Float(f), "toLong") => Ok(Value::Int(*f as i64)),
 
+        // `Int`/`Long`.toString(radix)` renders in the given base, sign first
+        // (`(-255).toString(16)` is `-ff`, not the two's-complement form).
+        (Value::Int(n), "toString") if !args.is_empty() => {
+            let radix = num_of(&args[0]) as u32;
+            if !(2..=36).contains(&radix) {
+                return Err(format!(
+                    "java.lang.IllegalArgumentException: radix {radix} was not in valid range 2..36"
+                ));
+            }
+            Ok(Value::str(to_radix(*n, radix)))
+        }
         // ── kotlin.Any — defined on every type ──
         (_, "toString") => Ok(Value::str(kotlin_string(recv))),
         // `hashCode()` needs the receiver's WIDTH, because `Int` and `Long` fold
@@ -5164,6 +5255,21 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // `first`/`second`.
         (HeapObj::Entry(k, _), "key") => Some(k.clone()),
         (HeapObj::Entry(_, v), "value") => Some(v.clone()),
+        // Every enum constant is `Comparable<E>` by `ordinal`. The member lives
+        // here rather than being lowered like the other enum members, because a
+        // compiler-generated body would have to exist per enum; the ordering is
+        // the same for all of them. The JVM answers the ordinal DIFFERENCE, not
+        // its sign — `Dir.NORTH.compareTo(Dir.WEST)` is `-3`.
+        (HeapObj::Instance { class, fields, .. }, "compareTo") if is_enum_class(class) => {
+            let mine = fields
+                .iter()
+                .find(|(n, _)| n == "ordinal")
+                .map(|(_, v)| num_of(v));
+            match (mine, args.first().and_then(enum_ordinal)) {
+                (Some(x), Some(y)) => Some(Value::Int(x - y)),
+                _ => None,
+            }
+        }
         // ── Instance property read (dynamic fallback when the compiler couldn't
         // statically resolve the receiver's class, e.g. `list[i].field`) ──
         (HeapObj::Instance { fields, .. }, _) => fields
@@ -5975,6 +6081,12 @@ fn display_obj(id: u32) -> String {
                         .collect::<Vec<_>>()
                         .join(", ");
                     format!("{class}({body})")
+                } else if is_enum_class(class) {
+                    // `Enum.toString()` is the constant's name.
+                    match fields.iter().find(|(n, _)| n == "name") {
+                        Some((_, v)) => kotlin_string(v),
+                        None => class.clone(),
+                    }
                 } else if type_is_throwable(class) {
                     // A user class extending a built-in throwable inherits
                     // `Throwable.toString()`, not `Object`'s identity form.

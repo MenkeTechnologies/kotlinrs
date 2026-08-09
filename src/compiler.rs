@@ -23,8 +23,8 @@ use crate::ast::*;
 use crate::host::{
     COLL_COPY, COLL_DEFAULT_CAP, COLL_HASH, COLL_SORTED, KT_ARRAY, KT_ARRAY_INIT, KT_ARRAY_NEW,
     KT_AS, KT_CHR_STRING, KT_CLASSOF, KT_CLOSURE_CALL, KT_COLL_HOF, KT_DBG_LINE, KT_DDIV,
-    KT_DISPLAY, KT_EQUALS_REG, KT_EXC_ABORT, KT_EXC_CUT, KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW,
-    KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND,
+    KT_DISPLAY, KT_ENUM_REG, KT_EQUALS_REG, KT_EXC_ABORT, KT_EXC_CUT, KT_EXC_DEPTH, KT_EXC_MATCH,
+    KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND,
     KT_FFI_CALL, KT_FFI_COMPILE, KT_GETFIELD, KT_HASH_REG, KT_IDIV, KT_IMOD, KT_INDEX_GET_VM,
     KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_JOIN, KT_LAZY_GET,
     KT_LAZY_NEW, KT_LIST, KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL,
@@ -268,6 +268,9 @@ struct ClassMeta {
     name: String,
     is_data: bool,
     is_object: bool,
+    /// `enum class` — its constants are singletons on its companion, it displays
+    /// as its `name` and it orders by `ordinal`.
+    is_enum: bool,
     is_interface: bool,
     /// `abstract class` / `sealed class` — has a constructor its subclasses call
     /// but cannot itself be instantiated.
@@ -357,6 +360,34 @@ impl ClassMeta {
     /// Whether this type can be written as a constructor call.
     fn instantiable(&self) -> bool {
         !self.is_object && !self.is_interface && !self.is_abstract
+    }
+}
+
+/// The class an unannotated body property's initializer produces, where the
+/// initializer names it syntactically: a constructor call for a declared class,
+/// or one of the collection builders. `None` when the initializer is anything
+/// else, which leaves the property's declared type alone.
+///
+/// This runs in the pre-pass that BUILDS the class table, so it cannot consult
+/// [`Compiler::infer`] — that needs the very table being built. Only the two
+/// forms whose class is visible in the syntax are answered; anything subtler
+/// keeps the `Unknown` it had.
+fn body_prop_class(p: &BodyProp, by_name: &HashMap<&str, &ClassDecl>) -> Option<String> {
+    // A `by lazy`/delegated property stores a cell or a delegate, not the value.
+    if p.lazy || p.delegate {
+        return None;
+    }
+    match &p.init {
+        Expr::Call { name, .. } if by_name.contains_key(name.as_str()) => Some(name.clone()),
+        Expr::Call { name, .. } => match name.as_str() {
+            "listOf" | "mutableListOf" | "arrayListOf" | "emptyList" => Some("List".to_string()),
+            "setOf" | "mutableSetOf" | "hashSetOf" | "linkedSetOf" | "sortedSetOf" | "emptySet" => {
+                Some("Set".to_string())
+            }
+            "mapOf" | "mutableMapOf" | "hashMapOf" | "emptyMap" => Some("Map".to_string()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -450,6 +481,17 @@ pub struct Compiler {
     /// The class whose method is currently being lowered (enables implicit
     /// `this` for member/method access). `None` at top level and in free funcs.
     cur_class: Option<String>,
+    /// The `object` whose property initializers are being lowered right now.
+    ///
+    /// [`Compiler::build_object`] evaluates every initializer into a local slot
+    /// and only publishes the singleton to its global once they are all done, so
+    /// while it runs the global still holds nothing. A later initializer naming
+    /// an earlier property through the QUALIFIED form — `val entries =
+    /// listOf(Dir.NORTH)` inside `Dir`'s own companion, which is legal Kotlin and
+    /// what the `enum` lowering emits — would therefore read an unset global and
+    /// fail at runtime. Recording the object being built lets that read resolve
+    /// to the slot instead, which is what the unqualified `NORTH` already does.
+    building_object: Option<String>,
     /// When true, emit a per-statement `Op::Extended(KT_DBG_LINE, 0)` marker
     /// (carrying the statement's source line) before each statement, so the
     /// `--dap` debugger can stop at breakpoints and step. Off for normal runs —
@@ -736,10 +778,25 @@ fn check_modifiers(
                     .map(|m| (*d, m))
             })
     };
+    // A supertype's DECLARED property (`val name: String` in an interface,
+    // `abstract val` in a class) is overridable too, and an implementor may
+    // satisfy it either with a stored `override val` or with a getter — which
+    // lowers to a zero-argument method. So a zero-argument `override` also
+    // counts as overriding a declared property of that name.
+    let inherited_prop = |name: &str, arity: usize| -> bool {
+        arity == 0
+            && mro[1..]
+                .iter()
+                .filter_map(|a| by_name.get(a.as_str()))
+                .any(|d| d.abstract_props.iter().any(|p| p.name == name))
+    };
     for m in &cd.methods {
         let found = inherited(&m.name, m.params.len());
         match (m.is_override, found) {
-            (true, None) if !ANY_MEMBERS.contains(&m.name.as_str()) => {
+            (true, None)
+                if !ANY_MEMBERS.contains(&m.name.as_str())
+                    && !inherited_prop(&m.name, m.params.len()) =>
+            {
                 return Err(format!(
                     "class {}: `{}` overrides nothing (line {})",
                     cd.name, m.name, m.line
@@ -878,8 +935,15 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
         let data_len = own_props.len();
         own_props.extend(cd.obj_props.iter().map(|p| PropMeta {
             name: p.name.clone(),
-            ty: p.ty,
-            class: p.class.clone(),
+            ty: match (p.ty, body_prop_class(p, &by_name)) {
+                // An unannotated body property holding a heap object types as
+                // one. Without this its type stays `Unknown`, and a comparison
+                // of two of them (`O.a == O.b`) would miss the object-equality
+                // path and compare the raw handles with the native op.
+                (Type::Unknown, Some(_)) => Type::Obj,
+                (t, _) => t,
+            },
+            class: p.class.clone().or_else(|| body_prop_class(p, &by_name)),
             mutable: p.mutable,
             lazy: p.lazy,
             // The delegate's class, taken from the initializer — `by Upper()`
@@ -921,6 +985,27 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
                 props.push(p.clone());
             }
         }
+        // A property this type only DECLARES (`val name: String` in an
+        // interface, `abstract val` in a class). It reserves the name so a
+        // receiver of this type resolves the read — and so an inherited default
+        // method's body can name it — while owning no field: the read lands on
+        // the storage the implementor's own `override val` contributed, which is
+        // already in the record above for a class that has one.
+        //
+        // Appended LAST, and never into `own_props`, so it cannot shift the
+        // field layout `KT_NEW`/`KT_EXTEND` build an instance in.
+        for p in &cd.abstract_props {
+            if !props.iter().any(|x| x.name == p.name) {
+                props.push(PropMeta {
+                    name: p.name.clone(),
+                    ty: p.ty,
+                    class: p.class.clone(),
+                    mutable: p.kind == PropKind::Var,
+                    lazy: false,
+                    delegate: None,
+                });
+            }
+        }
         // Kotlin's `data` members are derived from the primary constructor
         // alone. The flat field record keeps the inherited fields too (property
         // lookup needs them), so the *instance* records where this class's own
@@ -953,6 +1038,7 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
                 name: cd.name.clone(),
                 is_data: cd.is_data,
                 is_object: cd.is_object,
+                is_enum: cd.is_enum,
                 is_interface: cd.is_interface,
                 is_abstract: cd.is_abstract || cd.is_sealed,
                 props,
@@ -1094,6 +1180,7 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
         globals,
         method_index,
         cur_class: None,
+        building_object: None,
         debug,
         has_ffi,
         loops: Vec::new(),
@@ -1132,6 +1219,7 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
     }
     c.emit_tostring_registry();
     c.emit_equality_registry();
+    c.emit_enum_registry(program);
     for cd in &program.classes {
         if cd.is_object {
             c.build_object(cd)?;
@@ -1231,6 +1319,7 @@ impl Compiler {
         // Each initializer is evaluated in order and bound to a slot, so a later
         // one can name an earlier property (`val a = 1; val b = a + 1`). The
         // slots are read back below in field order.
+        let outer = self.building_object.replace(cd.name.clone());
         for p in &cd.obj_props {
             let t = self.compile_expr(&mut sc, &p.init)?;
             if p.lazy {
@@ -1240,6 +1329,7 @@ impl Compiler {
             let slot = sc.declare_obj(&p.name, ty, p.mutable, p.class.clone());
             self.b.emit(Op::SetSlot(slot), cd.line);
         }
+        self.building_object = outer;
         for p in &cd.obj_props {
             let slot = sc.slot(&p.name).expect("body property just declared");
             self.b.emit(Op::GetSlot(slot), cd.line);
@@ -1584,6 +1674,16 @@ impl Compiler {
             let sub = self.b.add_name(&method_sub_name(&owner, name));
             self.b.emit(Op::LoadInt(sub as i64), 0);
             self.b.emit(Op::Extended(op, 0), 0);
+        }
+    }
+
+    /// Publish every `enum` class tag, so the runtime can give its constants the
+    /// `toString` and the ordering an enum has (see [`KT_ENUM_REG`]).
+    fn emit_enum_registry(&mut self, program: &Program) {
+        for cd in program.classes.iter().filter(|c| c.is_enum) {
+            let t = self.b.add_constant(Value::str(cd.name.clone()));
+            self.b.emit(Op::LoadConst(t), cd.line);
+            self.b.emit(Op::Extended(KT_ENUM_REG, 0), cd.line);
         }
     }
 
@@ -2269,10 +2369,19 @@ impl Compiler {
         // Iterating a list OF lists keeps the inner element type, so a nested
         // `for` types its own variable too.
         let inner = self.infer_elem(sc, iter);
-        let vslot = sc.declare_elem(
+        // The element's CLASS where the iterable names it, so a property read on
+        // the loop variable resolves to its declared type.
+        let elem_cls = self.infer_elem_class(sc, iter);
+        let elem_ty = if elem_ty == Type::Unknown && elem_cls.is_some() {
+            Type::Obj
+        } else {
+            elem_ty
+        };
+        let vslot = sc.declare_full(
             var,
             elem_ty,
             false,
+            elem_cls,
             if elem_ty == Type::Unknown {
                 inner
             } else {
@@ -2401,11 +2510,9 @@ impl Compiler {
                 // Implicit `this`: a bare name that is a property of the class
                 // whose method we're lowering resolves to `this.name`.
                 if let Some(cls) = self.cur_class.clone() {
-                    if self
-                        .classes
-                        .get(&cls)
-                        .is_some_and(|m| m.prop(name).is_some())
-                    {
+                    if self.classes.get(&cls).is_some_and(|m| {
+                        m.prop(name).is_some() || m.methods.get(name).is_some_and(|s| s.arity == 0)
+                    }) {
                         return self.compile_member(
                             sc,
                             &Expr::Var("this".into()),
@@ -3011,6 +3118,20 @@ impl Compiler {
         if let Expr::Var(cls) = recv {
             if let Some(comp) = self.companion_of(cls) {
                 return self.compile_member(sc, &Expr::Var(comp), name, args, false, line);
+            }
+        }
+        // A property of the `object` whose initializers are being lowered right
+        // now, named through the qualified form. Its global is not published
+        // until every initializer has run (see [`Compiler::building_object`]),
+        // so the already-computed slot is the only place the value exists yet.
+        if args.is_empty() {
+            if let Expr::Var(obj) = recv {
+                if self.building_object.as_deref() == Some(obj.as_str()) {
+                    if let Some(slot) = sc.slot(name) {
+                        self.b.emit(Op::GetSlot(slot), line);
+                        return Ok(sc.ty(name));
+                    }
+                }
             }
         }
         // A companion constant on a primitive type (`Int.MAX_VALUE`,
@@ -4983,8 +5104,16 @@ impl Compiler {
                 Some((slot, sty)) => {
                     self.b.emit(Op::GetSlot(slot), 0);
                     let et = self.compile_expr(sc, e)?;
-                    let str_eq = sty.is_str() || et.is_str();
-                    self.b.emit(if str_eq { Op::StrEq } else { Op::NumEq }, 0);
+                    // A `when` arm is an `==` against the subject, so an object
+                    // subject takes the same object equality `==` does — the
+                    // native op would compare two heap HANDLES numerically and
+                    // pick whichever arm happened to sit at the lower one.
+                    if sty == Type::Obj || et == Type::Obj {
+                        self.b.emit(Op::CallBuiltin(KT_OBJEQ_VM, 2), 0);
+                    } else {
+                        let str_eq = sty.is_str() || et.is_str();
+                        self.b.emit(if str_eq { Op::StrEq } else { Op::NumEq }, 0);
+                    }
                 }
                 None => {
                     self.compile_expr(sc, e)?;
@@ -5443,6 +5572,75 @@ impl Compiler {
     /// lambda's return type and would need the lambda lowered first, and any
     /// receiver reached through a function return. Those keep `Unknown` and the
     /// conservative width.
+    /// The CLASS of what iterating `e` yields, where the expression names it.
+    ///
+    /// [`Compiler::infer_elem`] answers the coarse type, which is `Obj` for every
+    /// class alike; a `for` variable needs the class itself, or a property read
+    /// on it (`for (c in Color.values()) c.rgb`) has no declared type and its
+    /// arithmetic would not narrow — `rgb / 2` would divide as `Double`.
+    fn infer_elem_class(&self, sc: &Scope, e: &Expr) -> Option<String> {
+        match e {
+            // `E.values()` / `E.entries` yield `E`. Both are synthesized by the
+            // enum lowering onto the companion, so neither carries a declared
+            // element type of its own.
+            Expr::MethodCall { recv, name, .. } if name == "values" => match &**recv {
+                Expr::Var(cls) if self.classes.get(cls).is_some_and(|m| m.is_enum) => {
+                    Some(cls.clone())
+                }
+                _ => None,
+            },
+            Expr::Member { recv, name, .. } if name == "entries" => match &**recv {
+                Expr::Var(cls) if self.classes.get(cls).is_some_and(|m| m.is_enum) => {
+                    Some(cls.clone())
+                }
+                _ => None,
+            },
+            // A literal collection whose elements agree on a class.
+            Expr::Call { name, args, .. }
+                if matches!(
+                    name.as_str(),
+                    "listOf"
+                        | "setOf"
+                        | "mutableListOf"
+                        | "mutableSetOf"
+                        | "arrayOf"
+                        | "listOfNotNull"
+                        | "sequenceOf"
+                ) =>
+            {
+                let mut it = args.iter().map(|a| self.infer_class(sc, a));
+                let first = it.next().flatten()?;
+                it.all(|c| c.as_deref() == Some(first.as_str()))
+                    .then_some(first)
+            }
+            // The members that re-emit their receiver's own elements.
+            Expr::MethodCall { recv, name, .. }
+                if matches!(
+                    name.as_str(),
+                    "filter"
+                        | "filterNot"
+                        | "sorted"
+                        | "sortedDescending"
+                        | "sortedBy"
+                        | "sortedByDescending"
+                        | "sortedWith"
+                        | "reversed"
+                        | "take"
+                        | "takeLast"
+                        | "drop"
+                        | "dropLast"
+                        | "distinct"
+                        | "toList"
+                        | "toMutableList"
+                        | "toSet"
+                ) =>
+            {
+                self.infer_elem_class(sc, recv)
+            }
+            _ => None,
+        }
+    }
+
     fn infer_elem(&self, sc: &Scope, e: &Expr) -> Type {
         match e {
             Expr::Var(n) => sc.elem_of(n),
@@ -5602,7 +5800,15 @@ impl Compiler {
     fn declares_operator(&self, sc: &Scope, e: &Expr, name: &str) -> bool {
         self.infer_class(sc, e)
             .and_then(|c| self.classes.get(&c))
-            .is_some_and(|m| m.methods.contains_key(name))
+            .is_some_and(|m| {
+                m.methods.contains_key(name)
+                    // Every enum inherits `Comparable<E>.compareTo` from `Enum`,
+                    // ordering by `ordinal`. The member is real but has no
+                    // declaration to find here — it is implemented host-side for
+                    // every enum at once — so the convention is recognized by the
+                    // kind rather than by a method table entry.
+                    || (m.is_enum && name == "compareTo")
+            })
     }
 
     /// Emit the trailing iteration-order spec a `Set`/`Map` builder passes to
@@ -5672,6 +5878,14 @@ impl Compiler {
                 // An `object` singleton referenced by name.
                 if self.classes.get(n).is_some_and(|m| m.is_object) {
                     return Some(n.clone());
+                }
+                // A class name in receiver position IS its companion object, and
+                // `compile_member` rewrites the node that way. Inference has to
+                // agree, or `Owner.a == Owner.b` would infer `Unknown` on both
+                // sides and compile to the NATIVE equality — comparing two heap
+                // handles numerically instead of as objects.
+                if let Some(comp) = self.companion_of(n) {
+                    return Some(comp);
                 }
                 None
             }

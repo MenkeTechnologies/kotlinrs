@@ -53,6 +53,13 @@ pub struct Parser {
     /// `class C(g: G) : G by g { override fun … }`. Kotlin resolves the same
     /// ambiguity the same way: a trailing lambda is not allowed there.
     no_trailing_lambda: bool,
+    /// Classes synthesized while parsing another declaration, which
+    /// [`parse_program`] drains to the top level. An `enum` entry with a body
+    /// (`PLUS { override fun apply(…) = … }`) is an anonymous subclass of the
+    /// enum, and a subclass is a top-level `class` here; the entry is parsed
+    /// deep inside [`Parser::class_decl_mods`], which can only return one
+    /// declaration, so the extra ones queue here.
+    pending_classes: Vec<ClassDecl>,
 }
 
 /// Whether a postfix `(` may apply to this expression as an invocation.
@@ -105,6 +112,7 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
         fn_param_types: Vec::new(),
         type_params: Vec::new(),
         no_trailing_lambda: false,
+        pending_classes: Vec::new(),
     };
     let mut prog = Program::default();
     while !p.at(&Tok::Eof) {
@@ -138,6 +146,12 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
             Tok::Val | Tok::Var => prog.props.push(p.body_prop()?),
             Tok::Class | Tok::Data | Tok::Object => prog.classes.push(p.class_decl()?),
             Tok::Ident(w) if w == "interface" => prog.classes.push(p.class_decl()?),
+            // `enum class E { … }`. `enum` is a soft keyword, so it is matched
+            // positionally — only one directly followed by `class` starts a
+            // declaration, leaving a variable or function named `enum` alone.
+            Tok::Ident(w) if w == "enum" && matches!(p.peek_at(1), Tok::Class) => {
+                prog.classes.push(p.class_decl()?)
+            }
             // `package a.b` / `import a.b.*` — a dotted path, optionally ending
             // in `.*`. The package declaration is accepted and discarded (a
             // single-file program has no package-level name resolution here);
@@ -159,6 +173,10 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
             }
         }
     }
+    // The subclasses the `enum` entry lowering synthesized are ordinary
+    // top-level classes; they are appended before the companion hoist so that
+    // an entry-body subclass carrying its own companion is hoisted too.
+    prog.classes.append(&mut p.pending_classes);
     // Hoist each `companion object` to the top level. From here on it is an
     // ordinary singleton, and only the owner→companion NAME relation (which
     // `companion_name` reconstructs) is needed to resolve `Owner.member`.
@@ -170,6 +188,29 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
     prog.classes.extend(hoisted);
     expand_interface_delegation(&mut prog)?;
     Ok(prog)
+}
+
+/// One constant of an `enum class`, as written.
+struct EnumEntry {
+    name: String,
+    /// The arguments to the enum's primary constructor, `RED(0xFF0000)`.
+    args: Vec<Expr>,
+    /// `RED { override fun f() = … }` — the constant's own overrides, which
+    /// make it an anonymous subclass of the enum.
+    body: Option<Vec<FunDecl>>,
+    line: u32,
+}
+
+/// The synthetic subclass an `enum` constant with a body becomes. `$` cannot
+/// appear in a Kotlin identifier, so the name can never collide with a declared
+/// one.
+fn entry_class_name(cls: &str, entry: &str) -> String {
+    format!("{cls}${entry}")
+}
+
+/// A plain (uninterpolated) string literal expression.
+fn str_lit(s: &str) -> Expr {
+    Expr::Str(vec![StrExpr::Text(s.to_string())])
 }
 
 /// The synthetic field a `class C(b: B) : I by b` stores its delegate in.
@@ -611,6 +652,13 @@ impl Parser {
         } else {
             false
         };
+        // `enum class E(…) { A, B; … }`. A soft keyword, matched positionally so
+        // only an `enum` directly in front of `class` is one.
+        let is_enum = matches!(self.peek(), Tok::Ident(w) if w == "enum")
+            && matches!(self.peek_at(1), Tok::Class);
+        if is_enum {
+            self.bump();
+        }
         let is_interface = matches!(self.peek(), Tok::Ident(w) if w == "interface");
         let is_object = if is_interface {
             self.bump();
@@ -648,6 +696,11 @@ impl Parser {
         if has_primary {
             self.bump();
             while !self.at(&Tok::RParen) {
+                // A constructor property carries modifiers like any other:
+                // `class Base(override val name: String)` is how a class
+                // satisfies an interface's declared property with storage, and
+                // `private val` is just as legal.
+                self.modifiers();
                 let kind = match self.peek() {
                     Tok::Val => {
                         self.bump();
@@ -682,6 +735,30 @@ impl Parser {
                 }
             }
             self.eat(&Tok::RParen)?;
+        }
+        // Every enum constant carries the two properties `Enum` declares —
+        // `name` and `ordinal`. They are appended to the primary constructor so
+        // the ordinary class lowering stores them like any other `val`, and the
+        // entry lowering below is what supplies their arguments; the constants
+        // are the only construction sites, so a user never sees the extra
+        // parameters. Appending (rather than prepending) keeps the DECLARED
+        // parameters at the positions an entry's argument list writes them.
+        let has_primary = has_primary || is_enum;
+        if is_enum {
+            for (pname, ty) in [("name", Type::String), ("ordinal", Type::Int)] {
+                if params.iter().any(|p| p.name == pname) {
+                    return Err(format!(
+                        "enum class {name}: `{pname}` is already declared by Enum"
+                    ));
+                }
+                params.push(CtorProp {
+                    name: pname.to_string(),
+                    ty,
+                    class: None,
+                    kind: PropKind::Val,
+                    default: None,
+                });
+            }
         }
         if is_data && params.iter().all(|p| p.kind == PropKind::None) {
             return Err(format!(
@@ -745,8 +822,17 @@ impl Parser {
         let mut companion = None;
         let mut inits: Vec<InitBlock> = Vec::new();
         let mut secondaries: Vec<SecondaryCtor> = Vec::new();
+        let mut abstract_props: Vec<CtorProp> = Vec::new();
+        let mut entries: Vec<EnumEntry> = Vec::new();
         if self.at(&Tok::LBrace) {
             self.bump();
+            // An enum body opens with its constants, comma-separated, and the
+            // members (if any) follow a `;`. The constants come first in the
+            // grammar, so they are consumed before the member loop rather than
+            // being distinguished from a member by lookahead.
+            if is_enum {
+                entries = self.enum_entries()?;
+            }
             while !self.at(&Tok::RBrace) && !self.at(&Tok::Eof) {
                 if self.at(&Tok::Semi) {
                     self.bump();
@@ -808,6 +894,23 @@ impl Parser {
                     // class as well as an `object`. An `interface` has no
                     // storage to put one in, so it is rejected there.
                     Tok::Val | Tok::Var => {
+                        // `val x: T get() = …` is a computed property: a
+                        // zero-argument method wearing property syntax, which is
+                        // what it lowers to. An interface may carry one too —
+                        // it has a body, so it needs no storage.
+                        if let Some(f) = self.accessor_prop(mods)? {
+                            methods.push(f);
+                            continue;
+                        }
+                        // `val x: T` with nothing after it declares the property
+                        // WITHOUT storage — the only form an `interface` can
+                        // carry, and what `abstract val` means in a class. A
+                        // form that does need storage still has none to go in
+                        // inside an interface, so that stays an error.
+                        if let Some(p) = self.abstract_prop()? {
+                            abstract_props.push(p);
+                            continue;
+                        }
                         if is_interface {
                             return Err(format!(
                                 "interface {name}: a property with an initializer needs storage; \
@@ -827,6 +930,22 @@ impl Parser {
             self.eat(&Tok::RBrace)?;
         }
 
+        // An enum with an abstract member is itself abstract (and Kotlin then
+        // requires every constant to carry a body, which the missing
+        // constructor reports); an enum any of whose constants carries a body is
+        // extended by that constant's synthetic subclass, so it must be open.
+        let is_abstract = mods.abstract_ || (is_enum && methods.iter().any(|m| m.is_abstract));
+        let is_open = mods.open || (is_enum && entries.iter().any(|e| e.body.is_some()));
+        if is_enum {
+            // The constants, `values()`, `valueOf` and `entries` all live on the
+            // enum's companion, which is how `E.RED` already resolves — an enum
+            // may also declare a companion of its own, so they are MERGED into
+            // it rather than replacing it.
+            companion = Some(Box::new(
+                self.lower_enum_entries(&name, entries, &params, companion, line)?,
+            ));
+        }
+
         Ok(ClassDecl {
             name,
             params,
@@ -835,8 +954,8 @@ impl Parser {
             is_data,
             is_object,
             is_interface,
-            is_abstract: mods.abstract_,
-            is_open: mods.open,
+            is_abstract,
+            is_open,
             is_sealed: mods.sealed,
             parents,
             super_args,
@@ -845,8 +964,311 @@ impl Parser {
             has_primary,
             inits,
             secondaries,
+            abstract_props,
+            is_enum,
             line,
         })
+    }
+
+    /// The constant list at the head of an `enum class` body:
+    /// `RED, GREEN(2), BLUE { override fun f() = … }` with an optional trailing
+    /// `,` and a `;` before the members.
+    ///
+    /// The list may be empty (`enum class E { ; fun f() = 1 }`, and the
+    /// degenerate `enum class E {}`), so a body that opens on `;` or `}` is not
+    /// an error.
+    fn enum_entries(&mut self) -> Result<Vec<EnumEntry>, String> {
+        let mut entries = Vec::new();
+        while matches!(self.peek(), Tok::Ident(_)) {
+            let line = self.line();
+            let name = self.ident()?;
+            let mut args = Vec::new();
+            if self.at(&Tok::LParen) {
+                self.bump();
+                while !self.at(&Tok::RParen) {
+                    args.push(self.expr()?);
+                    if self.at(&Tok::Comma) {
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+                self.eat(&Tok::RParen)?;
+            }
+            // `RED { … }` — the constant's own body, an anonymous subclass of
+            // the enum. Only its methods are taken: Kotlin allows a property
+            // there too, but one would need storage on the subclass, and
+            // rejecting is better than dropping it silently.
+            let body = if self.at(&Tok::LBrace) {
+                self.bump();
+                let mut ms = Vec::new();
+                while !self.at(&Tok::RBrace) && !self.at(&Tok::Eof) {
+                    if self.at(&Tok::Semi) {
+                        self.bump();
+                        continue;
+                    }
+                    let mods = self.modifiers();
+                    if !self.at(&Tok::Fun) {
+                        return Err(format!(
+                            "enum constant {name}: only a `fun` may be overridden in a \
+                             constant's body (line {})",
+                            self.line()
+                        ));
+                    }
+                    ms.push(self.fun_decl_mods(mods)?);
+                }
+                self.eat(&Tok::RBrace)?;
+                Some(ms)
+            } else {
+                None
+            };
+            entries.push(EnumEntry {
+                name,
+                args,
+                body,
+                line,
+            });
+            if self.at(&Tok::Comma) {
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        if self.at(&Tok::Semi) {
+            self.bump();
+        }
+        Ok(entries)
+    }
+
+    /// Lower an `enum class`'s constants onto its companion object.
+    ///
+    /// Each constant becomes a `val` on the companion holding one instance, so
+    /// `E.RED` resolves through the companion rewrite every `Owner.member`
+    /// already uses, and the constant is a SINGLETON — evaluated once when the
+    /// companion initializes, which is what makes `E.RED === E.RED` and the
+    /// `when (c) { E.RED -> … }` comparison come out right.
+    ///
+    /// Alongside them go the three members `Enum`'s companion contributes:
+    /// `values()` (a fresh array per call, as on the JVM), `entries` (the
+    /// standing list), and `valueOf` (which throws `IllegalArgumentException`
+    /// for an unknown name, with the JVM's exact message).
+    fn lower_enum_entries(
+        &mut self,
+        cls: &str,
+        entries: Vec<EnumEntry>,
+        params: &[CtorProp],
+        companion: Option<Box<ClassDecl>>,
+        line: u32,
+    ) -> Result<ClassDecl, String> {
+        // Everything the constants supply beyond their written arguments: the
+        // declared parameters minus the two `Enum` ones this lowering appended.
+        let declared = params.len().saturating_sub(2);
+        let mut comp = match companion {
+            Some(c) => *c,
+            None => ClassDecl {
+                name: companion_name(cls),
+                params: Vec::new(),
+                obj_props: Vec::new(),
+                methods: Vec::new(),
+                is_data: false,
+                is_object: true,
+                is_interface: false,
+                is_abstract: false,
+                is_open: false,
+                is_sealed: false,
+                parents: Vec::new(),
+                super_args: Vec::new(),
+                delegates: Vec::new(),
+                companion: None,
+                has_primary: false,
+                inits: Vec::new(),
+                secondaries: Vec::new(),
+                abstract_props: Vec::new(),
+                is_enum: false,
+                line,
+            },
+        };
+
+        // The constants are prepended so they initialize before anything the
+        // user's own companion declares — a companion property may read `E.RED`,
+        // but a constant can never read a user property.
+        let mut props = Vec::with_capacity(entries.len() + 1);
+        for (ordinal, e) in entries.iter().enumerate() {
+            if e.args.len() != declared {
+                return Err(format!(
+                    "enum constant {cls}.{} takes {} argument(s), but {} were given (line {})",
+                    e.name,
+                    declared,
+                    e.args.len(),
+                    e.line
+                ));
+            }
+            // `E(<written args>, "NAME", ordinal)` — or, for a constant with a
+            // body, `E$NAME()`, whose synthetic subclass forwards the same
+            // arguments to `E`'s constructor.
+            let mut args = e.args.clone();
+            args.push(str_lit(&e.name));
+            args.push(Expr::Int(ordinal as i64));
+            let init = match &e.body {
+                None => Expr::Call {
+                    name: cls.to_string(),
+                    args,
+                    line: e.line,
+                },
+                Some(methods) => {
+                    let sub = entry_class_name(cls, &e.name);
+                    self.pending_classes.push(ClassDecl {
+                        name: sub.clone(),
+                        params: Vec::new(),
+                        obj_props: Vec::new(),
+                        methods: methods.clone(),
+                        is_data: false,
+                        is_object: false,
+                        is_interface: false,
+                        is_abstract: false,
+                        is_open: false,
+                        is_sealed: false,
+                        parents: vec![cls.to_string()],
+                        super_args: args,
+                        delegates: Vec::new(),
+                        companion: None,
+                        has_primary: false,
+                        inits: Vec::new(),
+                        secondaries: Vec::new(),
+                        abstract_props: Vec::new(),
+                        // The subclass IS the constant, so it displays and
+                        // orders as one.
+                        is_enum: true,
+                        line: e.line,
+                    });
+                    Expr::Call {
+                        name: sub,
+                        args: Vec::new(),
+                        line: e.line,
+                    }
+                }
+            };
+            props.push(BodyProp {
+                name: e.name.clone(),
+                ty: Type::Obj,
+                class: Some(cls.to_string()),
+                init,
+                mutable: false,
+                lazy: false,
+                delegate: false,
+            });
+        }
+
+        // `E.RED`, referenced the way user code does, so the constants are read
+        // back through the same companion rewrite rather than a second path.
+        let refs: Vec<Expr> = entries
+            .iter()
+            .map(|e| Expr::Member {
+                recv: Box::new(Expr::Var(cls.to_string())),
+                name: e.name.clone(),
+                safe: false,
+                line,
+            })
+            .collect();
+
+        props.push(BodyProp {
+            name: "entries".to_string(),
+            ty: Type::Obj,
+            class: None,
+            init: Expr::Call {
+                name: "listOf".to_string(),
+                args: refs.clone(),
+                line,
+            },
+            mutable: false,
+            lazy: false,
+            delegate: false,
+        });
+        props.append(&mut comp.obj_props);
+        comp.obj_props = props;
+
+        // `fun values() = arrayOf(E.RED, …)` — an ARRAY, and a fresh one per
+        // call, which is what the JVM's generated `values()` returns.
+        comp.methods.push(FunDecl {
+            name: "values".to_string(),
+            recv: None,
+            params: Vec::new(),
+            ret: Type::Obj,
+            ret_class: None,
+            body: vec![Stmt::new(
+                line,
+                StmtKind::Return(Some(Expr::Call {
+                    name: "arrayOf".to_string(),
+                    args: refs,
+                    line,
+                })),
+            )],
+            line,
+            is_abstract: false,
+            is_open: false,
+            is_override: false,
+        });
+
+        // `fun valueOf(value: String) = when (value) { "RED" -> E.RED; …
+        //   else -> throw IllegalArgumentException("No enum constant E.$value") }`
+        let subject = "value";
+        let mut arms: Vec<WhenArm> = entries
+            .iter()
+            .map(|e| WhenArm {
+                guard: WhenGuard::Conds(vec![WhenCond::Expr(str_lit(&e.name))]),
+                body: vec![Stmt::new(
+                    line,
+                    StmtKind::Expr(Expr::Member {
+                        recv: Box::new(Expr::Var(cls.to_string())),
+                        name: e.name.clone(),
+                        safe: false,
+                        line,
+                    }),
+                )],
+            })
+            .collect();
+        arms.push(WhenArm {
+            guard: WhenGuard::Else,
+            body: vec![Stmt::new(
+                line,
+                StmtKind::Expr(Expr::Throw(Box::new(Expr::Call {
+                    name: "IllegalArgumentException".to_string(),
+                    args: vec![Expr::Str(vec![
+                        StrExpr::Text(format!("No enum constant {cls}.")),
+                        StrExpr::Expr(Box::new(Expr::Var(subject.to_string()))),
+                    ])],
+                    line,
+                }))),
+            )],
+        });
+        comp.methods.push(FunDecl {
+            name: "valueOf".to_string(),
+            recv: None,
+            params: vec![Param {
+                name: subject.to_string(),
+                ty: Type::String,
+                class: None,
+                default: None,
+                vararg: None,
+            }],
+            ret: Type::Obj,
+            ret_class: Some(cls.to_string()),
+            body: vec![Stmt::new(
+                line,
+                StmtKind::Return(Some(Expr::When(WhenExpr {
+                    subject: Some(Box::new(Expr::Var(subject.to_string()))),
+                    binding: None,
+                    arms,
+                    line,
+                }))),
+            )],
+            line,
+            is_abstract: false,
+            is_open: false,
+            is_override: false,
+        });
+
+        Ok(comp)
     }
 
     /// A secondary constructor: `constructor(p: T) : this(a) { … }`.
@@ -928,6 +1350,118 @@ impl Parser {
     /// the delegated form `val z: Int by lazy { … }`. Used for a class body, an
     /// `object` body, and the top level alike — the three differ in WHERE the
     /// initializer runs, not in how it is written.
+    /// `val x: T get() = expr` / `val x: T get() { … }` — a property with a
+    /// custom getter and no backing field.
+    ///
+    /// Kotlin computes such a property on every read, so it is a zero-argument
+    /// METHOD wearing property syntax, and that is what it lowers to. Reads
+    /// already reach it: `compile_member` resolves a method of the name before a
+    /// stored property, so `x.label` runs the getter — and a class implementing
+    /// an interface's declared property this way dispatches virtually like any
+    /// other override.
+    ///
+    /// Answers `None` (position untouched) for every other property form.
+    fn accessor_prop(&mut self, mods: Mods) -> Result<Option<FunDecl>, String> {
+        let start = self.pos;
+        let line = self.line();
+        self.bump(); // `val` / `var`
+        let parsed = (|| -> Result<Option<(String, Type, Option<String>)>, String> {
+            let name = self.ident()?;
+            if !self.at(&Tok::Colon) {
+                return Ok(None);
+            }
+            self.bump();
+            let (ty, class) = self.type_ref()?;
+            Ok(Some((name, ty, class)))
+        })();
+        let is_get = matches!(self.peek(), Tok::Ident(w) if w == "get")
+            && matches!(self.peek_at(1), Tok::LParen);
+        let Ok(Some((name, ty, class))) = parsed else {
+            self.pos = start;
+            return Ok(None);
+        };
+        if !is_get {
+            self.pos = start;
+            return Ok(None);
+        }
+        self.bump(); // `get`
+        self.eat(&Tok::LParen)?;
+        self.eat(&Tok::RParen)?;
+        let body = if self.at(&Tok::Assign) {
+            self.bump();
+            let e = self.expr()?;
+            vec![Stmt::new(line, StmtKind::Return(Some(e)))]
+        } else {
+            self.block()?
+        };
+        // A `set(value) { … }` would need a settable non-field property, which
+        // has no lowering here; rejecting is better than silently dropping the
+        // writes.
+        if matches!(self.peek(), Tok::Ident(w) if w == "set") {
+            return Err(format!(
+                "property {name}: a custom `set` accessor is not supported (line {})",
+                self.line()
+            ));
+        }
+        Ok(Some(FunDecl {
+            name,
+            recv: None,
+            params: Vec::new(),
+            ret: ty,
+            ret_class: class,
+            body,
+            line,
+            is_abstract: false,
+            is_open: mods.open,
+            is_override: mods.override_,
+        }))
+    }
+
+    /// `val x: T` / `var x: T` with no initializer, no delegate and no accessor
+    /// — a property DECLARATION with no storage. Answers `None` (leaving the
+    /// position untouched) for every other property form, so the caller can fall
+    /// through to [`Parser::body_prop`].
+    ///
+    /// The shape can only be recognized by what FOLLOWS the type, and a type is
+    /// an arbitrary number of tokens, so the type is parsed and the position
+    /// rewound when it turns out not to be one of these.
+    fn abstract_prop(&mut self) -> Result<Option<CtorProp>, String> {
+        let start = self.pos;
+        let kind = match self.bump() {
+            Tok::Var => PropKind::Var,
+            _ => PropKind::Val,
+        };
+        // An untyped declaration cannot be abstract: with no initializer there
+        // would be nothing to take the type from.
+        let parsed = (|| -> Result<Option<(String, Type, Option<String>)>, String> {
+            let name = self.ident()?;
+            if !self.at(&Tok::Colon) {
+                return Ok(None);
+            }
+            self.bump();
+            let (ty, class) = self.type_ref()?;
+            Ok(Some((name, ty, class)))
+        })();
+        // `=` (an initializer), `by` (a delegate) and `get`/`set` (an accessor)
+        // each make the property something other than a bare declaration.
+        let bare = matches!(parsed, Ok(Some(_)))
+            && !self.at(&Tok::Assign)
+            && !matches!(self.peek(), Tok::Ident(w) if w == "by" || w == "get" || w == "set");
+        match parsed {
+            Ok(Some((name, ty, class))) if bare => Ok(Some(CtorProp {
+                name,
+                ty,
+                class,
+                kind,
+                default: None,
+            })),
+            _ => {
+                self.pos = start;
+                Ok(None)
+            }
+        }
+    }
+
     fn body_prop(&mut self) -> Result<BodyProp, String> {
         let mutable = matches!(self.bump(), Tok::Var);
         let name = self.ident()?;
@@ -2495,6 +3029,9 @@ impl Parser {
                         pos: 0,
                         fn_param_types: Vec::new(),
                         no_trailing_lambda: false,
+                        // A string template holds an expression, which can
+                        // never declare a class.
+                        pending_classes: Vec::new(),
                     };
                     let e = sub.expr()?;
                     out.push(StrExpr::Expr(Box::new(e)));

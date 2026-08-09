@@ -232,6 +232,21 @@ pub struct ClassDecl {
     pub inits: Vec<InitBlock>,
     /// `constructor(…) : this(…) { … }` declarations in source order.
     pub secondaries: Vec<SecondaryCtor>,
+    /// Properties DECLARED without storage: `val name: String` in an
+    /// `interface`, and `abstract val name: String` in a class.
+    ///
+    /// They reserve the name and type so a receiver of the declaring type
+    /// resolves `x.name` (and so an inherited default method's body can read
+    /// it), but contribute no field — the implementor's own `override val`
+    /// does, and that is the field the read lands on at run time.
+    pub abstract_props: Vec<CtorProp>,
+    /// `enum class E { A, B }` — the declaration is desugared by the parser into
+    /// an ordinary class plus a companion object holding one singleton per
+    /// entry (see `crate::parser`'s enum lowering), so by the time the compiler
+    /// sees it only the *observable* differences from a plain class remain, and
+    /// this flag carries them: `toString()` is the entry's `name` rather than
+    /// `Class@hash`, and `compareTo`/`<` order by `ordinal`.
+    pub is_enum: bool,
     pub line: u32,
 }
 

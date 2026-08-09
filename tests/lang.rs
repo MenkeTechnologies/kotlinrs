@@ -2890,3 +2890,192 @@ fn grouping_by_counts_per_key_in_first_encounter_order() {
         "{}\n"
     );
 }
+
+#[test]
+fn enum_valueof_rejects_an_unknown_name_the_way_the_jvm_does() {
+    // The frozen corpus can only hold programs that EXIT ZERO, so the fault
+    // path lives here. Both the exception type and the message are the JVM's —
+    // `kotlinc` prints exactly `No enum constant Dir.UP`.
+    let src = r#"
+enum class Dir { NORTH, SOUTH }
+fun main() {
+    try { Dir.valueOf("UP") } catch (e: IllegalArgumentException) { println(e.message) }
+}"#;
+    assert_eq!(stdout(src), "No enum constant Dir.UP\n");
+
+    let out = eval("enum class E { X }\nfun main() { println(E.valueOf(\"Q\")) }");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("IllegalArgumentException") && err.contains("No enum constant E.Q"),
+        "stderr was: {err}"
+    );
+}
+
+#[test]
+fn enum_constant_argument_list_must_match_the_primary_constructor() {
+    // A constant is the only place an enum's constructor is called, so a
+    // missing argument has to be caught rather than becoming a missing field.
+    // `kotlinc` rejects it too: "no value passed for parameter 'a'".
+    let out = eval("enum class E(val a: Int) { X }\nfun main() { println(E.X) }");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("takes 1 argument"), "stderr was: {err}");
+}
+
+#[test]
+fn enum_cannot_redeclare_the_two_properties_enum_itself_declares() {
+    // `name`/`ordinal` are appended to the primary constructor by the enum
+    // lowering, so a declared one would silently occupy the same slot.
+    // `kotlinc` rejects it as "hides member of supertype 'Enum'".
+    for src in [
+        "enum class E(val name: String) { X(\"a\") }\nfun main() { println(E.X) }",
+        "enum class E(val ordinal: Int) { X(1) }\nfun main() { println(E.X) }",
+    ] {
+        let out = eval(src);
+        assert!(!out.status.success(), "expected rejection for {src:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("already declared by Enum"),
+            "stderr was: {err}"
+        );
+    }
+}
+
+#[test]
+fn an_interface_property_may_be_declared_but_never_initialized() {
+    // A DECLARATION is storage-free and legal; an initializer needs a field an
+    // interface has none of, which `kotlinc` rejects as "property initializers
+    // in interfaces are prohibited".
+    let src = r#"
+interface I { val tag: String }
+class C(override val tag: String) : I
+fun main() {
+    val i: I = C("hi")
+    println(i.tag)
+}"#;
+    assert_eq!(stdout(src), "hi\n");
+
+    let out = eval("interface I { val x: Int = 5 }\nfun main() { println(1) }");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("interfaces have none"), "stderr was: {err}");
+}
+
+#[test]
+fn a_plain_class_compares_by_identity_and_a_data_class_by_value() {
+    // Kotlin's `==` is `Any.equals` unless the class overrides it or is a
+    // `data class`, so `K(1) == K(1)` is FALSE. The same question is asked
+    // wherever value equality is consulted, not only at `==`.
+    let src = r#"
+class K(val v: Int)
+fun main() {
+    val a = K(1)
+    println(a == K(1))
+    println(a == a)
+    println(listOf(K(1)).contains(K(1)))
+    println(listOf(a).contains(a))
+}"#;
+    assert_eq!(stdout(src), "false\ntrue\nfalse\ntrue\n");
+
+    // A `when` arm is an `==` against the subject. Comparing heap HANDLES with
+    // the native op instead would let the first arm win whatever the subject is.
+    let when_src = r#"
+data class P(val x: Int)
+fun main() {
+    val p = P(2)
+    println(when (p) { P(1) -> "one"; P(2) -> "two"; else -> "other" })
+}"#;
+    assert_eq!(stdout(when_src), "two\n");
+}
+
+#[test]
+fn a_declared_equals_decides_its_own_equality() {
+    // The override ignores `tag`, so two instances differing only there are
+    // equal — which neither identity nor a structural compare over every field
+    // would answer. Every equality-based member has to reach the declared body,
+    // not just `==`: a `contains` that fell back to comparing all the fields
+    // would answer `false` for the third line, and a `Set` that hashed by
+    // identity would keep both elements on the fourth.
+    let src = r#"
+class P(val v: Int, val tag: Int) {
+    override fun equals(other: Any?): Boolean = other is P && other.v == v
+    override fun hashCode(): Int = v
+}
+fun main() {
+    println(P(1, 9) == P(1, 8))
+    println(P(1, 9) == P(2, 9))
+    println(listOf(P(1, 9)).contains(P(1, 0)))
+    println(setOf(P(1, 9), P(1, 0)).size)
+}"#;
+    assert_eq!(stdout(src), "true\nfalse\ntrue\n1\n");
+}
+
+#[test]
+fn an_object_property_reads_through_its_owner_while_the_object_initializes() {
+    // An object publishes its singleton only once every initializer has run, so
+    // a later initializer naming an earlier property through the QUALIFIED form
+    // has to resolve to the value already computed rather than to the global
+    // that is still unset. The enum lowering emits exactly this shape.
+    let src = r#"
+class K(val v: Int)
+object O {
+    val A = K(1)
+    val B = K(2)
+    val all = listOf(O.A, O.B)
+    val total = O.A.v + O.B.v
+}
+fun main() {
+    println(O.all.size)
+    println(O.total)
+}"#;
+    assert_eq!(stdout(src), "2\n3\n");
+}
+
+#[test]
+fn a_bare_property_read_inside_a_method_keeps_its_declared_type() {
+    // The bare name resolves through an implicit `this`, and INFERENCE has to
+    // agree or the operands are untyped: `rgb / 2` would divide as `Double` and
+    // print `127.5`.
+    let src = r#"
+class Plain(val rgb: Int) { fun half(): Int = rgb / 2 }
+fun main() { println(Plain(255).half()) }"#;
+    assert_eq!(stdout(src), "127\n");
+
+    // Same failure in the other direction: a `String`-returning `super<T>.m()`
+    // that infers as untyped makes the enclosing `+` arithmetic, and the
+    // concatenation is then narrowed to 32 bits.
+    let super_src = r#"
+interface L { fun pick(): String = "L" }
+interface R { fun pick(): String = "R" }
+class B(val k: Int) : L, R {
+    override fun pick(): String = super<L>.pick() + super<R>.pick() + k
+}
+fun main() { println(B(5).pick()) }"#;
+    assert_eq!(stdout(super_src), "LR5\n");
+}
+
+#[test]
+fn a_computed_property_runs_its_getter_on_every_read() {
+    // `val x get() = …` has no backing field, so it must not be folded into a
+    // value stored once at construction.
+    let src = r#"
+class Counter {
+    var n = 0
+    val next: Int get() { n += 1; return n }
+}
+fun main() {
+    val c = Counter()
+    println(c.next)
+    println(c.next)
+    println(c.n)
+}"#;
+    assert_eq!(stdout(src), "1\n2\n2\n");
+
+    // A settable computed property has no lowering here, and dropping the
+    // writes silently would be worse than refusing the program.
+    let out = eval("class C { var x: Int get() = 1\nset(v) {} }\nfun main() { println(1) }");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("`set` accessor"), "stderr was: {err}");
+}

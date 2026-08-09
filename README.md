@@ -181,6 +181,28 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   A **`companion object`** (one per class, named or not) is hoisted to a
   singleton reached through the class name — `C.K`, `C.of(…)` — and, from inside
   the class, with no qualifier at all.
+  A property may be **computed** instead of stored — `val label: String get() =
+  "$name($code)"`, with an `= expr` or a block getter. It has no backing field,
+  so it runs on every read, and it dispatches virtually like any other member,
+  which is what lets an implementor satisfy a declared property that way.
+  A property may also be **declared without storage**: `val name: String` in an
+  `interface`, or `abstract val` in a class. The declaration reserves the name
+  and type — so a receiver of that type reads it, and an inherited default
+  method's body may name it — while the implementor supplies the storage, with
+  either `override val name: String` in its constructor or a getter.
+- **`enum class`** — `enum class Color(val rgb: Int) { RED(0xFF0000), GREEN(…);
+  fun hex() = … }`. Constants are singletons carrying `name` and `ordinal`, with
+  `Color.values()` (a fresh array per call, as on the JVM), `Color.entries`, and
+  `Color.valueOf(s)` — which throws `IllegalArgumentException("No enum constant
+  Color.X")` for an unknown name, with the JVM's exact message. An enum's
+  `toString()` is its constant's name, its equality is identity (so a `when (c)`
+  arm and a `Set`/`Map` behave), and it is `Comparable` by *declaration* order,
+  so `sorted()` restores the order the constants were written in and
+  `compareTo` answers the ordinal difference the JVM's does. A constant may
+  carry its own **body** (`PLUS("+") { override fun apply(a, b) = a + b }`),
+  which makes it an anonymous subclass — the shape that lets the enum declare an
+  `abstract fun` each constant implements. An enum may implement an interface
+  and declare a `companion object` of its own.
 - **Inheritance** — `open class`/`abstract class`/`sealed class`/`interface`,
   the `: Super(args), Iface1, Iface2` supertype list, `override`, `abstract`
   members with no body, interface members *with* a default body, and
@@ -801,6 +823,33 @@ capacity sized from the element count or the default 16, the
 reproduces the resize history — and validated against the reference toolchain
 across every size from 1 to 24 for both `Int` and `String` keys. `groupingBy
 { }.eachCount()` landed alongside, lazy as Kotlin's `Grouping` is.
+
+Also landed, with frozen corpus records captured from the reference toolchain:
+**`enum class`** — constants with constructor arguments and members, per-constant
+bodies over an `abstract fun`, `values`/`entries`/`valueOf`, the `name`
+`toString`, and the `ordinal` ordering, so `sorted()` restores declaration order
+and `compareTo` answers the ordinal DIFFERENCE the JVM's does. Constants are
+singletons on the enum's companion, which is what makes their identity equality
+fall out of the rule above rather than needing one of its own. Alongside them:
+**properties declared without storage** in an `interface` or as `abstract val`,
+satisfied by an `override val` constructor property or by a getter; and
+**computed properties** (`val x: Int get() = …`), which have no backing field,
+run per read, and dispatch virtually — which is how an interface's default
+method reads a property each implementor computes.
+
+Three more silent bugs surfaced with them. A **`when` subject that is an object**
+compared heap HANDLES with the native op, so the first arm won whatever the
+subject was — a `data class` subject included; the arm is an `==` against the
+subject and now goes through the same object equality. `Owner.a == Owner.b`
+**inferred neither side as an object** and took that same native path, as did a
+comparison of two unannotated `object` properties holding instances. And an
+**`object` property named through its owner while the object initialized**
+(`val all = listOf(O.A, O.B)`, the shape the enum lowering emits) read the global
+the singleton is not published to until every initializer has run.
+
+`toString(radix)` and `toInt(radix)` were **dropping the radix argument** —
+answering the base-10 reading, or throwing on a string valid in the base asked
+for.
 
 Next: `sequence { … }`/`yield`, real generic typing,
 `Delegates.observable`/`vetoable`, and a growing standard-library surface —
