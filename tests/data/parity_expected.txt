@@ -367,3 +367,60 @@ class Acc(val base: Int) {\n    var n = 0\n    val doubled = base * 2\n    compa
 open class Base(val id: Int) { val tag = "b" + id }\nclass Derived(id: Int) : Base(id) { val extra = id * 2 }\nfun main() {\n    val d = Derived(3)\n    println(d.tag)\n    println(d.extra)\n    println(d.id)\n}	b3\n6\n3\n
 fun main() {\n    println(listOf(1, 2, 3).map { it.toString() }.joinToString("|"))\n    var seen = 0\n    listOf(1, 2, 3).filter { seen++; it > 1 }.forEach { println(it) }\n    println(seen)\n}	1|2|3\n2\n3\n3\n
 fun Int.clampTo(hi: Int = 5): Int = if (this > hi) hi else this\nfun main() {\n    println(7.clampTo())\n    println(7.clampTo(10))\n    println(listOf(1, 9).map { it.clampTo() })\n}	5\n7\n[1, 5]\n
+class P(val x: Int, val y: Int) {\n    val sum: Int = x + y\n    init { println("i1 " + sum) }\n    val label: String = "p" + x\n    init { println("i2 " + label) }\n    constructor(x: Int) : this(x, 0) { println("c1 " + x) }\n    constructor() : this(9) { println("c0") }\n}\nfun main() {\n    P(1, 2)\n}	i1 3\ni2 p1\n
+class P(val x: Int, val y: Int) {\n    val sum: Int = x + y\n    init { println("i1 " + sum) }\n    val label: String = "p" + x\n    init { println("i2 " + label) }\n    constructor(x: Int) : this(x, 0) { println("c1 " + x) }\n    constructor() : this(9) { println("c0") }\n}\nfun main() {\n    P(5)\n}	i1 5\ni2 p5\nc1 5\n
+class P(val x: Int, val y: Int) {\n    val sum: Int = x + y\n    init { println("i1 " + sum) }\n    val label: String = "p" + x\n    init { println("i2 " + label) }\n    constructor(x: Int) : this(x, 0) { println("c1 " + x) }\n    constructor() : this(9) { println("c0") }\n}\nfun main() {\n    P()\n}	i1 9\ni2 p9\nc1 9\nc0\n
+class Q {\n    var v: Int = 1\n    init { println("qi " + v) }\n    constructor(a: Int) { v = a; println("q1 " + v) }\n    constructor(a: Int, b: Int) : this(a + b) { println("q2 " + v) }\n}\nfun main() {\n    println(Q(3).v)\n    println(Q(3, 4).v)\n}	qi 1\nq1 3\n3\nqi 1\nq1 7\nq2 7\n7\n
+open class B(val b: Int) {\n    init { println("B " + b) }\n    constructor() : this(100) { println("Bs") }\n}\nclass S(x: Int) : B(x * 2) {\n    val s = x + 1\n    init { println("S " + s + " " + b) }\n    constructor(a: Int, c: Int) : this(a + c) { println("Ss") }\n}\nfun main() {\n    println(S(3).s)\n    println(S(1, 2).s)\n    println(B().b)\n}	B 6\nS 4 6\n4\nB 6\nS 4 6\nSs\n4\nB 100\nBs\n100\n
+class D(val a: Int, val b: Int = 5) {\n    init { println("D " + a + " " + b) }\n    constructor(s: String) : this(s.length) { println("Ds " + s) }\n}\nfun main() {\n    println(D(2).b)\n    println(D("xyz").a)\n}	D 2 5\n5\nD 3 5\nDs xyz\n3\n
+class A {\n    var t = 0\n    init { t += 1 }\n    init { t += 10 }\n    constructor(n: Int) { t += n }\n}\nfun main() {\n    println(A(5).t)\n}	16\n
+class C {\n    init {\n        var n = 0\n        listOf(1, 2, 3).forEach { n += it }\n        println("sum=" + n)\n    }\n    constructor() { var m = 1; listOf(2, 3).forEach { m *= it }; println("prod=" + m) }\n}\nfun main() {\n    C()\n}	sum=6\nprod=6\n
+interface G { fun greet(): String; fun twice(): String { return greet() + greet() } }\nclass I(val n: String) : G { override fun greet(): String = "hi " + n }\nclass Dl(g: G) : G by g\nfun main() {\n    val d = Dl(I("bob"))\n    println(d.greet())\n    println(d.twice())\n}	hi bob\nhi bobhi bob\n
+interface G { fun greet(): String; fun twice(): String { return greet() + greet() } }\nclass I(val n: String) : G { override fun greet(): String = "hi " + n }\nclass Ov(g: G) : G by g { override fun greet(): String = "over" }\nfun main() {\n    println(Ov(I("x")).greet())\n    println(Ov(I("x")).twice())\n}	over\nhi xhi x\n
+interface G { fun greet(): String }\ninterface Sz { fun size(): Int }\nclass I(val n: String) : G { override fun greet(): String = "hi " + n }\nclass S5 : Sz { override fun size(): Int = 5 }\nclass Bo(g: G, s: Sz) : G by g, Sz by s\nfun main() {\n    val b = Bo(I("z"), S5())\n    println(b.greet())\n    println(b.size())\n}	hi z\n5\n
+import kotlin.reflect.KProperty\nclass U {\n    operator fun getValue(t: Any?, p: KProperty<*>): String = "GV:" + p.name\n    operator fun setValue(t: Any?, p: KProperty<*>, v: String) { println("SV:" + p.name + "=" + v) }\n}\nclass H { var s: String by U(); val t: String by U() }\nfun main() {\n    val h = H()\n    println(h.s)\n    h.s = "zz"\n    println(h.t)\n}	GV:s\nSV:s=zz\nGV:t\n
+import kotlin.reflect.KProperty\nclass Ct {\n    var hits = 0\n    operator fun getValue(t: Any?, p: KProperty<*>): Int { hits += 1; return hits }\n}\nclass H { val c: Int by Ct() }\nfun main() {\n    val h = H()\n    println(h.c)\n    println(h.c)\n    println(h.c)\n}	1\n2\n3\n
+fun adder(n: Int): (Int) -> Int = { it + n }\nfun main() {\n    println(adder(3)(4))\n}	7\n
+fun outer(): () -> String = { "from-outer" }\nfun main() {\n    println(outer()())\n}	from-outer\n
+fun twoLevel(): () -> (() -> Int) = { { 42 } }\nfun main() {\n    println(twoLevel()()())\n}	42\n
+fun main() {\n    val lst = listOf<(Int) -> Int>({ it + 1 }, { it * 10 })\n    println(lst[0](7))\n    println(lst[1](7))\n}	8\n70\n
+fun main() {\n    println({ x: Int -> x - 1 }(9))\n}	8\n
+class Bx(val f: (Int) -> Int) {\n    operator fun invoke(x: Int): Int = f(x)\n}\nfun main() {\n    val b = Bx({ it * 2 })\n    println(b(5))\n    println(b.f(6))\n    println(b.invoke(7))\n}	10\n12\n14\n
+fun adder(n: Int): (Int) -> Int = { it + n }\nfun main() {\n    println(adder(3).invoke(4))\n}	7\n
+fun main() {\n    println("abc".map { it })\n}	[a, b, c]\n
+fun main() {\n    println("abc".map { it.code })\n}	[97, 98, 99]\n
+fun main() {\n    println("hello".filter { it != 'l' })\n}	heo\n
+fun main() {\n    println("hello".filterNot { it == 'l' })\n}	heo\n
+fun main() {\n    println("abc".filterIndexed { i, c -> i > 0 })\n}	bc\n
+fun main() {\n    println("abc".sumOf { it.code })\n}	294\n
+fun main() {\n    println("aabbc".groupBy { it })\n}	{a=[a, a], b=[b, b], c=[c]}\n
+fun main() {\n    println("abc".count { it > 'a' })\n}	2\n
+fun main() {\n    println("abc".any { it == 'b' })\n    println("abc".all { it > 'a' })\n    println("abc".none { it == 'z' })\n}	true\nfalse\ntrue\n
+fun main() {\n    println("abc".takeWhile { it < 'c' })\n    println("abc".dropWhile { it < 'c' })\n}	ab\nc\n
+fun main() {\n    println("abc".partition { it < 'b' })\n}	(a, bc)\n
+fun main() {\n    println("abc".chunked(2))\n    println("abc".windowed(2))\n}	[ab, c]\n[ab, bc]\n
+fun main() {\n    println("abc".zip("xy"))\n}	[(a, x), (b, y)]\n
+fun main() {\n    println("abc".withIndex().toList())\n}	[IndexedValue(index=0, value=a), IndexedValue(index=1, value=b), IndexedValue(index=2, value=c)]\n
+fun main() {\n    println("abc".mapIndexed { i, c -> "" + i + c })\n}	[0a, 1b, 2c]\n
+fun main() {\n    println("abc".associateWith { it.code })\n}	{a=97, b=98, c=99}\n
+fun main() {\n    println("abc".flatMap { listOf(it, it) })\n}	[a, a, b, b, c, c]\n
+fun main() {\n    println("abc".onEach { })\n}	abc\n
+fun main() {\n    println("abc".fold("") { a, c -> a + c + "." })\n    println("abc".reduce { a, c -> a })\n}	a.b.c.\na\n
+fun main() {\n    println("abc".toList())\n    println("abc".toSet())\n    println("abc".asIterable().toList())\n}	[a, b, c]\n[a, b, c]\n[a, b, c]\n
+fun main() {\n    println("abc".maxOrNull())\n    println("abc".minOrNull())\n    println("abc".count())\n}	c\na\n3\n
+fun main() {\n    println("abc".single { it == 'b' })\n    println("abc".singleOrNull { it == 'z' })\n}	b\nnull\n
+fun main() {\n    println("abc".find { it > 'a' })\n    println("abc".findLast { it < 'c' })\n}	b\nb\n
+fun main() {\n    println("abc".indexOfFirst { it == 'b' })\n    println("abc".indexOfLast { it == 'b' })\n}	1\n1\n
+fun main() {\n    println("abc".maxByOrNull { it })\n    println("abc".minByOrNull { it })\n}	c\na\n
+fun main() {\n    println("abc".maxOf { it.code })\n    println("abc".minOf { it.code })\n}	99\n97\n
+fun main() {\n    println("abc".trim { it == 'a' })\n}	bc\n
+fun main() {\n    println("abc".mapNotNull { it })\n    println("abc".flatMapIndexed { i, c -> listOf(c) })\n}	[a, b, c]\n[a, b, c]\n
+fun main() {\n    println("abc".runningFold("") { a, c -> a + c })\n    println("abc".scan("") { a, c -> a + c })\n}	[, a, ab, abc]\n[, a, ab, abc]\n
+fun main() {\n    println("".map { it })\n    println("".filter { true })\n    println("".count())\n}	[]\n\n0\n
+fun main() {\n    println("a".map { it })\n    println("a".filter { true })\n    println("a".chunked(2))\n    println("a".windowed(2))\n}	[a]\na\n[a]\n[]\n
+fun main() {\n    println(listOf(1, 2, 3).onEach { })\n    println(listOf(1, 2, 3).withIndex().toList())\n    println(listOf(7).single())\n}	[1, 2, 3]\n[IndexedValue(index=0, value=1), IndexedValue(index=1, value=2), IndexedValue(index=2, value=3)]\n7\n
+fun main() {\n    println(listOf(1, 2, 3).runningFold(0) { a, b -> a + b })\n    println(listOf(1, 2, 3).mapNotNull { it })\n}	[0, 1, 3, 6]\n[1, 2, 3]\n
+class Bx(val f: (Int) -> Int)\nfun main() {\n    println(Bx({ it * 3 }).f(4))\n}	12\n
+class Ac(val f: (Int) -> Int) { fun go(x: Int): Int = f(x) }\nfun main() {\n    println(Ac({ it + 100 }).go(5))\n}	105\n
+class NoPrim {\n    var total: Int = 1\n    init { total += 10; println("np.init " + total) }\n    constructor(n: Int) { total += n; println("np.c1 " + total) }\n    constructor() : this(3) { total += 100; println("np.c0 " + total) }\n}\nfun main() {\n    println(NoPrim(3).total)\n    println(NoPrim().total)\n}	np.init 11\nnp.c1 14\n14\nnp.init 11\nnp.c1 14\nnp.c0 114\n114\n
+class Semi(val a: Int) {\n    val b: Int = a * 2\n    init { println("x"); println(b); }\n}\nfun main() {\n    println(Semi(3).b)\n}	x\n6\n6\n

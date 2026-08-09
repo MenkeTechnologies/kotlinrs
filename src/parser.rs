@@ -31,6 +31,7 @@
 use crate::ast::*;
 use crate::lexer::Lexer;
 use crate::token::{Spanned, StrPart, Tok};
+use std::collections::HashMap;
 
 pub struct Parser {
     toks: Vec<Spanned>,
@@ -47,6 +48,30 @@ pub struct Parser {
     /// it is rejected here rather than silently answering for a class named `T`
     /// that does not exist.
     type_params: Vec<String>,
+    /// Set while parsing a supertype's `by` delegate expression, where the `{`
+    /// that follows opens the CLASS BODY rather than a trailing lambda —
+    /// `class C(g: G) : G by g { override fun … }`. Kotlin resolves the same
+    /// ambiguity the same way: a trailing lambda is not allowed there.
+    no_trailing_lambda: bool,
+}
+
+/// Whether a postfix `(` may apply to this expression as an invocation.
+///
+/// Only chains that already produced a value *through* a call, index, lambda
+/// literal or `!!` qualify. A bare literal or name never does, so `val a = 1`
+/// followed by a statement-leading `(1..3)` cannot be misread as `1(1..3)`.
+/// A name followed by `(` is a [`Expr::Call`] the primary rule already
+/// consumed, so nothing is lost by excluding it here.
+fn invocable(e: &Expr) -> bool {
+    match e {
+        Expr::Call { .. }
+        | Expr::Invoke { .. }
+        | Expr::Index { .. }
+        | Expr::MethodCall { .. }
+        | Expr::Lambda { .. } => true,
+        Expr::NotNull(inner) => invocable(inner),
+        _ => false,
+    }
 }
 
 /// The coarse type of one function-type parameter: a lone identifier reads as
@@ -79,6 +104,7 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
         pos: 0,
         fn_param_types: Vec::new(),
         type_params: Vec::new(),
+        no_trailing_lambda: false,
     };
     let mut prog = Program::default();
     while !p.at(&Tok::Eof) {
@@ -142,7 +168,118 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
         .filter_map(|cd| cd.companion.take().map(|c| *c))
         .collect();
     prog.classes.extend(hoisted);
+    expand_interface_delegation(&mut prog)?;
     Ok(prog)
+}
+
+/// The synthetic field a `class C(b: B) : I by b` stores its delegate in.
+/// `$` cannot appear in a Kotlin identifier, so it can never collide.
+fn delegate_field(iface: &str) -> String {
+    format!("$delegate${iface}")
+}
+
+/// Rewrite every `class C : I by expr` into ordinary code: a stored property
+/// holding the delegate, plus one forwarding method per member of `I` the class
+/// does not declare itself.
+///
+/// Forwarding covers `I`'s methods WITH default bodies too, not just its
+/// abstract ones. That is what reproduces Kotlin's semantics: because the
+/// default body runs on the delegate, it calls the DELEGATE's implementation of
+/// any abstract member, not the delegating class's override —
+/// `class D(g: G) : G by g { override fun greet() = "override" }` has
+/// `D(impl).greet()` answer `"override"` but `D(impl).twice()` answer the
+/// delegate's greeting twice.
+fn expand_interface_delegation(prog: &mut Program) -> Result<(), String> {
+    // Every interface's members, including the ones it inherits from the
+    // interfaces it extends.
+    let ifaces: HashMap<String, ClassDecl> = prog
+        .classes
+        .iter()
+        .filter(|c| c.is_interface)
+        .map(|c| (c.name.clone(), c.clone()))
+        .collect();
+    fn members(
+        name: &str,
+        ifaces: &HashMap<String, ClassDecl>,
+        out: &mut Vec<FunDecl>,
+        depth: u32,
+    ) {
+        if depth > 32 {
+            return; // a cyclic `interface A : B`, already rejected downstream
+        }
+        let Some(cd) = ifaces.get(name) else { return };
+        for p in &cd.parents {
+            members(p, ifaces, out, depth + 1);
+        }
+        for m in &cd.methods {
+            if !out.iter().any(|e| e.name == m.name) {
+                out.push(m.clone());
+            }
+        }
+    }
+
+    for cd in &mut prog.classes {
+        if cd.delegates.is_empty() {
+            continue;
+        }
+        for (iface, expr) in std::mem::take(&mut cd.delegates) {
+            if !ifaces.contains_key(&iface) {
+                return Err(format!(
+                    "class {}: `by` delegation requires an interface supertype; \
+                     {iface} is not one",
+                    cd.name
+                ));
+            }
+            let field = delegate_field(&iface);
+            // The delegate is stored FIRST so a body property initializer can
+            // already see it.
+            cd.obj_props.insert(
+                0,
+                BodyProp {
+                    name: field.clone(),
+                    ty: Type::Obj,
+                    class: None,
+                    init: expr,
+                    mutable: false,
+                    lazy: false,
+                    delegate: false,
+                },
+            );
+            let mut inherited = Vec::new();
+            members(&iface, &ifaces, &mut inherited, 0);
+            for m in inherited {
+                if cd.methods.iter().any(|own| own.name == m.name) {
+                    continue; // an explicit override in the body wins
+                }
+                let recv = Expr::Member {
+                    recv: Box::new(Expr::Var("this".into())),
+                    name: field.clone(),
+                    safe: false,
+                    line: m.line,
+                };
+                let call = Expr::MethodCall {
+                    recv: Box::new(recv),
+                    name: m.name.clone(),
+                    args: m.params.iter().map(|p| Expr::Var(p.name.clone())).collect(),
+                    safe: false,
+                    line: m.line,
+                };
+                cd.methods.push(FunDecl {
+                    name: m.name.clone(),
+                    recv: None,
+                    params: m.params.clone(),
+                    ret: m.ret,
+                    ret_class: m.ret_class.clone(),
+                    body: vec![Stmt::new(m.line, StmtKind::Return(Some(call)))],
+                    line: m.line,
+                    is_abstract: false,
+                    is_open: true,
+                    is_override: true,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The spelling of a token that is a *soft* keyword in Kotlin — meaningful only
@@ -210,6 +347,37 @@ impl Parser {
     }
     fn at(&self, t: &Tok) -> bool {
         self.peek() == t
+    }
+    /// Whether the current token began on the same source line as the token
+    /// just consumed. The lexer drops newlines, so this is the only way to
+    /// recover Kotlin's newline sensitivity — needed for postfix `(`, where
+    /// `f()\n(1..3).forEach { … }` is two statements but `f()(1)` is one
+    /// invocation of the returned function.
+    fn glued_to_prev(&self) -> bool {
+        self.pos > 0 && self.toks[self.pos - 1].line == self.line()
+    }
+    /// The token following the `)` that closes the `(` at the cursor, without
+    /// consuming anything. Used to tell a function type's parameter list
+    /// (`(Int) -> R`) from a parenthesized type (`(() -> Int)`), which differ
+    /// only in whether an `->` follows the closing paren.
+    fn tok_after_parens(&self) -> &Tok {
+        let mut depth = 0usize;
+        let mut i = self.pos;
+        while let Some(s) = self.toks.get(i) {
+            match s.tok {
+                Tok::LParen => depth += 1,
+                Tok::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return self.toks.get(i + 1).map(|s| &s.tok).unwrap_or(&Tok::Eof);
+                    }
+                }
+                Tok::Eof => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        &Tok::Eof
     }
     fn bump(&mut self) -> Tok {
         let t = self.toks[self.pos].tok.clone();
@@ -476,7 +644,8 @@ impl Parser {
         // Primary constructor (classes only). `object`s and `interface`s have
         // none.
         let mut params = Vec::new();
-        if !is_object && !is_interface && self.at(&Tok::LParen) {
+        let has_primary = !is_object && !is_interface && self.at(&Tok::LParen);
+        if has_primary {
             self.bump();
             while !self.at(&Tok::RParen) {
                 let kind = match self.peek() {
@@ -525,6 +694,7 @@ impl Parser {
         // class has exactly one superclass and interfaces have no constructor.
         let mut parents = Vec::new();
         let mut super_args = Vec::new();
+        let mut delegates: Vec<(String, Expr)> = Vec::new();
         if self.at(&Tok::Colon) {
             self.bump();
             loop {
@@ -550,6 +720,16 @@ impl Parser {
                     }
                     self.eat(&Tok::RParen)?;
                 }
+                // `: I by expr` — interface delegation. Every member of `I`
+                // the class does not itself declare is forwarded to the value
+                // of `expr`.
+                if matches!(self.peek(), Tok::Ident(w) if w == "by") {
+                    self.bump();
+                    self.no_trailing_lambda = true;
+                    let d = self.expr();
+                    self.no_trailing_lambda = false;
+                    delegates.push((pname.clone(), d?));
+                }
                 parents.push(pname);
                 if self.at(&Tok::Comma) {
                     self.bump();
@@ -563,6 +743,8 @@ impl Parser {
         let mut methods = Vec::new();
         let mut obj_props = Vec::new();
         let mut companion = None;
+        let mut inits: Vec<InitBlock> = Vec::new();
+        let mut secondaries: Vec<SecondaryCtor> = Vec::new();
         if self.at(&Tok::LBrace) {
             self.bump();
             while !self.at(&Tok::RBrace) && !self.at(&Tok::Eof) {
@@ -583,6 +765,40 @@ impl Parser {
                     companion = Some(Box::new(
                         self.class_decl_mods(Mods::default(), Some(&name))?,
                     ));
+                    continue;
+                }
+                // `init { … }` — an initializer block. A soft keyword, so it is
+                // matched positionally: only an `init` directly followed by `{`
+                // is one, leaving a property or method named `init` alone.
+                if matches!(self.peek(), Tok::Ident(w) if w == "init")
+                    && matches!(self.peek_at(1), Tok::LBrace)
+                {
+                    if is_interface {
+                        return Err(format!(
+                            "interface {name}: an `init` block needs a constructor; \
+                             interfaces have none"
+                        ));
+                    }
+                    self.bump(); // `init`
+                                 // The shared block rule, so an `init` body accepts `;`
+                                 // separators and everything else a `fun` body does.
+                    let body = self.block()?;
+                    inits.push(InitBlock {
+                        after_props: obj_props.len(),
+                        body,
+                    });
+                    continue;
+                }
+                // `constructor(…) [: this(…) | : super(…)] { … }` — a secondary
+                // constructor.
+                if matches!(self.peek(), Tok::Ident(w) if w == "constructor") {
+                    if is_interface || is_object {
+                        return Err(format!(
+                            "{name}: a secondary constructor needs a constructor; \
+                             an interface and an object have none"
+                        ));
+                    }
+                    secondaries.push(self.secondary_ctor()?);
                     continue;
                 }
                 let mods = self.modifiers();
@@ -624,7 +840,86 @@ impl Parser {
             is_sealed: mods.sealed,
             parents,
             super_args,
+            delegates,
             companion,
+            has_primary,
+            inits,
+            secondaries,
+            line,
+        })
+    }
+
+    /// A secondary constructor: `constructor(p: T) : this(a) { … }`.
+    ///
+    /// The parameter list is a function's minus `vararg` (Kotlin allows it, but
+    /// nothing here needs it yet and rejecting is better than mis-binding), and
+    /// the body is optional — `constructor(x: Int) : this(x, 0)` is complete.
+    fn secondary_ctor(&mut self) -> Result<SecondaryCtor, String> {
+        let line = self.line();
+        self.bump(); // `constructor`
+        self.eat(&Tok::LParen)?;
+        let mut params = Vec::new();
+        while !self.at(&Tok::RParen) {
+            let pname = self.ident()?;
+            self.eat(&Tok::Colon)?;
+            let (ty, class) = self.type_ref()?;
+            let default = if self.at(&Tok::Assign) {
+                self.bump();
+                Some(self.expr()?)
+            } else {
+                None
+            };
+            params.push(Param {
+                name: pname,
+                ty,
+                class,
+                default,
+                vararg: None,
+            });
+            if self.at(&Tok::Comma) {
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        self.eat(&Tok::RParen)?;
+        let deleg = if self.at(&Tok::Colon) {
+            self.bump();
+            let kw = self.ident()?;
+            let is_super = match kw.as_str() {
+                "super" => true,
+                "this" => false,
+                other => {
+                    return Err(format!(
+                        "secondary constructor: expected `this(…)` or `super(…)` after `:`, \
+                         found `{other}` (line {line})"
+                    ))
+                }
+            };
+            self.eat(&Tok::LParen)?;
+            let mut args = Vec::new();
+            while !self.at(&Tok::RParen) {
+                args.push(self.expr()?);
+                if self.at(&Tok::Comma) {
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+            self.eat(&Tok::RParen)?;
+            Some(CtorDelegation { is_super, args })
+        } else {
+            None
+        };
+        let body = if self.at(&Tok::LBrace) {
+            self.block()?
+        } else {
+            Vec::new()
+        };
+        Ok(SecondaryCtor {
+            params,
+            deleg,
+            body,
             line,
         })
     }
@@ -646,23 +941,36 @@ impl Parser {
         // in this position.
         if matches!(self.peek(), Tok::Ident(w) if w == "by") {
             self.bump();
-            let what = self.ident()?;
-            if what != "lazy" {
-                return Err(format!(
-                    "property {name}: `by {what}` is not supported; only `by lazy` is"
-                ));
+            // `by lazy { … }` has its own lowering (a cell forced on first
+            // read); every other delegate goes through the general
+            // `getValue`/`setValue` operator protocol.
+            if matches!(self.peek(), Tok::Ident(w) if w == "lazy")
+                && matches!(self.peek_at(1), Tok::LBrace)
+            {
+                self.bump();
+                if mutable {
+                    return Err(format!("property {name}: `by lazy` requires `val`"));
+                }
+                let init = self.lambda()?;
+                return Ok(BodyProp {
+                    name,
+                    ty,
+                    class,
+                    init,
+                    mutable,
+                    lazy: true,
+                    delegate: false,
+                });
             }
-            if mutable {
-                return Err(format!("property {name}: `by lazy` requires `val`"));
-            }
-            let init = self.lambda()?;
+            let init = self.expr()?;
             return Ok(BodyProp {
                 name,
                 ty,
                 class,
                 init,
                 mutable,
-                lazy: true,
+                lazy: false,
+                delegate: true,
             });
         }
         self.eat(&Tok::Assign)?;
@@ -674,6 +982,7 @@ impl Parser {
             init,
             mutable,
             lazy: false,
+            delegate: false,
         })
     }
 
@@ -750,6 +1059,21 @@ impl Parser {
         // The coarse type can't carry a signature, so the parameter/return types
         // are consumed and discarded; the annotation only needs to mark the
         // binding as a callable value (its lowering is closure-invoke by slot).
+        // A parenthesized type `(T)` — which is what the return type of
+        // `() -> (() -> Int)` is. Only a `(…)` followed by `->` is a parameter
+        // list; without the arrow the parens are grouping, so the inner type is
+        // parsed on its own. Distinguished by looking past the matching `)`
+        // rather than by backtracking, because the parameter-list scan below
+        // has the `fn_param_types` side channel it cannot cleanly undo.
+        if self.at(&Tok::LParen) && !matches!(self.tok_after_parens(), Tok::Arrow) {
+            self.bump();
+            let inner = self.type_ref()?;
+            self.eat(&Tok::RParen)?;
+            if self.at(&Tok::Question) {
+                self.bump(); // nullable parenthesized type `((Int) -> Int)?`
+            }
+            return Ok(inner);
+        }
         if self.at(&Tok::LParen) {
             self.bump();
             // Record the parameter types as the list goes by. A parameter is
@@ -1495,6 +1819,35 @@ impl Parser {
                 e = Expr::NotNull(Box::new(e));
                 continue;
             }
+            // Invocation of the value the chain has produced so far — `f()()`,
+            // `lst[0](7)`, `{ x: Int -> x }(9)`, `m["k"]!!()`. Restricted to
+            // chains that already ended in a call/index/lambda so a bare value
+            // is never swallowed, and required to be glued to the previous
+            // token so a statement-leading `(1..3).forEach { … }` after
+            // `f()` stays a separate statement, exactly as Kotlin parses it.
+            if self.at(&Tok::LParen) && self.glued_to_prev() && invocable(&e) {
+                let line = self.line();
+                self.bump();
+                let mut args = Vec::new();
+                while !self.at(&Tok::RParen) {
+                    args.push(self.call_arg()?);
+                    if self.at(&Tok::Comma) {
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+                self.eat(&Tok::RParen)?;
+                if self.at(&Tok::LBrace) && !self.no_trailing_lambda {
+                    args.push(self.lambda()?);
+                }
+                e = Expr::Invoke {
+                    target: Box::new(e),
+                    args,
+                    line,
+                };
+                continue;
+            }
             // Indexed access `recv[index]` (chainable: `m[k][i]`).
             if self.at(&Tok::LBracket) {
                 let line = self.line();
@@ -1536,7 +1889,7 @@ impl Parser {
                 self.eat(&Tok::RParen)?;
             }
             // Trailing-lambda syntax: `list.map { … }` / `list.map(sel) { … }`.
-            if self.at(&Tok::LBrace) {
+            if self.at(&Tok::LBrace) && !self.no_trailing_lambda {
                 is_call = true;
                 args.push(self.lambda()?);
             }
@@ -1695,13 +2048,32 @@ impl Parser {
         let save = self.pos;
         self.bump(); // `<`
         let mut depth = 1i32;
+        // A function type argument (`listOf<(Int) -> Int>()`) puts parens and an
+        // `->` inside the list. They are tracked separately so the `>` that ends
+        // a nested `Map<K, V>` is not confused with one inside `(…)`.
+        let mut paren = 0i32;
         loop {
             match self.peek() {
+                Tok::LParen => {
+                    paren += 1;
+                    self.bump();
+                }
+                Tok::RParen => {
+                    paren -= 1;
+                    if paren < 0 {
+                        self.pos = save;
+                        return;
+                    }
+                    self.bump();
+                }
+                Tok::Arrow => {
+                    self.bump();
+                }
                 Tok::Lt => {
                     depth += 1;
                     self.bump();
                 }
-                Tok::Gt => {
+                Tok::Gt if paren == 0 => {
                     depth -= 1;
                     self.bump();
                     if depth == 0 {
@@ -1823,11 +2195,11 @@ impl Parser {
                     }
                     self.eat(&Tok::RParen)?;
                     // Trailing-lambda syntax on a free call: `apply(x) { … }`.
-                    if self.at(&Tok::LBrace) {
+                    if self.at(&Tok::LBrace) && !self.no_trailing_lambda {
                         args.push(self.lambda()?);
                     }
                     Ok(Expr::Call { name, args, line })
-                } else if self.at(&Tok::LBrace) {
+                } else if self.at(&Tok::LBrace) && !self.no_trailing_lambda {
                     // Bare trailing-lambda call `run { … }` (no parenthesized
                     // args). `Ident {` is unambiguously a call in Kotlin's
                     // expression grammar — there are no anonymous block statements.
@@ -2122,6 +2494,7 @@ impl Parser {
                         toks,
                         pos: 0,
                         fn_param_types: Vec::new(),
+                        no_trailing_lambda: false,
                     };
                     let e = sub.expr()?;
                     out.push(StrExpr::Expr(Box::new(e)));

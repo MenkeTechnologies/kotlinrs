@@ -211,8 +211,64 @@ pub struct ClassDecl {
     /// becomes a singleton like any other; `Owner.member` then resolves through
     /// it. `$` cannot appear in a Kotlin identifier, so the synthetic name can
     /// never collide with a declared one.
+    /// `: I by expr` — the interfaces this class delegates to, paired with the
+    /// expression producing the delegate. Every member of `I` the class does
+    /// not declare itself is forwarded to that value, INCLUDING `I`'s methods
+    /// with default bodies — which is why a default method of a delegated
+    /// interface calls the delegate's implementation of an abstract member
+    /// rather than the class's own override.
+    pub delegates: Vec<(String, Expr)>,
     pub companion: Option<Box<ClassDecl>>,
+    /// Whether a primary constructor was WRITTEN — `class C(…)` rather than
+    /// `class C`. A class without one has an implicit no-argument constructor,
+    /// but a `C()` call still selects a no-argument SECONDARY over it, because
+    /// Kotlin only synthesizes the implicit primary when no constructor is
+    /// declared at all.
+    pub has_primary: bool,
+    /// `init { … }` blocks in source order. Kotlin runs them INTERLEAVED with
+    /// the property initializers, in declaration order, so each records how
+    /// many `obj_props` were declared before it rather than being run as one
+    /// group — `val a = 1; init { … }; val b = 2` sees `a` but not `b`.
+    pub inits: Vec<InitBlock>,
+    /// `constructor(…) : this(…) { … }` declarations in source order.
+    pub secondaries: Vec<SecondaryCtor>,
     pub line: u32,
+}
+
+/// An `init { … }` block and its position among the body properties.
+#[derive(Debug, Clone)]
+pub struct InitBlock {
+    /// How many of [`ClassDecl::obj_props`] are declared ABOVE this block, and
+    /// so have already been initialized when it runs.
+    pub after_props: usize,
+    pub body: Vec<Stmt>,
+}
+
+/// A secondary constructor `constructor(p: T) : this(a) { … }`.
+///
+/// Its body runs AFTER the constructor it delegates to has fully run — every
+/// property initializer and every `init` block included. That ordering is
+/// observable (`Pt(5)` prints both `init` blocks before the secondary's own
+/// body), so it is what the lowering reproduces: the delegated constructor is
+/// called first and yields the instance the body then operates on.
+#[derive(Debug, Clone)]
+pub struct SecondaryCtor {
+    pub params: Vec<Param>,
+    /// The `: this(…)` / `: super(…)` arguments. `None` is an implicit
+    /// delegation to the primary constructor, which is what a class with no
+    /// primary constructor gets too — its property initializers and `init`
+    /// blocks still have to run exactly once, before the body.
+    pub deleg: Option<CtorDelegation>,
+    pub body: Vec<Stmt>,
+    pub line: u32,
+}
+
+/// The `: this(args)` or `: super(args)` clause of a secondary constructor.
+#[derive(Debug, Clone)]
+pub struct CtorDelegation {
+    /// `super(…)` rather than `this(…)`.
+    pub is_super: bool,
+    pub args: Vec<Expr>,
 }
 
 /// The synthetic top-level name a class's `companion object` is hoisted under.
@@ -246,6 +302,13 @@ pub struct BodyProp {
     /// is observable whenever the initializer has an effect or would fail: an
     /// eagerly-evaluated `lazy` would run it at startup instead of at first use.
     pub lazy: bool,
+    /// `val x: T by SomeDelegate()` — `init` then holds the DELEGATE, which is
+    /// what the field stores. Every read compiles to the delegate's
+    /// `getValue(thisRef, property)` and every write to its
+    /// `setValue(thisRef, property, value)`, so the property has no storage of
+    /// its own. `by lazy` is the one delegate with a dedicated lowering and
+    /// sets [`BodyProp::lazy`] instead.
+    pub delegate: bool,
 }
 
 /// A primary-constructor parameter with its property kind.
@@ -517,6 +580,19 @@ pub enum Expr {
     /// A call: `println(x)`, `print(x)`, or a user function `f(a, b)`.
     Call {
         name: String,
+        args: Vec<Expr>,
+        line: u32,
+    },
+    /// Invocation of an arbitrary expression that evaluates to a function
+    /// value: `f()()`, `lst[0](7)`, `{ x: Int -> x }(9)`, `obj.field(1)`.
+    ///
+    /// [`Expr::Call`] only covers invocation through a *name*; this covers the
+    /// general postfix `(` applied to whatever the preceding postfix chain
+    /// produced, which is how Kotlin reaches the `invoke` operator. A
+    /// user-declared `operator fun invoke` is reached the same way, so
+    /// `Box(f)(5)` and `Box(f).invoke(5)` compile to the same thing.
+    Invoke {
+        target: Box<Expr>,
         args: Vec<Expr>,
         line: u32,
     },

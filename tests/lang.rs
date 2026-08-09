@@ -2325,3 +2325,107 @@ fn a_reified_type_test_is_rejected_rather_than_answered() {
         "unexpected diagnostic: {err}"
     );
 }
+
+// ── Secondary constructors, delegation, invocation ──
+//
+// The frozen parity corpus pins the RESULTS of these against the reference
+// toolchain; what it cannot hold is a program `kotlinc` rejects. These cover
+// the diagnostics instead — each is a case where answering something would be
+// worse than failing, because the wrong answer is silent.
+
+#[test]
+fn secondary_constructor_delegating_to_itself_is_rejected() {
+    // `constructor(a: Int) : this(0)` would call itself forever. Kotlin reports
+    // it at compile time; so must we, rather than emitting a program that
+    // exhausts the stack at run time.
+    let out = eval(
+        "class C(val v: Int) {\n\
+         \x20   constructor(a: Int, b: Int) : this(a, b) { }\n\
+         }\n\
+         fun main() { println(C(1, 2).v) }",
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("delegates to itself"), "stderr was: {err}");
+}
+
+#[test]
+fn property_delegate_without_a_resolvable_class_is_rejected() {
+    // `by Delegates.observable(…)` names no class whose `getValue` could be
+    // called. Left unchecked the property becomes a plain stored field and
+    // printing it shows the DELEGATE instead of the value — a silent wrong
+    // answer, which is exactly what this rejection prevents.
+    let out = eval(
+        "import kotlin.properties.Delegates\n\
+         class O { var o: Int by Delegates.observable(1) { p, a, b -> } }\n\
+         fun main() { println(O().o) }",
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("getValue"), "stderr was: {err}");
+}
+
+#[test]
+fn by_delegation_requires_an_interface_supertype() {
+    let out = eval(
+        "open class B { fun m(): Int = 1 }\n\
+         class C(b: B) : B by b\n\
+         fun main() { println(C(B()).m()) }",
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("interface supertype"), "stderr was: {err}");
+}
+
+#[test]
+fn init_block_runs_interleaved_with_property_initializers() {
+    // Kotlin makes ONE declaration-order pass over the property initializers
+    // and the `init` blocks, so a block sees every property above it and none
+    // below it. Running them as two groups would still print both lines, in
+    // the wrong order — which is why the order is what is asserted.
+    assert_eq!(
+        stdout(
+            "class C {\n\
+             \x20   val a = 1\n\
+             \x20   init { println(\"i1 \" + a) }\n\
+             \x20   val b = a + 1\n\
+             \x20   init { println(\"i2 \" + b) }\n\
+             }\n\
+             fun main() { C() }"
+        ),
+        "i1 1\ni2 2\n"
+    );
+}
+
+#[test]
+fn statement_leading_paren_after_a_call_is_not_an_invocation() {
+    // The lexer drops newlines, so postfix `(` has to be gated on the token
+    // being glued to the previous one. Without that, `f()` followed by a
+    // statement that STARTS with `(` reads as `f()(…)`.
+    assert_eq!(
+        stdout(
+            "fun f(): Int = 1\n\
+             println(f())\n\
+             (1..3).forEach { print(it) }\n\
+             println(\"\")"
+        ),
+        "1\n123\n"
+    );
+}
+
+#[test]
+fn string_receiver_collection_result_follows_kotlin_text() {
+    // `kotlin.text` gives a `CharSequence` receiver a `String` result where the
+    // `Iterable` overload gives a `List` — but only for some members. A
+    // lowering that materializes the characters and reuses the list
+    // implementation wholesale is right for `map` and wrong for `filter`.
+    assert_eq!(stdout("println(\"abc\".map { it })"), "[a, b, c]\n");
+    assert_eq!(stdout("println(\"hello\".filter { it != 'l' })"), "heo\n");
+    assert_eq!(stdout("println(\"abc\".chunked(2))"), "[ab, c]\n");
+    assert_eq!(
+        stdout("println(\"abc\".partition { it < 'b' })"),
+        "(a, bc)\n"
+    );
+    assert_eq!(stdout("println(\"\".map { it })"), "[]\n");
+    assert_eq!(stdout("println(\"\".filter { true })"), "\n");
+}

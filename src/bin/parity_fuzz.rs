@@ -1408,6 +1408,118 @@ fn g_localfn(r: &mut Rng, _idx: usize) -> String {
     }
 }
 
+/// `ctor` — secondary constructors and `init`-block ORDERING.
+///
+/// The gap this hunts is not "does an object come out" but WHEN each piece
+/// runs: Kotlin interleaves the property initializers with the `init` blocks in
+/// declaration order, and a secondary constructor's body runs only after the
+/// constructor it delegates to has finished — including that constructor's own
+/// body when the delegation chains. Every probe therefore PRINTS from inside
+/// the initializers, so the ordering is in the output rather than only in the
+/// final field values, and the chained forms (`constructor() : this(9)`) are
+/// generated as often as the direct ones.
+fn g_ctor(r: &mut Rng, _idx: usize) -> String {
+    let n = pick(r, STEPS);
+    // Never `println` a bare instance: `Ord` is not a `data class`, so the JVM
+    // gives it `Object.toString` and the output carries an identity hash, which
+    // is exactly the nondeterminism this harness excludes. Each probe reads a
+    // field or calls a method instead — the `init`/constructor bodies still
+    // print, so the ORDERING under test is unaffected.
+    match r.below(9) {
+        0 => p(format!("Ord({n}).sum")),
+        1 => p(format!("Ord({n}, {n}).sum")),
+        2 => p("Ord().sum".to_string()),
+        3 => p(format!("Ord({n}).seen")),
+        4 => p(format!("NoPrim({n}).total")),
+        5 => p("NoPrim().total".to_string()),
+        6 => p(format!("SubOrd({n}).tag")),
+        7 => p(format!("SubOrd({n}, {n}).tag")),
+        _ => p(format!("Pick({n}).show()")),
+    }
+}
+
+/// `deleg` — interface delegation, exercised through the DELEGATED CALLS.
+///
+/// Constructing a `class C(x: I) : I by x` proves nothing; the divergence lives
+/// in which implementation a call reaches. A default method of the delegated
+/// interface runs on the DELEGATE, so it calls the delegate's implementation of
+/// an abstract member even when the delegating class overrides it — the one
+/// result a "forward only the abstract members" lowering gets wrong. Probes
+/// therefore call the plain member, the defaulted member, and the overridden
+/// member on the same shapes, and also through a supertype-typed binding.
+fn g_deleg(r: &mut Rng, _idx: usize) -> String {
+    let n = pick(r, STEPS);
+    match r.below(8) {
+        0 => p(format!("Fwd(Base1({n})).one()")),
+        1 => p(format!("Fwd(Base1({n})).both()")),
+        2 => p(format!("Over(Base1({n})).one()")),
+        3 => p(format!("Over(Base1({n})).both()")),
+        4 => p(format!("Two(Base1({n}), Base2({n})).one()")),
+        5 => p(format!("Two(Base1({n}), Base2({n})).two()")),
+        6 => p(format!("asOne(Fwd(Base1({n}))).both()")),
+        _ => p(format!("asOne(Over(Base1({n}))).both()")),
+    }
+}
+
+/// `invoke` — invoking the result of a call, `f()()`.
+///
+/// The lambda a probe invokes CAPTURES wherever it can: a non-capturing
+/// `{ 42 }` survives a lowering that loses the closure environment, so it would
+/// hide the bug a capturing one exposes. Three-deep chains, invocation off an
+/// index and off a lambda literal, and a class with `operator fun invoke` are
+/// all generated, because each reaches the postfix `(` from a different
+/// preceding form.
+fn g_invoke(r: &mut Rng, _idx: usize) -> String {
+    let n = pick(r, STEPS);
+    match r.below(9) {
+        0 => p(format!("adder({n})({n})")),
+        1 => p(format!("mulBy({n})({n})")),
+        2 => p(format!("twice({n})()()")),
+        3 => p(format!("fnList({n})[0]({n})")),
+        4 => p(format!("fnList({n})[1]({n})")),
+        5 => p(format!("{{ x: Int -> x - {n} }}({n})")),
+        6 => p(format!("Boxed({n})({n})")),
+        7 => p(format!("Boxed({n}).invoke({n})")),
+        _ => p(format!("adder({n}).invoke({n})")),
+    }
+}
+
+/// `strcoll` — the collection API on a `String` receiver.
+///
+/// The divergence here is the RESULT TYPE, not whether the call resolves:
+/// `kotlin.text` gives `"abc".filter { … }` a `String` where the `Iterable`
+/// overload would give a `List<Char>`, while `"abc".map { … }` keeps the
+/// `List`. A lowering that materializes the characters and reuses the list
+/// implementation wholesale is right for `map` and wrong for `filter`, and only
+/// printing the result tells them apart. The empty and single-character
+/// receivers are generated as often as the longer ones, because that is where
+/// `first`/`reduce`/`windowed` change answer or throw.
+fn g_strcoll(r: &mut Rng, _idx: usize) -> String {
+    let subj = pick(r, &["\"\"", "\"a\"", "\"abc\"", "\"aabbc\"", "\"hello\""]);
+    match r.below(20) {
+        0 => p(format!("{subj}.map {{ it }}")),
+        1 => p(format!("{subj}.map {{ it.code }}")),
+        2 => p(format!("{subj}.filter {{ it != 'l' }}")),
+        3 => p(format!("{subj}.filterNot {{ it == 'a' }}")),
+        4 => p(format!("{subj}.filterIndexed {{ i, c -> i % 2 == 0 }}")),
+        5 => p(format!("{subj}.sumOf {{ it.code }}")),
+        6 => p(format!("{subj}.groupBy {{ it }}")),
+        7 => p(format!("{subj}.count {{ it > 'a' }}")),
+        8 => p(format!("{subj}.any {{ it == 'b' }}")),
+        9 => p(format!("{subj}.all {{ it > 'A' }}")),
+        10 => p(format!("{subj}.takeWhile {{ it < 'c' }}")),
+        11 => p(format!("{subj}.dropWhile {{ it < 'c' }}")),
+        12 => p(format!("{subj}.partition {{ it < 'b' }}")),
+        13 => p(format!("{subj}.chunked(2)")),
+        14 => p(format!("{subj}.windowed(2)")),
+        15 => p(format!("{subj}.zip(\"xy\")")),
+        16 => p(format!("{subj}.withIndex().toList()")),
+        17 => p(format!("{subj}.associateWith {{ it.code }}")),
+        18 => p(format!("{subj}.mapIndexed {{ i, c -> \"\" + i + c }}")),
+        _ => p(format!("{subj}.onEach {{ }}")),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     All,
@@ -1460,6 +1572,10 @@ enum Mode {
     LazyProp,
     Result,
     LocalFn,
+    Ctor,
+    Deleg,
+    Invoke,
+    StrColl,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -1512,6 +1628,10 @@ const CONCRETE: &[Mode] = &[
     Mode::LazyProp,
     Mode::Result,
     Mode::LocalFn,
+    Mode::Ctor,
+    Mode::Deleg,
+    Mode::Invoke,
+    Mode::StrColl,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -1566,6 +1686,10 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::LazyProp => "lazyprop",
         Mode::Result => "result",
         Mode::LocalFn => "localfn",
+        Mode::Ctor => "ctor",
+        Mode::Deleg => "deleg",
+        Mode::Invoke => "invoke",
+        Mode::StrColl => "strcoll",
     }
 }
 
@@ -1632,6 +1756,10 @@ fn gen_probe(r: &mut Rng, mode: Mode, idx: usize) -> String {
         Mode::LazyProp => g_lazyprop(r, idx),
         Mode::Result => g_result(r, idx),
         Mode::LocalFn => g_localfn(r, idx),
+        Mode::Ctor => g_ctor(r, idx),
+        Mode::Deleg => g_deleg(r, idx),
+        Mode::Invoke => g_invoke(r, idx),
+        Mode::StrColl => g_strcoll(r, idx),
         Mode::All => unreachable!("resolved above"),
     }
 }
@@ -1766,6 +1894,83 @@ fn extra_declarations(probes: &[String]) -> String {
              \x20   return n * 2\n\
              }\n",
         );
+    }
+    // ── ctor: secondary constructors + `init` ordering ──
+    if named("Ord(") {
+        out.push_str(
+            "class Ord(val a: Int, val b: Int) {\n\
+             \x20   val sum: Int = a + b\n\
+             \x20   init { println(\"ord.i1 sum=\" + sum) }\n\
+             \x20   val seen: String = \"s\" + a\n\
+             \x20   init { println(\"ord.i2 seen=\" + seen) }\n\
+             \x20   constructor(a: Int) : this(a, 0) { println(\"ord.c1 \" + a) }\n\
+             \x20   constructor() : this(9) { println(\"ord.c0\") }\n\
+             }\n",
+        );
+    }
+    if named("NoPrim(") {
+        out.push_str(
+            "class NoPrim {\n\
+             \x20   var total: Int = 1\n\
+             \x20   init { total += 10; println(\"np.init \" + total) }\n\
+             \x20   constructor(n: Int) { total += n; println(\"np.c1 \" + total) }\n\
+             \x20   constructor() : this(3) { total += 100; println(\"np.c0 \" + total) }\n\
+             }\n",
+        );
+    }
+    if named("SubOrd(") {
+        out.push_str(
+            "open class OrdBase(val bv: Int) {\n\
+             \x20   init { println(\"base.init \" + bv) }\n\
+             }\n\
+             class SubOrd(x: Int) : OrdBase(x * 2) {\n\
+             \x20   val tag: String = \"t\" + x + \"/\" + bv\n\
+             \x20   init { println(\"sub.init \" + tag) }\n\
+             \x20   constructor(x: Int, y: Int) : this(x + y) { println(\"sub.c2\") }\n\
+             }\n",
+        );
+    }
+    if named("Pick(") {
+        out.push_str(
+            "class Pick(val a: Int, val b: Int = 5) {\n\
+             \x20   constructor(s: String) : this(s.length) { println(\"pick.str \" + s) }\n\
+             \x20   fun show(): String = \"\" + a + \":\" + b\n\
+             }\n",
+        );
+    }
+    // ── deleg: interface delegation ──
+    if named("Fwd(") || named("Over(") || named("Two(") || named("asOne(") {
+        out.push_str(
+            "interface One {\n\
+             \x20   fun one(): String\n\
+             \x20   fun both(): String { return one() + \"|\" + one() }\n\
+             }\n\
+             interface TwoI { fun two(): Int }\n\
+             class Base1(val k: Int) : One { override fun one(): String = \"b1-\" + k }\n\
+             class Base2(val k: Int) : TwoI { override fun two(): Int = k * 3 }\n\
+             class Fwd(x: One) : One by x\n\
+             class Over(x: One) : One by x { override fun one(): String = \"over\" }\n\
+             class Two(x: One, y: TwoI) : One by x, TwoI by y\n\
+             fun asOne(x: One): One = x\n",
+        );
+    }
+    // ── invoke: calling the result of a call ──
+    if named("adder(") {
+        out.push_str("fun adder(n: Int): (Int) -> Int = { it + n }\n");
+    }
+    if named("mulBy(") {
+        out.push_str("fun mulBy(n: Int): (Int) -> Int { return { x: Int -> x * n } }\n");
+    }
+    if named("twice(") {
+        out.push_str("fun twice(n: Int): () -> (() -> Int) = { { n + n } }\n");
+    }
+    if named("fnList(") {
+        out.push_str(
+            "fun fnList(n: Int): List<(Int) -> Int> = listOf<(Int) -> Int>({ it + n }, { it * n })\n",
+        );
+    }
+    if named("Boxed(") {
+        out.push_str("class Boxed(val k: Int) { operator fun invoke(x: Int): Int = x * 10 + k }\n");
     }
     if named("withLocal(") {
         out.push_str(

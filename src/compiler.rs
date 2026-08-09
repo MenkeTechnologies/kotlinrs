@@ -223,6 +223,9 @@ struct PropMeta {
     /// Declared `by lazy` — the stored value is a cell, so every read forces it
     /// (see [`crate::host::KT_LAZY_GET`]).
     lazy: bool,
+    /// Declared `by <delegate>` — the field stores the DELEGATE, and the class
+    /// whose `getValue`/`setValue` every access routes through.
+    delegate: Option<String>,
 }
 
 /// Static signature of a user function or class method.
@@ -298,6 +301,16 @@ struct ClassMeta {
     base: Option<String>,
     /// The superclass constructor arguments of `: Super(a, b)`.
     super_args: Vec<Expr>,
+    /// Whether a primary constructor was written. Without one, a `C()` call
+    /// selects a no-argument SECONDARY rather than the implicit primary.
+    has_primary: bool,
+    /// The parameter counts of the secondary constructors, in declaration
+    /// order. Constructor selection at a `C(args)` site is by arity first, then
+    /// by argument type where more than one candidate takes that many.
+    sec_arities: Vec<usize>,
+    /// The secondary constructors' parameters, parallel to `sec_arities`, for
+    /// binding named and defaulted arguments.
+    sec_params: Vec<Vec<Param>>,
     /// The built-in JVM throwable this class ultimately extends, if any
     /// (`class MyError(m: String) : Exception(m)` → `Some("Exception")`). Such a
     /// class carries a synthetic `message` field and displays / is caught like
@@ -345,6 +358,23 @@ impl ClassMeta {
     }
 }
 
+/// The class of a property's delegate, read off the `by <expr>` initializer.
+/// Only a direct constructor call names it — anything else leaves the delegate
+/// unresolvable at compile time, which is reported where the access is emitted
+/// rather than here.
+fn delegate_class_of(init: &Expr) -> Option<String> {
+    match init {
+        Expr::Call { name, .. } => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// The `KProperty` argument a delegated access passes: a one-field data
+/// instance carrying the property's name, which is what `property.name` reads.
+fn kproperty_meta() -> String {
+    "KProperty\u{1f}d\u{1f}1\u{1f}.\u{1f}name".to_string()
+}
+
 /// The mangled sub name for a class method (`Person#greet`).
 fn method_sub_name(class: &str, method: &str) -> String {
     format!("{class}#{method}")
@@ -354,6 +384,12 @@ fn method_sub_name(class: &str, method: &str) -> String {
 /// appear in a Kotlin identifier, so the name can never collide with a method.
 fn ctor_sub_name(class: &str) -> String {
     format!("{class}#$init")
+}
+
+/// The mangled sub name for a class's Nth secondary constructor
+/// (`Person#$ctor0`), numbered in declaration order.
+fn sec_ctor_sub_name(class: &str, idx: usize) -> String {
+    format!("{class}#$ctor{idx}")
 }
 
 /// The synthetic field a class extending a built-in throwable stores its
@@ -741,12 +777,30 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
         }
         check_modifiers(cd, &mro, &by_name)?;
 
+        // A `by <delegate>` whose class cannot be named at compile time has no
+        // `getValue` to call. Rejected here rather than left to become a plain
+        // stored field, which would silently print the DELEGATE where the
+        // property's value belongs. `kotlin.properties.Delegates.observable` /
+        // `vetoable` land here: they are stdlib factory calls, not constructor
+        // calls, and no host-side delegate object backs them yet.
+        for p in cd.obj_props.iter().filter(|p| p.delegate) {
+            if !delegate_class_of(&p.init).is_some_and(|c| by_name.contains_key(c.as_str())) {
+                return Err(format!(
+                    "class {}: property {} delegates to a value whose class is not a \
+                     user class declaring `operator fun getValue`; only that form of \
+                     `by` is supported (besides `by lazy`)",
+                    cd.name, p.name
+                ));
+            }
+        }
+
         let own_field = |p: &CtorProp| PropMeta {
             name: p.name.clone(),
             ty: p.ty,
             class: p.class.clone(),
             mutable: p.kind == PropKind::Var,
             lazy: false,
+            delegate: None,
         };
         // The superclass whose constructor this one chains to (interfaces have
         // none), and the built-in throwable the ancestry ultimately reaches.
@@ -778,6 +832,7 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
                 class: None,
                 mutable: false,
                 lazy: false,
+                delegate: None,
             });
         }
         own_props.extend(
@@ -795,6 +850,9 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
             class: p.class.clone(),
             mutable: p.mutable,
             lazy: p.lazy,
+            // The delegate's class, taken from the initializer — `by Upper()`
+            // names `Upper`, whose `getValue`/`setValue` the accesses call.
+            delegate: p.delegate.then(|| delegate_class_of(&p.init)).flatten(),
         }));
 
         // The full field record, base-most first — the order `KT_EXTEND` builds
@@ -821,6 +879,7 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
                         class: p.class.clone(),
                         mutable: p.mutable,
                         lazy: p.lazy,
+                        delegate: p.delegate.then(|| delegate_class_of(&p.init)).flatten(),
                     });
                 }
             }
@@ -874,6 +933,9 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
                 parents: cd.parents.clone(),
                 base,
                 super_args: cd.super_args.clone(),
+                has_primary: cd.has_primary,
+                sec_arities: cd.secondaries.iter().map(|s| s.params.len()).collect(),
+                sec_params: cd.secondaries.iter().map(|s| s.params.clone()).collect(),
                 throwable_base,
             },
         );
@@ -972,6 +1034,7 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
                     class: p.class.clone(),
                     mutable: p.mutable,
                     lazy: p.lazy,
+                    delegate: p.delegate.then(|| delegate_class_of(&p.init)).flatten(),
                 },
             )
             .is_some()
@@ -1087,6 +1150,9 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
     for cd in &program.classes {
         if !cd.is_object && !cd.is_interface {
             c.compile_ctor(cd)?;
+            for (i, sec) in cd.secondaries.iter().enumerate() {
+                c.compile_secondary_ctor(cd, i, sec)?;
+            }
         }
         for m in &cd.methods {
             if !m.is_abstract {
@@ -1213,6 +1279,27 @@ impl Compiler {
             let idx = self.b.add_name(&ctor_sub_name(base));
             self.b
                 .emit(Op::Call(idx, meta.super_args.len() as u8), cd.line);
+            // Bind the INHERITED properties to slots, read off the base
+            // instance the call just returned. A body property initializer and
+            // an `init` block may both name one — `class Sub(x: Int) : Base(x)
+            // { init { println(b) } }` — and at this point the subclass
+            // instance does not exist yet, so there is no `this` to read them
+            // through. The base instance is left back on the stack for the
+            // `KT_EXTEND` at the end.
+            let inherited = meta.props.len() - meta.own_props.len();
+            if inherited > 0 {
+                let base_slot = sc.declare_obj("$base", Type::Obj, false, Some(base.clone()));
+                self.b.emit(Op::SetSlot(base_slot), cd.line);
+                for p in &meta.props[..inherited] {
+                    self.b.emit(Op::GetSlot(base_slot), cd.line);
+                    let nidx = self.b.add_constant(Value::str(p.name.clone()));
+                    self.b.emit(Op::LoadConst(nidx), cd.line);
+                    self.b.emit(Op::Extended(KT_GETFIELD, 0), cd.line);
+                    let slot = sc.declare_obj(&p.name, p.ty, p.mutable, p.class.clone());
+                    self.b.emit(Op::SetSlot(slot), cd.line);
+                }
+                self.b.emit(Op::GetSlot(base_slot), cd.line);
+            }
         }
 
         // Body properties (`class C { var c = 0 }`) initialize after the
@@ -1220,15 +1307,39 @@ impl Compiler {
         // slot so a later initializer can name an earlier property. The base
         // instance is already on the stack; every initializer is stack-neutral
         // (push then `SetSlot`), so it stays put.
-        for p in &cd.obj_props {
-            let t = self.compile_expr(&mut sc, &p.init)?;
-            if p.lazy {
-                self.b.emit(Op::Extended(KT_LAZY_NEW, 0), cd.line);
+        //
+        // `init { … }` blocks are INTERLEAVED here rather than run as a group:
+        // Kotlin executes the property initializers and the `init` blocks in
+        // one declaration-order pass, so a block sees every property declared
+        // above it and none below it. Each block records how many properties
+        // preceded it, which is what drives the interleaving.
+        // A property initializer or an `init` block may contain a lambda that
+        // WRITES an enclosing property (`val n = run { log += "x"; 1 }`). Such a
+        // variable has to live in a box the closure shares, exactly as in a
+        // function body — without this the write is compiled against the
+        // constructor's own slot, which the closure only ever sees a copy of.
+        let ctor_body: Vec<Stmt> = cd
+            .obj_props
+            .iter()
+            .map(|p| Stmt::new(cd.line, StmtKind::Expr(p.init.clone())))
+            .chain(cd.inits.iter().flat_map(|b| b.body.iter().cloned()))
+            .collect();
+        let outer_boxed = std::mem::replace(&mut self.boxed_vars, lambda_writes(&ctor_body));
+        let res: Result<(), String> = (|| {
+            for (i, p) in cd.obj_props.iter().enumerate() {
+                self.emit_init_blocks(&mut sc, cd, i)?;
+                let t = self.compile_expr(&mut sc, &p.init)?;
+                if p.lazy {
+                    self.b.emit(Op::Extended(KT_LAZY_NEW, 0), cd.line);
+                }
+                let ty = if p.ty == Type::Unknown { t } else { p.ty };
+                let slot = sc.declare_obj(&p.name, ty, p.mutable, p.class.clone());
+                self.b.emit(Op::SetSlot(slot), cd.line);
             }
-            let ty = if p.ty == Type::Unknown { t } else { p.ty };
-            let slot = sc.declare_obj(&p.name, ty, p.mutable, p.class.clone());
-            self.b.emit(Op::SetSlot(slot), cd.line);
-        }
+            self.emit_init_blocks(&mut sc, cd, cd.obj_props.len())
+        })();
+        self.boxed_vars = outer_boxed;
+        res?;
 
         let midx = self.b.add_constant(Value::str(meta.meta_string()));
         self.b.emit(Op::LoadConst(midx), cd.line);
@@ -1263,6 +1374,131 @@ impl Compiler {
         };
         self.b.emit(op, cd.line);
         self.b.emit(Op::ReturnValue, cd.line);
+        Ok(())
+    }
+
+    /// Emit every `init { … }` block declared after exactly `done` body
+    /// properties, in source order.
+    ///
+    /// The instance does not exist yet at this point — it is allocated at the
+    /// very end of the constructor — so a block reads the properties from the
+    /// constructor frame's slots, which is where the initializers above it just
+    /// put them. That is enough for the observable ordering Kotlin specifies;
+    /// what it cannot do is call a method on the not-yet-built `this`.
+    fn emit_init_blocks(
+        &mut self,
+        sc: &mut Scope,
+        cd: &ClassDecl,
+        done: usize,
+    ) -> Result<(), String> {
+        for blk in cd.inits.iter().filter(|b| b.after_props == done) {
+            for s in &blk.body {
+                self.compile_stmt(sc, s)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit a secondary constructor's subroutine `Class#$ctorN`.
+    ///
+    /// The lowering mirrors the order Kotlin specifies and `kotlinc` shows:
+    /// the delegated constructor runs to completion FIRST — property
+    /// initializers, `init` blocks and, for a `: this(…)` chain, the other
+    /// secondary's body included — and only then does this body run, on the
+    /// instance that came back. The instance is bound as `this`, so the body
+    /// assigns properties through the ordinary field path.
+    fn compile_secondary_ctor(
+        &mut self,
+        cd: &ClassDecl,
+        idx: usize,
+        sec: &SecondaryCtor,
+    ) -> Result<(), String> {
+        let entry = self.b.current_pos();
+        let name_idx = self.b.add_name(&sec_ctor_sub_name(&cd.name, idx));
+        self.b.add_sub_entry(name_idx, entry);
+
+        let mut sc = Scope::new();
+        for p in &sec.params {
+            sc.declare_obj(&p.name, p.ty, false, p.class.clone());
+        }
+        for i in (0..sec.params.len()).rev() {
+            self.b.emit(Op::SetSlot(i as u16), sec.line);
+        }
+
+        // The delegation target. `: super(…)` is not a separate object here —
+        // the primary constructor is the one that chains to the superclass — so
+        // both spellings run the primary, which is also what an absent clause
+        // does. `: this(…)` with an arity no primary can take picks the
+        // secondary of that arity instead.
+        let meta = self.classes[&cd.name].clone();
+        // Where the delegation goes:
+        //
+        // * no clause — the primary, with no arguments. This is the shape a
+        //   class with no primary constructor has, and it is what makes its
+        //   property initializers and `init` blocks run exactly once, before
+        //   this body.
+        // * `: this(…)` — the same selection a `C(args)` call site uses, so
+        //   defaults are filled and named arguments reordered identically. A
+        //   secondary that selected ITSELF would recurse forever, which Kotlin
+        //   rejects outright.
+        // * `: super(…)` — the primary is the only thing that chains to the
+        //   superclass here, so a NON-EMPTY argument list has nowhere to go.
+        let explicit_this = sec.deleg.as_ref().filter(|d| !d.is_super);
+        if let Some(d) = sec
+            .deleg
+            .as_ref()
+            .filter(|d| d.is_super && !d.args.is_empty())
+        {
+            return Err(format!(
+                "class {}: `: super({} argument(s))` from a secondary constructor is not \
+                 supported; delegate through the primary constructor instead (line {})",
+                cd.name,
+                d.args.len(),
+                sec.line
+            ));
+        }
+        let args: Vec<Expr> = explicit_this.map(|d| d.args.clone()).unwrap_or_default();
+        let (target_sec, params) = match explicit_this {
+            Some(_) => self.select_ctor(&sc, &meta, &args),
+            None => (
+                None,
+                meta.ctor_params.iter().map(|p| p.as_param()).collect(),
+            ),
+        };
+        if target_sec == Some(idx) {
+            return Err(format!(
+                "class {}: secondary constructor delegates to itself (line {})",
+                cd.name, sec.line
+            ));
+        }
+        let target = match target_sec {
+            Some(i) => sec_ctor_sub_name(&cd.name, i),
+            None => ctor_sub_name(&cd.name),
+        };
+        self.cur_class = Some(cd.name.clone());
+        let outer_boxed = std::mem::replace(&mut self.boxed_vars, lambda_writes(&sec.body));
+        let res: Result<(), String> = (|| {
+            let full = self.expand_args(&format!("constructor {}", cd.name), &params, &args)?;
+            for a in &full {
+                self.compile_expr(&mut sc, a)?;
+            }
+            let tidx = self.b.add_name(&target);
+            self.b.emit(Op::Call(tidx, params.len() as u8), sec.line);
+            // The delegated constructor's result is the instance; bind it as
+            // `this` so the body's property reads and writes resolve.
+            let this = sc.declare_obj("this", Type::Obj, false, Some(cd.name.clone()));
+            self.b.emit(Op::SetSlot(this), sec.line);
+            for s in &sec.body {
+                self.compile_stmt(&mut sc, s)?;
+            }
+            // A constructor evaluates to the instance it built.
+            self.b.emit(Op::GetSlot(this), sec.line);
+            Ok(())
+        })();
+        self.boxed_vars = outer_boxed;
+        self.cur_class = None;
+        res?;
+        self.b.emit(Op::ReturnValue, sec.line);
         Ok(())
     }
 
@@ -2162,6 +2398,7 @@ impl Compiler {
             }
             Expr::Binary { op, l, r } => self.compile_binary(sc, *op, l, r),
             Expr::Call { name, args, line } => self.compile_call(sc, name, args, *line),
+            Expr::Invoke { target, args, line } => self.compile_invoke(sc, target, args, *line),
             Expr::Member {
                 recv,
                 name,
@@ -2768,6 +3005,20 @@ impl Compiler {
                 // A stored property read.
                 if args.is_empty() {
                     if let Some(p) = meta.prop(name).cloned() {
+                        // A delegated property has no storage: the read is the
+                        // delegate's `getValue(thisRef, property)`.
+                        if let Some(dc) = &p.delegate {
+                            if !self.classes.contains_key(dc) {
+                                return Err(format!(
+                                    "property {name}: delegate {dc} is not a class declaring \
+                                     `operator fun getValue`"
+                                ));
+                            }
+                            self.emit_delegate_head(sc, recv, name, line)?;
+                            let idx = self.b.add_name(&method_sub_name(dc, "getValue"));
+                            self.b.emit(Op::Call(idx, 3), line);
+                            return Ok(p.ty);
+                        }
                         self.compile_expr(sc, recv)?;
                         let nidx = self.b.add_constant(Value::str(name.to_string()));
                         self.b.emit(Op::LoadConst(nidx), line);
@@ -2778,6 +3029,28 @@ impl Compiler {
                             self.b.emit(Op::CallBuiltin(KT_LAZY_GET, 0), line);
                         }
                         return Ok(p.ty);
+                    }
+                }
+                // A property that HOLDS a function value, called through the
+                // receiver: `box.f(5)`. The class declares no method `f`, so
+                // this is a field read followed by an invocation — without it
+                // the property read above would silently swallow the arguments
+                // and yield the closure itself.
+                if !args.is_empty() && !meta.methods.contains_key(name) {
+                    if let Some(p) = meta.prop(name).cloned() {
+                        self.compile_expr(sc, recv)?;
+                        let nidx = self.b.add_constant(Value::str(name.to_string()));
+                        self.b.emit(Op::LoadConst(nidx), line);
+                        self.b.emit(Op::Extended(KT_GETFIELD, 0), line);
+                        if p.lazy {
+                            self.b.emit(Op::CallBuiltin(KT_LAZY_GET, 0), line);
+                        }
+                        for a in args {
+                            self.compile_expr(sc, a)?;
+                        }
+                        self.b
+                            .emit(Op::CallBuiltin(KT_CLOSURE_CALL, args.len() as u8), line);
+                        return Ok(Type::Unknown);
                     }
                 }
                 // `data class` synthesized `copy(...)` — clone with positional
@@ -2798,6 +3071,18 @@ impl Compiler {
                 self.emit_virtual_call(sc, recv, name, args, &cands, line)?;
                 return Ok(self.virtual_ret_type(&cands, name));
             }
+        }
+        // `f.invoke(args)` on a function value — the explicit spelling of
+        // `f(args)`. A user class declaring its own `invoke` was already
+        // dispatched above, so reaching here means the receiver is a closure.
+        if name == "invoke" {
+            self.compile_expr(sc, recv)?;
+            for a in args {
+                self.compile_expr(sc, a)?;
+            }
+            self.b
+                .emit(Op::CallBuiltin(KT_CLOSURE_CALL, args.len() as u8), line);
+            return Ok(Type::Unknown);
         }
         // The bitwise members (reached from their infix spelling, `x shl 4`).
         // `and`/`or`/`xor` cannot widen a value, so they only need a static
@@ -3267,6 +3552,33 @@ impl Compiler {
     }
 
     /// `recv.field (op)= value` — an object property write.
+    /// Push a delegated property's delegate, the `thisRef` it was declared in,
+    /// and the `KProperty` naming it — the leading three arguments of both
+    /// `getValue(thisRef, property)` and `setValue(thisRef, property, value)`.
+    ///
+    /// The receiver is compiled twice, which is why a delegated access is only
+    /// emitted for a receiver that is a name or `this` — the shapes an access
+    /// site actually takes.
+    fn emit_delegate_head(
+        &mut self,
+        sc: &mut Scope,
+        recv: &Expr,
+        name: &str,
+        line: u32,
+    ) -> Result<(), String> {
+        self.compile_expr(sc, recv)?; // [recv]
+        let fidx = self.b.add_constant(Value::str(name.to_string()));
+        self.b.emit(Op::LoadConst(fidx), line);
+        self.b.emit(Op::Extended(KT_GETFIELD, 0), line); // [delegate]
+        self.compile_expr(sc, recv)?; // [delegate, thisRef]
+        let midx = self.b.add_constant(Value::str(kproperty_meta()));
+        self.b.emit(Op::LoadConst(midx), line);
+        let nidx = self.b.add_constant(Value::str(name.to_string()));
+        self.b.emit(Op::LoadConst(nidx), line);
+        self.b.emit(Op::Extended(KT_NEW, 1), line); // [delegate, thisRef, property]
+        Ok(())
+    }
+
     fn compile_set_member(
         &mut self,
         sc: &mut Scope,
@@ -3282,6 +3594,27 @@ impl Compiler {
                     return Err(format!("val cannot be reassigned: {name}"));
                 }
             }
+        }
+        // A delegated property has no storage: the write is the delegate's
+        // `setValue(thisRef, property, value)`.
+        if let Some(dc) = self
+            .infer_class(sc, recv)
+            .and_then(|c| self.classes.get(&c).and_then(|m| m.prop(name)).cloned())
+            .and_then(|p| p.delegate)
+        {
+            if !self.classes.contains_key(&dc) {
+                return Err(format!(
+                    "property {name}: delegate {dc} is not a class declaring \
+                     `operator fun setValue`"
+                ));
+            }
+            self.emit_delegate_head(sc, recv, name, 0)?;
+            let store = self.compound_value(recv, name, None, op, value);
+            self.compile_expr(sc, &store)?; // [delegate, thisRef, property, value]
+            let idx = self.b.add_name(&method_sub_name(&dc, "setValue"));
+            self.b.emit(Op::Call(idx, 4), 0);
+            self.b.emit(Op::Pop, 0); // `setValue` answers Unit
+            return Ok(());
         }
         self.compile_expr(sc, recv)?; // [obj]
         let store = self.compound_value(recv, name, None, op, value);
@@ -3617,6 +3950,38 @@ impl Compiler {
         self.b.emit(Op::Shr, 0);
     }
 
+    /// `target(args)` where `target` is an arbitrary expression rather than a
+    /// name — `f()()`, `lst[0](7)`, `{ … }(9)`.
+    ///
+    /// Kotlin spells this as the `invoke` operator, so an instance of a class
+    /// that declares `operator fun invoke` routes to that method; everything
+    /// else is a function value and goes through the closure-call builtin, the
+    /// same one a named `f(args)` on a local uses.
+    fn compile_invoke(
+        &mut self,
+        sc: &mut Scope,
+        target: &Expr,
+        args: &[Expr],
+        line: u32,
+    ) -> Result<Type, String> {
+        if let Some(cls) = self.infer_class(sc, target) {
+            if self
+                .classes
+                .get(&cls)
+                .is_some_and(|m| m.methods.contains_key("invoke"))
+            {
+                return self.compile_member(sc, target, "invoke", args, false, line);
+            }
+        }
+        self.compile_expr(sc, target)?;
+        for a in args {
+            self.compile_expr(sc, a)?;
+        }
+        self.b
+            .emit(Op::CallBuiltin(KT_CLOSURE_CALL, args.len() as u8), line);
+        Ok(Type::Unknown)
+    }
+
     fn compile_call(
         &mut self,
         sc: &mut Scope,
@@ -3639,6 +4004,20 @@ impl Compiler {
         // — the local holds a closure handle. Locals win over same-named free
         // functions (lexical shadowing), matching Kotlin.
         if let Some(slot) = sc.slot(name) {
+            // …unless the local holds an instance of a class declaring
+            // `operator fun invoke`, in which case `b(5)` is that method, not a
+            // closure call. Kotlin resolves the same way: the `invoke` operator
+            // is what makes any value callable.
+            if let Some(cls) = sc.class_of(name) {
+                if self
+                    .classes
+                    .get(&cls)
+                    .is_some_and(|m| m.methods.contains_key("invoke"))
+                {
+                    let recv = Expr::Var(name.to_string());
+                    return self.compile_member(sc, &recv, "invoke", args, false, line);
+                }
+            }
             self.b.emit(Op::GetSlot(slot), line);
             for a in args {
                 self.compile_expr(sc, a)?;
@@ -3861,6 +4240,27 @@ impl Compiler {
                     .filter(|c| self.classes[c].methods.contains_key(name))
                 {
                     return self.compile_member(sc, &Expr::Var(comp), name, args, false, line);
+                }
+                // Implicit `this.f(args)` where `f` is a PROPERTY holding a
+                // function value — `class Box(val f: (Int) -> Int) { fun go(x:
+                // Int) = f(x) }`. Checked before the method case only in the
+                // sense that a class cannot have both; a method of the same
+                // name wins below because `methods` is consulted first there.
+                if let Some(cls) = self.cur_class.clone() {
+                    let is_prop = self
+                        .classes
+                        .get(&cls)
+                        .is_some_and(|m| !m.methods.contains_key(name) && m.prop(name).is_some());
+                    if is_prop && sc.slot("this").is_some() {
+                        return self.compile_member(
+                            sc,
+                            &Expr::Var("this".into()),
+                            name,
+                            args,
+                            false,
+                            line,
+                        );
+                    }
                 }
                 // Implicit `this.method(args)` inside a class method.
                 if let Some(cls) = self.cur_class.clone() {
@@ -4157,6 +4557,57 @@ impl Compiler {
     /// then each stored-property value in declaration order, then `KT_NEW`. Only
     /// `val`/`var` primary-constructor params are stored; plain params are not
     /// modeled (they carry no property).
+    /// Choose which constructor a `C(args)` call runs: `None` for the primary,
+    /// `Some(i)` for the Nth secondary, together with that constructor's
+    /// parameters.
+    ///
+    /// Arity narrows the field — a candidate must be able to take this many
+    /// arguments, counting the primary's defaults. Where more than one still
+    /// fits, the ARGUMENT TYPES decide, which is what tells
+    /// `Def(2)` from `Def("xyz")` when `class Def(val a: Int, val b: Int = 5)`
+    /// also declares `constructor(s: String)`. A class that wrote no primary
+    /// constructor prefers a secondary outright, because Kotlin only
+    /// synthesizes the implicit primary when nothing else is declared.
+    fn select_ctor(
+        &self,
+        sc: &Scope,
+        meta: &ClassMeta,
+        args: &[Expr],
+    ) -> (Option<usize>, Vec<Param>) {
+        let primary: Vec<Param> = meta.ctor_params.iter().map(|p| p.as_param()).collect();
+        let required = primary.iter().filter(|p| p.default.is_none()).count();
+        let argc = args.len();
+        let arg_types: Vec<Type> = args.iter().map(|a| self.infer(sc, a)).collect();
+
+        let primary_fits = argc >= required
+            && argc <= primary.len()
+            && meta.has_primary
+            && params_accept(&primary, &arg_types);
+        if primary_fits {
+            return (None, primary);
+        }
+        let sec = meta
+            .sec_arities
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| **n == argc)
+            .map(|(i, _)| i)
+            // Prefer a secondary whose parameter types match; fall back to the
+            // first of that arity so an unresolvable argument type still picks
+            // one rather than failing.
+            .find(|i| params_accept(&meta.sec_params[*i], &arg_types))
+            .or_else(|| {
+                meta.sec_arities
+                    .iter()
+                    .position(|n| *n == argc)
+                    .filter(|_| !meta.has_primary || argc < required || argc > primary.len())
+            });
+        match sec {
+            Some(i) => (Some(i), meta.sec_params[i].clone()),
+            None => (None, primary),
+        }
+    }
+
     fn compile_construct(
         &mut self,
         sc: &mut Scope,
@@ -4174,12 +4625,16 @@ impl Compiler {
             };
             return Err(format!("cannot construct {what} {}", meta.name));
         }
-        let params: Vec<Param> = meta.ctor_params.iter().map(|p| p.as_param()).collect();
+        let (sec, params) = self.select_ctor(sc, meta, args);
         let full = self.expand_args(&format!("constructor {}", meta.name), &params, args)?;
         for a in &full {
             self.compile_expr(sc, a)?;
         }
-        let idx = self.b.add_name(&ctor_sub_name(&meta.name));
+        let name = match sec {
+            Some(i) => sec_ctor_sub_name(&meta.name, i),
+            None => ctor_sub_name(&meta.name),
+        };
+        let idx = self.b.add_name(&name);
         self.b.emit(Op::Call(idx, params.len() as u8), line);
         Ok(Type::Obj)
     }
@@ -4388,6 +4843,11 @@ impl Compiler {
     fn infer(&self, sc: &Scope, e: &Expr) -> Type {
         match e {
             Expr::Super { .. } => Type::Unknown,
+            // The result of invoking a function value. The declared return type
+            // of a `(Int) -> Int` is not tracked through the value, so this is
+            // the same `Unknown` a named call on a local lambda yields, and it
+            // reaches the same runtime-tagged display path.
+            Expr::Invoke { .. } => Type::Unknown,
             // A named argument types as the value it carries.
             Expr::Named { value, .. } => self.infer(sc, value),
             Expr::Int(_) => Type::Int,
@@ -5094,6 +5554,33 @@ fn lambda_writes(body: &[Stmt]) -> HashSet<String> {
     out.into_inner()
 }
 
+/// Whether a parameter list can accept arguments of these coarse types.
+///
+/// Only a CONFLICT rejects: both the parameter and the argument must have a
+/// known primitive type and they must disagree. `Unknown` on either side is
+/// silent, and `Int`/`Long` are interchangeable because an integer literal
+/// takes whichever width the parameter declares. Anything the coarse type
+/// system cannot tell apart is therefore accepted, which keeps this a
+/// tie-breaker rather than a type checker.
+fn params_accept(params: &[Param], args: &[Type]) -> bool {
+    fn primitive(t: Type) -> bool {
+        matches!(
+            t,
+            Type::Int | Type::Long | Type::Double | Type::Boolean | Type::Char | Type::String
+        )
+    }
+    !params.iter().zip(args).any(|(p, a)| {
+        let (want, got) = (p.ty, *a);
+        primitive(want)
+            && primitive(got)
+            && want != got
+            && !matches!(
+                (want, got),
+                (Type::Int, Type::Long) | (Type::Long, Type::Int)
+            )
+    })
+}
+
 /// Whether `name` is one of the receiver-taking scope functions.
 fn is_scope_fn(name: &str) -> bool {
     matches!(
@@ -5298,6 +5785,13 @@ fn is_coll_hof(name: &str) -> bool {
             | "firstOrNull"
             | "lastOrNull"
             | "forEach"
+            | "onEach"
+            | "mapNotNull"
+            | "flatMapIndexed"
+            | "runningFold"
+            | "scan"
+            | "runningReduce"
+            | "scanReduce"
             | "fold"
             | "reduce"
             | "any"
@@ -5343,7 +5837,17 @@ fn is_coll_hof(name: &str) -> bool {
 fn is_optional_hof(name: &str) -> bool {
     matches!(
         name,
-        "chunked" | "windowed" | "zip" | "joinToString" | "getOrElse"
+        // `trim`/`trimStart`/`trimEnd` belong here rather than in
+        // [`is_coll_hof`] because their no-lambda spelling is the whitespace
+        // trim, a plain `String` member — only the predicate form iterates.
+        "chunked"
+            | "windowed"
+            | "zip"
+            | "joinToString"
+            | "getOrElse"
+            | "trim"
+            | "trimStart"
+            | "trimEnd"
     )
 }
 
@@ -5442,6 +5946,9 @@ fn expr_any(e: &Expr, f: &dyn Fn(&Expr) -> bool) -> bool {
     }
     match e {
         Expr::Call { args, .. } => args.iter().any(|a| expr_any(a, f)),
+        Expr::Invoke { target, args, .. } => {
+            expr_any(target, f) || args.iter().any(|a| expr_any(a, f))
+        }
         Expr::Member { recv, .. } => expr_any(recv, f),
         Expr::MethodCall { recv, args, .. } => {
             expr_any(recv, f) || args.iter().any(|a| expr_any(a, f))

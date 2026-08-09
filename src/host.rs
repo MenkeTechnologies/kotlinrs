@@ -2192,6 +2192,11 @@ fn join_to_string(
 }
 
 fn sequence_items(v: &Value) -> Vec<Value> {
+    // A `String` is a `CharSequence`, so it is a valid other-operand for the
+    // members that take one (`"abc".zip("xy")`, `list.zip("xy")`).
+    if let Value::Str(s) = v {
+        return chars_of(s);
+    }
     with_obj(v, |o| match o {
         HeapObj::List(items) | HeapObj::Set(items) => items.clone(),
         HeapObj::Array { items, .. } => items.clone(),
@@ -2478,6 +2483,65 @@ fn same_kind_as(recv: &Value, out: Vec<Value>) -> Value {
     }
 }
 
+/// The `chunked`/`windowed` groups of a `CharSequence` receiver, each rebuilt
+/// as a `String` — which is what the `kotlin.text` overload hands its lambda
+/// and what its no-lambda form returns (`"abc".chunked(2)` is `[ab, c]`).
+fn coll_hof_str_groups(name: &str, chars: &Value, extras: &[Value]) -> Result<Vec<Value>, String> {
+    let items = list_snapshot(chars).unwrap_or_default();
+    let size = extras.first().map(|v| v.to_int()).unwrap_or(0);
+    let chunking = name == "chunked";
+    let step = if chunking {
+        size
+    } else {
+        extras.get(1).map(|v| v.to_int()).unwrap_or(1)
+    };
+    if size <= 0 || step <= 0 {
+        return Err(format!(
+            "java.lang.IllegalArgumentException: \
+             size {size} and step {step} must be greater than zero."
+        ));
+    }
+    let partial = chunking || extras.get(2).is_some_and(truthy);
+    Ok(windows_of(&items, size as usize, step as usize, partial)
+        .iter()
+        .map(chars_to_string)
+        .collect())
+}
+
+/// A string's characters as `Char` values, indexed by UTF-16 code unit — the
+/// same basis `String.length` and `s[i]` use.
+pub fn chars_of(s: &str) -> Vec<Value> {
+    s.encode_utf16().map(|u| char_of(u as i64)).collect()
+}
+
+/// Concatenate a sequence of `Char`s back into a `String`. The inverse of
+/// [`chars_of`], used to give a `CharSequence` receiver the `String` result its
+/// `kotlin.text` overload has where the `Iterable` one would give a `List`.
+fn chars_to_string(v: &Value) -> Value {
+    let items = list_snapshot(v).unwrap_or_default();
+    Value::str(items.iter().map(kotlin_string).collect::<String>())
+}
+
+/// Whether the `kotlin.text` overload of `name` — the one with a `CharSequence`
+/// receiver — answers a `String` where the `Iterable` overload answers a
+/// `List`. `map`/`flatMap`/`groupBy` are deliberately absent: those keep their
+/// `List`/`Map` result on a `String` receiver too (`"abc".map { it }` is
+/// `[a, b, c]`, not `abc`).
+fn charseq_returns_string(name: &str) -> bool {
+    matches!(
+        name,
+        "filter"
+            | "filterNot"
+            | "filterIndexed"
+            | "takeWhile"
+            | "dropWhile"
+            | "trim"
+            | "trimStart"
+            | "trimEnd"
+            | "onEach"
+    )
+}
+
 fn coll_hof(
     vm: &mut VM,
     name: &str,
@@ -2485,6 +2549,42 @@ fn coll_hof(
     extras: &[Value],
     clo: &Value,
 ) -> Result<Value, String> {
+    // A `String` receiver: `kotlin.text` mirrors most of the collection API on
+    // `CharSequence`, iterating the characters. The shared implementation below
+    // works on the materialized `Char`s; only the RESULT type differs, and
+    // only for the members whose text overload rebuilds a string.
+    if let Value::Str(s) = recv {
+        let chars = alloc(HeapObj::List(chars_of(s)));
+        // `chunked`/`windowed` hand each group to the lambda as a `String`, not
+        // as a `List<Char>`, so the groups are rebuilt before the callback.
+        if matches!(name, "chunked" | "windowed") {
+            let groups = coll_hof_str_groups(name, &chars, extras)?;
+            let mut out = Vec::with_capacity(groups.len());
+            for g in groups {
+                out.push(invoke_closure(vm, clo, &[g])?);
+            }
+            return Ok(alloc(HeapObj::List(out)));
+        }
+        let out = coll_hof(vm, name, &chars, extras, clo)?;
+        if charseq_returns_string(name) {
+            return Ok(chars_to_string(&out));
+        }
+        // `partition` yields a `Pair<String, String>` on a `CharSequence`.
+        if name == "partition" {
+            if let Some((a, b)) = with_obj(&out, |o| match o {
+                HeapObj::Pair(a, b) => Some((a.clone(), b.clone())),
+                _ => None,
+            })
+            .flatten()
+            {
+                return Ok(alloc(HeapObj::Pair(
+                    chars_to_string(&a),
+                    chars_to_string(&b),
+                )));
+            }
+        }
+        return Ok(out);
+    }
     let items = list_snapshot(recv)
         .ok_or_else(|| format!("unresolved reference: {name} on {}", obj_label(recv)))?;
     match name {
@@ -2510,12 +2610,84 @@ fn coll_hof(
             }
             Ok(Value::Undef)
         }
+        // `onEach` is `forEach` that answers the RECEIVER, so it chains
+        // (`list.onEach { … }.size`). That return value is the whole
+        // difference between the two.
+        "onEach" => {
+            for it in &items {
+                invoke_closure(vm, clo, std::slice::from_ref(it))?;
+            }
+            Ok(alloc(HeapObj::List(items)))
+        }
         "fold" => {
             let mut acc = extras.first().cloned().unwrap_or(Value::Undef);
             for it in items {
                 acc = invoke_closure(vm, clo, &[acc, it])?;
             }
             Ok(acc)
+        }
+        // `runningFold` (and its alias `scan`) is `fold` that keeps every
+        // intermediate accumulator, INCLUDING the initial one — so the result
+        // is one longer than the input.
+        "runningFold" | "scan" => {
+            let mut acc = extras.first().cloned().unwrap_or(Value::Undef);
+            let mut out = vec![acc.clone()];
+            for it in items {
+                acc = invoke_closure(vm, clo, &[acc, it])?;
+                out.push(acc.clone());
+            }
+            Ok(alloc(HeapObj::List(out)))
+        }
+        // The same for `reduce`: the first element seeds the accumulator, so an
+        // empty input gives an empty result rather than an error.
+        "runningReduce" | "scanReduce" => {
+            let mut iter = items.into_iter();
+            let Some(mut acc) = iter.next() else {
+                return Ok(alloc(HeapObj::List(Vec::new())));
+            };
+            let mut out = vec![acc.clone()];
+            for it in iter {
+                acc = invoke_closure(vm, clo, &[acc, it])?;
+                out.push(acc.clone());
+            }
+            Ok(alloc(HeapObj::List(out)))
+        }
+        // `mapNotNull` drops the results that came back null.
+        "mapNotNull" => {
+            let mut out = Vec::new();
+            for it in items {
+                let v = invoke_closure(vm, clo, &[it])?;
+                if !matches!(v, Value::Undef) {
+                    out.push(v);
+                }
+            }
+            Ok(alloc(HeapObj::List(out)))
+        }
+        "flatMapIndexed" => {
+            let mut out = Vec::new();
+            for (i, it) in items.into_iter().enumerate() {
+                let sub = invoke_closure(vm, clo, &[Value::Int(i as i64), it])?;
+                out.extend(sequence_items(&sub));
+            }
+            Ok(alloc(HeapObj::List(out)))
+        }
+        // The predicate forms of `trim`/`trimStart`/`trimEnd`, which only a
+        // `CharSequence` receiver has: drop elements from the requested end(s)
+        // for as long as the predicate holds.
+        "trim" | "trimStart" | "trimEnd" => {
+            let mut lo = 0usize;
+            let mut hi = items.len();
+            if name != "trimEnd" {
+                while lo < hi && truthy(&invoke_closure(vm, clo, &[items[lo].clone()])?) {
+                    lo += 1;
+                }
+            }
+            if name != "trimStart" {
+                while hi > lo && truthy(&invoke_closure(vm, clo, &[items[hi - 1].clone()])?) {
+                    hi -= 1;
+                }
+            }
+            Ok(alloc(HeapObj::List(items[lo..hi].to_vec())))
         }
         "reduce" => {
             let mut iter = items.into_iter();
@@ -3674,11 +3846,33 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
             }))
         }
 
+        // A `String` member the text-specific arms above did not claim:
+        // `kotlin.text` also mirrors the LAMBDA-FREE collection members on
+        // `CharSequence`, over the characters. Reached last so a member that
+        // exists on both — `take`, `first`, `indexOf`, `reversed` — keeps the
+        // `String` behaviour, which differs (`"abc".take(2)` is `ab`, not
+        // `[a, b]`).
+        (Value::Str(s), _) => charseq_member(s, name, args)
+            .unwrap_or_else(|| Err(format!("unresolved reference: {name} on String"))),
+
         _ => Err(format!(
             "unresolved reference: {name} on {}",
             type_label(recv)
         )),
     }
+}
+
+/// The lambda-free collection members of a `CharSequence` receiver, over the
+/// string's characters. `None` when the name is not one of them.
+fn charseq_member(s: &str, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    let chars = chars_of(s);
+    // `chunked`/`windowed` answer a `List<String>` here, where the `Iterable`
+    // overload answers a `List<List<T>>`.
+    if matches!(name, "chunked" | "windowed") {
+        let list = alloc(HeapObj::List(chars));
+        return Some(coll_hof_str_groups(name, &list, args).map(|g| alloc(HeapObj::List(g))));
+    }
+    sequence_member(&chars, None, name, args)
 }
 
 /// The `kotlin.Char` members, on the code unit `code`.
@@ -4164,8 +4358,45 @@ fn sequence_member(
                 partial,
             )))));
         }
-        "toList" | "toMutableList" | "toTypedArray" | "asList" => {
+        "toList" | "toMutableList" | "toTypedArray" | "asList" | "asIterable" | "asSequence" => {
             return Some(Ok(alloc(HeapObj::List(items.to_vec()))))
+        }
+        // `withIndex()` pairs each element with its position. Kotlin's element
+        // type is the data class `IndexedValue`, whose `index`/`value` are read
+        // as ordinary properties and which prints as
+        // `IndexedValue(index=0, value=a)` — so it is built as a data instance
+        // rather than as a `Pair`, which would print `(0, a)`.
+        "withIndex" => {
+            let out = items
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    alloc(HeapObj::Instance {
+                        class: "IndexedValue".to_string(),
+                        is_data: true,
+                        fields: vec![
+                            ("index".to_string(), Value::Int(i as i64)),
+                            ("value".to_string(), v.clone()),
+                        ],
+                        data_from: 0,
+                        data_len: 2,
+                    })
+                })
+                .collect();
+            return Some(Ok(alloc(HeapObj::List(out))));
+        }
+        // `single()` — the element of a one-element sequence, and an error for
+        // any other length. The predicate form is a higher-order member and
+        // lives in `coll_hof`.
+        "single" | "singleOrNull" if args.is_empty() => {
+            return Some(match (items.len(), name) {
+                (1, _) => Ok(items[0].clone()),
+                (_, "singleOrNull") => Ok(Value::Undef),
+                (0, _) => Err("java.util.NoSuchElementException: List is empty.".to_string()),
+                _ => Err("java.lang.IllegalArgumentException: \
+                          List has more than one element."
+                    .to_string()),
+            })
         }
         // `toSet` yields a `Set`; `distinct` yields a `List` with the same
         // elements — the pair Kotlin draws the distinction between.

@@ -421,12 +421,16 @@ name-based lookup falls into) would be silently wrong — so it is a compile err
 
 Not yet (see roadmap): `sequence { … }` / `yield` (a generator needs a
 continuation this VM has no opcode for, so an infinite sequence cannot be
-modelled by evaluating eagerly), real generic *typing*, secondary constructors,
-delegation other than `by lazy`, directly invoking a call result (`f()()`; bind
-it first), the collection functions on a `String` receiver (`"abc".map { … }`,
-`"abc".toCharArray()`, `"abc".first()`; `for (c in s)` and `s[i]` work), and the
-rest of the standard-library surface. Each fails loudly rather than answering
-wrong.
+modelled by evaluating eagerly), real generic *typing*,
+`kotlin.properties.Delegates.observable` / `vetoable` (a property delegate that
+is not a constructor call has no class whose `getValue` could be resolved at
+compile time, and no host-side delegate object backs the stdlib factories yet),
+an explicit `: super(args)` from a secondary constructor (the primary
+constructor is the only thing that chains to the superclass here), calling a
+method on `this` from inside an `init` block (the instance is allocated after
+the initializers run, so there is no receiver yet — reading properties works),
+and the rest of the standard-library surface. Each fails loudly rather than
+answering wrong.
 
 One limitation is a **representation** limit rather than a missing feature, and
 so is excluded from the fuzzer and the frozen corpus by design: every integer is
@@ -668,10 +672,35 @@ comparing two heap handles numerically — answering `true` for any two pairs �
 because the constructor spelling was not inferred as a heap object the way
 `a to b` was.
 
-Next: `sequence { … }`/`yield`, the collection functions on a `String` receiver
-(`"abc".map { … }`), real generic typing, secondary constructors, and a growing
-standard-library surface — alongside the sibling parity tooling (LSP/DAP,
-reference generator, differential harness).
+Also landed, each with a new differential-harness mode (`ctor`, `deleg`,
+`invoke`, `strcoll`) and frozen corpus records captured from the reference
+toolchain: **secondary constructors** — including the ORDER Kotlin specifies,
+where the property initializers and the `init` blocks run interleaved in
+declaration order and a secondary's body runs only after the constructor it
+delegates to has finished; **interface delegation** (`class C(x: I) : I by x`),
+which forwards `I`'s defaulted members too, so a default method calls the
+DELEGATE's implementation rather than the delegating class's override, as
+Kotlin specifies; **property delegation** through a custom `operator fun
+getValue` / `setValue`, which receive the `thisRef` and a `KProperty` carrying
+the property's name; **invoking the result of a call** (`f()()`, `lst[0](7)`,
+`{ x: Int -> x }(9)`, `f.invoke(x)`, and a class declaring `operator fun
+invoke`); and **the collection functions on a `String` receiver**, where the
+result TYPE follows `kotlin.text` rather than `Iterable` — `"abc".map { … }` is
+a `List<Char>` but `"abc".filter { … }` is a `String`, and `chunked`/`windowed`
+answer a `List<String>`.
+
+Three bugs surfaced along the way. Constructor selection needed the ARGUMENT
+TYPES, not just the arity: with `class D(val a: Int, val b: Int = 5)` and
+`constructor(s: String)`, `D("xyz")` matches both by arity. A class that writes
+no primary constructor must prefer a no-argument SECONDARY over the implicit
+primary. And the `ctor` harness mode found on its first run that an `init` body
+rejected a `;` separator, because it was parsing statements directly instead of
+through the shared block rule.
+
+Next: `sequence { … }`/`yield`, real generic typing,
+`Delegates.observable`/`vetoable`, and a growing standard-library surface —
+alongside the sibling parity tooling (LSP/DAP, reference generator, differential
+harness).
 
 ## [0xFF] LICENSE
 
