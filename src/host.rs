@@ -143,6 +143,15 @@ pub const KT_CLASSOF: u16 = 34;
 /// [`KT_DISPLAY`] resolves with `Chunk::find_sub`. Emitted once per overriding
 /// class, before `main`, and only in a program that declares one.
 pub const KT_TOSTRING_REG: u16 = 35;
+/// Register a class's `equals(Any?)` override. Stack: `[tagStr, subNameIdx]`,
+/// exactly as [`KT_TOSTRING_REG`]. Consulted by [`equal_vm`], which is what
+/// makes `==` — and every equality-based collection member — run the user body
+/// instead of the built-in structural compare.
+pub const KT_EQUALS_REG: u16 = 38;
+/// Register a class's `hashCode()` override. Stack: `[tagStr, subNameIdx]`.
+/// Consulted by [`hash_vm`], so a `List`/`Set`/`Map` fold over an instance
+/// picks up the user's answer the way the JVM's does.
+pub const KT_HASH_REG: u16 = 39;
 
 // ── Builtin ids (`Op::CallBuiltin`) ─────────────────────────────────────────
 //
@@ -205,6 +214,33 @@ pub const KT_DISPLAY: u16 = 107;
 /// override — the [`KT_DISPLAY`] element rendering with a separator. Stack:
 /// `[recv]` or `[recv, sep]` (`argc` distinguishes).
 pub const KT_JOIN: u16 = 108;
+/// The re-entrant twins of the `KT_METHOD` / `KT_SET` / `KT_IN` /
+/// `KT_INDEX_GET` / `KT_INDEX_SET` extension ops.
+///
+/// Each reaches container equality, and container equality can run a user
+/// `equals`/`hashCode` through a nested `vm.run()`. fusevm dispatches
+/// `Op::Extended` by *taking* the handler out of the VM for the duration of the
+/// call, so a nested run finds none and every extension op it executes silently
+/// does nothing — the member body would read its receiver's fields as `Undef`.
+/// The `builtin_table` is indexed in place and survives re-entry, so these live
+/// there instead. `KT_INDEX_SET_VM` is a statement and answers `Undef`, which
+/// its emission site pops.
+pub const KT_METHOD_VM: u16 = 125;
+pub const KT_SET_VM: u16 = 126;
+pub const KT_IN_VM: u16 = 127;
+pub const KT_INDEX_GET_VM: u16 = 128;
+pub const KT_INDEX_SET_VM: u16 = 129;
+pub const KT_MAP_VM: u16 = 130;
+
+/// Kotlin `==` over heap objects. Stack: `[a, b]`; pushes a `Bool`.
+///
+/// A **builtin**, not an `Op::Extended`, for one reason: a user `equals` body
+/// runs through a nested `vm.run()`, and fusevm's extension dispatch *takes*
+/// the handler out of the VM for the duration of a call — so every
+/// `Op::Extended` the nested run executes would find no handler and silently do
+/// nothing. The `builtin_table` survives re-entry, which is the same reason
+/// [`KT_DISPLAY`] is a builtin. See [`equal_vm`].
+pub const KT_OBJEQ_VM: u16 = 109;
 
 // ── Exception builtins (`try` / `catch` / `finally` / `throw`) ──────────────
 //
@@ -296,6 +332,16 @@ thread_local! {
     /// Class tag → the name-pool index of its `toString()` subroutine, as
     /// published by [`KT_TOSTRING_REG`]. Consulted by [`KT_DISPLAY`].
     static TOSTRING_SUBS: RefCell<std::collections::HashMap<String, u16>> =
+        RefCell::new(std::collections::HashMap::new());
+
+    /// Class tag → the name-pool index of its `equals(Any?)` subroutine, as
+    /// published by [`KT_EQUALS_REG`]. Consulted by [`equal_vm`].
+    static EQUALS_SUBS: RefCell<std::collections::HashMap<String, u16>> =
+        RefCell::new(std::collections::HashMap::new());
+
+    /// Class tag → the name-pool index of its `hashCode()` subroutine, as
+    /// published by [`KT_HASH_REG`]. Consulted by [`hash_vm`].
+    static HASHCODE_SUBS: RefCell<std::collections::HashMap<String, u16>> =
         RefCell::new(std::collections::HashMap::new());
 
     /// Class tag → one character per OWN property, `'l'` where that property is
@@ -578,6 +624,8 @@ fn reset_heap() {
     HEAP.with(|h| h.borrow_mut().clear());
     TYPES.with(|t| t.borrow_mut().clear());
     TOSTRING_SUBS.with(|t| t.borrow_mut().clear());
+    EQUALS_SUBS.with(|t| t.borrow_mut().clear());
+    HASHCODE_SUBS.with(|t| t.borrow_mut().clear());
     PENDING.with(|p| *p.borrow_mut() = None);
     STASH.with(|s| s.borrow_mut().clear());
 }
@@ -1261,7 +1309,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             }
             args.reverse();
             let recv = vm.pop();
-            match kt_method(&recv, &name, &args) {
+            match kt_method(vm, &recv, &name, &args) {
                 Ok(v) => vm.push(v),
                 Err(e) => {
                     fault(vm, e);
@@ -1347,6 +1395,18 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let tag = vm.pop().to_str();
             TOSTRING_SUBS.with(|t| t.borrow_mut().insert(tag, idx));
         }
+        KT_EQUALS_REG => {
+            // Stack: [tagStr, subNameIdx].
+            let idx = vm.pop().to_int() as u16;
+            let tag = vm.pop().to_str();
+            EQUALS_SUBS.with(|t| t.borrow_mut().insert(tag, idx));
+        }
+        KT_HASH_REG => {
+            // Stack: [tagStr, subNameIdx].
+            let idx = vm.pop().to_int() as u16;
+            let tag = vm.pop().to_str();
+            HASHCODE_SUBS.with(|t| t.borrow_mut().insert(tag, idx));
+        }
         KT_GETFIELD => {
             // Stack: [obj, nameStr].
             let name = vm.pop().to_str();
@@ -1404,7 +1464,8 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
                 vals.push(vm.pop());
             }
             vals.reverse();
-            vm.push(alloc(HeapObj::Set(distinct(&vals))));
+            let items = distinct(vm, &vals);
+            vm.push(alloc(HeapObj::Set(items)));
         }
         KT_MAP => {
             // Stack: [pair0 .. pair{n-1}]; each a Pair handle.
@@ -1460,7 +1521,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
         KT_INDEX_GET => {
             let index = vm.pop();
             let recv = vm.pop();
-            match index_get(&recv, &index) {
+            match index_get(vm, &recv, &index) {
                 Ok(v) => vm.push(v),
                 Err(e) => {
                     fault(vm, e);
@@ -1472,7 +1533,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let value = vm.pop();
             let index = vm.pop();
             let recv = vm.pop();
-            if let Err(e) = index_set(&recv, &index, value) {
+            if let Err(e) = index_set(vm, &recv, &index, value) {
                 fault(vm, e);
             }
         }
@@ -1594,7 +1655,8 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
         KT_IN => {
             let container = vm.pop();
             let value = vm.pop();
-            vm.push(Value::Bool(contains_value(&container, &value)));
+            let has = contains_value(vm, &container, &value);
+            vm.push(Value::Bool(has));
         }
         KT_ITER_SIZE => {
             let recv = vm.pop();
@@ -1746,6 +1808,13 @@ fn register_builtins(vm: &mut VM) {
     vm.register_builtin(KT_PRINT, b_print);
     vm.register_builtin(KT_DISPLAY, b_display);
     vm.register_builtin(KT_JOIN, b_join);
+    vm.register_builtin(KT_OBJEQ_VM, b_objeq);
+    vm.register_builtin(KT_METHOD_VM, b_method);
+    vm.register_builtin(KT_SET_VM, b_set_new);
+    vm.register_builtin(KT_IN_VM, b_in);
+    vm.register_builtin(KT_INDEX_GET_VM, b_index_get);
+    vm.register_builtin(KT_INDEX_SET_VM, b_index_set);
+    vm.register_builtin(KT_MAP_VM, b_map_new);
     vm.register_builtin(KT_EXC_NEW, b_exc_new);
     vm.register_builtin(KT_EXC_THROW, b_exc_throw);
     vm.register_builtin(KT_EXC_PENDING, b_exc_pending);
@@ -1783,20 +1852,54 @@ fn is_int(v: &Value) -> bool {
 /// `value in container` for every container kind `in` accepts: numeric
 /// membership in a range, element membership in a `List` or array, key
 /// membership in a `Map`, and substring containment in a `String`.
-fn contains_value(container: &Value, value: &Value) -> bool {
+fn contains_value(vm: &mut VM, container: &Value, value: &Value) -> bool {
     if let Value::Str(s) = container {
         return s.contains(&kotlin_string(value));
     }
-    with_obj(container, |o| match o {
+    // A range answers without any element comparison. Everything else hands back
+    // its elements so the search runs OUTSIDE the heap borrow: an `equals`
+    // override allocates, and comparing under `with_obj`'s shared borrow would
+    // panic the moment it did.
+    enum Search {
+        Range(bool),
+        /// Elements, and whether membership is hash-gated (a `Set`/`Map` key).
+        Elems(Vec<Value>, bool),
+        No,
+    }
+    let search = with_obj(container, |o| match o {
         // `'x' in 'a'..'z'` compares code units, like every other range test.
-        HeapObj::Range(r) => r.is_char == is_char(value) && r.contains(num_of(value)),
-        HeapObj::List(items) | HeapObj::Set(items) | HeapObj::Array { items, .. } => {
-            items.iter().any(|v| value_eq(v, value))
+        HeapObj::Range(r) => {
+            Search::Range(r.is_char == is_char(value) && r.contains(num_of(value)))
         }
-        HeapObj::Map(entries) => entries.iter().any(|(k, _)| value_eq(k, value)),
-        _ => false,
+        HeapObj::List(items) | HeapObj::Array { items, .. } => Search::Elems(items.clone(), false),
+        HeapObj::Set(items) => Search::Elems(items.clone(), true),
+        HeapObj::Map(entries) => {
+            Search::Elems(entries.iter().map(|(k, _)| k.clone()).collect(), true)
+        }
+        _ => Search::No,
     })
-    .unwrap_or(false)
+    .unwrap_or(Search::No);
+    match search {
+        Search::Range(hit) => hit,
+        Search::Elems(items, hashed) => items.iter().any(|v| member_eq(vm, v, value, hashed)),
+        Search::No => false,
+    }
+}
+
+/// One element comparison for a container search.
+///
+/// `hashed` picks the container's rule, which Kotlin does NOT share between the
+/// two families: a `List` compares with `equals` alone, while a `Set` or a `Map`
+/// key reaches `equals` only once the hash buckets agree. The difference is
+/// observable exactly when a class overrides one of the pair without the other —
+/// `listOf(e).contains(e2)` is `true` while `setOf(e, e2).size` is `2` for a
+/// class that defines `equals` but leaves `hashCode` identity.
+fn member_eq(vm: &mut VM, a: &Value, b: &Value, hashed: bool) -> bool {
+    if hashed {
+        hash_eq_vm(vm, a, b)
+    } else {
+        equal_vm(vm, a, b)
+    }
 }
 
 /// Element count of an iterable, or `None` when the value cannot be iterated —
@@ -2027,14 +2130,234 @@ fn run_sub(vm: &mut VM, entry: usize, stack_base: usize) -> Result<Value, String
 /// The distinct elements of `vals`, keeping the first occurrence of a repeat —
 /// the element order a Kotlin `LinkedHashSet` iterates in. Membership uses
 /// [`value_eq`] (structural), so two equal `data class` instances collapse.
-fn distinct(vals: &[Value]) -> Vec<Value> {
+fn distinct(vm: &mut VM, vals: &[Value]) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::with_capacity(vals.len());
     for v in vals {
-        if !out.iter().any(|x| value_eq(x, v)) {
+        // Hash-gated: `distinct()` and `setOf` both build a `LinkedHashSet`, so
+        // a class that overrides `equals` without `hashCode` keeps its
+        // duplicates here exactly as it does on the JVM.
+        if !out.iter().any(|x| hash_eq_vm(vm, x, v)) {
             out.push(v.clone());
         }
     }
     out
+}
+
+/// Run a registered no-argument-or-one-argument override body for `recv`.
+///
+/// `extra` is the `other` an `equals` takes; `None` is the `hashCode` shape.
+/// The heap is never borrowed across the call — the body can allocate — and a
+/// fault inside it surfaces as `None` so the caller can fall back rather than
+/// answer from a half-run frame.
+fn run_override(
+    vm: &mut VM,
+    subs: SubRegistry,
+    recv: &Value,
+    extra: Option<&Value>,
+) -> Option<Value> {
+    let tag = instance_tag(recv)?;
+    let idx = subs.lookup(&tag)?;
+    let entry = vm.chunk.find_sub(idx)?;
+    let base = vm.stack.len();
+    vm.stack.push(recv.clone());
+    if let Some(other) = extra {
+        vm.stack.push(other.clone());
+    }
+    run_sub(vm, entry, base).ok()
+}
+
+/// Which registry [`run_override`] should consult.
+#[derive(Clone, Copy)]
+enum SubRegistry {
+    Equals,
+    HashCode,
+}
+
+impl SubRegistry {
+    fn lookup(self, tag: &str) -> Option<u16> {
+        match self {
+            SubRegistry::Equals => EQUALS_SUBS.with(|t| t.borrow().get(tag).copied()),
+            SubRegistry::HashCode => HASHCODE_SUBS.with(|t| t.borrow().get(tag).copied()),
+        }
+    }
+}
+
+/// Kotlin `==`, with a user `equals` in play.
+///
+/// `a == b` compiles to `a?.equals(b) ?: (b === null)` on the JVM, so dispatch
+/// is on the LEFT operand's class. When that class declared an `equals`, its
+/// body runs through a nested `vm.run()` — the same re-entrant pattern
+/// [`display_vm`] uses for `toString` — and its answer is final. Otherwise the
+/// structural walk recurses with `equal_vm` again, so an override still applies
+/// to a list element, a `Pair` half or a `Map` value, and anything with no
+/// overriding instance inside falls through to the VM-less [`value_eq`].
+pub fn equal_vm(vm: &mut VM, a: &Value, b: &Value) -> bool {
+    // A declared `equals` runs even when both sides are the SAME object.
+    //
+    // Kotlin's `==` lowers to `Intrinsics.areEqual(a, b)`, which is
+    // `a == null ? b == null : a.equals(b)` — there is no `a === b` short-circuit
+    // at the call site, and `java.util.ArrayList.indexOf` likewise calls
+    // `equals` per element without one. Skipping the body for a self-comparison
+    // is observable the moment `equals` has an effect: a counting `equals`
+    // reports 1 call after `x == x` on the reference toolchain, and reported 0
+    // here until this short-circuit was removed.
+    if let Some(r) = run_override(vm, SubRegistry::Equals, a, Some(b)) {
+        return truthy(&r);
+    }
+    // With no override the answer cannot depend on how many times it is asked,
+    // so the identity of two equal handles settles it without a walk.
+    if let (Value::Obj(ia), Value::Obj(ib)) = (a, b) {
+        if ia == ib {
+            return true;
+        }
+    }
+    // No override on the left: recurse structurally, but only for the shapes
+    // that can HOLD an instance. Clone the children out first — the nested run
+    // an override needs will mutate the heap.
+    enum Shape {
+        Seq(Vec<Value>, bool),
+        Map(Vec<(Value, Value)>),
+        Couple(Value, Value),
+        Triple(Value, Value, Value),
+        Data(String, Vec<Value>),
+        Plain,
+    }
+    fn shape_of(v: &Value) -> Shape {
+        with_obj(v, |o| match o {
+            HeapObj::List(items) => Shape::Seq(items.clone(), false),
+            HeapObj::Set(items) => Shape::Seq(items.clone(), true),
+            HeapObj::Map(entries) => Shape::Map(entries.clone()),
+            HeapObj::Pair(x, y) | HeapObj::Entry(x, y) => Shape::Couple(x.clone(), y.clone()),
+            HeapObj::Triple(x, y, z) => Shape::Triple(x.clone(), y.clone(), z.clone()),
+            HeapObj::Instance {
+                class,
+                is_data: true,
+                fields,
+                data_from,
+                data_len,
+            } => Shape::Data(
+                class.clone(),
+                data_slice(fields, *data_from, *data_len)
+                    .iter()
+                    .map(|(_, v)| v.clone())
+                    .collect(),
+            ),
+            _ => Shape::Plain,
+        })
+        .unwrap_or(Shape::Plain)
+    }
+    // A kind only ever equals its own kind, and `value_eq` already refuses every
+    // cross-kind pairing; matching both sides keeps that true here.
+    match (shape_of(a), shape_of(b)) {
+        (Shape::Seq(xa, sa), Shape::Seq(xb, sb)) if sa == sb => {
+            if xa.len() != xb.len() {
+                return false;
+            }
+            if sa {
+                // A `Set` compares order-insensitively — `AbstractSet.equals`
+                // is `size` plus `containsAll`, so each probe goes through the
+                // HASH-gated `contains`, not a bare `equals`. Two sets of a
+                // class that declares `equals` without `hashCode` are therefore
+                // NOT equal, even element for element.
+                xa.iter().all(|x| xb.iter().any(|y| hash_eq_vm(vm, x, y)))
+            } else {
+                xa.iter().zip(&xb).all(|(x, y)| equal_vm(vm, x, y))
+            }
+        }
+        (Shape::Map(ea), Shape::Map(eb)) => {
+            // `AbstractMap.equals` looks each key up with `get` — hash-gated —
+            // and compares the VALUE it finds with `equals`.
+            ea.len() == eb.len()
+                && ea.iter().all(|(k, v)| {
+                    eb.iter()
+                        .any(|(k2, v2)| hash_eq_vm(vm, k, k2) && equal_vm(vm, v, v2))
+                })
+        }
+        (Shape::Couple(a1, a2), Shape::Couple(b1, b2)) => {
+            // A `Pair` never equals an `Entry`, though both are a key/value
+            // couple here, so the kinds are checked before the halves.
+            kind_tag(a) == kind_tag(b) && equal_vm(vm, &a1, &b1) && equal_vm(vm, &a2, &b2)
+        }
+        (Shape::Triple(a1, a2, a3), Shape::Triple(b1, b2, b3)) => {
+            equal_vm(vm, &a1, &b1) && equal_vm(vm, &a2, &b2) && equal_vm(vm, &a3, &b3)
+        }
+        (Shape::Data(ca, fa), Shape::Data(cb, fb)) => {
+            ca == cb && fa.len() == fb.len() && fa.iter().zip(&fb).all(|(x, y)| equal_vm(vm, x, y))
+        }
+        _ => value_eq(a, b),
+    }
+}
+
+/// A one-word discriminator for the heap kinds `equal_vm` folds together, so
+/// two shapes that share a `Shape` arm but not a Kotlin type stay unequal.
+fn kind_tag(v: &Value) -> &'static str {
+    with_obj(v, |o| match o {
+        HeapObj::Pair(..) => "Pair",
+        HeapObj::Entry(..) => "Entry",
+        _ => "",
+    })
+    .unwrap_or("")
+}
+
+/// Kotlin `hashCode()`, with a user `hashCode` in play — the [`value_hash`]
+/// walk, re-entrant so an override answers for the instance itself AND for one
+/// nested in a `List`/`Set`/`Map`/`Pair` whose fold reads its elements.
+fn hash_vm(vm: &mut VM, v: &Value, long: bool) -> i32 {
+    if let Some(r) = run_override(vm, SubRegistry::HashCode, v, None) {
+        return r.to_int() as i32;
+    }
+    enum Shape {
+        List(Vec<Value>),
+        Set(Vec<Value>),
+        Map(Vec<(Value, Value)>),
+        Pair(Value, Value),
+        Entry(Value, Value),
+        Plain,
+    }
+    let shape = with_obj(v, |o| match o {
+        HeapObj::List(items) => Shape::List(items.clone()),
+        HeapObj::Set(items) => Shape::Set(items.clone()),
+        HeapObj::Map(entries) => Shape::Map(entries.clone()),
+        HeapObj::Pair(a, b) => Shape::Pair(a.clone(), b.clone()),
+        HeapObj::Entry(k, val) => Shape::Entry(k.clone(), val.clone()),
+        _ => Shape::Plain,
+    })
+    .unwrap_or(Shape::Plain);
+    match shape {
+        Shape::List(items) => items.iter().fold(1i32, |h, x| {
+            h.wrapping_mul(31).wrapping_add(hash_vm(vm, x, false))
+        }),
+        Shape::Set(items) => items
+            .iter()
+            .fold(0i32, |h, x| h.wrapping_add(hash_vm(vm, x, false))),
+        Shape::Map(entries) => entries.iter().fold(0i32, |h, (k, val)| {
+            h.wrapping_add(hash_vm(vm, k, false) ^ hash_vm(vm, val, false))
+        }),
+        Shape::Pair(a, b) => hash_vm(vm, &a, false)
+            .wrapping_mul(31)
+            .wrapping_add(hash_vm(vm, &b, false)),
+        Shape::Entry(k, val) => hash_vm(vm, &k, false) ^ hash_vm(vm, &val, false),
+        Shape::Plain => value_hash(v, long),
+    }
+}
+
+/// Membership for the HASH-based containers — `Set`, `Map` keys, `distinct`.
+///
+/// The JVM reaches `equals` only after the hash buckets agree, so a class that
+/// overrides `equals` WITHOUT `hashCode` keeps its duplicates in a `HashSet`
+/// even though the two compare equal. Modelling the gate rather than calling
+/// `equals` directly is what reproduces that: an unoverridden `hashCode` on a
+/// plain class is its identity, so two distinct instances never meet.
+/// Unlike `==`, a hash container DOES short-circuit on identity:
+/// `HashMap.getNode` tests `(k = e.key) == key || key.equals(k)`, so a lookup by
+/// the very object already stored never runs the body.
+fn hash_eq_vm(vm: &mut VM, a: &Value, b: &Value) -> bool {
+    if let (Value::Obj(ia), Value::Obj(ib)) = (a, b) {
+        if ia == ib {
+            return true;
+        }
+    }
+    hash_vm(vm, a, false) == hash_vm(vm, b, false) && equal_vm(vm, a, b)
 }
 
 /// The declared class tag of a value, when it is a class instance or an `object`
@@ -2107,6 +2430,105 @@ fn display_vm(vm: &mut VM, v: &Value) -> String {
 fn b_display(vm: &mut VM, _argc: u8) -> Value {
     let v = vm.pop();
     Value::str(display_vm(vm, &v))
+}
+
+/// `KT_MAP_VM` — see [`KT_MAP_VM`]. Stack: `[pair0 .. pairN]`, each a `Pair`.
+///
+/// `mapOf` fills a `LinkedHashMap` by `put`, so a repeated key keeps its first
+/// POSITION and takes the last VALUE. Which keys count as repeated is the
+/// hash-gated container equality — not the raw handle comparison this used,
+/// which collapsed only keys that were literally the same object and so left
+/// `mapOf(D(1) to 1, D(1) to 2)` with two entries for every structural key
+/// (a `data class`, a `List`, or a class with a declared `equals`).
+fn b_map_new(vm: &mut VM, argc: u8) -> Value {
+    let mut pairs = Vec::with_capacity(argc as usize);
+    for _ in 0..argc {
+        pairs.push(vm.pop());
+    }
+    pairs.reverse();
+    let mut entries: Vec<(Value, Value)> = Vec::with_capacity(pairs.len());
+    for p in pairs {
+        let kv = with_obj(&p, |o| match o {
+            HeapObj::Pair(a, b) => Some((a.clone(), b.clone())),
+            _ => None,
+        })
+        .flatten();
+        if let Some((k, v)) = kv {
+            let at = entries.iter().position(|(ek, _)| hash_eq_vm(vm, ek, &k));
+            match at {
+                Some(i) => entries[i].1 = v,
+                None => entries.push((k, v)),
+            }
+        }
+    }
+    alloc(HeapObj::Map(entries))
+}
+
+/// `KT_METHOD_VM` — see [`KT_METHOD_VM`]. Stack: `[recv, arg0 .. argN, name]`.
+fn b_method(vm: &mut VM, argc: u8) -> Value {
+    let name = vm.pop().to_str();
+    let mut args = Vec::with_capacity(argc as usize);
+    for _ in 0..argc {
+        args.push(vm.pop());
+    }
+    args.reverse();
+    let recv = vm.pop();
+    match kt_method(vm, &recv, &name, &args) {
+        Ok(v) => v,
+        Err(e) => {
+            fault(vm, e);
+            Value::Undef
+        }
+    }
+}
+
+/// `KT_SET_VM` — see [`KT_SET_VM`]. Stack: `[v0 .. vN]`.
+fn b_set_new(vm: &mut VM, argc: u8) -> Value {
+    let mut vals = Vec::with_capacity(argc as usize);
+    for _ in 0..argc {
+        vals.push(vm.pop());
+    }
+    vals.reverse();
+    let items = distinct(vm, &vals);
+    alloc(HeapObj::Set(items))
+}
+
+/// `KT_IN_VM` — see [`KT_IN_VM`]. Stack: `[value, container]`.
+fn b_in(vm: &mut VM, _argc: u8) -> Value {
+    let container = vm.pop();
+    let value = vm.pop();
+    Value::Bool(contains_value(vm, &container, &value))
+}
+
+/// `KT_INDEX_GET_VM` — see [`KT_INDEX_GET_VM`]. Stack: `[recv, index]`.
+fn b_index_get(vm: &mut VM, _argc: u8) -> Value {
+    let index = vm.pop();
+    let recv = vm.pop();
+    match index_get(vm, &recv, &index) {
+        Ok(v) => v,
+        Err(e) => {
+            fault(vm, e);
+            Value::Undef
+        }
+    }
+}
+
+/// `KT_INDEX_SET_VM` — see [`KT_INDEX_SET_VM`]. Stack: `[recv, index, value]`.
+fn b_index_set(vm: &mut VM, _argc: u8) -> Value {
+    let value = vm.pop();
+    let index = vm.pop();
+    let recv = vm.pop();
+    if let Err(e) = index_set(vm, &recv, &index, value) {
+        fault(vm, e);
+    }
+    Value::Undef
+}
+
+/// `KT_OBJEQ_VM` — see [`KT_OBJEQ_VM`].
+fn b_objeq(vm: &mut VM, _argc: u8) -> Value {
+    let b = vm.pop();
+    let a = vm.pop();
+    Value::Bool(equal_vm(vm, &a, &b))
 }
 
 /// `KT_JOIN` — see [`KT_JOIN`]. `argc` is 1 when a separator was supplied.
@@ -3375,7 +3797,7 @@ fn trailing_width(args: &[Value], at: usize) -> i64 {
     }
 }
 
-fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     // A `Char` shares the `Value::Obj` variant with the heap but is not a heap
     // object, so its members resolve first.
     if let Some(code) = char_code(recv) {
@@ -3383,7 +3805,7 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
     }
     // Heap objects (List/Map/Pair/data-class members) dispatch through the heap.
     if let Value::Obj(_) = recv {
-        return obj_method(recv, name, args);
+        return obj_method(vm, recv, name, args);
     }
     match (recv, name) {
         // ── kotlin.String ──
@@ -3832,7 +4254,7 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
         // differently and share one runtime representation. The compiler
         // appends 32/64 the way it does for the shifts; see [`int_hash`].
         (_, "hashCode") => Ok(Value::Int(
-            value_hash(recv, trailing_width(args, 0) == 64) as i64
+            hash_vm(vm, recv, trailing_width(args, 0) == 64) as i64
         )),
         (_, "equals") => Ok(Value::Bool(args.first().is_some_and(|o| value_eq(recv, o)))),
         // `compareTo` on the primitives answers the sign, unlike `String`'s
@@ -3852,7 +4274,7 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
         // exists on both — `take`, `first`, `indexOf`, `reversed` — keeps the
         // `String` behaviour, which differs (`"abc".take(2)` is `ab`, not
         // `[a, b]`).
-        (Value::Str(s), _) => charseq_member(s, name, args)
+        (Value::Str(s), _) => charseq_member(vm, s, name, args)
             .unwrap_or_else(|| Err(format!("unresolved reference: {name} on String"))),
 
         _ => Err(format!(
@@ -3864,7 +4286,12 @@ fn kt_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> 
 
 /// The lambda-free collection members of a `CharSequence` receiver, over the
 /// string's characters. `None` when the name is not one of them.
-fn charseq_member(s: &str, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+fn charseq_member(
+    vm: &mut VM,
+    s: &str,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
     let chars = chars_of(s);
     // `chunked`/`windowed` answer a `List<String>` here, where the `Iterable`
     // overload answers a `List<List<T>>`.
@@ -3872,7 +4299,7 @@ fn charseq_member(s: &str, name: &str, args: &[Value]) -> Option<Result<Value, S
         let list = alloc(HeapObj::List(chars));
         return Some(coll_hof_str_groups(name, &list, args).map(|g| alloc(HeapObj::List(g))));
     }
-    sequence_member(&chars, None, name, args)
+    sequence_member(vm, &chars, false, None, name, args)
 }
 
 /// The `kotlin.Char` members, on the code unit `code`.
@@ -3927,7 +4354,7 @@ fn char_method(code: i64, name: &str, args: &[Value]) -> Result<Value, String> {
 /// Dispatch a member/method on a heap object (`List`/`Map`/`Pair`, or a `data`
 /// class's synthesized members). User-defined class methods never reach here —
 /// the compiler lowers those to direct `Op::Call`s on method subs.
-fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     // `componentN` (destructuring) is uniform across the ordered kinds.
     if let Some(idx) = name
         .strip_prefix("component")
@@ -3951,7 +4378,7 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
     }
     match name {
         "toString" => return Ok(Value::str(kotlin_string(recv))),
-        "hashCode" => return Ok(Value::Int(value_hash(recv, false) as i64)),
+        "hashCode" => return Ok(Value::Int(hash_vm(vm, recv, false) as i64)),
         "equals" => return Ok(Value::Bool(args.first().is_some_and(|o| value_eq(recv, o)))),
         _ => {}
     }
@@ -3963,7 +4390,7 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         // the reason the two share one arm but not one result.
         "add" => {
             let v = args.first().cloned().unwrap_or(Value::Undef);
-            let seen = key_position(recv, &v).is_some();
+            let seen = key_position(vm, recv, &v).is_some();
             let added = with_obj_mut(recv, |o| match o {
                 HeapObj::List(items) => {
                     items.push(v);
@@ -3989,7 +4416,7 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         // by-position form and stays separate.
         "remove" => {
             let v = args.first().cloned().unwrap_or(Value::Undef);
-            let at = key_position(recv, &v);
+            let at = key_position(vm, recv, &v);
             let removed = with_obj_mut(recv, |o| match o {
                 HeapObj::List(items) | HeapObj::Set(items) => Some(match at {
                     Some(i) => {
@@ -4084,7 +4511,7 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             // Map.put(k, v) → previous value or null.
             let k = args.first().cloned().unwrap_or(Value::Undef);
             let v = args.get(1).cloned().unwrap_or(Value::Undef);
-            let at = key_position(recv, &k);
+            let at = key_position(vm, recv, &k);
             let prev = with_obj_mut(recv, |o| match o {
                 HeapObj::Map(entries) => match at.and_then(|i| entries.get_mut(i)) {
                     Some(slot) => Some(std::mem::replace(&mut slot.1, v)),
@@ -4107,7 +4534,8 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
     // `first`/`last` are *properties* of the progression (defined even when it is
     // empty), where a list's are element accessors.
     let kind = with_obj(recv, |o| match o {
-        HeapObj::List(_) | HeapObj::Set(_) => 1u8,
+        HeapObj::List(_) => 1u8,
+        HeapObj::Set(_) => 4,
         HeapObj::Array { .. } => 2,
         HeapObj::Range(_) => 3,
         _ => 0,
@@ -4121,7 +4549,9 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         .flatten();
         let items = list_snapshot(recv).unwrap_or_default();
         if let Some(v) = sequence_member(
+            vm,
             &items,
+            kind == 4,
             range.map(|r| (r.wrap(r.first), r.wrap(r.last()))),
             name,
             args,
@@ -4130,23 +4560,34 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         }
     }
 
+    // `Map` key lookup runs BEFORE the read-only block: locating a key uses the
+    // hash-gated container equality, which re-enters the VM for a user
+    // `equals`/`hashCode` and so cannot run under the heap borrow that block
+    // holds.
+    let is_map = with_obj(recv, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false);
+    if is_map && matches!(name, "containsKey" | "get") {
+        let k = args.first().cloned().unwrap_or(Value::Undef);
+        let at = key_position(vm, recv, &k);
+        return Ok(match name {
+            "containsKey" => Value::Bool(at.is_some()),
+            _ => at
+                .and_then(|i| {
+                    with_obj(recv, |o| match o {
+                        HeapObj::Map(entries) => entries.get(i).map(|(_, v)| v.clone()),
+                        _ => None,
+                    })
+                    .flatten()
+                })
+                .unwrap_or(Value::Undef),
+        });
+    }
+
     // Read-only members.
     let res = with_obj(recv, |o| match (o, name) {
         // ── Map ──
         (HeapObj::Map(entries), "size") => Some(Value::Int(entries.len() as i64)),
         (HeapObj::Map(entries), "isEmpty") => Some(Value::Bool(entries.is_empty())),
         (HeapObj::Map(entries), "isNotEmpty") => Some(Value::Bool(!entries.is_empty())),
-        (HeapObj::Map(entries), "containsKey") => {
-            Some(Value::Bool(args.first().is_some_and(|k| {
-                entries.iter().any(|(ek, _)| value_eq(ek, k))
-            })))
-        }
-        (HeapObj::Map(entries), "get") => Some(
-            args.first()
-                .and_then(|k| entries.iter().find(|(ek, _)| value_eq(ek, k)))
-                .map(|(_, v)| v.clone())
-                .unwrap_or(Value::Undef),
-        ),
         // ── Pair ──
         // `key`/`value` alias `first`/`second`: iterating a `Map` yields
         // `Map.Entry`, which is carried as a `Pair` here, and an entry is read
@@ -4197,7 +4638,11 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
 /// keep looking (a `Map`/`Pair`/instance member, or the unresolved-reference
 /// diagnostic).
 fn sequence_member(
+    vm: &mut VM,
     items: &[Value],
+    // Whether the receiver is hash-gated (a `Set`) rather than a `List`; see
+    // `member_eq`.
+    hashed: bool,
     range: Option<(Value, Value)>,
     name: &str,
     args: &[Value],
@@ -4278,16 +4723,30 @@ fn sequence_member(
                 items[from as usize..to as usize].to_vec(),
             ))));
         }
-        "contains" => Value::Bool(
-            args.first()
-                .is_some_and(|a| items.iter().any(|v| value_eq(v, a))),
-        ),
-        "indexOf" => Value::Int(
-            args.first()
-                .and_then(|a| items.iter().position(|v| value_eq(v, a)))
-                .map(|p| p as i64)
-                .unwrap_or(-1),
-        ),
+        "contains" => {
+            let needle = args.first().cloned();
+            Value::Bool(needle.is_some_and(|a| items.iter().any(|v| member_eq(vm, v, &a, hashed))))
+        }
+        // `Collection.containsAll` — every element of the argument present, by
+        // the receiver's own equality rule. Vacuously true for an empty
+        // argument, as on the JVM.
+        "containsAll" => {
+            let wanted = args.first().map(sequence_items).unwrap_or_default();
+            Value::Bool(
+                wanted
+                    .iter()
+                    .all(|w| items.iter().any(|v| member_eq(vm, v, w, hashed))),
+            )
+        }
+        "indexOf" => {
+            let needle = args.first().cloned();
+            Value::Int(
+                needle
+                    .and_then(|a| items.iter().position(|v| member_eq(vm, v, &a, hashed)))
+                    .map(|p| p as i64)
+                    .unwrap_or(-1),
+            )
+        }
         "sum" => sum_values(items),
         // An empty average is NaN in Kotlin, not an error.
         "average" => {
@@ -4401,20 +4860,20 @@ fn sequence_member(
         // `toSet` yields a `Set`; `distinct` yields a `List` with the same
         // elements — the pair Kotlin draws the distinction between.
         "toSet" | "toMutableSet" | "toHashSet" => {
-            return Some(Ok(alloc(HeapObj::Set(distinct(items)))))
+            return Some(Ok(alloc(HeapObj::Set(distinct(vm, items)))))
         }
-        "distinct" => return Some(Ok(alloc(HeapObj::List(distinct(items))))),
+        "distinct" => return Some(Ok(alloc(HeapObj::List(distinct(vm, items))))),
         // The set operators are defined on any `Iterable` and all return a
         // `Set`, whichever kind the receiver was.
         "union" | "intersect" | "subtract" => {
             let other = args.first().map(sequence_items).unwrap_or_default();
             let out: Vec<Value> = match name {
-                "union" => distinct(&[items.to_vec(), other].concat()),
-                "intersect" => distinct(items)
+                "union" => distinct(vm, &[items.to_vec(), other].concat()),
+                "intersect" => distinct(vm, items)
                     .into_iter()
                     .filter(|x| other.iter().any(|y| value_eq(x, y)))
                     .collect(),
-                _ => distinct(items)
+                _ => distinct(vm, items)
                     .into_iter()
                     .filter(|x| !other.iter().any(|y| value_eq(x, y)))
                     .collect(),
@@ -4520,7 +4979,7 @@ fn sum_values(items: &[Value]) -> Value {
 }
 
 /// `recv[index]` — list element (bounds-checked) or map value (null if absent).
-fn index_get(recv: &Value, index: &Value) -> Result<Value, String> {
+fn index_get(vm: &mut VM, recv: &Value, index: &Value) -> Result<Value, String> {
     // `s[i]` is a `Char`, indexed by UTF-16 code unit — the same basis
     // `String.length` uses.
     if let Value::Str(s) = recv {
@@ -4536,6 +4995,22 @@ fn index_get(recv: &Value, index: &Value) -> Result<Value, String> {
             )),
         };
     }
+    // A `Map` key search runs first and OUTSIDE the heap borrow below: it is
+    // hash-gated container equality, which re-enters the VM for a user
+    // `equals`/`hashCode`.
+    if with_obj(recv, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false) {
+        let at = key_position(vm, recv, index);
+        // Map get returns null (Kotlin `V?`) when the key is absent.
+        return Ok(at
+            .and_then(|i| {
+                with_obj(recv, |o| match o {
+                    HeapObj::Map(entries) => entries.get(i).map(|(_, v)| v.clone()),
+                    _ => None,
+                })
+                .flatten()
+            })
+            .unwrap_or(Value::Undef));
+    }
     let out = with_obj(recv, |o| match o {
         HeapObj::List(items) | HeapObj::Set(items) | HeapObj::Array { items, .. } => {
             let i = index.to_int();
@@ -4548,12 +5023,6 @@ fn index_get(recv: &Value, index: &Value) -> Result<Value, String> {
                 Ok(items[i as usize].clone())
             }
         }
-        // Map get returns null (Kotlin `V?`) when the key is absent.
-        HeapObj::Map(entries) => Ok(entries
-            .iter()
-            .find(|(k, _)| value_eq(k, index))
-            .map(|(_, v)| v.clone())
-            .unwrap_or(Value::Undef)),
         _ => Err(format!("{} does not support indexing", obj_label(recv))),
     });
     out.unwrap_or_else(|| Err("indexing a non-object value".to_string()))
@@ -4566,24 +5035,25 @@ fn index_get(recv: &Value, index: &Value) -> Result<Value, String> {
 /// search must run under a *shared* borrow. Nesting it inside the `borrow_mut`
 /// the mutation takes would panic, which is why every mutator below locates
 /// first and mutates second.
-fn key_position(recv: &Value, v: &Value) -> Option<usize> {
-    with_obj(recv, |o| match o {
-        HeapObj::List(items) | HeapObj::Set(items) | HeapObj::Array { items, .. } => {
-            items.iter().position(|x| value_eq(x, v))
-        }
-        HeapObj::Map(entries) => entries.iter().position(|(k, _)| value_eq(k, v)),
-        _ => None,
-    })
-    .flatten()
+fn key_position(vm: &mut VM, recv: &Value, v: &Value) -> Option<usize> {
+    // Extracted before the scan for the reason above, and because a user
+    // `equals` re-enters the VM and can allocate.
+    let (keys, hashed) = with_obj(recv, |o| match o {
+        HeapObj::List(items) | HeapObj::Array { items, .. } => (items.clone(), false),
+        HeapObj::Set(items) => (items.clone(), true),
+        HeapObj::Map(entries) => (entries.iter().map(|(k, _)| k.clone()).collect(), true),
+        _ => (Vec::new(), false),
+    })?;
+    keys.iter().position(|x| member_eq(vm, x, v, hashed))
 }
 
 /// `recv[index] = value` — list set (bounds-checked) or map put.
-fn index_set(recv: &Value, index: &Value, value: Value) -> Result<(), String> {
+fn index_set(vm: &mut VM, recv: &Value, index: &Value, value: Value) -> Result<(), String> {
     // Only a `Map` looks its slot up by equality; a list/array indexes by
     // position, so it must not pay for the scan.
     let is_map = with_obj(recv, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false);
     let at = if is_map {
-        key_position(recv, index)
+        key_position(vm, recv, index)
     } else {
         None
     };
@@ -4668,15 +5138,24 @@ fn heap_eq(a: &HeapObj, b: &HeapObj) -> bool {
                 ..
             },
         ) => {
+            // A class that declares NEITHER `equals` NOR `data` inherits
+            // `Any.equals`, which is reference identity — two separately
+            // constructed `Foo(1)` are NOT equal on the JVM. Distinct handles
+            // are all that reach here (the same handle short-circuits in
+            // `value_eq`), so the answer is `false`.
+            //
+            // A declared `equals` is answered by `equal_vm`, which needs the VM
+            // to run the body; this VM-less path cannot, and reports the
+            // identity its caller would otherwise get wrong in the other
+            // direction.
+            if !*ia {
+                return false;
+            }
             // A `data class`'s generated `equals` compares the primary-
             // constructor properties only, so neither an inherited field nor a
             // body property is part of the comparison even though the record
             // carries both.
-            let (fa, fb) = if *ia {
-                (data_slice(fa, *da, *la), data_slice(fb, *db, *lb))
-            } else {
-                (&fa[..], &fb[..])
-            };
+            let (fa, fb) = (data_slice(fa, *da, *la), data_slice(fb, *db, *lb));
             ca == cb
                 && fa.len() == fb.len()
                 && fa.iter().zip(fb).all(|((_, x), (_, y))| value_eq(x, y))

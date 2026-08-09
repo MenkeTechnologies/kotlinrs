@@ -22,13 +22,14 @@
 use crate::ast::*;
 use crate::host::{
     KT_ARRAY, KT_ARRAY_INIT, KT_ARRAY_NEW, KT_AS, KT_CHR_STRING, KT_CLASSOF, KT_CLOSURE_CALL,
-    KT_COLL_HOF, KT_DBG_LINE, KT_DDIV, KT_DISPLAY, KT_EXC_ABORT, KT_EXC_CUT, KT_EXC_DEPTH,
-    KT_EXC_MATCH, KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW,
-    KT_EXC_UNSTASH, KT_EXTEND, KT_FFI_CALL, KT_FFI_COMPILE, KT_GETFIELD, KT_IDIV, KT_IMOD, KT_IN,
-    KT_INDEX_GET, KT_INDEX_SET, KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_JOIN, KT_LAZY_GET,
-    KT_LAZY_NEW, KT_LIST, KT_MAKE_CLOSURE, KT_MAP, KT_MATH, KT_METHOD, KT_NEW, KT_NOTNULL,
-    KT_OBJEQ, KT_PAIR, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_RESULT_HOF,
-    KT_RUN_CATCHING, KT_SCOPE_FN, KT_SET, KT_SETFIELD, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG,
+    KT_COLL_HOF, KT_DBG_LINE, KT_DDIV, KT_DISPLAY, KT_EQUALS_REG, KT_EXC_ABORT, KT_EXC_CUT,
+    KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE,
+    KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND, KT_FFI_CALL, KT_FFI_COMPILE, KT_GETFIELD, KT_HASH_REG,
+    KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET,
+    KT_ITER_SIZE, KT_JOIN, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH,
+    KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_PAIR, KT_PRINT, KT_PRINTLN, KT_RANGE,
+    KT_RANGE_STEP, KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN, KT_SETFIELD, KT_SET_VM,
+    KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
@@ -1099,6 +1100,7 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
         c.b.emit(Op::Extended(KT_TYPE_REG, 0), line);
     }
     c.emit_tostring_registry();
+    c.emit_equality_registry();
     for cd in &program.classes {
         if cd.is_object {
             c.build_object(cd)?;
@@ -1518,12 +1520,39 @@ impl Compiler {
         if !self.has_tostring_override() {
             return;
         }
-        for (tag, owner) in self.method_index["toString"].clone() {
+        self.emit_member_registry("toString", KT_TOSTRING_REG);
+    }
+
+    /// Publish each overriding class's `equals(Any?)` and `hashCode()` to the
+    /// runtime, the same way [`Self::emit_tostring_registry`] publishes
+    /// `toString`.
+    ///
+    /// These two are what `==` and every hash-based container consult, and both
+    /// are silently wrong without the registry: `==` would run the built-in
+    /// structural compare over a class whose author said otherwise, and a `Set`
+    /// would fold an identity hash where the user supplied one.
+    fn emit_equality_registry(&mut self) {
+        for name in ["equals", "hashCode"] {
+            if self.method_index.get(name).map_or(true, |t| t.is_empty()) {
+                continue;
+            }
+            let op = if name == "equals" {
+                KT_EQUALS_REG
+            } else {
+                KT_HASH_REG
+            };
+            self.emit_member_registry(name, op);
+        }
+    }
+
+    /// Emit one `tag → subroutine` publication per class that declares `name`.
+    fn emit_member_registry(&mut self, name: &str, op: u16) {
+        for (tag, owner) in self.method_index[name].clone() {
             let t = self.b.add_constant(Value::str(tag));
             self.b.emit(Op::LoadConst(t), 0);
-            let sub = self.b.add_name(&method_sub_name(&owner, "toString"));
+            let sub = self.b.add_name(&method_sub_name(&owner, name));
             self.b.emit(Op::LoadInt(sub as i64), 0);
-            self.b.emit(Op::Extended(KT_TOSTRING_REG, 0), 0);
+            self.b.emit(Op::Extended(op, 0), 0);
         }
     }
 
@@ -1825,7 +1854,8 @@ impl Compiler {
                     self.b.emit(Op::GetSlot(slot), 0);
                     self.b.emit(Op::LoadInt(0), 0);
                     self.compile_expr(sc, &full)?;
-                    self.b.emit(Op::Extended(KT_INDEX_SET, 0), 0);
+                    self.b.emit(Op::CallBuiltin(KT_INDEX_SET_VM, 3), 0);
+                    self.b.emit(Op::Pop, 0);
                     return Ok(());
                 }
                 match op {
@@ -2220,7 +2250,7 @@ impl Compiler {
                 .b
                 .add_constant(Value::str(format!("component{}", i + 1)));
             self.b.emit(Op::LoadConst(cidx), 0);
-            self.b.emit(Op::Extended(KT_METHOD, 0), 0);
+            self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 0), 0);
             self.b.emit(Op::SetSlot(*slot), 0);
         }
 
@@ -2309,7 +2339,7 @@ impl Compiler {
                     // element 0 of it.
                     if sc.is_boxed(name) {
                         self.b.emit(Op::LoadInt(0), 0);
-                        self.b.emit(Op::Extended(KT_INDEX_GET, 0), 0);
+                        self.b.emit(Op::CallBuiltin(KT_INDEX_GET_VM, 2), 0);
                     }
                     return Ok(sc.ty(name));
                 }
@@ -2422,7 +2452,7 @@ impl Compiler {
                 let ty = self.index_elem_ty(sc, recv);
                 self.compile_expr(sc, recv)?;
                 self.compile_expr(sc, index)?;
-                self.b.emit(Op::Extended(KT_INDEX_GET, 0), *line);
+                self.b.emit(Op::CallBuiltin(KT_INDEX_GET_VM, 2), *line);
                 Ok(ty)
             }
             Expr::Pair { first, second } => {
@@ -2450,7 +2480,7 @@ impl Compiler {
             } => {
                 self.compile_expr(sc, value)?;
                 self.compile_expr(sc, container)?;
-                self.b.emit(Op::Extended(KT_IN, 0), 0);
+                self.b.emit(Op::CallBuiltin(KT_IN_VM, 2), 0);
                 if *negated {
                     self.b.emit(Op::LogNot, 0);
                 }
@@ -3103,7 +3133,7 @@ impl Compiler {
                 .emit(Op::LoadInt(if rt == Type::Long { 64 } else { 32 }), line);
             let nidx = self.b.add_constant(Value::str(name.to_string()));
             self.b.emit(Op::LoadConst(nidx), line);
-            self.b.emit(Op::Extended(KT_METHOD, 1), line);
+            self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 1), line);
             return Ok(Type::Int);
         }
         if matches!(name, "shl" | "shr" | "ushr" | "inv" | "and" | "or" | "xor")
@@ -3126,7 +3156,7 @@ impl Compiler {
                     let nidx = self.b.add_constant(Value::str(name.to_string()));
                     self.b.emit(Op::LoadConst(nidx), line);
                     self.b
-                        .emit(Op::Extended(KT_METHOD, args.len() as u8 + 1), line);
+                        .emit(Op::CallBuiltin(KT_METHOD_VM, args.len() as u8 + 1), line);
                 } else {
                     self.emit_kt_method(sc, recv, name, args, line)?;
                 }
@@ -3240,7 +3270,8 @@ impl Compiler {
         }
         let nidx = self.b.add_constant(Value::str(name.to_string()));
         self.b.emit(Op::LoadConst(nidx), line);
-        self.b.emit(Op::Extended(KT_METHOD, args.len() as u8), line);
+        self.b
+            .emit(Op::CallBuiltin(KT_METHOD_VM, args.len() as u8), line);
         let end = self.b.current_pos();
         for j in done {
             self.b.patch_jump(j, end);
@@ -3324,7 +3355,8 @@ impl Compiler {
         }
         let nidx = self.b.add_constant(Value::str(name.to_string()));
         self.b.emit(Op::LoadConst(nidx), line);
-        self.b.emit(Op::Extended(KT_METHOD, args.len() as u8), line);
+        self.b
+            .emit(Op::CallBuiltin(KT_METHOD_VM, args.len() as u8), line);
         Ok(method_ret_type(name))
     }
 
@@ -3638,7 +3670,8 @@ impl Compiler {
         self.compile_expr(sc, index)?; // [recv, index]
         let store = self.compound_value(recv, "", Some(index), op, value);
         self.compile_expr(sc, &store)?; // [recv, index, value]
-        self.b.emit(Op::Extended(KT_INDEX_SET, 0), 0);
+        self.b.emit(Op::CallBuiltin(KT_INDEX_SET_VM, 3), 0);
+        self.b.emit(Op::Pop, 0);
         Ok(())
     }
 
@@ -3697,7 +3730,7 @@ impl Compiler {
                 .b
                 .add_constant(Value::str(format!("component{}", i + 1)));
             self.b.emit(Op::LoadConst(cidx), 0);
-            self.b.emit(Op::Extended(KT_METHOD, 0), 0);
+            self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 0), 0);
             let slot = sc.declare(nm, Type::Unknown, false);
             self.b.emit(Op::SetSlot(slot), 0);
         }
@@ -3808,7 +3841,10 @@ impl Compiler {
         if matches!(op, BinOp::Eq | BinOp::Ne) && (lt == Type::Obj || rt == Type::Obj) {
             self.compile_expr(sc, l)?;
             self.compile_expr(sc, r)?;
-            self.b.emit(Op::Extended(KT_OBJEQ, 0), 0);
+            // A builtin rather than the `KT_OBJEQ` extension op: a user `equals`
+            // override runs re-entrantly, which an extension handler cannot host
+            // (see `KT_OBJEQ_VM`).
+            self.b.emit(Op::CallBuiltin(KT_OBJEQ_VM, 2), 0);
             if op == BinOp::Ne {
                 self.b.emit(Op::LogNot, 0);
             }
@@ -4189,7 +4225,8 @@ impl Compiler {
                 for a in args {
                     self.compile_expr(sc, a)?;
                 }
-                self.b.emit(Op::Extended(KT_SET, args.len() as u8), line);
+                self.b
+                    .emit(Op::CallBuiltin(KT_SET_VM, args.len() as u8), line);
                 Ok(Type::Obj)
             }
             "mapOf" | "mutableMapOf" | "hashMapOf" | "emptyMap" => {
@@ -4197,7 +4234,8 @@ impl Compiler {
                 for a in args {
                     self.compile_expr(sc, a)?;
                 }
-                self.b.emit(Op::Extended(KT_MAP, args.len() as u8), line);
+                self.b
+                    .emit(Op::CallBuiltin(KT_MAP_VM, args.len() as u8), line);
                 Ok(Type::Obj)
             }
             _ => {

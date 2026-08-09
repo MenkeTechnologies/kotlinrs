@@ -1576,6 +1576,7 @@ enum Mode {
     Deleg,
     Invoke,
     StrColl,
+    Equality,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -1632,7 +1633,83 @@ const CONCRETE: &[Mode] = &[
     Mode::Deleg,
     Mode::Invoke,
     Mode::StrColl,
+    Mode::Equality,
 ];
+
+/// Instance **equality** — `==` between class instances, and the three rules
+/// Kotlin picks between.
+///
+/// The generator had no probe of this shape at all, which is why the fuzzer
+/// stayed clean while `Eqp(1) == Eqp(1)` answered `true`: a class that declares
+/// neither `data` nor `equals` inherits `Any.equals`, i.e. **reference
+/// identity**, so two separate constructions are NOT equal. The three families
+/// are emitted together because they only differ from each other:
+///
+/// * `EqPlain` — no override: identity.
+/// * `EqEq` — `equals` only: `List` members see it, but a `Set`/`Map` key does
+///   not, because the hash buckets never meet.
+/// * `EqBoth` — `equals` + `hashCode`: every container sees it.
+fn g_equality(r: &mut Rng, _idx: usize) -> String {
+    let a = pick(r, &[0, 1, 2, 7]);
+    let b = pick(r, &[0, 1, 2, 7]);
+    let cls = pick(r, &["EqPlain", "EqEq", "EqBoth"]);
+    match r.below(22) {
+        0 => p(format!("{cls}({a}) == {cls}({b})")),
+        1 => p(format!("{cls}({a}) != {cls}({b})")),
+        2 => p(format!("listOf({cls}({a})).contains({cls}({b}))")),
+        3 => p(format!("{cls}({a}) in listOf({cls}({b}))")),
+        4 => p(format!(
+            "listOf({cls}({a}), {cls}({b})).indexOf({cls}({b}))"
+        )),
+        5 => p(format!("setOf({cls}({a}), {cls}({b})).size")),
+        6 => p(format!("listOf({cls}({a}), {cls}({b})).distinct().size")),
+        7 => p(format!(
+            "mapOf({cls}({a}) to 1, {cls}({b}) to 2)[{cls}({a})]"
+        )),
+        8 => p(format!(
+            "mapOf({cls}({a}) to 1, {cls}({b}) to 2).containsKey({cls}({b}))"
+        )),
+        9 => p(format!("listOf({cls}({a})) == listOf({cls}({b}))")),
+        // Two elements, not one: a 1-element `setOf`/`mapOf` is
+        // `java.util.Collections.singleton*`, whose `contains`/`get` consult
+        // `equals` ALONE — no hash gate, no identity check. That corner is a
+        // documented exclusion (see README), so probes stay off it.
+        10 => p(format!(
+            "setOf({cls}({a}), {cls}(9)) == setOf({cls}({b}), {cls}(9))"
+        )),
+        11 => p(format!("({cls}({a}) to 1) == ({cls}({b}) to 1)")),
+        12 => p(format!(
+            "listOf(listOf({cls}({a}))) == listOf(listOf({cls}({b})))"
+        )),
+        13 => p(format!("{cls}({a}).equals({cls}({b}))")),
+        // A self-comparison. `==` is `Intrinsics.areEqual`, which has NO
+        // identity short-circuit, so a declared `equals` DOES run here.
+        // The local is named per class as well as per operand: two probes that
+        // shared `se{a}{b}` across families collided as `conflicting
+        // declarations` and made the whole batch barren.
+        14 => format!(
+            "    val se{cls}{a}{b} = {cls}({a})\n    println(se{cls}{a}{b} == se{cls}{a}{b})"
+        ),
+        15 => p(format!(
+            "mutableListOf({cls}({a}), {cls}({b})).remove({cls}({b}))"
+        )),
+        // Only `EqBoth` has a REPRODUCIBLE hashCode. `EqPlain`/`EqEq` inherit
+        // the JVM's identity hash, which differs run to run, so a probe folding
+        // one could never agree with anything and would be noise, not signal.
+        16 => p("listOf(EqBoth(1)).hashCode()".to_string()),
+        17 => p("setOf(EqBoth(1)).hashCode()".to_string()),
+        18 => p("(EqBoth(1) to 0).hashCode()".to_string()),
+        19 => p(format!(
+            "mapOf({cls}({a}) to 1).values.toList() == listOf(1)"
+        )),
+        20 => p(format!(
+            "listOf({cls}({a}), {cls}({b})).count {{ it == {cls}({a}) }}"
+        )),
+        _ => p(format!(
+            "listOf({cls}({a})).containsAll(listOf({cls}({b})))"
+        )),
+    }
+}
 
 fn mode_name(m: Mode) -> &'static str {
     match m {
@@ -1690,6 +1767,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Deleg => "deleg",
         Mode::Invoke => "invoke",
         Mode::StrColl => "strcoll",
+        Mode::Equality => "equality",
     }
 }
 
@@ -1760,6 +1838,7 @@ fn gen_probe(r: &mut Rng, mode: Mode, idx: usize) -> String {
         Mode::Deleg => g_deleg(r, idx),
         Mode::Invoke => g_invoke(r, idx),
         Mode::StrColl => g_strcoll(r, idx),
+        Mode::Equality => g_equality(r, idx),
         Mode::All => unreachable!("resolved above"),
     }
 }
@@ -1789,6 +1868,25 @@ fn gen_probes(seed: u64, mode: Mode, n: usize) -> Vec<String> {
 fn extra_declarations(probes: &[String]) -> String {
     let mut out = String::new();
     let named = |m: &str| probes.iter().any(|p| p.contains(m));
+    // The three equality families — see `g_equality`.
+    if named("EqPlain(") {
+        out.push_str("class EqPlain(val a: Int)\n");
+    }
+    if named("EqEq(") {
+        out.push_str(
+            "class EqEq(val a: Int) {\n\
+             \x20   override fun equals(other: Any?): Boolean = other is EqEq && other.a == a\n\
+             }\n",
+        );
+    }
+    if named("EqBoth(") {
+        out.push_str(
+            "class EqBoth(val a: Int) {\n\
+             \x20   override fun equals(other: Any?): Boolean = other is EqBoth && other.a == a\n\
+             \x20   override fun hashCode(): Int = a\n\
+             }\n",
+        );
+    }
     if named("Acc(") || named("Acc.") {
         out.push_str(
             "class Acc(val base: Int) {\n\

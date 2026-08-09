@@ -447,11 +447,47 @@ it overrides must be overridable — `open`, `abstract`, or itself an `override`
 with every `interface` member implicitly open. A member is matched by name *and*
 arity, so a same-named member at another arity stays an overload.
 
-Two members are not routed to a user override: `==` and `hashCode()` on a class
-that declares its own `equals`/`hashCode` still use the built-in structural
-comparison (a `toString()` override *is* honoured everywhere). And method
-overloading is not supported — two `fun f` at different arities in one class is
-a compile error here.
+**Instance equality is Kotlin's**, which means three different answers
+depending on what a class declares, and every one of them is observable:
+
+- A class that declares neither `data` nor `equals` inherits `Any.equals` —
+  **reference identity**. `Plain(1) == Plain(1)` is `false`, `listOf(Plain(1))`
+  does not contain `Plain(1)`, and two of them do not collapse in a `Set`.
+- A `data class` compares its primary-constructor properties structurally.
+- A declared `equals` wins over both, and it is reached from **every** place
+  equality is: `==`/`!=`, `in`, `contains`/`containsAll`/`indexOf`/`remove`,
+  `distinct`, `Set` membership, `Map` key lookup and `mapOf`'s repeated-key
+  collapse, and recursively through a `List`/`Set`/`Map`/`Pair`/`Triple` that
+  holds one. A declared `hashCode` likewise drives the container folds.
+
+The two container families do **not** share a rule, and the difference is
+visible exactly when a class supplies one half of the contract without the
+other. A `List` compares with `equals` alone; a `Set`, a `Map` key and
+`distinct` reach `equals` only once the hashes agree — so a class with `equals`
+but no `hashCode` is found by `listOf(...).contains(...)` and still keeps its
+duplicates in a `Set`. `Set` and `Map` *equality* is hash-gated too, because
+`AbstractSet.equals` is `containsAll` and `AbstractMap.equals` is `get`.
+
+`==` itself does not short-circuit on identity: it lowers to
+`Intrinsics.areEqual(a, b)`, so a declared `equals` runs even for `x == x`. A
+hash container does short-circuit (`HashMap.getNode` tests `k == key` first), so
+a lookup by the stored object skips the body. This is only observable through an
+`equals` with an effect, and it is checked by the frozen corpus.
+
+Method overloading is not supported — two `fun f` at different arities in one
+class is a compile error here.
+
+One equality corner is **excluded** rather than modelled, and the exclusion is
+deliberate: a 1-element `setOf`/`mapOf` is `java.util.Collections.singleton` /
+`singletonMap` on the JVM, whose `contains`/`get` consult `equals` **alone** —
+no hash gate and no identity check — where every other size uses a
+`LinkedHashSet`/`LinkedHashMap` and gates on the hash. So
+`mapOf(e1 to 5)[e2]` finds the entry while `mapOf(e1 to 5, e3 to 6)[e2]` does
+not, for a class with `equals` and no `hashCode`. Reproducing that needs the
+container to remember whether it came from a 1-element immutable literal — a
+provenance this runtime's `Set`/`Map` do not carry — and it only shows up for a
+class that has already broken the `equals`/`hashCode` contract. The fuzzer keeps
+its probes off 1-element immutable containers for this reason.
 
 A `return`, `break` or `continue` out of a `try` that owns a `finally` is
 honoured: the finalizer runs first, and every finalizer between the jump and its
@@ -593,6 +629,16 @@ fusevm::VM  ──►  three-tier Cranelift JIT (linear · block · tracing)
   records enter that file, and it invokes the reference toolchain **exclusively**
   — a corpus recorded from kotlinrs would be a record of our own behaviour rather
   than of Kotlin's, and would pass forever no matter what broke.
+- **A run the oracle could not answer is not a pass.** Two failing sides compare
+  equal, so a program `kotlinc` rejects — or a `kotlin` that times out — produces
+  no output on either side and scores as agreement. `parity-fuzz` therefore
+  requires the reference toolchain to have exited 0 with non-empty stdout before
+  a program counts, reports the rest as **barren** with their probe count, and
+  exits non-zero on them. Its summary prints probes *generated* and probes
+  *compared* separately, so a gap between the two is visible rather than
+  flattered. Scratch directories are per-process (pid plus a counter) in both
+  harnesses, because several agents share this checkout and a fixed path lets one
+  run delete another's case mid-iteration.
 
 ## [0x06] STATUS & ROADMAP
 
@@ -696,6 +742,34 @@ no primary constructor must prefer a no-argument SECONDARY over the implicit
 primary. And the `ctor` harness mode found on its first run that an `init` body
 rejected a `;` separator, because it was parsing statements directly instead of
 through the shared block rule.
+
+Also landed, with a new `equality` harness mode: **instance equality**, in all
+three of the forms described above. A plain class now compares by reference
+identity rather than structurally, and a declared `equals`/`hashCode` is
+reached from every equality-based member instead of being ignored. Two
+supporting changes made that possible. Container dispatch, `Set`/`Map`
+construction, indexing and `in` moved from `Op::Extended` to the builtin table,
+because fusevm's extension dispatch *takes* the handler out of the VM for the
+duration of a call — so an override body running through a nested `vm.run()`
+found no handler and every extension op it executed silently did nothing,
+leaving it reading its own fields as `Undef`. And `Collection.containsAll` was
+added, being equality-based and previously absent.
+
+The widened generator immediately caught a bug older than the feature:
+`mapOf`'s repeated-key collapse compared key HANDLES rather than Kotlin
+equality, so `mapOf(D(1) to 1, D(1) to 2)` kept two entries — wrong for a
+`data class`, a `List` key, or any declared `equals`, and right only for
+primitives and `String`. Two more were self-inflicted and caught the same way:
+`==` was short-circuiting on identity (Kotlin's `Intrinsics.areEqual` does not,
+so a counting `equals` reported one call fewer than the reference toolchain),
+and `Set`/`Map` equality compared elements with a bare `equals` where the JVM
+goes through the hash-gated `containsAll`/`get`.
+
+The `parity-fuzz` harness also stopped scoring a **barren** run as a pass: a
+program the reference toolchain could not compile or run produces no output,
+which compares equal to our own failure and used to count as agreement. Such
+programs are now reported and counted separately, and they fail the run — which
+is how the two generator name-collisions above were found rather than absorbed.
 
 Next: `sequence { … }`/`yield`, real generic typing,
 `Delegates.observable`/`vetoable`, and a growing standard-library surface —

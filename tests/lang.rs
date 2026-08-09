@@ -2429,3 +2429,205 @@ fn string_receiver_collection_result_follows_kotlin_text() {
     assert_eq!(stdout("println(\"\".map { it })"), "[]\n");
     assert_eq!(stdout("println(\"\".filter { true })"), "\n");
 }
+
+#[test]
+fn plain_class_equality_is_reference_identity() {
+    // A class that declares neither `data` nor `equals` inherits `Any.equals`,
+    // which on the JVM is reference identity — so two separate constructions of
+    // the same arguments are NOT equal, and no container finds one by the other.
+    // This frontend answered structural equality here, which is `true` where
+    // Kotlin says `false` for every line below.
+    let src = "\
+class Plain(val a: Int)
+data class Dat(val a: Int)
+fun main() {
+    val p = Plain(1)
+    println(p == p)
+    println(Plain(1) == Plain(1))
+    println(Plain(1) != Plain(1))
+    println(listOf(Plain(1)) == listOf(Plain(1)))
+    println(Plain(1) in listOf(Plain(1)))
+    println(setOf(Plain(1), Plain(1)).size)
+    println(mapOf(Plain(1) to 1, Plain(2) to 2).containsKey(Plain(1)))
+    println(Dat(1) == Dat(1))
+    println(listOf(Dat(1)) == listOf(Dat(1)))
+    println(setOf(Dat(1), Dat(1)).size)
+}";
+    // Captured from kotlinc-jvm 2.4.10 / JRE 26.0.2.
+    assert_eq!(
+        prog(src),
+        "true\nfalse\ntrue\nfalse\nfalse\n2\nfalse\ntrue\ntrue\n1\n"
+    );
+}
+
+#[test]
+fn declared_equals_without_hashcode_reaches_lists_but_not_hash_containers() {
+    // Overriding `equals` alone breaks the JVM's equals/hashCode contract, and
+    // the two container families diverge as a result: a `List` compares with
+    // `equals` and finds the twin, while a `Set`/`Map` key hashes FIRST and the
+    // identity hashes never meet — so the duplicates survive and the lookup
+    // misses. Calling the override for every container would answer `1` and
+    // `5` on the last three lines; ignoring it would answer `false` on the
+    // list lines. Both are wrong, in opposite directions.
+    let src = "\
+class OnlyEq(val a: Int) {
+    override fun equals(other: Any?): Boolean = other is OnlyEq && other.a == a
+}
+fun main() {
+    println(OnlyEq(1) == OnlyEq(1))
+    println(OnlyEq(1) == OnlyEq(2))
+    println(OnlyEq(1) != OnlyEq(2))
+    println(listOf(OnlyEq(1)).contains(OnlyEq(1)))
+    println(listOf(OnlyEq(9), OnlyEq(1)).indexOf(OnlyEq(1)))
+    println(listOf(OnlyEq(1)) == listOf(OnlyEq(1)))
+    println(setOf(OnlyEq(1), OnlyEq(1)).size)
+    println(listOf(OnlyEq(1), OnlyEq(1)).distinct().size)
+    println(mapOf(OnlyEq(1) to 5, OnlyEq(2) to 6)[OnlyEq(1)])
+}";
+    assert_eq!(prog(src), "true\nfalse\ntrue\ntrue\n1\ntrue\n2\n2\nnull\n");
+}
+
+#[test]
+fn declared_equals_and_hashcode_reach_every_container() {
+    // With both halves of the contract supplied, the hash gate opens and every
+    // container sees the user's answer — including the `hashCode()` folds, which
+    // read the override per element rather than the instance's identity.
+    let src = "\
+class Both(val a: Int) {
+    override fun equals(other: Any?): Boolean = other is Both && other.a == a
+    override fun hashCode(): Int = a
+}
+fun main() {
+    println(Both(1) == Both(1))
+    println(setOf(Both(1), Both(1), Both(2)).size)
+    println(listOf(Both(1), Both(1)).distinct().size)
+    println(mapOf(Both(1) to 5, Both(2) to 6)[Both(1)])
+    println(mapOf(Both(1) to 5, Both(2) to 6).containsKey(Both(2)))
+    println(listOf(Both(3)).hashCode())
+    println(setOf(Both(3)).hashCode())
+    println((Both(3) to 0).hashCode())
+    println(listOf(listOf(Both(1))) == listOf(listOf(Both(1))))
+    println((Both(1) to 2) == (Both(1) to 2))
+    val m = mutableMapOf(Both(1) to 1)
+    m[Both(1)] = 9
+    println(m.size)
+    println(m[Both(1)])
+}";
+    assert_eq!(
+        prog(src),
+        "true\n2\n1\n5\ntrue\n34\n3\n93\ntrue\ntrue\n1\n9\n"
+    );
+}
+
+#[test]
+fn equals_override_runs_even_for_a_self_comparison() {
+    // Kotlin's `==` lowers to `Intrinsics.areEqual(a, b)` — `a?.equals(b)` with
+    // NO `a === b` short-circuit — and `ArrayList.indexOf` calls `equals` per
+    // element the same way. A counting override therefore fires on `x == x`.
+    // A hash container is the exception: `HashMap.getNode` tests `k == key`
+    // before `key.equals(k)`, so a lookup by the stored object skips the body.
+    // The counts below are the observable difference, and they were measured
+    // against the reference toolchain rather than reasoned about — an earlier
+    // reading of this test had the `==` lines at 0 calls and was wrong.
+    let src = "\
+var calls = 0
+class C(val a: Int) {
+    override fun equals(other: Any?): Boolean {
+        calls = calls + 1
+        return other is C && other.a == a
+    }
+    override fun hashCode(): Int = a
+}
+fun main() {
+    val x = C(1)
+    val y = C(2)
+    println(x == x)
+    println(calls)
+    println(x == C(1))
+    println(calls)
+    calls = 0
+    println(listOf(x, y).contains(x))
+    println(\"list: \" + calls)
+    calls = 0
+    println(setOf(x, y).contains(x))
+    println(\"set: \" + calls)
+    calls = 0
+    println(mapOf(x to 1, y to 2)[x])
+    println(\"map: \" + calls)
+    calls = 0
+    println(listOf(x, y).distinct().size)
+    println(\"distinct: \" + calls)
+}";
+    assert_eq!(
+        prog(src),
+        "true\n1\ntrue\n2\ntrue\nlist: 1\ntrue\nset: 0\n1\nmap: 0\n2\ndistinct: 0\n"
+    );
+}
+
+#[test]
+fn contains_all_uses_the_receivers_equality_rule() {
+    // `Collection.containsAll`, vacuous on an empty argument.
+    assert_eq!(
+        prog("fun main() { println(listOf(1, 2, 3).containsAll(listOf(1, 3))) }"),
+        "true\n"
+    );
+    assert_eq!(
+        prog("fun main() { println(listOf(1, 2).containsAll(listOf(4))) }"),
+        "false\n"
+    );
+    assert_eq!(
+        prog("fun main() { println(listOf(1).containsAll(listOf<Int>())) }"),
+        "true\n"
+    );
+}
+
+#[test]
+fn set_and_map_equality_go_through_the_hash_gate() {
+    // `AbstractSet.equals` is `size` plus `containsAll`, and `AbstractMap.equals`
+    // looks each key up with `get` — both HASH-gated. So two sets holding
+    // element-wise "equal" instances of a class that declares `equals` without
+    // `hashCode` are NOT equal, while the same lists ARE. Comparing set elements
+    // with a bare `equals` answers `true` on the first line and is wrong.
+    let src = "\
+class E(val a: Int) {
+    override fun equals(other: Any?): Boolean = other is E && other.a == a
+}
+class B(val a: Int) {
+    override fun equals(other: Any?): Boolean = other is B && other.a == a
+    override fun hashCode(): Int = a
+}
+data class D(val a: Int)
+fun main() {
+    println(setOf(E(2), E(9)) == setOf(E(2), E(9)))
+    println(setOf(B(2), B(9)) == setOf(B(2), B(9)))
+    println(setOf(D(2), D(9)) == setOf(D(2), D(9)))
+    println(setOf(1, 2) == setOf(2, 1))
+    println(mapOf(E(1) to 1, E(2) to 2) == mapOf(E(1) to 1, E(2) to 2))
+    println(mapOf(B(1) to 1, B(2) to 2) == mapOf(B(1) to 1, B(2) to 2))
+    println(mapOf(1 to \"a\") == mapOf(1 to \"a\"))
+    println(listOf(E(2), E(9)) == listOf(E(2), E(9)))
+}";
+    assert_eq!(
+        prog(src),
+        "false\ntrue\ntrue\ntrue\nfalse\ntrue\ntrue\ntrue\n"
+    );
+}
+
+#[test]
+fn map_literal_collapses_a_repeated_key_by_kotlin_equality() {
+    // `mapOf` fills a `LinkedHashMap` by `put`, so a repeated key keeps its
+    // first POSITION and takes the last VALUE. The key match is Kotlin
+    // equality, not object identity — comparing handles left two entries for
+    // every structural key (a `data class`, a `List`, a declared `equals`).
+    let src = "\
+data class D(val a: Int)
+fun main() {
+    println(mapOf(D(1) to 1, D(1) to 2)[D(1)])
+    println(mapOf(D(1) to 1, D(1) to 2).size)
+    println(mapOf(\"x\" to 1, \"x\" to 2)[\"x\"])
+    println(mapOf(listOf(1) to 1, listOf(1) to 2).size)
+    println(mapOf(listOf(1) to 1, listOf(2) to 2).size)
+    println(mapOf(1 to 1, 1 to 2)[1])
+}";
+    assert_eq!(prog(src), "2\n1\n2\n1\n2\n2\n");
+}
