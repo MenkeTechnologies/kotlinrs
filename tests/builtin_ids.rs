@@ -1,4 +1,30 @@
-//! Source-level guard on the hand-assigned host dispatch ids.
+//! Source-level guard on the hand-keyed dispatch registries.
+//!
+//! Two halves. The first covers the NUMERIC space — the `KT_*` ids. The second
+//! covers the NAME-keyed registries, which are the more dangerous of the two
+//! because a duplicate there produces no build signal whatsoever:
+//!
+//! | registry | shape | what a duplicate key does |
+//! | --- | --- | --- |
+//! | `match name { … }` | `rustc` pattern | **warns** `unreachable pattern` |
+//! | `matches!(name, "a" \| "b")` | `rustc` pattern | **warns** `unreachable pattern` |
+//! | `&[("name", …)]` + `.find(…)` | plain slice | **silent** — the first entry wins forever |
+//!
+//! Only the third row is a registry in the sense that matters: nothing in the
+//! language relates one tuple in a `const` slice to another, so a second
+//! `("NumberFormatException", …)` row pasted above the real one simply takes
+//! over every lookup and the build stays clean. `host::BUILTIN_THROWABLES`,
+//! `host::THROWABLE_PARENTS` and `lsp::CORPUS` are all that shape. The
+//! [`name_keyed_tables_key_each_name_once`] test reads them back out as TEXT
+//! and rejects a repeated key.
+//!
+//! The same silence covers the OTHER name-keyed contract: two `matches!` name
+//! sets that must stay disjoint (`compiler::is_coll_hof` vs `is_optional_hof`
+//! — a name in both never reaches its no-lambda member spelling) and a name set
+//! that must line up 1:1 with a dispatch table in another file
+//! (`compiler::is_coll_hof` ∪ `is_optional_hof` vs the arms of
+//! `host::coll_hof`). Neither relation exists in the type system;
+//! [`hof_name_sets_are_disjoint_and_dispatch_once`] pins both.
 //!
 //! Every `KT_*` id in `src/host.rs` is a hand-picked number, and nothing in the
 //! type system stops two of them from being the same. That is not a theoretical
@@ -24,6 +50,7 @@
 
 const HOST: &str = include_str!("../src/host.rs");
 const COMPILER: &str = include_str!("../src/compiler.rs");
+const LSP: &str = include_str!("../src/lsp.rs");
 
 /// The identifier starting at byte `at` in `line`, or `""` if none does.
 fn ident_at(line: &str, at: usize) -> &str {
@@ -214,6 +241,303 @@ fn compiler_emits_each_id_through_its_own_table() {
     assert!(
         problems.is_empty(),
         "{} mis-routed emit site(s) in src/compiler.rs:\n{}",
+        problems.len(),
+        problems.join("\n")
+    );
+}
+
+// ── The NAME-keyed registries ──────────────────────────────────────────────
+
+/// One row of a `const NAME: &[( … )] = &[ … ];` table: its string literals in
+/// source order, and the 1-based line the row opens on.
+struct Row {
+    strings: Vec<String>,
+    line: usize,
+}
+
+/// The rows of the `&[…]` slice literal `decl` introduces.
+///
+/// A hand-written scanner rather than a line regex because the tables wrap: a
+/// row can span four lines, and `lsp::CORPUS`'s description strings contain
+/// commas, parentheses and escaped quotes. Tracking string state and paren
+/// depth is what keeps those out of the row split.
+fn table_rows(src: &'static str, decl: &str) -> Vec<Row> {
+    let at = src
+        .find(decl)
+        .unwrap_or_else(|| panic!("`{decl}` is gone — this test's parser has drifted"));
+    // `= &[`, not the first `&[`: the DECLARED TYPE is also a slice literal
+    // (`&[(&str, &str)]`), and starting there would read the type's own
+    // parentheses as the table's first row.
+    let open = at + src[at..].find("= &[").expect("table has no `= &[`") + 4;
+
+    let mut rows = Vec::new();
+    let mut line = 1 + src[..open].matches('\n').count();
+    let mut cur: Option<Row> = None;
+    let mut depth = 0usize;
+    let mut chars = src[open..].chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' => line += 1,
+            // A `//` comment runs to end of line; its text is not table data.
+            '/' if chars.peek() == Some(&'/') => {
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        line += 1;
+                        break;
+                    }
+                }
+            }
+            '"' => {
+                let mut s = String::new();
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\\' => {
+                            s.push('\\');
+                            if let Some(e) = chars.next() {
+                                s.push(e);
+                            }
+                        }
+                        '"' => break,
+                        '\n' => {
+                            line += 1;
+                            s.push('\n');
+                        }
+                        other => s.push(other),
+                    }
+                }
+                if let Some(row) = cur.as_mut() {
+                    row.strings.push(s);
+                }
+            }
+            '(' => {
+                depth += 1;
+                if depth == 1 {
+                    cur = Some(Row {
+                        strings: Vec::new(),
+                        line,
+                    });
+                }
+            }
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(row) = cur.take() {
+                        rows.push(row);
+                    }
+                }
+            }
+            // The `]` that closes the slice — only meaningful outside a row.
+            ']' if depth == 0 => break,
+            _ => {}
+        }
+    }
+    rows
+}
+
+/// The string literals of `matches!(name, "a" | "b" | …)` inside `fn`.
+fn name_set(src: &'static str, decl: &str) -> Vec<String> {
+    let at = src
+        .find(decl)
+        .unwrap_or_else(|| panic!("`{decl}` is gone — this test's parser has drifted"));
+    let end = at + src[at..].find("\n}").expect("unterminated fn");
+    let body = &src[at..end];
+    assert!(
+        body.contains("matches!("),
+        "`{decl}` is no longer a `matches!` name set — this test's parser has drifted"
+    );
+    literals(body)
+}
+
+/// Every double-quoted literal in `body`, in order. The inputs here are
+/// hand-written name lists with no escapes.
+fn literals(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(a) = rest.find('"') {
+        let tail = &rest[a + 1..];
+        let Some(b) = tail.find('"') else { break };
+        out.push(tail[..b].to_string());
+        rest = &tail[b + 1..];
+    }
+    out
+}
+
+/// The names `host::coll_hof` has a `match` arm for. Arms sit at exactly eight
+/// columns and open with the string key, so an arm BODY (twelve columns in) is
+/// never mistaken for one.
+fn coll_hof_arms() -> Vec<String> {
+    let at = HOST
+        .find("\nfn coll_hof(")
+        .expect("`fn coll_hof` is gone — this test's parser has drifted");
+    let mut out = Vec::new();
+    for line in HOST[at + 1..].lines() {
+        if line == "}" {
+            break;
+        }
+        let Some(key) = line.strip_prefix("        \"") else {
+            continue;
+        };
+        let Some(head) = key.split("=>").next() else {
+            continue;
+        };
+        out.extend(literals(&format!("\"{head}")));
+    }
+    assert!(
+        out.len() > 30,
+        "parsed only {} `coll_hof` arms — this test's parser has drifted",
+        out.len()
+    );
+    out
+}
+
+/// Names appearing more than once in `keys`, each with the lines it landed on.
+fn repeats(keys: &[(String, usize)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, (key, line)) in keys.iter().enumerate() {
+        let dups: Vec<String> = keys[i + 1..]
+            .iter()
+            .filter(|(k, _)| k == key)
+            .map(|(_, l)| l.to_string())
+            .collect();
+        if !dups.is_empty() {
+            out.push(format!(
+                "  {key:?}: line {line}, again on line(s) {}",
+                dups.join(", ")
+            ));
+        }
+    }
+    out
+}
+
+#[test]
+fn name_keyed_tables_key_each_name_once() {
+    // (table, file, how many leading strings form the key, floor on row count)
+    let tables: [(&str, &str, usize, usize); 3] = [
+        ("pub const BUILTIN_THROWABLES", "src/host.rs", 1, 15),
+        ("const THROWABLE_PARENTS", "src/host.rs", 1, 15),
+        // A corpus entry is `(name, chapter, signature, description, example)`
+        // and the same NAME legitimately appears in several chapters — `count`
+        // is both a member and a higher-order function. The key is the pair.
+        ("const CORPUS", "src/lsp.rs", 2, 250),
+    ];
+
+    let mut problems = Vec::new();
+    for (decl, file, key_len, floor) in tables {
+        let src = if file == "src/lsp.rs" { LSP } else { HOST };
+        let rows = table_rows(src, decl);
+        assert!(
+            rows.len() >= floor,
+            "parsed only {} row(s) out of {decl} — this test's parser has drifted",
+            rows.len()
+        );
+        let keys: Vec<(String, usize)> = rows
+            .iter()
+            .map(|r| {
+                assert!(
+                    r.strings.len() >= key_len,
+                    "{file}:{}: row in {decl} has {} string(s), fewer than the {key_len}-string \
+                     key — this test's parser has drifted",
+                    r.line,
+                    r.strings.len()
+                );
+                (r.strings[..key_len].join("\u{1f}"), r.line)
+            })
+            .collect();
+        for dup in repeats(&keys) {
+            problems.push(format!("{decl} ({file}):\n{dup}"));
+        }
+    }
+
+    assert!(
+        problems.is_empty(),
+        "{} duplicate key(s) in a name-keyed table. Every one of these tables is read with \
+         `.iter().find(…)`, so the FIRST row wins and the later one is dead — and unlike a \
+         duplicate `match` arm, `rustc` says nothing about it. Merge the rows:\n{}",
+        problems.len(),
+        problems.join("\n")
+    );
+}
+
+#[test]
+fn throwable_hierarchy_is_closed() {
+    let declared: Vec<String> = table_rows(HOST, "pub const BUILTIN_THROWABLES")
+        .iter()
+        .map(|r| r.strings[0].clone())
+        .collect();
+    let parents: Vec<(String, String)> = table_rows(HOST, "const THROWABLE_PARENTS")
+        .iter()
+        .map(|r| (r.strings[0].clone(), r.strings[1].clone()))
+        .collect();
+
+    let mut problems = Vec::new();
+    for name in &declared {
+        // `Throwable` is the root and is the one class with no parent row.
+        if name != "Throwable" && !parents.iter().any(|(c, _)| c == name) {
+            problems.push(format!(
+                "  {name} is in BUILTIN_THROWABLES but has no THROWABLE_PARENTS row — \
+                 `catch (e: Exception)` will not claim it"
+            ));
+        }
+    }
+    for (class, parent) in &parents {
+        if !declared.contains(class) {
+            problems.push(format!(
+                "  {class} has a parent row but is not in BUILTIN_THROWABLES — \
+                 `throwable_ancestry` stops before reaching it"
+            ));
+        }
+        if !declared.contains(parent) {
+            problems.push(format!(
+                "  {class}'s parent {parent} is not in BUILTIN_THROWABLES — the ancestry walk \
+                 falls off the end of the chain"
+            ));
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "{} break(s) in the throwable hierarchy:\n{}",
+        problems.len(),
+        problems.join("\n")
+    );
+}
+
+#[test]
+fn hof_name_sets_are_disjoint_and_dispatch_once() {
+    let coll = name_set(COMPILER, "fn is_coll_hof(");
+    let optional = name_set(COMPILER, "fn is_optional_hof(");
+    let arms = coll_hof_arms();
+
+    let mut problems = Vec::new();
+    for name in &coll {
+        if optional.contains(name) {
+            problems.push(format!(
+                "  {name:?} is in BOTH is_coll_hof and is_optional_hof. The call site tests \
+                 is_coll_hof first, so the no-lambda member spelling can never reach the member \
+                 dispatch — and neither `matches!` knows the other exists"
+            ));
+        }
+    }
+    for name in coll.iter().chain(&optional) {
+        if !arms.contains(name) {
+            problems.push(format!(
+                "  {name:?} is declared a higher-order collection function in src/compiler.rs, \
+                 but `host::coll_hof` has no arm for it — the call faults at run time"
+            ));
+        }
+    }
+    for name in &arms {
+        if !coll.contains(name) && !optional.contains(name) {
+            problems.push(format!(
+                "  `host::coll_hof` has an arm for {name:?}, but neither is_coll_hof nor \
+                 is_optional_hof names it — nothing in src/compiler.rs ever routes there"
+            ));
+        }
+    }
+    problems.sort_unstable();
+    problems.dedup();
+    assert!(
+        problems.is_empty(),
+        "{} higher-order-function routing problem(s) between src/compiler.rs and src/host.rs:\n{}",
         problems.len(),
         problems.join("\n")
     );
