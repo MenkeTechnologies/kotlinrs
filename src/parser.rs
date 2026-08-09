@@ -2703,7 +2703,11 @@ impl Parser {
                 }
             }
         }
-        if !self.at(&Tok::LParen) {
+        // A trailing lambda counts as the argument list: `buildList<Int> { … }`
+        // has no parentheses at all, and Kotlin still reads it as a generic
+        // call. Nothing else follows a real type-argument list, so requiring
+        // one of the two is what keeps `a < b` a comparison.
+        if !self.at(&Tok::LParen) && !self.at(&Tok::LBrace) {
             self.pos = save;
         }
     }

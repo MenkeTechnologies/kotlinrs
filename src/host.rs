@@ -160,6 +160,16 @@ pub const KT_EQUALS_REG: u16 = 38;
 /// Consulted by `hash_vm`, so a `List`/`Set`/`Map` fold over an instance
 /// picks up the user's answer the way the JVM's does.
 pub const KT_HASH_REG: u16 = 39;
+/// Build a `StringBuilder`. Stack: `[]`, `[initial]`, or `[capacity]` with
+/// `arg` = the argument count; pushes the new builder's `Value::Obj` handle.
+///
+/// The two one-argument forms are told apart by the value: `StringBuilder(64)`
+/// preallocates and starts EMPTY where `StringBuilder("64")` starts with that
+/// text, which is the JVM's `(int)` / `(CharSequence)` overload split. Capacity
+/// itself is unobservable here — nothing in Kotlin reads it back except
+/// `capacity()`, whose exact growth policy is a JVM implementation detail — so
+/// the int form just yields an empty builder.
+pub const KT_BUILDER: u16 = 40;
 
 // ── Builtin ids (`Op::CallBuiltin`) ─────────────────────────────────────────
 //
@@ -256,6 +266,18 @@ pub const KT_MAP_VM: u16 = 130;
 /// neighbours above: element equality can run a user `equals`/`hashCode`
 /// through a nested `vm.run()`, which an extension handler cannot host.
 pub const KT_OPER_VM: u16 = 131;
+
+/// The `kotlin` preconditions — `require`, `requireNotNull`, `check`,
+/// `checkNotNull`, `error`, and `TODO`. Stack: `[subject?, message?, nameStr]`
+/// with `argc` = how many of the two leading slots are present; the name on top
+/// picks which contract applies.
+///
+/// One id for all six because they differ only in which throwable they raise
+/// and what its default message says. A builtin rather than an `Op::Extended`
+/// because the optional message is a LAMBDA — `require(ok) { expensive() }`
+/// must not evaluate `expensive()` when the condition holds — and invoking one
+/// needs the re-entrant builtin table.
+pub const KT_PRECOND: u16 = 132;
 
 /// Kotlin `==` over heap objects. Stack: `[a, b]`; pushes a `Bool`.
 ///
@@ -720,6 +742,24 @@ enum HeapObj {
         items: Vec<Value>,
         desc: String,
     },
+    /// A `java.lang.StringBuilder`, as its content in UTF-16 code units plus the
+    /// capacity of the array holding them.
+    ///
+    /// Code units rather than a Rust `String` because every index a builder
+    /// takes is a JVM `char` offset, and the two disagree the moment a
+    /// supplementary character appears: `StringBuilder("a😀b")` has `length` 4,
+    /// `[1]` is the HIGH SURROGATE `\uD83D`, and `deleteCharAt(1)` leaves a
+    /// three-unit sequence with half a pair in it — none of which a `String`
+    /// can even represent, let alone index.
+    ///
+    /// `cap` is carried because `capacity()` is observable and its growth is
+    /// specified: a builder starts at 16 (`StringBuilder()`), at
+    /// `initial.length + 16` (`StringBuilder(text)`), or at the requested size,
+    /// and an append that does not fit grows it to `max(2 * cap + 2, needed)`.
+    Builder {
+        units: Vec<u16>,
+        cap: usize,
+    },
 }
 
 /// Which syntactic form produced a range. This is not cosmetic: `a..b` and
@@ -1017,6 +1057,9 @@ pub const BUILTIN_THROWABLES: &[(&str, &str)] = &[
         "java.lang.NegativeArraySizeException",
     ),
     ("NoSuchElementException", "java.util.NoSuchElementException"),
+    // `TODO()`'s throwable. It is Kotlin's own, not the JVM's, so it keeps the
+    // `kotlin.` package its `toString` prints.
+    ("NotImplementedError", "kotlin.NotImplementedError"),
 ];
 
 /// The JVM throwable hierarchy kotlinrs models, as `(class, superclass)` simple
@@ -1045,6 +1088,9 @@ const THROWABLE_PARENTS: &[(&str, &str)] = &[
     ("UnsupportedOperationException", "RuntimeException"),
     ("NegativeArraySizeException", "RuntimeException"),
     ("NoSuchElementException", "RuntimeException"),
+    // An `Error`, NOT an `Exception` — which is why `catch (e: Exception)` does
+    // not catch what `TODO()` throws and `catch (e: Throwable)` does.
+    ("NotImplementedError", "Error"),
 ];
 
 /// The fully-qualified name of a throwable's simple name, or `None` when the
@@ -1709,6 +1755,12 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let tag = vm.pop().to_str();
             HASHCODE_SUBS.with(|t| t.borrow_mut().insert(tag, idx));
         }
+        KT_BUILDER => {
+            // Stack: [] or [arg]; `arg` is the argument count.
+            let init = (arg == 1).then(|| vm.pop());
+            let b = new_builder(init);
+            vm.push(b);
+        }
         KT_GETFIELD => {
             // Stack: [obj, nameStr].
             let name = vm.pop().to_str();
@@ -2118,6 +2170,7 @@ fn register_builtins(vm: &mut VM) {
     vm.register_builtin(KT_INDEX_SET_VM, b_index_set);
     vm.register_builtin(KT_MAP_VM, b_map_new);
     vm.register_builtin(KT_OPER_VM, b_operator);
+    vm.register_builtin(KT_PRECOND, b_precond);
     vm.register_builtin(KT_EXC_NEW, b_exc_new);
     vm.register_builtin(KT_EXC_THROW, b_exc_throw);
     vm.register_builtin(KT_EXC_PENDING, b_exc_pending);
@@ -2221,6 +2274,7 @@ fn iter_len(recv: &Value) -> Option<i64> {
         HeapObj::Range(r) => Some(r.count()),
         // `for (e in map)` walks the entries.
         HeapObj::Map(entries) => Some(entries.len() as i64),
+        HeapObj::Builder { units, .. } => Some(units.len() as i64),
         _ => None,
     })
     .flatten()
@@ -2256,6 +2310,10 @@ fn iter_at(recv: &Value, i: i64) -> Value {
             usize::try_from(i).ok().and_then(|i| items.get(i).cloned())
         }
         HeapObj::Range(r) => Some(r.value_at(i)),
+        HeapObj::Builder { units, .. } => usize::try_from(i)
+            .ok()
+            .and_then(|i| units.get(i))
+            .map(|u| char_of(*u as i64)),
         _ => None,
     })
     .flatten()
@@ -3274,6 +3332,70 @@ fn result_parts(v: &Value) -> Option<(Value, Option<Value>)> {
         _ => None,
     })
     .flatten()
+}
+
+/// `KT_PRECOND` — see [`KT_PRECOND`]. Stack: `[subject?, message?, nameStr]`.
+fn b_precond(vm: &mut VM, argc: u8) -> Value {
+    let name = vm.pop().to_str();
+    let mut vals = Vec::with_capacity(argc as usize);
+    for _ in 0..argc {
+        vals.push(vm.pop());
+    }
+    vals.reverse();
+    // `error(msg)` / `TODO(reason)` have no condition to test — their single
+    // argument is the message. Everything else reads `(subject, message?)`.
+    let unconditional = matches!(name.as_str(), "error" | "TODO");
+    let mut vals = vals.into_iter();
+    let subject = if unconditional {
+        Value::Undef
+    } else {
+        vals.next().unwrap_or(Value::Undef)
+    };
+    let message = vals.next();
+    // `require`/`check` fail on a false condition; the `…NotNull` pair fails on
+    // Kotlin `null` and otherwise ANSWERS the value, which is what lets
+    // `val x = checkNotNull(maybe)` stand in for the value. `error`/`TODO`
+    // always fail.
+    let (ok, value) = match name.as_str() {
+        "require" | "check" => (truthy(&subject), Value::Undef),
+        "requireNotNull" | "checkNotNull" => (!matches!(subject, Value::Undef), subject.clone()),
+        _ => (false, Value::Undef),
+    };
+    if ok {
+        return value;
+    }
+    // The lazy message is a lambda so it only runs on the failing path —
+    // `require(ok) { expensive() }` must not call `expensive` when `ok` holds.
+    let msg = match &message {
+        Some(m) if closure_meta(m).is_some() => match invoke_closure(vm, m, &[]) {
+            Ok(v) => Some(kotlin_string(&v)),
+            Err(e) => {
+                fault(vm, e);
+                return Value::Undef;
+            }
+        },
+        Some(m) => Some(kotlin_string(m)),
+        None => None,
+    };
+    let (class, default) = match name.as_str() {
+        "require" => ("IllegalArgumentException", "Failed requirement."),
+        "requireNotNull" => ("IllegalArgumentException", "Required value was null."),
+        "check" => ("IllegalStateException", "Check failed."),
+        "checkNotNull" => ("IllegalStateException", "Required value was null."),
+        "error" => ("IllegalStateException", ""),
+        _ => ("NotImplementedError", ""),
+    };
+    // `TODO(reason)` APPENDS the reason to the fixed sentence rather than
+    // replacing it: `An operation is not implemented: reason`.
+    let text = match (name.as_str(), &msg) {
+        ("TODO", Some(m)) => format!("An operation is not implemented: {m}"),
+        ("TODO", None) => "An operation is not implemented.".to_string(),
+        (_, Some(m)) => m.clone(),
+        (_, None) => default.to_string(),
+    };
+    let fqn = throwable_fqn(class).unwrap_or(class);
+    raise(vm, new_throwable(fqn, Some(&text)));
+    Value::Undef
 }
 
 /// `KT_RESULT_HOF` — see [`KT_RESULT_HOF`].
@@ -4386,6 +4508,230 @@ fn trailing_width(args: &[Value], at: usize) -> i64 {
     }
 }
 
+// ── java.lang.StringBuilder ─────────────────────────────────────────────────
+
+/// The spare room every `StringBuilder` constructor leaves: `StringBuilder()`
+/// starts at 16 and `StringBuilder(text)` at `text.length + 16`.
+const BUILDER_SLACK: usize = 16;
+
+/// The capacity that holds `needed` units, grown from `cap` the way
+/// `AbstractStringBuilder` grows it — double it plus two, or jump straight to
+/// what is needed when even that is too small.
+fn builder_cap(cap: usize, needed: usize) -> usize {
+    if needed <= cap {
+        cap
+    } else {
+        (cap * 2 + 2).max(needed)
+    }
+}
+
+/// Build the `Op::Extended(KT_BUILDER, argc)` result: `StringBuilder()`,
+/// `StringBuilder(text)`, or `StringBuilder(capacity)`.
+fn new_builder(arg: Option<Value>) -> Value {
+    let (units, cap) = match arg {
+        // The `(int)` overload: an EMPTY builder that has merely preallocated.
+        Some(Value::Int(n)) => (Vec::new(), n.max(0) as usize),
+        Some(v) => {
+            let units: Vec<u16> = kotlin_string(&v).encode_utf16().collect();
+            let cap = units.len() + BUILDER_SLACK;
+            (units, cap)
+        }
+        None => (Vec::new(), BUILDER_SLACK),
+    };
+    alloc(HeapObj::Builder { units, cap })
+}
+
+/// A builder's content, or `None` for any other receiver.
+fn builder_units(v: &Value) -> Option<Vec<u16>> {
+    with_obj(v, |o| match o {
+        HeapObj::Builder { units, .. } => Some(units.clone()),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// Rewrite a builder's content in place, growing its capacity to fit the
+/// result. Answers `f`'s value, or `None` when `v` is not a builder.
+fn edit_builder<T>(v: &Value, f: impl FnOnce(&mut Vec<u16>) -> T) -> Option<T> {
+    with_obj_mut(v, |o| match o {
+        HeapObj::Builder { units, cap } => {
+            let out = f(units);
+            *cap = builder_cap(*cap, units.len());
+            Some(out)
+        }
+        _ => None,
+    })
+    .flatten()
+}
+
+/// `StringBuilder` members.
+///
+/// The mutating ones are here because they have no `String` counterpart, and
+/// every one of them answers the RECEIVER so `sb.append(a).append(b)` keeps
+/// building the same object. Everything else is inherited from `CharSequence`
+/// and behaves identically on a `String`, so it delegates rather than being
+/// written twice — `length`, `indexOf`, `substring`, `startsWith`, `first`,
+/// `toList`, `count`, and the rest all resolve through [`kt_method`] on a
+/// snapshot of the content.
+fn builder_method(
+    vm: &mut VM,
+    recv: &Value,
+    units: Vec<u16>,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, String> {
+    let len = units.len();
+    /// The JVM's index diagnostic. `insert` says "offset" where the rest say
+    /// "index"; the two messages are otherwise identical.
+    fn oob(what: &str, i: i64, len: usize) -> String {
+        format!("java.lang.StringIndexOutOfBoundsException: {what} {i}, length {len}")
+    }
+    /// A member argument as the code units `String.valueOf` would append.
+    ///
+    /// Rendered up front, NOT inside the mutation closure below: an argument
+    /// that is itself a heap object (`sb.append(listOf(1, 2))`) reads the heap
+    /// to stringify, and the mutation already holds it borrowed.
+    fn arg_units(args: &[Value], i: usize) -> Vec<u16> {
+        args.get(i)
+            .map(kotlin_string)
+            .unwrap_or_default()
+            .encode_utf16()
+            .collect()
+    }
+    let int_arg = |i: usize| args.get(i).map(|v| v.to_int()).unwrap_or(0);
+    // A member that mutates answers the receiver, so its arm only has to say
+    // what changed.
+    let chained = |f: &mut dyn FnMut(&mut Vec<u16>)| {
+        edit_builder(recv, |u| f(u));
+        Ok(recv.clone())
+    };
+    match name {
+        "toString" => Ok(Value::str(String::from_utf16_lossy(&units))),
+        // `StringBuilder` does not override `equals`/`hashCode`, so both are
+        // `Object`'s — identity, NOT the content two equal-looking builders
+        // share. Delegating them to the `String` snapshot would quietly make
+        // `StringBuilder("ab") == StringBuilder("ab")` true.
+        "equals" => Ok(Value::Bool(args.first().is_some_and(|o| value_eq(recv, o)))),
+        "hashCode" => Ok(Value::Int(hash_vm(vm, recv, false) as i64)),
+        "append" | "appendLine" => {
+            let mut add = arg_units(args, 0);
+            if name == "appendLine" {
+                add.push(b'\n' as u16);
+            }
+            chained(&mut |u| u.extend_from_slice(&add))
+        }
+        "insert" => {
+            let at = int_arg(0);
+            if at < 0 || at as usize > len {
+                return Err(oob("offset", at, len));
+            }
+            let ins = arg_units(args, 1);
+            chained(&mut |u| {
+                u.splice(at as usize..at as usize, ins.clone());
+            })
+        }
+        "deleteCharAt" => {
+            let at = int_arg(0);
+            if at < 0 || at as usize >= len {
+                return Err(oob("index", at, len));
+            }
+            chained(&mut |u| {
+                u.remove(at as usize);
+            })
+        }
+        // `delete`/`replace` CLAMP their end to the length rather than
+        // throwing — `StringBuilder("abc").delete(1, 99)` is `a` — but still
+        // reject a start outside the sequence.
+        "delete" | "replace" => {
+            let (start, end) = (int_arg(0), int_arg(1));
+            if start < 0 || start as usize > len || start > end {
+                return Err(oob("start", start, len));
+            }
+            let (start, end) = (start as usize, (end as usize).min(len));
+            let with = if name == "replace" {
+                arg_units(args, 2)
+            } else {
+                Vec::new()
+            };
+            chained(&mut |u| {
+                u.splice(start..end, with.clone());
+            })
+        }
+        // The JVM reverses code units but keeps each surrogate PAIR facing
+        // forward, so `"a😀b"` reverses to `"b😀a"` and not to two broken
+        // halves. Reversing twice and swapping the halves back is exactly what
+        // `AbstractStringBuilder.reverse` does.
+        "reverse" => chained(&mut |u| {
+            u.reverse();
+            let mut i = 0;
+            while i + 1 < u.len() {
+                // Reversing put each pair back to front, as `[low, high]`.
+                if (0xDC00..0xE000).contains(&u[i]) && (0xD800..0xDC00).contains(&u[i + 1]) {
+                    u.swap(i, i + 1);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        }),
+        // `clear()` is `kotlin.text`'s builder-returning spelling of
+        // `setLength(0)`; `setLength` itself answers `Unit` and PADS with NUL
+        // when it grows.
+        "clear" => chained(&mut |u| u.clear()),
+        "setLength" => {
+            let n = int_arg(0);
+            if n < 0 {
+                return Err(oob("length", n, len));
+            }
+            edit_builder(recv, |u| u.resize(n as usize, 0));
+            Ok(Value::Undef)
+        }
+        "setCharAt" => {
+            let at = int_arg(0);
+            if at < 0 || at as usize >= len {
+                return Err(oob("index", at, len));
+            }
+            let c = args
+                .get(1)
+                .and_then(char_code)
+                .unwrap_or_else(|| int_arg(1)) as u16;
+            edit_builder(recv, |u| u[at as usize] = c);
+            Ok(Value::Undef)
+        }
+        "capacity" => Ok(Value::Int(
+            with_obj(recv, |o| match o {
+                HeapObj::Builder { cap, .. } => *cap as i64,
+                _ => 0,
+            })
+            .unwrap_or(0),
+        )),
+        "ensureCapacity" | "trimToSize" => {
+            let want = if name == "trimToSize" {
+                len
+            } else {
+                int_arg(0).max(0) as usize
+            };
+            with_obj_mut(recv, |o| {
+                if let HeapObj::Builder { cap, .. } = o {
+                    *cap = if name == "trimToSize" {
+                        len
+                    } else {
+                        builder_cap(*cap, want)
+                    };
+                }
+            });
+            Ok(Value::Undef)
+        }
+        _ => kt_method(
+            vm,
+            &Value::str(String::from_utf16_lossy(&units)),
+            name,
+            args,
+        )
+        .map_err(|e| e.replace("on String", "on StringBuilder")),
+    }
+}
+
 fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     // A `Char` shares the `Value::Obj` variant with the heap but is not a heap
     // object, so its members resolve first.
@@ -4464,7 +4810,10 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
                 None => -1,
             }))
         }
-        (Value::Str(s), "substring") => {
+        // `subSequence` is the `CharSequence` spelling of the two-argument
+        // `substring`. It is typed `CharSequence` rather than `String`, but the
+        // JVM answers a `String` for both receivers kotlinrs has.
+        (Value::Str(s), "substring" | "subSequence") => {
             let units: Vec<u16> = s.encode_utf16().collect();
             let start = args.first().map(|v| v.to_int()).unwrap_or(0);
             let end = args
@@ -4960,6 +5309,13 @@ fn char_method(code: i64, name: &str, args: &[Value]) -> Result<Value, String> {
 /// class's synthesized members). User-defined class methods never reach here —
 /// the compiler lowers those to direct `Op::Call`s on method subs.
 fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    // A `StringBuilder` resolves first and entirely on its own: it is a
+    // `CharSequence`, not a collection, so none of the collection members below
+    // apply to it, and the ones whose NAMES collide (`clear`, `remove`, `set`)
+    // mean something different or nothing at all.
+    if let Some(units) = builder_units(recv) {
+        return builder_method(vm, recv, units, name, args);
+    }
     // `componentN` (destructuring) is uniform across the ordered kinds.
     if let Some(idx) = name
         .strip_prefix("component")
@@ -5053,6 +5409,69 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             return match added {
                 Some(b) => Ok(Value::Bool(b)),
                 None => Err(format!("unresolved reference: add on {}", obj_label(recv))),
+            };
+        }
+        // The bulk mutators. All three answer whether the receiver CHANGED,
+        // which is why each one compares before and after rather than reporting
+        // the argument's size: `addAll(emptyList())` is `false`, and so is
+        // `removeAll` of elements that were never there.
+        //
+        // Membership runs through `key_position` — outside the heap borrow —
+        // because a user `equals`/`hashCode` re-enters the VM.
+        "addAll" | "removeAll" | "retainAll" => {
+            let other = args.first().map(sequence_items).unwrap_or_default();
+            let keep: Vec<bool> = if name == "addAll" {
+                Vec::new()
+            } else {
+                // `retainAll` keeps what the argument holds; `removeAll` drops it.
+                let want = name == "retainAll";
+                let items = as_iterable(recv).unwrap_or_default();
+                items
+                    .iter()
+                    .map(|v| other.iter().any(|o| value_eq(v, o)) == want)
+                    .collect()
+            };
+            // A `Set` ignores an element it already holds, so `addAll` has to
+            // ask per element rather than extending blindly.
+            let fresh: Vec<Value> = if name == "addAll" {
+                let mut seen: Vec<Value> = Vec::new();
+                other
+                    .iter()
+                    .filter(|v| {
+                        let dup = key_position(vm, recv, v).is_some()
+                            || seen.iter().any(|s| value_eq(s, v));
+                        seen.push((*v).clone());
+                        !dup
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let changed = with_obj_mut(recv, |o| {
+                // Only a `Set` de-duplicates; a `MutableList` appends every
+                // element it is given, repeats included.
+                let is_set = matches!(o, HeapObj::Set(_));
+                let items = match o {
+                    HeapObj::List(items) | HeapObj::Set(items) => items,
+                    _ => return None,
+                };
+                let before = items.len();
+                if name == "addAll" {
+                    items.extend(if is_set { fresh } else { other });
+                } else {
+                    let mut keep = keep.into_iter();
+                    items.retain(|_| keep.next().unwrap_or(true));
+                }
+                Some(items.len() != before)
+            })
+            .flatten();
+            return match changed {
+                Some(b) => Ok(Value::Bool(b)),
+                None => Err(format!(
+                    "unresolved reference: {name} on {}",
+                    obj_label(recv)
+                )),
             };
         }
         // `remove(element)` on a mutable list or set — `removeAt(index)` is the
@@ -5521,6 +5940,18 @@ fn sequence_member(
             return Some(Ok(alloc(HeapObj::Set(distinct(vm, items)))))
         }
         "distinct" => return Some(Ok(alloc(HeapObj::List(distinct(vm, items))))),
+        // `filterNotNull` drops Kotlin `null` (carried as `Undef`) and always
+        // answers a `List`, whichever kind the receiver was — it is the
+        // type-narrowing member, not a `filter` overload.
+        "filterNotNull" => {
+            return Some(Ok(alloc(HeapObj::List(
+                items
+                    .iter()
+                    .filter(|v| !matches!(v, Value::Undef))
+                    .cloned()
+                    .collect(),
+            ))))
+        }
         // The set operators are defined on any `Iterable` and all return a
         // `Set`, whichever kind the receiver was.
         "union" | "intersect" | "subtract" => {
@@ -5624,6 +6055,7 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
         | HeapObj::Closure { .. }
         | HeapObj::Grouping { .. }
         | HeapObj::Range(_)
+        | HeapObj::Builder { .. }
         | HeapObj::Exc { .. } => None,
     })
     .flatten()
@@ -5654,6 +6086,18 @@ fn index_get(vm: &mut VM, recv: &Value, index: &Value) -> Result<Value, String> 
             Some(u) => Ok(char_of(u as i64)),
             None => Err(format!(
                 "java.lang.StringIndexOutOfBoundsException: index {i}, length {len}"
+            )),
+        };
+    }
+    // `sb[i]` indexes the builder's code units, with the same diagnostic a
+    // `String` gives.
+    if let Some(units) = builder_units(recv) {
+        let i = index.to_int();
+        return match usize::try_from(i).ok().and_then(|i| units.get(i)) {
+            Some(u) => Ok(char_of(*u as i64)),
+            None => Err(format!(
+                "java.lang.StringIndexOutOfBoundsException: index {i}, length {}",
+                units.len()
             )),
         };
     }
@@ -5735,6 +6179,20 @@ fn index_set(vm: &mut VM, recv: &Value, index: &Value, value: Value) -> Result<(
                 None => entries.push((index.clone(), value)),
             }
             Ok(())
+        }
+        // `sb[i] = c` — `kotlin.text`'s operator spelling of `setCharAt`.
+        HeapObj::Builder { units, .. } => {
+            let i = index.to_int();
+            match usize::try_from(i).ok().filter(|i| *i < units.len()) {
+                Some(i) => {
+                    units[i] = char_code(&value).unwrap_or_else(|| value.to_int()) as u16;
+                    Ok(())
+                }
+                None => Err(format!(
+                    "java.lang.StringIndexOutOfBoundsException: index {i}, length {}",
+                    units.len()
+                )),
+            }
         }
         _ => Err(format!(
             "{} does not support indexed assignment",
@@ -6016,6 +6474,7 @@ fn obj_hash(recv: &Value) -> Option<i32> {
         }),
         // Identity-hashed: `Object.hashCode`.
         HeapObj::Array { .. }
+        | HeapObj::Builder { .. }
         | HeapObj::Closure { .. }
         | HeapObj::Grouping { .. }
         | HeapObj::Exc { .. } => None,
@@ -6051,6 +6510,7 @@ fn obj_label(recv: &Value) -> String {
         }
         .to_string(),
         HeapObj::Array { .. } => "Array".to_string(),
+        HeapObj::Builder { .. } => "StringBuilder".to_string(),
         HeapObj::Exc { class, .. } => class.rsplit('.').next().unwrap_or(class).to_string(),
     })
     .unwrap_or_else(|| "value".to_string())
@@ -6171,6 +6631,9 @@ fn display_obj(id: u32) -> String {
             // no reimplementation can reproduce — the heap handle stands in, so
             // the SHAPE matches (`[I@1b6d3586`) but the digits do not.
             HeapObj::Array { desc, .. } => format!("{desc}@{id:x}"),
+            // `StringBuilder.toString()` is its content, which is why an
+            // interpolated or printed builder reads as plain text.
+            HeapObj::Builder { units, .. } => String::from_utf16_lossy(units),
             // `Throwable.toString()`: the qualified class name, plus `": " +
             // message` when the constructor was given one.
             HeapObj::Exc { class, msg } => match msg {
@@ -6191,7 +6654,17 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         "Int" | "Long" | "Byte" | "Short" => matches!(v, Value::Int(_)),
         "Double" | "Float" => matches!(v, Value::Float(_)),
         "Boolean" => matches!(v, Value::Bool(_)),
-        "String" | "CharSequence" => matches!(v, Value::Str(_)),
+        "String" => matches!(v, Value::Str(_)),
+        // A `StringBuilder` is a `CharSequence` alongside `String`, but neither
+        // is the other: `sb is String` and `"x" is StringBuilder` are both
+        // false on the JVM. `Appendable` is the builder's alone.
+        "CharSequence" => {
+            matches!(v, Value::Str(_))
+                || with_obj(v, |o| matches!(o, HeapObj::Builder { .. })).unwrap_or(false)
+        }
+        "StringBuilder" | "StringBuffer" | "Appendable" => {
+            with_obj(v, |o| matches!(o, HeapObj::Builder { .. })).unwrap_or(false)
+        }
         // `Any` matches any non-null value; unknown names never match.
         "Any" => !matches!(v, Value::Undef),
         // The built-in container types. Type arguments are erased on the JVM,

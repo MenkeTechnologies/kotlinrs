@@ -851,6 +851,47 @@ the singleton is not published to until every initializer has run.
 answering the base-10 reading, or throwing on a string valid in the base asked
 for.
 
+Also landed, with frozen corpus records captured from the reference toolchain:
+**`StringBuilder`** — the first mutable JVM object in the heap, and the first
+whose members split into a half that mutates and a half inherited from
+`CharSequence`. Every mutator (`append`/`appendLine`/`insert`/`delete`/
+`replace`/`deleteCharAt`/`reverse`/`clear`) answers the RECEIVER, so a chain
+keeps building one object; `setLength`/`setCharAt` answer `Unit`, and
+`setLength` pads with NUL (`\u0000`) when it grows. The content is held as UTF-16 code
+units rather than a Rust `String`, because every index a builder takes is a JVM
+`char` offset and the two disagree the moment a supplementary character appears
+— `StringBuilder("a😀b")` has `length` 4, `[1]` is the high surrogate, and
+`deleteCharAt(1)` leaves half a pair, none of which a `String` can represent.
+`reverse` keeps each surrogate pair facing forward the way
+`AbstractStringBuilder` does. `capacity()` is modelled too, growth policy
+included (16 by default, `text.length + 16` from a text,
+`max(2 * cap + 2, needed)` on an append that does not fit). The read-only half
+is delegated to the `String` members rather than written twice. Alongside it:
+**`buildString`/`buildList`**, which desugar to `apply` over a fresh builder so
+the block's unqualified `append`/`add` is the receiver-scope machinery that
+already existed; **`listOfNotNull`** and the `filterNotNull` member; the bulk
+mutators **`addAll`/`removeAll`/`retainAll`**, each answering whether the
+receiver CHANGED; and the top-level **`repeat`** and the preconditions
+**`require`/`requireNotNull`/`check`/`checkNotNull`/`error`/`TODO`**, whose
+message block runs only on the failing path and whose `NotImplementedError`
+descends from `Error`, so `catch (e: Exception)` does not catch it.
+
+Two bugs surfaced with them. A generic call whose only argument is a trailing
+lambda (`buildList<Int> { }`) was **rolling its type-argument list back** — the
+scan required a `(` immediately after the `>` — so the whole call re-parsed as a
+chain of comparisons and failed on the name. And `StringBuilder(…)` inferred as
+an untyped value made `==` **coerce two heap handles** and answer `true` for any
+two builders, the same class of bug the `Pair` constructor had; a
+`StringBuilder` overrides neither `equals` nor `hashCode`, so identity is the
+whole contract.
+
+The hand-assigned host dispatch ids are now **guarded by a test that reads them
+back out of the source**. Nothing had been checking them: `register_builtin`
+overwrites by id, so two ops that both reach for the next free number merge
+without a conflict and the later handler silently replaces the earlier one. The
+guard fails on a duplicate id, on an id with no dispatch home or two of them,
+and on an emit site that routes an id through the wrong table.
+
 Next: `sequence { … }`/`yield`, real generic typing,
 `Delegates.observable`/`vetoable`, and a growing standard-library surface —
 alongside the sibling parity tooling (LSP/DAP, reference generator, differential

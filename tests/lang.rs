@@ -3079,3 +3079,194 @@ fun main() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("`set` accessor"), "stderr was: {err}");
 }
+
+#[test]
+fn a_string_builder_mutates_one_object_through_a_chain() {
+    // Every mutator answers the RECEIVER, not a copy: if `append` returned a
+    // fresh builder the chain would still print `a1true`, but `sb` itself would
+    // be left holding only `a` — which is what this checks.
+    let src = r#"
+fun main() {
+    val sb = StringBuilder()
+    val same = sb.append("a").append(1).append(true)
+    same.append("!")
+    println(sb)
+    println(sb.length)
+}"#;
+    assert_eq!(stdout(src), "a1true!\n7\n");
+}
+
+#[test]
+fn a_string_builder_indexes_utf16_code_units_like_the_jvm() {
+    // `length`, `[i]`, `substring`, and `reverse` all count `char`s, so a
+    // supplementary character is TWO positions. A Rust-`char` implementation
+    // would answer 3 / `😀` / `😀b` / `b😀a` here and only the last would match.
+    let src = r#"
+fun main() {
+    val sb = StringBuilder("a😀b")
+    println(sb.length)
+    println(sb[1].code)
+    println(sb.substring(1, 3))
+    println(StringBuilder("a😀b").reverse())
+}"#;
+    assert_eq!(
+        stdout(src),
+        "4\n55357\n\u{1F600}\n b\u{1F600}a\n".replace(" ", "")
+    );
+}
+
+#[test]
+fn two_string_builders_holding_the_same_text_are_not_equal() {
+    // `StringBuilder` overrides neither `equals` nor `hashCode`, so `==` is
+    // identity. Inferring the constructor's result as an untyped value made the
+    // comparison coerce both handles and answer `true`.
+    let src = r#"
+fun main() {
+    val a = StringBuilder("ab")
+    println(a == StringBuilder("ab"))
+    println(a == a)
+    println(a.equals(StringBuilder("ab")))
+    println(buildString { append("ab") } == "ab")
+}"#;
+    assert_eq!(stdout(src), "false\ntrue\nfalse\ntrue\n");
+}
+
+#[test]
+fn a_string_builder_grows_its_capacity_the_way_the_jvm_does() {
+    // 16 by default, `text.length + 16` from a text, and `max(2 * cap + 2, n)`
+    // once an append does not fit.
+    let src = r#"
+fun main() {
+    println(StringBuilder().capacity())
+    println(StringBuilder("abc").capacity())
+    println(StringBuilder(5).capacity())
+    val tight = StringBuilder(2)
+    tight.append("abcdef")
+    println(tight.capacity())
+    val grown = StringBuilder()
+    repeat(20) { grown.append("x") }
+    println(grown.capacity())
+}"#;
+    assert_eq!(stdout(src), "16\n19\n5\n6\n34\n");
+}
+
+#[test]
+fn a_string_builder_inherits_the_char_sequence_members_from_string() {
+    // The read-only half is delegated rather than reimplemented, so it must
+    // answer exactly what the same call on the text would — including the
+    // members whose `CharSequence` overload differs from the `Iterable` one
+    // (`reversed` is a String, `toList` is a List).
+    let src = r#"
+fun main() {
+    val sb = StringBuilder("abc")
+    println(sb.indexOf("b"))
+    println(sb.startsWith("ab"))
+    println(sb.reversed())
+    println(sb.toList())
+    println(sb.count())
+    println(sb.contains("b"))
+    println(sb.isEmpty())
+    println(sb is CharSequence)
+    println(sb is StringBuilder)
+}"#;
+    assert_eq!(
+        stdout(src),
+        "1\ntrue\ncba\n[a, b, c]\n3\ntrue\nfalse\ntrue\ntrue\n"
+    );
+}
+
+#[test]
+fn a_string_builder_reports_the_jvm_index_diagnostics() {
+    // `insert` says "offset" where the rest say "index", and `delete` CLAMPS
+    // its end instead of throwing.
+    let src = r#"
+fun main() {
+    try { StringBuilder("abc").deleteCharAt(9) } catch (e: Exception) { println(e) }
+    try { StringBuilder("abc").insert(9, "x") } catch (e: Exception) { println(e) }
+    try { println(StringBuilder("abc")[9]) } catch (e: Exception) { println(e) }
+    println(StringBuilder("abc").delete(1, 99))
+}"#;
+    assert_eq!(
+        stdout(src),
+        "java.lang.StringIndexOutOfBoundsException: index 9, length 3\n\
+         java.lang.StringIndexOutOfBoundsException: offset 9, length 3\n\
+         java.lang.StringIndexOutOfBoundsException: index 9, length 3\n\
+         a\n"
+    );
+}
+
+#[test]
+fn a_precondition_message_block_runs_only_when_the_check_fails() {
+    // The lazy message is the whole point of the lambda overload: on the
+    // passing path it must not run at all.
+    let src = r#"
+fun main() {
+    var ran = false
+    require(true) { ran = true; "unused" }
+    check(true) { ran = true; "unused" }
+    println(ran)
+    try { require(false) { "bad input" } } catch (e: Exception) { println(e) }
+    try { check(false) } catch (e: Exception) { println(e) }
+    println(checkNotNull(5))
+}"#;
+    assert_eq!(
+        stdout(src),
+        "false\n\
+         java.lang.IllegalArgumentException: bad input\n\
+         java.lang.IllegalStateException: Check failed.\n\
+         5\n"
+    );
+}
+
+#[test]
+fn todo_throws_an_error_that_catch_exception_does_not_catch() {
+    // `NotImplementedError` descends from `Error`, so the `Exception` arm must
+    // be skipped — the hierarchy, not just the message, has to be right.
+    let src = r#"
+fun main() {
+    try { TODO("later") } catch (e: Exception) { println("wrong arm") } catch (e: Throwable) { println(e) }
+}"#;
+    assert_eq!(
+        stdout(src),
+        "kotlin.NotImplementedError: An operation is not implemented: later\n"
+    );
+}
+
+#[test]
+fn the_bulk_mutators_report_whether_the_receiver_changed() {
+    // Each answers "did this change anything", NOT the argument's size — and a
+    // `MutableSet` skips what it already holds where a `MutableList` appends
+    // every element it is given.
+    let src = r#"
+fun main() {
+    val xs = mutableListOf(1, 1, 2)
+    println(xs.addAll(listOf<Int>()))
+    println(xs.addAll(listOf(1)))
+    println(xs)
+    println(xs.removeAll(listOf(1)))
+    println(xs)
+    val s = mutableSetOf(1, 2)
+    println(s.addAll(listOf(2, 3)))
+    println(s)
+    println(s.addAll(listOf(3)))
+    println(s.retainAll(listOf(3)))
+    println(s)
+}"#;
+    assert_eq!(
+        stdout(src),
+        "false\ntrue\n[1, 1, 2, 1]\ntrue\n[2]\ntrue\n[1, 2, 3]\nfalse\ntrue\n[3]\n"
+    );
+}
+
+#[test]
+fn a_generic_call_with_only_a_trailing_lambda_is_not_a_comparison() {
+    // `buildList<Int> { }` has no parentheses at all, so the type-argument scan
+    // has to accept a trailing lambda as the argument list — while `a < b` and
+    // `a < b && c > d` stay comparisons.
+    assert_eq!(stdout("println(buildList<Int> { })"), "[]\n");
+    assert_eq!(
+        stdout("val a = 1; val b = 2; val c = 4; val d = 3; println(a < b && c > d)"),
+        "true\n"
+    );
+    assert_eq!(stdout("val a = 1; val b = 2; println(a < b)"), "true\n");
+}

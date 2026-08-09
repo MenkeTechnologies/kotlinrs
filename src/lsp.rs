@@ -2213,6 +2213,70 @@ const CORPUS: &[Entry] = &[
         "A checked cast. The runtime value is unchanged — what the cast supplies is the static type `T`, which then decides integer width and `/` dispatch downstream. A mismatch throws `ClassCastException`; the safe form `as?` yields `null` instead. `Int` and `Long` share one runtime representation here, so a cast cannot tell them apart.",
         "val a: Any = 5\nprintln((a as Int) / 2)   // 2\nprintln(a as? String)     // null",
     ),
+    // ── StringBuilder, builders, and the preconditions ──
+    (
+        "StringBuilder",
+        "Builtin Functions",
+        "StringBuilder()\nStringBuilder(text: CharSequence)\nStringBuilder(capacity: Int)",
+        "A mutable character sequence. Every mutator (`append`, `appendLine`, `insert`, `delete`, `replace`, `deleteCharAt`, `reverse`, `clear`) answers the RECEIVER, so calls chain and keep building one object. `setLength`/`setCharAt` answer `Unit`; `setLength` pads with `\\u0000` when it grows. Content is held as UTF-16 code units, so `length`, `sb[i]`, and every index argument count `char`s the way the JVM does. `capacity()` is modelled too: 16 by default, `text.length + 16` from a text, and an append that does not fit grows to `max(2 * cap + 2, needed)`. The read-only `CharSequence` members (`length`, `indexOf`, `substring`, `startsWith`, `first`, `toList`, …) behave exactly as on `String`. It overrides neither `equals` nor `hashCode`, so two builders holding the same text are NOT equal.",
+        "val sb = StringBuilder()\nsb.append(\"a\").append(1).append(true)\nprintln(sb)          // a1true\nprintln(sb.length)   // 6",
+    ),
+    (
+        "buildString",
+        "Builtin Functions",
+        "buildString(block: StringBuilder.() -> Unit): String\nbuildString(capacity: Int, block: StringBuilder.() -> Unit): String",
+        "Runs the block against a fresh `StringBuilder` bound as `this` — so `append(x)` needs no qualifier — and yields its `toString()`. The capacity overload is accepted and its hint discarded.",
+        "println(buildString { append(\"a\"); append(1) })   // a1",
+    ),
+    (
+        "buildList",
+        "Builtin Functions",
+        "buildList(block: MutableList<T>.() -> Unit): List<T>",
+        "The list counterpart of `buildString`: a fresh mutable list bound as the block's `this`, yielded once the block has filled it. `add`/`addAll` inside need no qualifier.",
+        "println(buildList { add(1); addAll(listOf(2, 3)) })   // [1, 2, 3]",
+    ),
+    (
+        "listOfNotNull",
+        "Builtin Functions",
+        "listOfNotNull(vararg elements: T?): List<T>",
+        "Builds a `List` from its arguments with the `null`s dropped. `filterNotNull()` is the member form, on any existing collection.",
+        "println(listOfNotNull(1, null, 3))   // [1, 3]",
+    ),
+    (
+        "repeat",
+        "Builtin Functions",
+        "repeat(times: Int, action: (Int) -> Unit)",
+        "Runs the block `times` times with the zero-based index as `it`, and yields `Unit`. A non-positive count runs it not at all.",
+        "repeat(3) { print(it) }   // 012",
+    ),
+    (
+        "require",
+        "Builtin Functions",
+        "require(value: Boolean)\nrequire(value: Boolean, lazyMessage: () -> Any)\nrequireNotNull(value: T?): T",
+        "Argument preconditions. A false condition throws `IllegalArgumentException: Failed requirement.`, or the message the block produced — the block runs ONLY on the failing path. `requireNotNull` throws `Required value was null.` on `null` and otherwise answers the value.",
+        "try { require(1 > 2) { \"bad input\" } } catch (e: Exception) { println(e.message) }   // bad input",
+    ),
+    (
+        "check",
+        "Builtin Functions",
+        "check(value: Boolean)\ncheck(value: Boolean, lazyMessage: () -> Any)\ncheckNotNull(value: T?): T\nerror(message: Any): Nothing",
+        "State preconditions — the `IllegalStateException` mirror of `require`. The defaults are `Check failed.` and `Required value was null.`; `error(msg)` throws unconditionally with the message given.",
+        "try { check(false) } catch (e: Exception) { println(e.message) }   // Check failed.",
+    ),
+    (
+        "TODO",
+        "Builtin Functions",
+        "TODO(): Nothing\nTODO(reason: String): Nothing",
+        "Throws `kotlin.NotImplementedError: An operation is not implemented`, with `: reason` appended when one is given. It is an `Error`, not an `Exception`, so `catch (e: Exception)` does not catch it.",
+        "try { TODO(\"later\") } catch (e: Throwable) { println(e) }   // kotlin.NotImplementedError: An operation is not implemented: later",
+    ),
+    (
+        "addAll",
+        "Mutable Collection Members",
+        "MutableCollection<T>.addAll(elements: Collection<T>): Boolean\nMutableCollection<T>.removeAll(elements: Collection<T>): Boolean\nMutableCollection<T>.retainAll(elements: Collection<T>): Boolean",
+        "Bulk mutation. Each answers whether the receiver CHANGED, so `addAll(emptyList())` is `false`. A `MutableList` appends every element it is given; a `MutableSet` skips the ones it already holds.",
+        "val xs = mutableListOf(1, 2)\nprintln(xs.addAll(listOf(3)))   // true\nprintln(xs)                    // [1, 2, 3]",
+    ),
 ];
 /// The reference corpus, exposed for offline doc generation (`gen-docs`).
 pub fn corpus() -> &'static [Entry] {

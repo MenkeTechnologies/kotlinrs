@@ -22,15 +22,15 @@
 use crate::ast::*;
 use crate::host::{
     COLL_COPY, COLL_DEFAULT_CAP, COLL_HASH, COLL_SORTED, KT_ARRAY, KT_ARRAY_INIT, KT_ARRAY_NEW,
-    KT_AS, KT_CHR_STRING, KT_CLASSOF, KT_CLOSURE_CALL, KT_COLL_HOF, KT_DBG_LINE, KT_DDIV,
-    KT_DISPLAY, KT_ENUM_REG, KT_EQUALS_REG, KT_EXC_ABORT, KT_EXC_CUT, KT_EXC_DEPTH, KT_EXC_MATCH,
-    KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND,
-    KT_FFI_CALL, KT_FFI_COMPILE, KT_GETFIELD, KT_HASH_REG, KT_IDIV, KT_IMOD, KT_INDEX_GET_VM,
-    KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_JOIN, KT_LAZY_GET,
-    KT_LAZY_NEW, KT_LIST, KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL,
-    KT_OBJEQ_VM, KT_OPER_VM, KT_PAIR, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_RESULT_HOF,
-    KT_RUN_CATCHING, KT_SCOPE_FN, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG, KT_TO_STRING,
-    KT_TYPE_REG,
+    KT_AS, KT_BUILDER, KT_CHR_STRING, KT_CLASSOF, KT_CLOSURE_CALL, KT_COLL_HOF, KT_DBG_LINE,
+    KT_DDIV, KT_DISPLAY, KT_ENUM_REG, KT_EQUALS_REG, KT_EXC_ABORT, KT_EXC_CUT, KT_EXC_DEPTH,
+    KT_EXC_MATCH, KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW,
+    KT_EXC_UNSTASH, KT_EXTEND, KT_FFI_CALL, KT_FFI_COMPILE, KT_GETFIELD, KT_HASH_REG, KT_IDIV,
+    KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET,
+    KT_ITER_SIZE, KT_JOIN, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH,
+    KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT,
+    KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN, KT_SETFIELD,
+    KT_SET_VM, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
@@ -4498,6 +4498,98 @@ impl Compiler {
                 self.b.emit(Op::Extended(KT_PAIR, 1), line);
                 Ok(Type::Obj)
             }
+            // `StringBuilder()` / `StringBuilder(text)` / `StringBuilder(cap)`.
+            // The two one-argument overloads are told apart by the VALUE at
+            // run time (see [`crate::host::new_builder`]) rather than here: a
+            // frontend that inferred `Unknown` for the argument would otherwise
+            // have to guess which constructor was written.
+            "StringBuilder" | "StringBuffer" if args.len() <= 1 => {
+                for a in args {
+                    self.compile_expr(sc, a)?;
+                }
+                self.b
+                    .emit(Op::Extended(KT_BUILDER, args.len() as u8), line);
+                Ok(Type::Obj)
+            }
+            // `buildString { … }` / `buildList { … }` are `apply` over a fresh
+            // mutable builder, with the result read back out — literally how
+            // `kotlin.text` and `kotlin.collections` define them. Desugaring to
+            // that instead of adding two more host ops means the block's
+            // implicit `this` (`append(x)` with no qualifier) is the receiver
+            // scope machinery already used by `apply`, not a second one.
+            //
+            // The capacity overload (`buildString(64) { … }`) is accepted and
+            // its hint discarded: nothing observable depends on it.
+            "buildString" | "buildList" if args.last().is_some_and(is_lambda) => {
+                let ctor = if name == "buildString" {
+                    "StringBuilder"
+                } else {
+                    "mutableListOf"
+                };
+                let fresh = Expr::Call {
+                    name: ctor.to_string(),
+                    args: Vec::new(),
+                    line,
+                };
+                let filled = Expr::MethodCall {
+                    recv: Box::new(fresh),
+                    name: "apply".to_string(),
+                    args: vec![args[args.len() - 1].clone()],
+                    safe: false,
+                    line,
+                };
+                if name == "buildList" {
+                    return self.compile_expr(sc, &filled).map(|_| Type::Obj);
+                }
+                self.compile_member(sc, &filled, "toString", &[], false, line)?;
+                Ok(Type::String)
+            }
+            // `repeat(n) { … }` runs the block with the index `it`, exactly
+            // what `(0 until n).forEach { … }` does — and Kotlin's own `repeat`
+            // is that loop. Desugaring keeps the `it` binding, the `Unit`
+            // result, and the zero-iteration case all on one code path.
+            "repeat" if args.len() == 2 && is_lambda(&args[1]) => {
+                let indices = Expr::Range {
+                    start: Box::new(Expr::Int(0)),
+                    end: Box::new(args[0].clone()),
+                    kind: RangeKind::Until,
+                };
+                self.compile_member(sc, &indices, "forEach", &args[1..], false, line)
+            }
+            // The `kotlin` preconditions. Their message argument is passed
+            // UNEVALUATED (as the lambda it was written as) so the failing path
+            // is the only one that runs it; see [`KT_PRECOND`].
+            "require" | "requireNotNull" | "check" | "checkNotNull" | "error" | "TODO"
+                if args.len() <= 2 =>
+            {
+                for a in args {
+                    self.compile_expr(sc, a)?;
+                }
+                let nidx = self.b.add_constant(Value::str(name.to_string()));
+                self.b.emit(Op::LoadConst(nidx), line);
+                self.b
+                    .emit(Op::CallBuiltin(KT_PRECOND, args.len() as u8), line);
+                // `requireNotNull`/`checkNotNull` answer their subject; the
+                // rest answer `Unit` (or never return at all).
+                Ok(match name {
+                    "requireNotNull" | "checkNotNull" => Type::Unknown,
+                    _ => Type::Unit,
+                })
+            }
+            // `listOfNotNull(a, b, c)` is `listOf(a, b, c).filterNotNull()` —
+            // the nulls are dropped at run time because the frontend cannot see
+            // which arguments are null (`listOfNotNull(maybe, "b")` depends on
+            // a value, not a type).
+            "listOfNotNull" => {
+                for a in args {
+                    self.compile_expr(sc, a)?;
+                }
+                self.b.emit(Op::Extended(KT_LIST, args.len() as u8), line);
+                let nidx = self.b.add_constant(Value::str("filterNotNull".to_string()));
+                self.b.emit(Op::LoadConst(nidx), line);
+                self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 0), line);
+                Ok(Type::Obj)
+            }
             // `ArrayList(other)` copies a collection, where `ArrayList()` builds
             // an empty one. A `List` iterates in position order however it was
             // built, so unlike its `Set`/`Map` siblings it needs no order spec.
@@ -5373,6 +5465,15 @@ impl Compiler {
                 "Pair" if args.len() == 2 => Type::Obj,
                 "Triple" if args.len() == 3 => Type::Obj,
                 "runCatching" => Type::Obj,
+                // A `StringBuilder` is a heap object, and saying so is what
+                // keeps `==` on two of them IDENTITY (the JVM's, since
+                // `StringBuilder` overrides no `equals`): left unknown, the
+                // comparison coerces both handles and answers `true` for any
+                // two builders. `buildList` yields a list; `buildString`
+                // yields the plain `String` its `toString()` produced.
+                "StringBuilder" | "StringBuffer" if args.len() <= 1 => Type::Obj,
+                "buildList" | "listOfNotNull" => Type::Obj,
+                "buildString" => Type::String,
                 // `with(x) { … }` / `run { … }` evaluate to their block, whose
                 // type the frontend does not track.
                 "with" | "run" => Type::Unknown,
