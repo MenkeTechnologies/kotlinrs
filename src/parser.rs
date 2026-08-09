@@ -60,6 +60,14 @@ pub struct Parser {
     /// it is rejected here rather than silently answering for a class named `T`
     /// that does not exist.
     type_params: Vec<String>,
+    /// The type-parameter names of the enclosing CLASS only, without the ones a
+    /// method adds — the list [`crate::ast::ClassDecl::type_params`] keeps.
+    ///
+    /// `type_params` above is the union (a method body sees both its class's and
+    /// its own), and the union cannot be indexed: a receiver's type argument is
+    /// positional against the CLASS's list, so `class Box<T> { fun <U> f(): T }`
+    /// has to record `0` for `T` whichever position the union put it in.
+    class_type_params: Vec<String>,
     /// Set while parsing a supertype's `by` delegate expression, where the `{`
     /// that follows opens the CLASS BODY rather than a trailing lambda —
     /// `class C(g: G) : G by g { override fun … }`. Kotlin resolves the same
@@ -125,6 +133,7 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
         fn_ret_types: Vec::new(),
         last_type_param: None,
         type_params: Vec::new(),
+        class_type_params: Vec::new(),
         no_trailing_lambda: false,
         pending_classes: Vec::new(),
     };
@@ -329,6 +338,13 @@ fn expand_interface_delegation(prog: &mut Program) -> Result<(), String> {
                     // the argument that supplies a type-variable result is at
                     // the same index.
                     ret_type_param_of: m.ret_type_param_of,
+                    // A CLASS type variable is not carried across: the index is
+                    // positional against the interface's type-parameter list,
+                    // and the delegating class has a list of its own that need
+                    // not agree with it in length or in order. Dropping it
+                    // leaves such a call untyped, which is the answer the
+                    // frontend already gives everywhere it cannot name a width.
+                    ret_class_type_param_of: None,
                     body: vec![Stmt::new(m.line, StmtKind::Return(Some(call)))],
                     line: m.line,
                     is_abstract: false,
@@ -624,10 +640,21 @@ impl Parser {
             (None, None, None)
         };
         // Pair the result's type variable with the parameter that carries it.
-        let ret_type_param_of = ret_tp.and_then(|r| {
+        let ret_type_param_of = ret_tp.as_ref().and_then(|r| {
             param_tps
                 .iter()
                 .position(|p| p.as_deref() == Some(r.as_str()))
+        });
+        // …and, failing that, with the enclosing class's type parameter of that
+        // name: `class Box<T>(val v: T) { fun get(): T = v }` reads its width
+        // from the RECEIVER's type argument rather than from an argument of its
+        // own. Both can hold at once (`fun id(x: T): T` inside `Box<T>`); the
+        // argument is checked first at the call site because it is present even
+        // where the receiver's instantiation is not known.
+        let ret_class_type_param_of = ret_tp.and_then(|r| {
+            self.class_type_params
+                .iter()
+                .position(|p| p.as_str() == r.as_str())
         });
         // Body is either a block `{ … }` or a single-expression body `= expr`
         // (Kotlin `fun f(...) = expr`), which desugars to `{ return expr }`.
@@ -661,6 +688,7 @@ impl Parser {
             ret,
             ret_class,
             ret_type_param_of,
+            ret_class_type_param_of,
             body,
             line,
             is_abstract: bodyless,
@@ -729,7 +757,8 @@ impl Parser {
         // an annotation that mentions one (`val v: T`) resolves to the unknown
         // type rather than to a heap class called `T` — see [`Parser::type_ref`].
         let tps = self.type_params_decl();
-        let outer_tps = std::mem::replace(&mut self.type_params, tps);
+        let outer_ctps = std::mem::replace(&mut self.class_type_params, tps.clone());
+        let outer_tps = std::mem::replace(&mut self.type_params, tps.clone());
 
         // Primary constructor (classes only). `object`s and `interface`s have
         // none.
@@ -757,6 +786,14 @@ impl Parser {
                 let pname = self.ident()?;
                 self.eat(&Tok::Colon)?;
                 let (ty, class) = self.type_ref()?;
+                // The type variable this parameter was declared with, as an
+                // index into the class's list — what a construction site reads
+                // the type argument off (see [`CtorProp::type_param_of`]).
+                let type_param_of = self.last_type_param.take().and_then(|r| {
+                    self.class_type_params
+                        .iter()
+                        .position(|p| p.as_str() == r.as_str())
+                });
                 let default = if self.at(&Tok::Assign) {
                     self.bump();
                     Some(self.expr()?)
@@ -769,6 +806,7 @@ impl Parser {
                     class,
                     kind,
                     default,
+                    type_param_of,
                 });
                 if self.at(&Tok::Comma) {
                     self.bump();
@@ -799,6 +837,8 @@ impl Parser {
                     class: None,
                     kind: PropKind::Val,
                     default: None,
+                    // The two properties `Enum` declares are not generic.
+                    type_param_of: None,
                 });
             }
         }
@@ -989,8 +1029,10 @@ impl Parser {
         }
 
         self.type_params = outer_tps;
+        self.class_type_params = outer_ctps;
         Ok(ClassDecl {
             name,
+            type_params: tps,
             params,
             obj_props,
             methods,
@@ -1110,6 +1152,8 @@ impl Parser {
             Some(c) => *c,
             None => ClassDecl {
                 name: companion_name(cls),
+                // An `enum class` cannot declare type parameters.
+                type_params: Vec::new(),
                 params: Vec::new(),
                 obj_props: Vec::new(),
                 methods: Vec::new(),
@@ -1162,6 +1206,7 @@ impl Parser {
                     let sub = entry_class_name(cls, &e.name);
                     self.pending_classes.push(ClassDecl {
                         name: sub.clone(),
+                        type_params: Vec::new(),
                         params: Vec::new(),
                         obj_props: Vec::new(),
                         methods: methods.clone(),
@@ -1241,6 +1286,7 @@ impl Parser {
             // A synthesized member of a concrete enum: its result is an array of
             // that enum, never a type variable.
             ret_type_param_of: None,
+            ret_class_type_param_of: None,
             body: vec![Stmt::new(
                 line,
                 StmtKind::Return(Some(Expr::Call {
@@ -1301,6 +1347,7 @@ impl Parser {
             ret_class: Some(cls.to_string()),
             // Likewise: `valueOf` answers the enum itself.
             ret_type_param_of: None,
+            ret_class_type_param_of: None,
             body: vec![Stmt::new(
                 line,
                 StmtKind::Return(Some(Expr::When(WhenExpr {
@@ -1422,6 +1469,14 @@ impl Parser {
             let (ty, class) = self.type_ref()?;
             Ok(Some((name, ty, class)))
         })();
+        // The type variable the annotation named, read while it is still fresh
+        // (only the `Ok(Some(_))` path below ran `type_ref`, and the others
+        // return without using this).
+        let ret_class_type_param_of = self.last_type_param.take().and_then(|r| {
+            self.class_type_params
+                .iter()
+                .position(|p| p.as_str() == r.as_str())
+        });
         let is_get = matches!(self.peek(), Tok::Ident(w) if w == "get")
             && matches!(self.peek_at(1), Tok::LParen);
         let Ok(Some((name, ty, class))) = parsed else {
@@ -1457,10 +1512,11 @@ impl Parser {
             params: Vec::new(),
             ret: ty,
             ret_class: class,
-            // A computed property's getter takes no arguments, so even when the
-            // declared type IS a type variable there is nothing at the call site
-            // to resolve it from.
+            // A computed property's getter takes no arguments, so an ARGUMENT
+            // can never supply its type variable — but the receiver can, when
+            // the variable is one of the enclosing class's.
             ret_type_param_of: None,
+            ret_class_type_param_of,
             body,
             line,
             is_abstract: false,
@@ -1506,6 +1562,10 @@ impl Parser {
                 class,
                 kind,
                 default: None,
+                // An abstract or interface property declaration owns no
+                // storage, so no construction site fixes a type argument
+                // through it.
+                type_param_of: None,
             })),
             _ => {
                 self.pos = start;
@@ -3108,6 +3168,7 @@ impl Parser {
                     let toks = Lexer::new(src).tokenize()?;
                     let mut sub = Parser {
                         type_params: Vec::new(),
+                        class_type_params: Vec::new(),
                         toks,
                         pos: 0,
                         fn_param_types: Vec::new(),

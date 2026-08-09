@@ -3270,3 +3270,73 @@ fn a_generic_call_with_only_a_trailing_lambda_is_not_a_comparison() {
     );
     assert_eq!(stdout("val a = 1; val b = 2; println(a < b)"), "true\n");
 }
+
+#[test]
+fn a_generic_class_carries_its_type_argument_into_member_arithmetic() {
+    // Kotlin's integer width is a property of the STATIC type, and for a generic
+    // class the construction site fixes it: `Box(65536)` makes `T` an `Int`, so
+    // the product wraps at 32 bits; `Box(65536L)` makes it a `Long`, which keeps
+    // all 64. Both directions are asserted together on purpose — a rule that
+    // always narrows a type-variable read gets the first line right and the
+    // second wrong, and a rule that never narrows gets exactly the opposite. The
+    // frozen parity corpus holds these same shapes against the real toolchain;
+    // this pins the pair so the two cannot be traded for one another.
+    let src = r#"class Box<T>(val v: T) {
+    fun get(): T = v
+    val once: T get() = v
+}
+fun main() {
+    println(Box(65536).v * Box(2000000000).v)
+    println(Box(65536L).v * Box(2000000000L).v)
+    println(Box(65536).get() * Box(2000000000).get())
+    println(Box(65536L).get() * Box(2000000000L).get())
+    println(Box(65536).once * Box(2000000000).once)
+    println(Box(65536L).once * Box(2000000000L).once)
+}"#;
+    assert_eq!(
+        stdout(src),
+        "-1811939328\n131072000000000\n-1811939328\n131072000000000\n\
+         -1811939328\n131072000000000\n"
+    );
+}
+
+#[test]
+fn a_type_argument_that_is_not_an_int_is_left_alone() {
+    // The other half of the rule above: only an `Int`-width type argument may
+    // reach the 32-bit wrap. A `String` argument must concatenate, a `Double`
+    // must divide by IEEE rules rather than truncate, and a `Char` must stay a
+    // `Char` — each is a value the wrap would silently corrupt.
+    let src = r#"class Box<T>(val v: T)
+class Pair2<A, B>(val a: A, val b: B)
+fun main() {
+    println(Box("a").v + Box("b").v)
+    println(Box(7.0).v / Box(2.0).v)
+    println(Box(7).v / Box(2).v)
+    println(Box('a').v + 1)
+    println(Box(listOf(1, 2)).v)
+    println(Pair2(65536L, 2000000000).a * Pair2(65536L, 2000000000).b)
+    println(Pair2(65536, 2000000000).a * Pair2(65536, 2000000000).b)
+}"#;
+    assert_eq!(
+        stdout(src),
+        "ab\n3.5\n3\nb\n[1, 2]\n131072000000000\n-1811939328\n"
+    );
+}
+
+#[test]
+fn a_computed_property_is_typed_by_its_declared_result() {
+    // `val d: Int get() = k` is a zero-argument method wearing property syntax.
+    // `compile_member` always resolved it as one, but inference did not look
+    // there at all, so the read was untyped and `C(a).d + C(b).d` skipped the
+    // 32-bit wrap that `C(a).f() + C(b).f()` was already getting. The `Long`
+    // line is what keeps the fix from being "narrow every member read".
+    let src = r#"class C(val k: Int) {
+    val d: Int get() = k
+    val e: Long get() = k.toLong()
+}
+fun main() {
+    println(C(2000000000).d + C(2000000000).d)
+    println(C(2000000000).e + C(2000000000).e)
+}"#;
+    assert_eq!(stdout(src), "-294967296\n4000000000\n");
+}

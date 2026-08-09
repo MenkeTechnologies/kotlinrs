@@ -154,6 +154,16 @@ pub struct FunDecl {
     /// `None` when the return type is not a type variable, or names one that no
     /// parameter carries (there is nothing at the call site to read it from).
     pub ret_type_param_of: Option<usize>,
+    /// The index into the ENCLOSING CLASS's type-parameter list that a
+    /// type-variable return type names — `class Box<T>(…) { fun get(): T }`
+    /// records `Some(0)`.
+    ///
+    /// This is the member counterpart of [`FunDecl::ret_type_param_of`]: there
+    /// the width comes from an argument at the call site, here it comes from the
+    /// RECEIVER's type argument, which the instantiation `Box(65536)` fixed.
+    /// `None` for a free function, and for a method whose result is not one of
+    /// its class's type variables.
+    pub ret_class_type_param_of: Option<usize>,
     pub body: Vec<Stmt>,
     pub line: u32,
     /// `abstract fun m(): T` (or an `interface` member with no body) — the
@@ -187,6 +197,14 @@ pub enum PropKind {
 #[derive(Debug, Clone)]
 pub struct ClassDecl {
     pub name: String,
+    /// The declared type-parameter NAMES, in order — `class Box<T>` records
+    /// `["T"]`. Coarse typing carries no type variables in [`Type`], so the list
+    /// exists to give each variable an INDEX: a constructor parameter and a
+    /// method result record the index they name (see
+    /// [`CtorProp::type_param_of`] and [`FunDecl::ret_class_type_param_of`]),
+    /// and a construction site resolves that index to the concrete type its
+    /// argument supplied.
+    pub type_params: Vec<String>,
     /// Primary-constructor parameters (empty for an `object`).
     pub params: Vec<CtorProp>,
     /// Properties declared in the class BODY rather than the primary
@@ -345,6 +363,16 @@ pub struct CtorProp {
     pub kind: PropKind,
     /// The default value of `class C(val a: Int = 5)`.
     pub default: Option<Expr>,
+    /// The index into the class's [`ClassDecl::type_params`] this parameter was
+    /// declared with — `class Box<T>(val v: T)` records `Some(0)` for `v`.
+    ///
+    /// It is what lets a construction site FIX the type argument: `Box(65536)`
+    /// passes an `Int` in the position that declares `T`, so `T` is `Int` for
+    /// that instance and `Box(65536).v * Box(2000000000).v` is `Int` arithmetic
+    /// that wraps at 32 bits. Without it the property read stayed untyped and
+    /// the product widened past 32 bits (`131072000000000` for the reference
+    /// toolchain's `-1811939328`).
+    pub type_param_of: Option<usize>,
 }
 
 impl CtorProp {

@@ -1675,13 +1675,26 @@ const CONCRETE: &[Mode] = &[
 /// has an answer the source spells out — the width, the division discipline and
 /// the display all follow the argument that was passed in.
 ///
-/// The `Double` and `String` instantiations are deliberately mixed with the
-/// `Int` ones: they must NOT truncate or wrap, so a frontend that fixes the
+/// The `Double`, `Long` and `String` instantiations are deliberately mixed with
+/// the `Int` ones: they must NOT truncate or wrap, so a frontend that fixes the
 /// `Int` case by always narrowing fails these instead.
+///
+/// A generic CLASS is covered in every role its type argument can reach, because
+/// each role resolves the argument from a different place: a stored property and
+/// a `var` property off the CONSTRUCTION site, a method result and a computed
+/// property off the RECEIVER, a nested instantiation off the argument's own
+/// arguments, and a second type parameter off a different position of the same
+/// argument list. A generator that declared only `class GBox<T>(val v: T)` said
+/// nothing about any of the others.
 fn g_generic(r: &mut Rng, idx: usize) -> String {
     let big = pick(r, BIGINTS);
     let op = pick(r, AOPS);
-    match r.below(10) {
+    // The `Long` spelling of the same magnitudes: identical arithmetic that must
+    // NOT wrap, so a probe pair over the two catches a rule that got the `Int`
+    // case right by narrowing everything.
+    let lbig = format!("{}L", pick(r, BIGINTS));
+    let lbig2 = format!("{}L", pick(r, BIGINTS));
+    match r.below(20) {
         0 => format!("println(gid({}) {op} gid({}))", pick(r, BIGINTS), big),
         1 => format!("println(gid({}) / gid({}))", pick(r, INTS), pick(r, DIVS)),
         2 => format!("println(gid({}) % gid({}))", pick(r, INTS), pick(r, DIVS)),
@@ -1692,24 +1705,57 @@ fn g_generic(r: &mut Rng, idx: usize) -> String {
         ),
         4 => format!("println(gid({}) + gid({}))", pick(r, STRS), pick(r, STRS)),
         5 => format!("println(-gid({}))", pick(r, BIGINTS)),
-        // `INTS`, not `BIGINTS`, and that is a KNOWN BOUNDARY rather than a
-        // preference: a generic CLASS's type argument is not propagated, so
-        // `GBox(65536).v * GBox(2000000000).v` reads as untyped and does not
-        // wrap at 32 bits (it answers `131072000000000` for the reference
-        // toolchain's `-1811939328`). A generic FUNCTION does propagate it —
-        // that is what shape `0` covers with `BIGINTS`. Widen these to `BIGINTS`
-        // once a class instantiation carries its type argument.
-        6 => format!(
-            "println(GBox({}).v {op} GBox({}).v)",
-            pick(r, INTS),
-            pick(r, INTS)
-        ),
+        // A stored `T`-typed property, read straight off the construction site.
+        // `BIGINTS` on both sides, so the product leaves the `Int` range and the
+        // answer differs between a frontend that carries the type argument and
+        // one that does not.
+        6 => format!("println(GBox({big}).v {op} GBox({}).v)", pick(r, BIGINTS)),
         7 => format!(
             "println(GBox({}).get() / GBox({}).get())",
-            pick(r, INTS),
+            pick(r, BIGINTS),
             pick(r, DIVS)
         ),
-        8 => format!(
+        // The same two shapes at `Long` width. Nothing here may narrow, and the
+        // magnitudes are the ones that WOULD change value if it did.
+        8 => format!("println(GBox({lbig}).v {op} GBox({lbig2}).v)"),
+        9 => format!("println(GBox({lbig}).get() {op} GBox({lbig2}).get())"),
+        // A method result and a computed property: both read the type argument
+        // off the RECEIVER rather than off an argument of their own.
+        10 => format!(
+            "println(GBox({big}).get() {op} GBox({}).get())",
+            pick(r, BIGINTS)
+        ),
+        11 => format!(
+            "println(GBox({big}).once {op} GBox({}).once)",
+            pick(r, BIGINTS)
+        ),
+        12 => format!("println(GBox({lbig}).once {op} GBox({lbig2}).once)"),
+        // A `var` property, whose type argument the construction site fixes even
+        // though a later write is what supplies the value.
+        13 => format!(
+            "val gm{idx} = GMut({big}); gm{idx}.v = {}; println(gm{idx}.v {op} gm{idx}.v)",
+            pick(r, BIGINTS)
+        ),
+        14 => format!(
+            "val gl{idx} = GMut({lbig}); gl{idx}.v = {lbig2}; println(gl{idx}.v {op} gl{idx}.v)"
+        ),
+        // Two type parameters: each position of the argument list supplies a
+        // different one, so a frontend that resolves only the first is wrong on
+        // the second — and the mixed `Int`/`Long` pair below is wrong for a
+        // frontend that resolves both to whatever the first argument was.
+        15 => format!(
+            "println(GTwo({big}, {}).a {op} GTwo({big}, {}).b)",
+            pick(r, BIGINTS),
+            pick(r, BIGINTS)
+        ),
+        16 => format!("println(GTwo({lbig}, {big}).a {op} GTwo({lbig}, {big}).b)"),
+        // A nested instantiation — the inner argument is itself a generic type,
+        // so the width lives two levels down.
+        17 => format!(
+            "println(GBox(GBox({big})).v.v {op} GBox({}).v)",
+            pick(r, BIGINTS)
+        ),
+        18 => format!(
             "val gv{idx} = gfirst({}, {}); println(gv{idx} {op} {})",
             pick(r, INTS),
             pick(r, INTS),
@@ -2056,8 +2102,23 @@ fn extra_declarations(probes: &[String]) -> String {
     if named("gfirst(") {
         out.push_str("fun <T> gfirst(a: T, b: T): T = a\n");
     }
+    // `once` is a COMPUTED property: a zero-argument method wearing property
+    // syntax, whose declared result is the class's type variable. It resolves
+    // its width from the receiver exactly as `get()` does, and it is a separate
+    // lowering path — reads of it go through the member node, not the call one.
     if named("GBox(") {
-        out.push_str("class GBox<T>(val v: T) {\n\x20   fun get(): T = v\n}\n");
+        out.push_str(
+            "class GBox<T>(val v: T) {\n\
+             \x20   fun get(): T = v\n\
+             \x20   val once: T get() = v\n\
+             }\n",
+        );
+    }
+    if named("GMut(") {
+        out.push_str("class GMut<T>(var v: T)\n");
+    }
+    if named("GTwo(") {
+        out.push_str("class GTwo<A, B>(val a: A, val b: B)\n");
     }
     if named("DBody(") {
         out.push_str("data class DBody(val a: Int) {\n\x20   val extra = a + 1\n}\n");

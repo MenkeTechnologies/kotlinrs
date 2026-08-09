@@ -432,18 +432,40 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   and must be followed by `(`, which is how Kotlin resolves the same ambiguity).
 - **Comments** — `//` and nested `/* … */`.
 
-Generic *declarations* are parsed but erased: `fun <T> f(x: T)` and
-`class Box<T>` compile with `T` reading as an untyped value, and the `inline` /
-`noinline` / `crossinline` / `tailrec` / `operator` / `infix` / `const`
-modifiers are accepted and discarded — each changes how the JVM compiles a
-declaration, not what it computes. A **reified** type test is the one case that
-cannot be erased quietly: `x is T` / `x as T` against a type parameter has no
-answer a coarse type system could give, and answering `false` (the shape a
+Generic *declarations* carry no type variable in the coarse type itself, but a
+**use site supplies the one it needs**. Kotlin's integer width is a property of
+the static type, so a `T` that reads as untyped silently changes the answer:
+`gid(2_000_000_000) + gid(2_000_000_000)` has to wrap at 32 bits, and
+`gid(2_000_000_000L) + gid(2_000_000_000L)` has to not. Two sources are
+resolved:
+
+- **An argument**, for `fun <T> id(x: T): T` — the type argument is whatever the
+  matching argument's type is.
+- **The receiver's type argument**, for a member of a generic class. A
+  construction fixes it (`Box(65536)` makes `T` an `Int`), and a read of a
+  `T`-typed stored property, `var` property, computed property (`val v: T get()
+  = …`) or method result (`fun get(): T`) answers with it. Nested
+  instantiations (`Box(Box(65536)).v.v`) and classes with several type
+  parameters (`Pair2<A, B>`) resolve per position.
+
+Everything the frontend cannot resolve stays untyped, which narrows nothing —
+so a `String` or `Double` type argument is never mistaken for an `Int`. Type
+arguments written down rather than inferred are still discarded: `val b:
+Box<Int> = …` and `fun f(): Box<Int>` reach their members untyped unless the
+construction is in hand.
+
+The `inline` / `noinline` / `crossinline` / `tailrec` / `operator` / `infix` /
+`const` modifiers are accepted and discarded — each changes how the JVM compiles
+a declaration, not what it computes. A **reified** type test is the one case
+that cannot be erased quietly: `x is T` / `x as T` against a type parameter has
+no answer a coarse type system could give, and answering `false` (the shape a
 name-based lookup falls into) would be silently wrong — so it is a compile error.
 
 Not yet (see roadmap): `sequence { … }` / `yield` (a generator needs a
 continuation this VM has no opcode for, so an infinite sequence cannot be
-modelled by evaluating eagerly), real generic *typing*,
+modelled by evaluating eagerly), a type argument written down rather than
+inferred from a construction (`val b: Box<Int> = …`, `class Sub : Box<Int>()`),
+variance and bounds,
 `kotlin.properties.Delegates.observable` / `vetoable` (a property delegate that
 is not a constructor call has no class whose `getValue` could be resolved at
 compile time, and no host-side delegate object backs the stdlib factories yet),
@@ -892,7 +914,7 @@ without a conflict and the later handler silently replaces the earlier one. The
 guard fails on a duplicate id, on an id with no dispatch home or two of them,
 and on an emit site that routes an id through the wrong table.
 
-Next: `sequence { … }`/`yield`, real generic typing,
+Next: `sequence { … }`/`yield`, written-down type arguments,
 `Delegates.observable`/`vetoable`, and a growing standard-library surface —
 alongside the sibling parity tooling (LSP/DAP, reference generator, differential
 harness).
