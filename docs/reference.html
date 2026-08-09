@@ -1480,139 +1480,145 @@ println('c'.minus('a'))   // 2</code></pre>
         <article class="doc-entry" id="doc-sequence-members-8">
           <h3><a class="doc-anchor" href="#doc-sequence-members-8">#</a> <code>contains</code></h3>
           <pre><code class="lang-kotlin">contains(element: T): Boolean</code></pre>
-          <p>Membership by structural equality — the same comparison <code>==</code> uses, so a nested list or data-class element compares by value.</p>
+          <p>Membership by the receiver's own equality rule. A <code>List</code> compares with <code>equals</code>; a <code>Set</code> reaches <code>equals</code> only after the hashes agree. So a <code>data class</code> element or a class with a declared <code>equals</code> is found by value, while a class that declares neither compares by reference identity and is not found by a fresh construction.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2).contains(2))   // true</code></pre>
         </article>
         <article class="doc-entry" id="doc-sequence-members-9">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-9">#</a> <code>indexOf</code></h3>
+          <h3><a class="doc-anchor" href="#doc-sequence-members-9">#</a> <code>containsAll</code></h3>
+          <pre><code class="lang-kotlin">containsAll(elements: Collection&lt;T&gt;): Boolean</code></pre>
+          <p>Whether every element of the argument is present, by the same rule <code>contains</code> uses. Vacuously <code>true</code> for an empty argument.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).containsAll(listOf(1, 3)))   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-10">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-10">#</a> <code>indexOf</code></h3>
           <pre><code class="lang-kotlin">indexOf(element: T): Int</code></pre>
           <p>Position of the first structurally equal element, or -1. There is no <code>lastIndexOf</code> and no <code>indexOfFirst</code>.</p>
           <pre><code class="lang-kotlin">println(listOf("a", "b").indexOf("b"))   // 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-10">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-10">#</a> <code>sum</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-11">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-11">#</a> <code>sum</code></h3>
           <pre><code class="lang-kotlin">sum(): Int
 sum(): Double</code></pre>
           <p>Adds the elements. The result is an <code>Int</code> when every element is integral and a <code>Double</code> otherwise — so a mixed sequence sums to a <code>Double</code>. An empty sequence sums to <code>0</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).sum())   // 6</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-11">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-11">#</a> <code>average</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-12">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-12">#</a> <code>average</code></h3>
           <pre><code class="lang-kotlin">average(): Double</code></pre>
           <p>Arithmetic mean, always a <code>Double</code>. An empty sequence averages to <code>NaN</code> rather than raising, matching Kotlin.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2).average())   // 1.5</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-12">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-12">#</a> <code>max</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-13">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-13">#</a> <code>max</code></h3>
           <pre><code class="lang-kotlin">max(): T</code></pre>
           <p>The largest element — strings lexicographically, chars by code unit, everything else numerically. An empty sequence raises <code>NoSuchElementException</code>. kotlinrs implements the pre-1.4 spelling only: there is no <code>maxOrNull</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(3, 1, 2).max())   // 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-13">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-13">#</a> <code>min</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-14">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-14">#</a> <code>min</code></h3>
           <pre><code class="lang-kotlin">min(): T</code></pre>
           <p>The smallest element, by the same ordering as <code>max</code>, raising on an empty sequence. There is no <code>minOrNull</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(3, 1, 2).min())   // 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-14">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-14">#</a> <code>toList</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-15">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-15">#</a> <code>toList</code></h3>
           <pre><code class="lang-kotlin">toList(): List&lt;T&gt;</code></pre>
           <p>A <code>List</code> holding the same elements, in order. On a range this is what materializes it.</p>
           <pre><code class="lang-kotlin">println((1..3).toList())   // [1, 2, 3]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-15">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-15">#</a> <code>toMutableList</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-16">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-16">#</a> <code>toMutableList</code></h3>
           <pre><code class="lang-kotlin">toMutableList(): MutableList&lt;T&gt;</code></pre>
           <p>The same copy <code>toList</code> makes — <code>List</code> and <code>MutableList</code> are one runtime object here.</p>
           <pre><code class="lang-kotlin">println(setOf(1, 2).toMutableList())   // [1, 2]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-16">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-16">#</a> <code>toTypedArray</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-17">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-17">#</a> <code>toTypedArray</code></h3>
           <pre><code class="lang-kotlin">toTypedArray(): Array&lt;T&gt;</code></pre>
           <p>Yields a <code>List</code>, not an <code>Array</code> — it shares <code>toList</code>'s implementation. This diverges from Kotlin: the result prints its elements as <code>[1, 2]</code> and compares structurally, where a real array would print its JVM descriptor and compare by identity.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2).toTypedArray())   // [1, 2]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-17">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-17">#</a> <code>asList</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-18">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-18">#</a> <code>asList</code></h3>
           <pre><code class="lang-kotlin">asList(): List&lt;T&gt;</code></pre>
           <p>A <code>List</code> over the same elements. It is a copy here rather than a view, so mutating the receiver afterwards does not show through.</p>
           <pre><code class="lang-kotlin">println(intArrayOf(1, 2).asList())   // [1, 2]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-18">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-18">#</a> <code>toSet</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-19">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-19">#</a> <code>toSet</code></h3>
           <pre><code class="lang-kotlin">toSet(): Set&lt;T&gt;</code></pre>
           <p>A <code>Set</code> of the distinct elements, first occurrence kept, in encounter order.</p>
           <pre><code class="lang-kotlin">println(listOf(3, 1, 3).toSet())   // [3, 1]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-19">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-19">#</a> <code>toMutableSet</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-20">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-20">#</a> <code>toMutableSet</code></h3>
           <pre><code class="lang-kotlin">toMutableSet(): MutableSet&lt;T&gt;</code></pre>
           <p>The same distinct <code>Set</code> <code>toSet</code> builds.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 1).toMutableSet())   // [1]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-20">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-20">#</a> <code>toHashSet</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-21">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-21">#</a> <code>toHashSet</code></h3>
           <pre><code class="lang-kotlin">toHashSet(): MutableSet&lt;T&gt;</code></pre>
           <p>The same insertion-ordered distinct <code>Set</code>. Kotlin's <code>HashSet</code> gives no order guarantee; here encounter order is always kept.</p>
           <pre><code class="lang-kotlin">println(listOf(2, 1, 2).toHashSet())   // [2, 1]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-21">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-21">#</a> <code>distinct</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-22">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-22">#</a> <code>distinct</code></h3>
           <pre><code class="lang-kotlin">distinct(): List&lt;T&gt;</code></pre>
           <p>The distinct elements as a **<code>List</code>**, where <code>toSet</code> gives the same elements as a <code>Set</code>. That is the whole difference between the two, and it decides how the result compares and prints.</p>
           <pre><code class="lang-kotlin">println(listOf(3, 1, 3).distinct())   // [3, 1]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-22">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-22">#</a> <code>union</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-23">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-23">#</a> <code>union</code></h3>
           <pre><code class="lang-kotlin">union(other: Iterable&lt;T&gt;): Set&lt;T&gt;</code></pre>
           <p>Distinct elements of the receiver followed by those of the argument, as a <code>Set</code>. Defined on any iterable receiver, and always returning a <code>Set</code> whatever kind the receiver was. Only the method form parses — <code>a union b</code> as an infix call is a syntax error.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2).union(listOf(2, 3)))   // [1, 2, 3]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-23">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-23">#</a> <code>intersect</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-24">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-24">#</a> <code>intersect</code></h3>
           <pre><code class="lang-kotlin">intersect(other: Iterable&lt;T&gt;): Set&lt;T&gt;</code></pre>
           <p>Distinct receiver elements that also appear in the argument, as a <code>Set</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).intersect(listOf(2, 3, 4)))   // [2, 3]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-24">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-24">#</a> <code>subtract</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-25">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-25">#</a> <code>subtract</code></h3>
           <pre><code class="lang-kotlin">subtract(other: Iterable&lt;T&gt;): Set&lt;T&gt;</code></pre>
           <p>Distinct receiver elements that do not appear in the argument, as a <code>Set</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).subtract(listOf(2)))   // [1, 3]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-25">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-25">#</a> <code>sorted</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-26">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-26">#</a> <code>sorted</code></h3>
           <pre><code class="lang-kotlin">sorted(): List&lt;T&gt;</code></pre>
           <p>Ascending sort into a new <code>List</code> — strings lexicographically, chars by code unit, everything else numerically. There is no <code>sortedWith</code> and no in-place <code>sort</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(3, 1, 2).sorted())   // [1, 2, 3]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-26">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-26">#</a> <code>sortedDescending</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-27">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-27">#</a> <code>sortedDescending</code></h3>
           <pre><code class="lang-kotlin">sortedDescending(): List&lt;T&gt;</code></pre>
           <p>Descending sort into a new <code>List</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(3, 1, 2).sortedDescending())   // [3, 2, 1]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-27">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-27">#</a> <code>take</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-28">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-28">#</a> <code>take</code></h3>
           <pre><code class="lang-kotlin">take(n: Int): List&lt;T&gt;</code></pre>
           <p>The first <code>n</code> elements as a <code>List</code>. An oversized <code>n</code> clamps to the whole sequence; a negative one raises <code>IllegalArgumentException: Requested element count N is less than zero.</code> There is no <code>takeWhile</code> and no <code>takeLast</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).take(2))   // [1, 2]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-28">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-28">#</a> <code>drop</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-29">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-29">#</a> <code>drop</code></h3>
           <pre><code class="lang-kotlin">drop(n: Int): List&lt;T&gt;</code></pre>
           <p>Everything after the first <code>n</code> elements, as a <code>List</code>. An oversized <code>n</code> yields an empty list; a negative one raises <code>IllegalArgumentException</code>. There is no <code>dropWhile</code> and no <code>dropLast</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).drop(1))   // [2, 3]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-29">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-29">#</a> <code>joinToString</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-30">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-30">#</a> <code>joinToString</code></h3>
           <pre><code class="lang-kotlin">joinToString(): String
 joinToString(separator: Any): String</code></pre>
           <p>Renders the elements with the same stringifier <code>println</code> uses, joined by a separator that defaults to <code>", "</code>. Only the separator parameter exists — there is no <code>prefix</code>, <code>postfix</code>, <code>limit</code> or <code>transform</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).joinToString("-"))   // 1-2-3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-members-30">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-30">#</a> <code>reversed</code></h3>
+        <article class="doc-entry" id="doc-sequence-members-31">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-31">#</a> <code>reversed</code></h3>
           <pre><code class="lang-kotlin">reversed(): List&lt;T&gt;
 IntRange.reversed(): IntProgression</code></pre>
           <p>Reverses the order. On a list, set or array the result is a reversed <code>List</code>; on a range it is instead a descending <code>IntProgression</code>, which prints in its <code>b downTo a step 1</code> form.</p>

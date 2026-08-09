@@ -1445,8 +1445,15 @@ const CORPUS: &[Entry] = &[
         "contains",
         "Sequence Members",
         "contains(element: T): Boolean",
-        "Membership by structural equality — the same comparison `==` uses, so a nested list or data-class element compares by value.",
+        "Membership by the receiver's own equality rule. A `List` compares with `equals`; a `Set` reaches `equals` only after the hashes agree. So a `data class` element or a class with a declared `equals` is found by value, while a class that declares neither compares by reference identity and is not found by a fresh construction.",
         "println(listOf(1, 2).contains(2))   // true",
+    ),
+    (
+        "containsAll",
+        "Sequence Members",
+        "containsAll(elements: Collection<T>): Boolean",
+        "Whether every element of the argument is present, by the same rule `contains` uses. Vacuously `true` for an empty argument.",
+        "println(listOf(1, 2, 3).containsAll(listOf(1, 3)))   // true",
     ),
     (
         "indexOf",
