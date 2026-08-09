@@ -1096,7 +1096,13 @@ fn g_collarg(r: &mut Rng, _idx: usize) -> String {
         10 => p(format!("{xs}.windowed({n}, {step}, true)")),
         11 => p(format!("{xs}.windowed({n}) {{ it.sum() }}")),
         12 => p(format!("{xs}.zip(listOf(9, 8, 7)) {{ a, b -> a * b }}")),
-        _ => p(format!("{xs}.slice(0..{})", r.below(2))),
+        // `slice` is given a receiver long enough for the range it is handed.
+        // Drawn from the shared pool it could be `listOf(1)` or an empty list,
+        // and `slice(0..1)` on those THROWS — which aborts the reference run
+        // partway and made the whole 40-probe batch barren, every probe after
+        // it uncompared. The throwing path belongs in `exc` mode, where a
+        // `try`/`catch` keeps the batch alive.
+        _ => p(format!("listOf(3, 1, 2).slice(0..{})", r.below(3))),
     }
 }
 
@@ -1454,8 +1460,8 @@ fn g_deleg(r: &mut Rng, _idx: usize) -> String {
         1 => p(format!("Fwd(Base1({n})).both()")),
         2 => p(format!("Over(Base1({n})).one()")),
         3 => p(format!("Over(Base1({n})).both()")),
-        4 => p(format!("Two(Base1({n}), Base2({n})).one()")),
-        5 => p(format!("Two(Base1({n}), Base2({n})).two()")),
+        4 => p(format!("Two(Base1({n}), TwoB({n})).one()")),
+        5 => p(format!("Two(Base1({n}), TwoB({n})).two()")),
         6 => p(format!("asOne(Fwd(Base1({n}))).both()")),
         _ => p(format!("asOne(Over(Base1({n}))).both()")),
     }
@@ -1649,7 +1655,7 @@ const CONCRETE: &[Mode] = &[
 /// * `EqEq` — `equals` only: `List` members see it, but a `Set`/`Map` key does
 ///   not, because the hash buckets never meet.
 /// * `EqBoth` — `equals` + `hashCode`: every container sees it.
-fn g_equality(r: &mut Rng, _idx: usize) -> String {
+fn g_equality(r: &mut Rng, idx: usize) -> String {
     let a = pick(r, &[0, 1, 2, 7]);
     let b = pick(r, &[0, 1, 2, 7]);
     let cls = pick(r, &["EqPlain", "EqEq", "EqBoth"]);
@@ -1685,11 +1691,11 @@ fn g_equality(r: &mut Rng, _idx: usize) -> String {
         // A self-comparison. `==` is `Intrinsics.areEqual`, which has NO
         // identity short-circuit, so a declared `equals` DOES run here.
         // The local is named per class as well as per operand: two probes that
-        // shared `se{a}{b}` across families collided as `conflicting
-        // declarations` and made the whole batch barren.
-        14 => format!(
-            "    val se{cls}{a}{b} = {cls}({a})\n    println(se{cls}{a}{b} == se{cls}{a}{b})"
-        ),
+        // named by the probe INDEX, which is the only thing unique within a
+        // batch: keying on the class and operands still collided whenever the
+        // same triple was drawn twice, and a collision is `conflicting
+        // declarations`, which makes the whole 40-probe batch barren.
+        14 => format!("    val se{idx} = {cls}({a})\n    println(se{idx} == se{idx})"),
         15 => p(format!(
             "mutableListOf({cls}({a}), {cls}({b})).remove({cls}({b}))"
         )),
@@ -2045,7 +2051,7 @@ fn extra_declarations(probes: &[String]) -> String {
              }\n\
              interface TwoI { fun two(): Int }\n\
              class Base1(val k: Int) : One { override fun one(): String = \"b1-\" + k }\n\
-             class Base2(val k: Int) : TwoI { override fun two(): Int = k * 3 }\n\
+             class TwoB(val k: Int) : TwoI { override fun two(): Int = k * 3 }\n\
              class Fwd(x: One) : One by x\n\
              class Over(x: One) : One by x { override fun one(): String = \"over\" }\n\
              class Two(x: One, y: TwoI) : One by x, TwoI by y\n\
