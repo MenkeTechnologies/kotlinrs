@@ -16,8 +16,23 @@
 
 use std::process::Command;
 
+/// Scratch directories are per-PROCESS, not per-program.
+///
+/// Keying only on the program's hash gives two concurrent runs of this test the
+/// SAME directory for the same record — and the `remove_dir_all` below then
+/// deletes a peer's `T.kt` between its write and its read. Several agents share
+/// this checkout, so that is a live collision, and it corrupts the run that
+/// loses the race rather than failing it. The pid (plus a per-call counter, so
+/// one process never reuses a directory either) makes every run disjoint.
+static SCRATCH_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn run(src: &str) -> (String, bool) {
-    let dir = std::env::temp_dir().join(format!("kotlinrs_parity_{}", fnv1a(src)));
+    let n = SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "kotlinrs_parity_{}_{}_{n}",
+        std::process::id(),
+        fnv1a(src)
+    ));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let path = dir.join("T.kt");
     std::fs::write(&path, src).expect("write program");

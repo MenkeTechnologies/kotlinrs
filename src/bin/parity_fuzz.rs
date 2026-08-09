@@ -2294,11 +2294,30 @@ fn render(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).replace('\n', "\\n")
 }
 
-fn diverges(probes: &[String], t: &Tools, timeout: Duration) -> bool {
+/// Run one program through both sides and hand back (oracle, ours).
+fn compare(probes: &[String], t: &Tools, timeout: Duration) -> (RunOut, RunOut) {
     let src = build_program(probes);
     let a = run_oracle(&t.kotlinc, &t.kotlin, &src, timeout);
     let b = run_ours(&t.ours, &src, timeout);
+    (a, b)
+}
+
+fn diverges(probes: &[String], t: &Tools, timeout: Duration) -> bool {
+    let (a, b) = compare(probes, t, timeout);
     differs(&a, &b)
+}
+
+/// Whether the reference toolchain actually PRODUCED an answer to compare
+/// against — exit 0 and non-empty stdout.
+///
+/// A run where it did not is **barren**, not a pass. Two failing sides compare
+/// equal, so a `kotlinc` that rejected the generated program (or a `kotlin` that
+/// timed out) scores as agreement under `differs` and quietly inflates the
+/// clean count. Sibling frontends have been burned by exactly this: a whole
+/// fuzz session reporting `divergences: 0` across hundreds of oracle timeouts.
+/// Barren programs are counted and reported separately, and they fail the run.
+fn oracle_answered(oracle: &RunOut) -> bool {
+    oracle.ok && !oracle.stdout.is_empty()
 }
 
 fn minimize(probes: &[String], t: &Tools, timeout: Duration) -> Vec<String> {
@@ -2359,6 +2378,9 @@ struct Args {
     mode: Mode,
     timeout: Duration,
     verbose: bool,
+    /// Print the generated program instead of running it — the only way to
+    /// see what a BARREN seed actually handed the reference toolchain.
+    dump: bool,
 }
 
 fn parse_args() -> Args {
@@ -2370,6 +2392,7 @@ fn parse_args() -> Args {
         mode: Mode::All,
         timeout: Duration::from_secs(300),
         verbose: false,
+        dump: false,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -2384,6 +2407,7 @@ fn parse_args() -> Args {
             "--probes" => a.probes = take(&mut i).parse().unwrap_or(a.probes),
             "--seed" => a.seed = take(&mut i).parse().ok(),
             "--once" => a.once = true,
+            "--dump" => a.dump = true,
             "--verbose" | "-v" => a.verbose = true,
             "--timeout" => a.timeout = Duration::from_secs(take(&mut i).parse().unwrap_or(300)),
             "--mode" => {
@@ -2466,6 +2490,8 @@ fn main() {
     let base = args.seed.unwrap_or(0x5EED);
     let mut failures = 0usize;
     let mut probes_run = 0usize;
+    let mut probes_compared = 0usize;
+    let mut barren = 0usize;
 
     for k in 0..iters {
         let seed = if args.once {
@@ -2475,12 +2501,31 @@ fn main() {
         };
         let probes = gen_probes(seed, args.mode, args.probes);
         probes_run += probes.len();
-        if !diverges(&probes, &t, args.timeout) {
+        if args.dump {
+            print!("{}", build_program(&probes));
+            continue;
+        }
+        let (oracle, ours) = compare(&probes, &t, args.timeout);
+        if !oracle_answered(&oracle) {
+            // Never scored as a pass — see `oracle_answered`.
+            barren += 1;
+            eprintln!(
+                "seed {seed}: BARREN — the reference toolchain produced no output \
+                 (ok={}, {} byte(s)); {} probe(s) NOT compared",
+                oracle.ok,
+                oracle.stdout.len(),
+                probes.len()
+            );
+            continue;
+        }
+        if !differs(&oracle, &ours) {
             if args.verbose {
                 eprintln!("seed {seed}: ok ({} probes)", probes.len());
             }
+            probes_compared += probes.len();
             continue;
         }
+        probes_compared += probes.len();
         failures += 1;
         let minimal = minimize(&probes, &t, args.timeout);
         let src = build_program(&minimal);
@@ -2494,8 +2539,13 @@ fn main() {
         println!("  ours  : ok={} out={}", b.ok, render(&b.stdout));
     }
 
-    eprintln!("parity-fuzz: {iters} program(s), {probes_run} probe(s), {failures} divergence(s)");
-    if failures > 0 {
+    eprintln!(
+        "parity-fuzz: {iters} program(s), {probes_run} probe(s) generated, \
+         {probes_compared} compared, {failures} divergence(s), {barren} barren"
+    );
+    // A barren program is a hole in the measurement, not a pass, so it fails the
+    // run just as a divergence does.
+    if failures > 0 || barren > 0 {
         std::process::exit(1);
     }
 }
