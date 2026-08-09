@@ -771,6 +771,34 @@ which compares equal to our own failure and used to count as agreement. Such
 programs are now reported and counted separately, and they fail the run — which
 is how the two generator name-collisions above were found rather than absorbed.
 
+Also landed, closing a silent wrong answer of the worst kind: the **operator
+conventions**. Kotlin's operators are not instructions bound to primitive
+types — `a + b` *means* `a.plus(b)`, resolved against the left operand like any
+other member — and lowering one to an arithmetic op coerced the receiver's
+object handle to a number, so `listOf(1, 2, 3) - 2` evaluated to `-2.0`: a
+collection operation answering with arithmetic. The whole family now resolves
+(`+ - * / %`, `< > <= >=` through `compareTo`, `+=`/`-=` splitting `plus` from
+the in-place `plusAssign`, `in` through `contains`, `..` through `rangeTo`,
+`[]`/`[]=` through `get`/`set`, unary `-`/`!`, and `++`/`--` through
+`inc`/`dec`), against a user class statically and against a `List`/`Set`/`Map`
+at run time. An operator the stdlib does not define on a collection now fails
+loudly rather than answering a coerced number. Two inference gaps surfaced with
+it, both a node the emitter typed one way and inference another: a bare
+property read inside a method, and `super<T>.m()`.
+
+Also landed: the **JVM collection constructors** — `HashMap`, `HashSet`,
+`LinkedHashMap`, `LinkedHashSet`, `TreeSet`, `ArrayList` — and, with them, the
+iteration order those classes actually have. A `HashMap` walks its bucket
+TABLE, not its insertion sequence, so `hashMapOf("banana" to 1, "apple" to 2,
+"cherry" to 3, "zebra" to 4)` prints `{banana=1, zebra=4, apple=2, cherry=3}`;
+`hashMapOf`, `hashSetOf` and `sortedSetOf` had all been quietly answering in
+insertion order. The table is modelled as Java builds it — a power-of-two
+capacity sized from the element count or the default 16, the
+`h xor (h ushr 16)` spread, and a stable ordering by bucket index that
+reproduces the resize history — and validated against the reference toolchain
+across every size from 1 to 24 for both `Int` and `String` keys. `groupingBy
+{ }.eachCount()` landed alongside, lazy as Kotlin's `Grouping` is.
+
 Next: `sequence { … }`/`yield`, real generic typing,
 `Delegates.observable`/`vetoable`, and a growing standard-library surface —
 alongside the sibling parity tooling (LSP/DAP, reference generator, differential

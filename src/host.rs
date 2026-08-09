@@ -369,6 +369,211 @@ thread_local! {
     /// [`int_hash`]). The compiler knows the declared type, so it says so.
     static LONG_FIELDS: RefCell<std::collections::HashMap<String, String>> =
         RefCell::new(std::collections::HashMap::new());
+
+    /// Heap handle → the iteration discipline of that `Map`/`Set`, for the
+    /// collections that do NOT iterate in insertion order. See [`CollOrder`].
+    ///
+    /// A side table rather than a field on the heap variants: `HeapObj::Map`
+    /// and `HeapObj::Set` are matched at ~70 sites that all want the entries
+    /// and nothing else, and iteration order is a property of the collection's
+    /// IDENTITY, not of its contents.
+    static COLL_ORDER: RefCell<std::collections::HashMap<u32, CollOrder>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// How a `Map`/`Set` orders its own iteration.
+///
+/// Kotlin's `mapOf`/`setOf` build `LinkedHashMap`/`LinkedHashSet`, which iterate
+/// in insertion order — that is the default, and it needs no entry here. The
+/// other two JVM collections Kotlin exposes do not, and printing them in
+/// insertion order is a silent wrong answer: `hashMapOf("banana" to 1, "apple"
+/// to 2, "cherry" to 3, "zebra" to 4)` prints `{banana=1, zebra=4, apple=2,
+/// cherry=3}` on the reference toolchain.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CollOrder {
+    /// `java.util.HashMap`/`HashSet` — bucket-table order, from a table that
+    /// started at the carried initial capacity. See [`hash_order`].
+    Hash(usize),
+    /// `java.util.TreeSet`/`TreeMap` — ascending natural order of the keys.
+    Sorted,
+}
+
+/// Iteration order `1`: a `java.util.HashMap`/`HashSet` bucket table. One of the
+/// codes the compiler packs into the trailing spec argument of `KT_SET_VM` /
+/// `KT_MAP_VM`; `0` (the absent bit pattern) is the insertion-ordered default.
+pub const COLL_HASH: u8 = 1;
+/// Iteration order `2`: a `java.util.TreeSet`, ascending by natural order.
+pub const COLL_SORTED: u8 = 2;
+/// Spec flag: the `HashSet(other)` copy form rather than the vararg builder.
+pub const COLL_COPY: u8 = 0x10;
+/// Spec flag: the no-argument constructor, which starts from Java's default
+/// 16-bucket table instead of one sized to the element count.
+pub const COLL_DEFAULT_CAP: u8 = 0x20;
+
+/// The collection discipline a builder call asks for, as the compiler encodes it
+/// in the trailing argument of `KT_SET_VM`/`KT_MAP_VM`.
+///
+/// The low nibble names the iteration order. Two flags above it separate the
+/// three construction shapes, which a runtime look at the arguments cannot tell
+/// apart: `hashSetOf(listOf(1))` builds a one-element set holding a list, where
+/// `HashSet(listOf(1))` copies that list's elements, and the two differ again in
+/// the table they start from — a no-arg `HashSet()` gets Java's default 16
+/// buckets, while a sized builder pre-divides its element count by the load
+/// factor and often starts SMALLER, which changes the mask and so the order.
+#[derive(Clone, Copy)]
+struct CollSpec {
+    order: Option<CollOrder>,
+    /// The `HashSet(other)` form: take the single argument's elements.
+    copy: bool,
+    /// The no-argument constructor: Java's default table, not a sized one.
+    default_cap: bool,
+}
+
+impl CollSpec {
+    /// Take the trailing spec argument off the stack.
+    fn pop(vm: &mut VM) -> CollSpec {
+        let code = vm.pop().to_int() as u8;
+        CollSpec {
+            order: match code & 0x0f {
+                COLL_HASH => Some(CollOrder::Hash(DEFAULT_CAPACITY)),
+                COLL_SORTED => Some(CollOrder::Sorted),
+                _ => None,
+            },
+            copy: code & COLL_COPY != 0,
+            default_cap: code & COLL_DEFAULT_CAP != 0,
+        }
+    }
+
+    /// Record the built collection's discipline and put it in that order.
+    fn apply(self, vm: &mut VM, v: &Value, size: usize) {
+        let ord = match self.order {
+            Some(CollOrder::Hash(_)) if self.default_cap => CollOrder::Hash(DEFAULT_CAPACITY),
+            Some(CollOrder::Hash(_)) => CollOrder::Hash(map_capacity(size)),
+            Some(o) => o,
+            None => return,
+        };
+        set_order(vm, v, ord);
+    }
+}
+
+/// Record `v`'s iteration discipline, and put it in that order straight away.
+fn set_order(vm: &mut VM, v: &Value, ord: CollOrder) {
+    if let Value::Obj(id) = v {
+        COLL_ORDER.with(|c| c.borrow_mut().insert(*id, ord));
+    }
+    reorder(vm, v);
+}
+
+/// The discipline recorded for `v`, if it is not the insertion-ordered default.
+fn order_of(v: &Value) -> Option<CollOrder> {
+    match v {
+        Value::Obj(id) => COLL_ORDER.with(|c| c.borrow().get(id).copied()),
+        _ => None,
+    }
+}
+
+/// Restore `v`'s iteration order after a mutation.
+///
+/// The stored sequence IS the iteration sequence — every reader walks the
+/// `Vec` — so a `HashMap` is kept permanently in bucket order rather than
+/// reordered at each read. An insertion-ordered collection has no entry in
+/// [`COLL_ORDER`] and costs nothing here.
+fn reorder(vm: &mut VM, v: &Value) {
+    let Some(ord) = order_of(v) else {
+        return;
+    };
+    // Keys first, under a short borrow: ranking them runs `hashCode`/
+    // `compareTo`, which can re-enter the VM and reallocate the heap.
+    let keys: Vec<Value> = match with_obj(v, |o| match o {
+        HeapObj::Map(entries) => Some(entries.iter().map(|(k, _)| k.clone()).collect()),
+        HeapObj::Set(items) => Some(items.clone()),
+        _ => None,
+    })
+    .flatten()
+    {
+        Some(k) => k,
+        None => return,
+    };
+    let order = match ord {
+        CollOrder::Hash(initial) => hash_order(vm, &keys, initial),
+        CollOrder::Sorted => {
+            let mut idx: Vec<usize> = (0..keys.len()).collect();
+            idx.sort_by(|&a, &b| value_cmp(&keys[a], &keys[b]));
+            idx
+        }
+    };
+    with_obj_mut(v, |o| match o {
+        HeapObj::Map(entries) => {
+            *entries = order.iter().map(|&i| entries[i].clone()).collect();
+        }
+        HeapObj::Set(items) => {
+            *items = order.iter().map(|&i| items[i].clone()).collect();
+        }
+        _ => {}
+    });
+}
+
+/// The positions of `keys` in `java.util.HashMap` ITERATION order.
+///
+/// A `HashMap` iterates its bucket TABLE, not its insertion sequence. The table
+/// holds `n` buckets for a power-of-two `n`; a key lands in bucket
+/// `(n - 1) & (h ^ (h >>> 16))`, where the exclusive-or is Java's `HashMap.hash`
+/// spread, mixing the high bits down so they survive the mask; and a bucket
+/// keeps its own arrivals in the order they came.
+///
+/// Java grows the table by splitting each bucket's chain into a low and a high
+/// half, and Java 8 onward preserves relative order within each half. That is
+/// what makes a STABLE sort of the insertion sequence by final bucket index
+/// reproduce the whole resize history without replaying it.
+///
+/// Known boundary, deliberately not modelled: a bucket that reaches eight
+/// entries in a table of at least 64 becomes a red-black tree, and iterates in
+/// the tree's order rather than its arrival order. It takes eight keys colliding
+/// under the mask to reach, and the tree order needs `Comparable` tie-breaking
+/// that has no meaning for every key type.
+fn hash_order(vm: &mut VM, keys: &[Value], initial: usize) -> Vec<usize> {
+    let n = table_size(keys.len(), initial);
+    let mut idx: Vec<usize> = (0..keys.len()).collect();
+    let buckets: Vec<u32> = keys.iter().map(|k| bucket_of(vm, k, n)).collect();
+    idx.sort_by_key(|&i| buckets[i]); // stable: ties keep arrival order
+    idx
+}
+
+/// `java.util.HashMap`'s default table size.
+const DEFAULT_CAPACITY: usize = 16;
+
+/// The bucket `key` occupies in a table of `n` buckets.
+fn bucket_of(vm: &mut VM, key: &Value, n: usize) -> u32 {
+    let h = hash_vm(vm, key, false) as u32;
+    let spread = h ^ (h >> 16);
+    spread & (n as u32 - 1)
+}
+
+/// The table size a `HashMap` holding `size` entries has reached, having started
+/// at `initial` buckets.
+///
+/// The table doubles when a put takes the size past `0.75 * n`, so the final
+/// size is the smallest power of two at or above `initial` that still leaves the
+/// entries under that load factor.
+fn table_size(size: usize, initial: usize) -> usize {
+    let mut n = initial.max(1).next_power_of_two();
+    while size * 4 > n * 3 {
+        n *= 2;
+    }
+    n
+}
+
+/// Kotlin's `mapCapacity` — the initial capacity its `hashMapOf`/`hashSetOf`
+/// request for a known element count. It is not the count: asking for `size`
+/// buckets would resize immediately, so the builders pre-divide by the load
+/// factor. The resulting table is often SMALLER than the default 16, which
+/// changes the bucket mask and so the printed order.
+fn map_capacity(expected: usize) -> usize {
+    if expected < 3 {
+        expected + 1
+    } else {
+        ((expected as f32 / 0.75f32) + 1.0f32) as usize
+    }
 }
 
 /// The registered `Long`-field mask for a class tag (see [`LONG_FIELDS`]).
@@ -483,6 +688,16 @@ enum HeapObj {
     Exc {
         class: String,
         msg: Option<String>,
+    },
+    /// A `Grouping` — the source elements and the key selector `groupingBy`
+    /// was handed, held until a terminal operation asks for something.
+    ///
+    /// Kotlin's `Grouping` is an interface over exactly this pair, and it is
+    /// deliberately lazy: `groupingBy { }.eachCount()` counts per key without
+    /// ever building the per-key lists `groupBy` allocates.
+    Grouping {
+        items: Vec<Value>,
+        key: Value,
     },
     /// A JVM array. `desc` is its JVM type descriptor (`"[I"`,
     /// `"[Ljava.lang.Integer;"`, …), which only exists to reproduce the
@@ -639,6 +854,7 @@ fn difference_modulo(a: i64, b: i64, c: i64) -> i64 {
 /// no residual objects (handles are per-run identities).
 fn reset_heap() {
     HEAP.with(|h| h.borrow_mut().clear());
+    COLL_ORDER.with(|c| c.borrow_mut().clear());
     TYPES.with(|t| t.borrow_mut().clear());
     TOSTRING_SUBS.with(|t| t.borrow_mut().clear());
     EQUALS_SUBS.with(|t| t.borrow_mut().clear());
@@ -2459,27 +2675,36 @@ fn b_display(vm: &mut VM, _argc: u8) -> Value {
 /// `mapOf(D(1) to 1, D(1) to 2)` with two entries for every structural key
 /// (a `data class`, a `List`, or a class with a declared `equals`).
 fn b_map_new(vm: &mut VM, argc: u8) -> Value {
+    let spec = CollSpec::pop(vm);
     let mut pairs = Vec::with_capacity(argc as usize);
     for _ in 0..argc {
         pairs.push(vm.pop());
     }
     pairs.reverse();
-    let mut entries: Vec<(Value, Value)> = Vec::with_capacity(pairs.len());
-    for p in pairs {
-        let kv = with_obj(&p, |o| match o {
-            HeapObj::Pair(a, b) => Some((a.clone(), b.clone())),
-            _ => None,
-        })
-        .flatten();
-        if let Some((k, v)) = kv {
-            let at = entries.iter().position(|(ek, _)| hash_eq_vm(vm, ek, &k));
-            match at {
-                Some(i) => entries[i].1 = v,
-                None => entries.push((k, v)),
-            }
-        }
+    // The copy form `HashMap(other)` takes ONE map and re-buckets its entries;
+    // the builder form takes `k to v` pairs.
+    let sources: Vec<(Value, Value)> = if spec.copy {
+        pairs.first().and_then(as_couples).unwrap_or_default()
+    } else {
+        pairs
+            .iter()
+            .filter_map(|p| {
+                with_obj(p, |o| match o {
+                    HeapObj::Pair(a, b) => Some((a.clone(), b.clone())),
+                    _ => None,
+                })
+                .flatten()
+            })
+            .collect()
+    };
+    let mut entries: Vec<(Value, Value)> = Vec::with_capacity(sources.len());
+    for (k, v) in sources {
+        map_upsert(vm, &mut entries, k, v);
     }
-    alloc(HeapObj::Map(entries))
+    let n = entries.len();
+    let m = alloc(HeapObj::Map(entries));
+    spec.apply(vm, &m, n);
+    m
 }
 
 /// `KT_METHOD_VM` — see [`KT_METHOD_VM`]. Stack: `[recv, arg0 .. argN, name]`.
@@ -2502,13 +2727,22 @@ fn b_method(vm: &mut VM, argc: u8) -> Value {
 
 /// `KT_SET_VM` — see [`KT_SET_VM`]. Stack: `[v0 .. vN]`.
 fn b_set_new(vm: &mut VM, argc: u8) -> Value {
+    let spec = CollSpec::pop(vm);
     let mut vals = Vec::with_capacity(argc as usize);
     for _ in 0..argc {
         vals.push(vm.pop());
     }
     vals.reverse();
+    // `HashSet(other)` copies the argument's elements; `hashSetOf(a, b)` takes
+    // the arguments themselves.
+    if spec.copy {
+        vals = vals.first().and_then(as_iterable).unwrap_or_default();
+    }
     let items = distinct(vm, &vals);
-    alloc(HeapObj::Set(items))
+    let n = items.len();
+    let s = alloc(HeapObj::Set(items));
+    spec.apply(vm, &s, n);
+    s
 }
 
 /// `KT_IN_VM` — see [`KT_IN_VM`]. Stack: `[value, container]`.
@@ -2554,6 +2788,15 @@ fn b_operator(vm: &mut VM, _argc: u8) -> Value {
             Value::Undef
         }
     }
+}
+
+/// The source elements and key selector of a `Grouping` receiver.
+fn grouping_parts(v: &Value) -> Option<(Vec<Value>, Value)> {
+    with_obj(v, |o| match o {
+        HeapObj::Grouping { items, key } => Some((items.clone(), key.clone())),
+        _ => None,
+    })
+    .flatten()
 }
 
 /// The elements of `v` when it is a Kotlin `Iterable` — a `List`, a `Set`, a
@@ -2687,6 +2930,7 @@ fn operator_apply(vm: &mut VM, lhs: &Value, name: &str, rhs: &Value) -> Result<V
                     *slot = entries;
                 }
             });
+            reorder(vm, lhs);
             return Ok(Value::Undef);
         }
         return Ok(alloc(HeapObj::Map(entries)));
@@ -2752,6 +2996,7 @@ fn operator_apply(vm: &mut VM, lhs: &Value, name: &str, rhs: &Value) -> Result<V
             (HeapObj::Array { items: slot, .. }, HeapObj::List(v)) => *slot = v,
             _ => {}
         });
+        reorder(vm, lhs);
         return Ok(Value::Undef);
     }
     Ok(alloc(result))
@@ -3573,6 +3818,14 @@ fn coll_hof(
             }
             Ok(alloc(HeapObj::Map(entries)))
         }
+        // `groupingBy` does no work: it pairs the source with the key selector
+        // and defers everything to a terminal operation. That laziness is the
+        // whole point of `Grouping` over `groupBy` — `eachCount` never builds
+        // the per-key LISTS that `groupBy` materializes.
+        "groupingBy" => Ok(alloc(HeapObj::Grouping {
+            items: items.to_vec(),
+            key: clo.clone(),
+        })),
         "groupBy" => {
             // key → list of elements, keys in first-appearance order.
             let mut entries: Vec<(Value, Vec<Value>)> = Vec::new();
@@ -4059,7 +4312,14 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
     }
     // Heap objects (List/Map/Pair/data-class members) dispatch through the heap.
     if let Value::Obj(_) = recv {
-        return obj_method(vm, recv, name, args);
+        let out = obj_method(vm, recv, name, args);
+        // A mutating member (`add`, `put`, `remove`, …) may have appended to a
+        // collection that does not iterate in insertion order. Restoring the
+        // discipline here rather than at each mutation keeps the ~10 mutating
+        // members from having to remember to; it is a map lookup and no more
+        // for the insertion-ordered collections, which are the common case.
+        reorder(vm, recv);
+        return out;
     }
     match (recv, name) {
         // ── kotlin.String ──
@@ -4641,6 +4901,24 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         "plus" | "minus" | "plusAssign" | "minusAssign" => {
             let rhs = args.first().cloned().unwrap_or(Value::Undef);
             return operator_apply(vm, recv, name, &rhs);
+        }
+        // The `Grouping` terminal operations. `eachCount` is the one that takes
+        // no lambda, so it resolves here; `fold`/`reduce`/`aggregate` carry one
+        // and arrive through the higher-order path instead.
+        "eachCount" | "eachCountTo" => {
+            if let Some((items, key)) = grouping_parts(recv) {
+                let mut entries: Vec<(Value, Value)> = Vec::new();
+                for it in items {
+                    let k = invoke_closure(vm, &key, std::slice::from_ref(&it))?;
+                    // Keys come out in FIRST-ENCOUNTER order: `eachCount` fills
+                    // a `LinkedHashMap`.
+                    match entries.iter_mut().find(|(ek, _)| value_eq(ek, &k)) {
+                        Some(slot) => slot.1 = Value::Int(slot.1.to_int() + 1),
+                        None => entries.push((k, Value::Int(1))),
+                    }
+                }
+                return Ok(alloc(HeapObj::Map(entries)));
+            }
         }
         "plusElement" | "minusElement" => {
             let rhs = args.first().cloned().unwrap_or(Value::Undef);
@@ -5236,7 +5514,11 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
             2 => Some(b.clone()),
             _ => None,
         },
-        HeapObj::Map(_) | HeapObj::Closure { .. } | HeapObj::Range(_) | HeapObj::Exc { .. } => None,
+        HeapObj::Map(_)
+        | HeapObj::Closure { .. }
+        | HeapObj::Grouping { .. }
+        | HeapObj::Range(_)
+        | HeapObj::Exc { .. } => None,
     })
     .flatten()
     .ok_or_else(|| format!("no component{n} on {}", obj_label(recv)))
@@ -5353,6 +5635,8 @@ fn index_set(vm: &mut VM, recv: &Value, index: &Value, value: Value) -> Result<(
             obj_label(recv)
         )),
     });
+    // A new key appended to a `HashMap` belongs in its bucket, not at the end.
+    reorder(vm, recv);
     out.unwrap_or_else(|| Err("indexing a non-object value".to_string()))
 }
 
@@ -5625,7 +5909,10 @@ fn obj_hash(recv: &Value) -> Option<i32> {
             }
         }),
         // Identity-hashed: `Object.hashCode`.
-        HeapObj::Array { .. } | HeapObj::Closure { .. } | HeapObj::Exc { .. } => None,
+        HeapObj::Array { .. }
+        | HeapObj::Closure { .. }
+        | HeapObj::Grouping { .. }
+        | HeapObj::Exc { .. } => None,
     })
     .flatten()
 }
@@ -5649,6 +5936,7 @@ fn obj_label(recv: &Value) -> String {
         HeapObj::Res { .. } => "Result".to_string(),
         HeapObj::Entry(_, _) => "Map.Entry".to_string(),
         HeapObj::Closure { .. } => "Function".to_string(),
+        HeapObj::Grouping { .. } => "Grouping".to_string(),
         HeapObj::Range(r) => match (r.is_char, r.progression) {
             (true, true) => "CharProgression",
             (true, false) => "CharRange",
@@ -5742,6 +6030,10 @@ fn display_obj(id: u32) -> String {
             // reproduce — a stable placeholder is enough (lambdas are rarely
             // printed, only invoked).
             HeapObj::Closure { params, .. } => format!("(lambda arity={params})"),
+            // A `Grouping` is an anonymous object on the JVM, so it has no
+            // meaningful printed form; it exists to be consumed by a terminal
+            // operation, not displayed.
+            HeapObj::Grouping { items, .. } => format!("(grouping size={})", items.len()),
             // `IntRange.toString` is `first..last`; `IntProgression.toString` is
             // `first..last step n` ascending and `first downTo last step n`
             // descending, where `last` is the last element actually reached

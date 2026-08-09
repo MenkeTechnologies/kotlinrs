@@ -21,15 +21,16 @@
 
 use crate::ast::*;
 use crate::host::{
-    KT_ARRAY, KT_ARRAY_INIT, KT_ARRAY_NEW, KT_AS, KT_CHR_STRING, KT_CLASSOF, KT_CLOSURE_CALL,
-    KT_COLL_HOF, KT_DBG_LINE, KT_DDIV, KT_DISPLAY, KT_EQUALS_REG, KT_EXC_ABORT, KT_EXC_CUT,
-    KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE,
-    KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND, KT_FFI_CALL, KT_FFI_COMPILE, KT_GETFIELD, KT_HASH_REG,
-    KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET,
-    KT_ITER_SIZE, KT_JOIN, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH,
-    KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OPER_VM, KT_PAIR, KT_PRINT, KT_PRINTLN,
-    KT_RANGE, KT_RANGE_STEP, KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN, KT_SETFIELD, KT_SET_VM,
-    KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG,
+    COLL_COPY, COLL_DEFAULT_CAP, COLL_HASH, COLL_SORTED, KT_ARRAY, KT_ARRAY_INIT, KT_ARRAY_NEW,
+    KT_AS, KT_CHR_STRING, KT_CLASSOF, KT_CLOSURE_CALL, KT_COLL_HOF, KT_DBG_LINE, KT_DDIV,
+    KT_DISPLAY, KT_EQUALS_REG, KT_EXC_ABORT, KT_EXC_CUT, KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW,
+    KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND,
+    KT_FFI_CALL, KT_FFI_COMPILE, KT_GETFIELD, KT_HASH_REG, KT_IDIV, KT_IMOD, KT_INDEX_GET_VM,
+    KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_JOIN, KT_LAZY_GET,
+    KT_LAZY_NEW, KT_LIST, KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL,
+    KT_OBJEQ_VM, KT_OPER_VM, KT_PAIR, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_RESULT_HOF,
+    KT_RUN_CATCHING, KT_SCOPE_FN, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG, KT_TO_STRING,
+    KT_TYPE_REG,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
@@ -4326,8 +4327,14 @@ impl Compiler {
                 self.b.emit(Op::Extended(KT_PAIR, 1), line);
                 Ok(Type::Obj)
             }
+            // `ArrayList(other)` copies a collection, where `ArrayList()` builds
+            // an empty one. A `List` iterates in position order however it was
+            // built, so unlike its `Set`/`Map` siblings it needs no order spec.
+            "ArrayList" if args.len() == 1 => {
+                self.compile_member(sc, &args[0], "toMutableList", &[], false, line)
+            }
             // Collection builders → heap objects.
-            "listOf" | "mutableListOf" | "arrayListOf" | "emptyList" => {
+            "listOf" | "mutableListOf" | "arrayListOf" | "emptyList" | "ArrayList" => {
                 for a in args {
                     self.compile_expr(sc, a)?;
                 }
@@ -4408,21 +4415,27 @@ impl Compiler {
                 let rt = self.resolve_math_fn(name).unwrap();
                 self.compile_math(sc, &rt, args, line)
             }
-            // `Set` builders → an insertion-ordered distinct heap collection,
-            // which is what Kotlin's `LinkedHashSet`-backed `setOf` is.
-            "setOf" | "mutableSetOf" | "hashSetOf" | "linkedSetOf" | "sortedSetOf" | "emptySet" => {
+            // `Set` builders. `setOf`/`linkedSetOf` are `LinkedHashSet`-backed
+            // and iterate in insertion order; `hashSetOf`/`HashSet` and
+            // `sortedSetOf` do NOT, and the trailing spec argument says which
+            // (see `COLL_HASH`).
+            "setOf" | "mutableSetOf" | "hashSetOf" | "linkedSetOf" | "sortedSetOf" | "emptySet"
+            | "HashSet" | "LinkedHashSet" | "TreeSet" => {
                 for a in args {
                     self.compile_expr(sc, a)?;
                 }
+                self.emit_coll_spec(name, args.len());
                 self.b
                     .emit(Op::CallBuiltin(KT_SET_VM, args.len() as u8), line);
                 Ok(Type::Obj)
             }
-            "mapOf" | "mutableMapOf" | "hashMapOf" | "emptyMap" => {
-                // Each argument is a `k to v` Pair.
+            "mapOf" | "mutableMapOf" | "hashMapOf" | "emptyMap" | "HashMap" | "LinkedHashMap" => {
+                // Each argument is a `k to v` Pair — except in the copy form
+                // `HashMap(other)`, whose single argument is a whole map.
                 for a in args {
                     self.compile_expr(sc, a)?;
                 }
+                self.emit_coll_spec(name, args.len());
                 self.b
                     .emit(Op::CallBuiltin(KT_MAP_VM, args.len() as u8), line);
                 Ok(Type::Obj)
@@ -5168,10 +5181,11 @@ impl Compiler {
             },
             Expr::Call { name, args, .. } => match name.as_str() {
                 "println" | "print" => Type::Unit,
-                "listOf" | "mutableListOf" | "arrayListOf" | "emptyList" | "mapOf"
-                | "mutableMapOf" | "hashMapOf" | "emptyMap" | "setOf" | "mutableSetOf"
-                | "hashSetOf" | "linkedSetOf" | "sortedSetOf" | "emptySet" | "arrayOf"
-                | "intArrayOf" | "doubleArrayOf" | "booleanArrayOf" | "charArrayOf"
+                "listOf" | "mutableListOf" | "arrayListOf" | "emptyList" | "ArrayList"
+                | "mapOf" | "mutableMapOf" | "hashMapOf" | "emptyMap" | "setOf"
+                | "mutableSetOf" | "hashSetOf" | "linkedSetOf" | "sortedSetOf" | "emptySet"
+                | "HashSet" | "LinkedHashSet" | "TreeSet" | "HashMap" | "LinkedHashMap"
+                | "arrayOf" | "intArrayOf" | "doubleArrayOf" | "booleanArrayOf" | "charArrayOf"
                 | "IntArray" | "DoubleArray" | "BooleanArray" | "CharArray" | "Array" => Type::Obj,
                 // `Pair`/`Triple`/`Result` are heap objects, and saying so is
                 // what routes `==` on them to STRUCTURAL equality: the native
@@ -5591,6 +5605,34 @@ impl Compiler {
             .is_some_and(|m| m.methods.contains_key(name))
     }
 
+    /// Emit the trailing iteration-order spec a `Set`/`Map` builder passes to
+    /// its host builtin — see [`COLL_HASH`].
+    ///
+    /// The JVM class the builder names decides how the result ITERATES, and
+    /// only the call site knows it: every one of them lands in the same
+    /// `HeapObj::Map`/`Set`. `HashMap()` and `HashMap(other)` differ too, and a
+    /// runtime look at the arguments cannot separate them from `hashMapOf` —
+    /// `hashSetOf(listOf(1))` is a set holding a list, not a copy of one.
+    fn emit_coll_spec(&mut self, name: &str, argc: usize) {
+        let order = match name {
+            "hashSetOf" | "HashSet" | "hashMapOf" | "HashMap" => COLL_HASH,
+            "sortedSetOf" | "TreeSet" => COLL_SORTED,
+            _ => 0,
+        };
+        // The JVM constructors take a collection to copy, or nothing at all.
+        // The Kotlin builders take their elements.
+        let ctor = matches!(
+            name,
+            "HashSet" | "LinkedHashSet" | "TreeSet" | "HashMap" | "LinkedHashMap"
+        );
+        let shape = match (ctor, argc) {
+            (true, 0) => COLL_DEFAULT_CAP,
+            (true, _) => COLL_COPY,
+            _ => 0,
+        };
+        self.b.emit(Op::LoadInt(i64::from(order | shape)), 0);
+    }
+
     /// Emit the runtime operator-convention dispatch for a heap receiver whose
     /// class the frontend could not name — a `List`/`Set`/`Map`/range.
     /// Stack: `[lhs, rhs, nameStr]`; see [`KT_OPER_VM`].
@@ -5638,14 +5680,15 @@ impl Compiler {
                     return Some(name.clone()); // constructor
                 }
                 match name.as_str() {
-                    "listOf" | "mutableListOf" | "arrayListOf" | "emptyList" => {
+                    "listOf" | "mutableListOf" | "arrayListOf" | "emptyList" | "ArrayList" => {
                         return Some("List".to_string())
                     }
                     "setOf" | "mutableSetOf" | "hashSetOf" | "linkedSetOf" | "sortedSetOf"
-                    | "emptySet" => return Some("Set".to_string()),
-                    "mapOf" | "mutableMapOf" | "hashMapOf" | "emptyMap" => {
-                        return Some("Map".to_string())
+                    | "emptySet" | "HashSet" | "LinkedHashSet" | "TreeSet" => {
+                        return Some("Set".to_string())
                     }
+                    "mapOf" | "mutableMapOf" | "hashMapOf" | "emptyMap" | "HashMap"
+                    | "LinkedHashMap" => return Some("Map".to_string()),
                     // The primitive array factories, whose name states the
                     // element type. `arrayOf`/`Array` are deliberately absent:
                     // their elements are unconstrained.
@@ -6173,6 +6216,7 @@ fn is_coll_hof(name: &str) -> bool {
             | "associateBy"
             | "associateWith"
             | "groupBy"
+            | "groupingBy"
             // The searching predicates. Each also has a no-argument member
             // spelling (`list.first()`), which the `!args.is_empty()` guard at
             // the call site keeps on the plain path.
@@ -6229,7 +6273,7 @@ fn hof_ret_type(name: &str) -> Type {
     match name {
         "map" | "mapIndexed" | "flatMap" | "filter" | "filterNot" | "partition" | "takeWhile"
         | "dropWhile" | "sortedBy" | "sortedByDescending" | "associate" | "associateBy"
-        | "associateWith" | "groupBy" => Type::Obj,
+        | "associateWith" | "groupBy" | "groupingBy" => Type::Obj,
         "filterIndexed" | "mapValues" | "mapKeys" | "sortedWith" | "chunked" | "windowed"
         | "zip" => Type::Obj,
         "forEach" | "forEachIndexed" => Type::Unit,

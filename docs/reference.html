@@ -885,8 +885,8 @@ println(s.add(2))   // true</code></pre>
         <article class="doc-entry" id="doc-builtin-functions-9">
           <h3><a class="doc-anchor" href="#doc-builtin-functions-9">#</a> <code>hashSetOf</code></h3>
           <pre><code class="lang-kotlin">hashSetOf(vararg elements: T): MutableSet&lt;T&gt;</code></pre>
-          <p>Builds the same insertion-ordered <code>Set</code> every other set builder does. Kotlin's <code>HashSet</code> has no order guarantee; here the display order is always insertion order.</p>
-          <pre><code class="lang-kotlin">println(hashSetOf(3, 1))   // [3, 1]</code></pre>
+          <p>Builds a <code>java.util.HashSet</code>, which iterates its BUCKET TABLE rather than its insertion sequence — so the printed order is neither the argument order nor a sorted one. A key sits in bucket <code>(n - 1) and (h xor (h ushr 16))</code> of a power-of-two table sized from the element count, and buckets are walked in index order. Use <code>linkedSetOf</code> for insertion order or <code>sortedSetOf</code> for ascending order.</p>
+          <pre><code class="lang-kotlin">println(hashSetOf(3, 1))   // [1, 3]</code></pre>
         </article>
         <article class="doc-entry" id="doc-builtin-functions-10">
           <h3><a class="doc-anchor" href="#doc-builtin-functions-10">#</a> <code>linkedSetOf</code></h3>
@@ -897,9 +897,8 @@ println(s.add(2))   // true</code></pre>
         <article class="doc-entry" id="doc-builtin-functions-11">
           <h3><a class="doc-anchor" href="#doc-builtin-functions-11">#</a> <code>sortedSetOf</code></h3>
           <pre><code class="lang-kotlin">sortedSetOf(vararg elements: T): MutableSet&lt;T&gt;</code></pre>
-          <p>Accepted, but it does **not** sort — it builds the same insertion-ordered distinct set as <code>setOf</code>. This diverges from Kotlin, where the result is a <code>TreeSet</code> in ascending order. Call <code>sorted()</code> on it if order matters.</p>
-          <pre><code class="lang-kotlin">println(sortedSetOf(3, 1, 2))            // [3, 1, 2]
-println(sortedSetOf(3, 1, 2).sorted())   // [1, 2, 3]</code></pre>
+          <p>Builds a <code>TreeSet</code> — the elements in ascending natural order, whatever order they were given in, and kept that way as more are added.</p>
+          <pre><code class="lang-kotlin">println(sortedSetOf(3, 1, 2))   // [1, 2, 3]</code></pre>
         </article>
         <article class="doc-entry" id="doc-builtin-functions-12">
           <h3><a class="doc-anchor" href="#doc-builtin-functions-12">#</a> <code>emptySet</code></h3>
@@ -925,77 +924,115 @@ println(m)   // {a=1, b=2}</code></pre>
         <article class="doc-entry" id="doc-builtin-functions-15">
           <h3><a class="doc-anchor" href="#doc-builtin-functions-15">#</a> <code>hashMapOf</code></h3>
           <pre><code class="lang-kotlin">hashMapOf(vararg pairs: Pair&lt;K, V&gt;): MutableMap&lt;K, V&gt;</code></pre>
-          <p>Builds the same insertion-ordered <code>Map</code> <code>mutableMapOf</code> does. Kotlin's <code>HashMap</code> has no order guarantee; here iteration and display order are always insertion order.</p>
-          <pre><code class="lang-kotlin">println(hashMapOf("b" to 1, "a" to 2))   // {b=1, a=2}</code></pre>
+          <p>Builds a <code>java.util.HashMap</code>, which iterates its BUCKET TABLE rather than its insertion sequence — the printed order follows the keys' hashes, not the argument order. Use <code>mutableMapOf</code>/<code>LinkedHashMap</code> when insertion order matters.</p>
+          <pre><code class="lang-kotlin">println(hashMapOf("b" to 1, "a" to 2))   // {a=2, b=1}</code></pre>
         </article>
         <article class="doc-entry" id="doc-builtin-functions-16">
-          <h3><a class="doc-anchor" href="#doc-builtin-functions-16">#</a> <code>emptyMap</code></h3>
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-16">#</a> <code>HashMap</code></h3>
+          <pre><code class="lang-kotlin">HashMap(): MutableMap&lt;K, V&gt; / HashMap(other: Map&lt;K, V&gt;): MutableMap&lt;K, V&gt;</code></pre>
+          <p>The <code>java.util.HashMap</code> constructor — empty, or a copy of another map. It iterates in bucket order like <code>hashMapOf</code>, but a no-argument one starts from Java's default 16-bucket table where a sized builder starts from a table derived from its element count; the two mask differently, so the same keys can print in different orders.</p>
+          <pre><code class="lang-kotlin">val m = HashMap&lt;String, Int&gt;()
+m["a"] = 1
+println(m)   // {a=1}</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-17">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-17">#</a> <code>LinkedHashMap</code></h3>
+          <pre><code class="lang-kotlin">LinkedHashMap(): MutableMap&lt;K, V&gt; / LinkedHashMap(other: Map&lt;K, V&gt;): MutableMap&lt;K, V&gt;</code></pre>
+          <p>The insertion-ordered map constructor — the same collection <code>mapOf</code>/<code>mutableMapOf</code> build.</p>
+          <pre><code class="lang-kotlin">println(LinkedHashMap(mapOf("b" to 2)))   // {b=2}</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-18">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-18">#</a> <code>HashSet</code></h3>
+          <pre><code class="lang-kotlin">HashSet(): MutableSet&lt;T&gt; / HashSet(other: Collection&lt;T&gt;): MutableSet&lt;T&gt;</code></pre>
+          <p>The <code>java.util.HashSet</code> constructor — empty, or a copy of another collection's elements. Iterates in bucket order, like <code>hashSetOf</code>. Note the difference from the builder: <code>HashSet(listOf(1))</code> copies the list, where <code>hashSetOf(listOf(1))</code> builds a one-element set holding it.</p>
+          <pre><code class="lang-kotlin">println(HashSet(listOf(3, 1)))   // [1, 3]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-19">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-19">#</a> <code>LinkedHashSet</code></h3>
+          <pre><code class="lang-kotlin">LinkedHashSet(): MutableSet&lt;T&gt; / LinkedHashSet(other: Collection&lt;T&gt;): MutableSet&lt;T&gt;</code></pre>
+          <p>The insertion-ordered set constructor — the same collection <code>setOf</code>/<code>linkedSetOf</code> build.</p>
+          <pre><code class="lang-kotlin">println(LinkedHashSet(listOf(3, 1)))   // [3, 1]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-20">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-20">#</a> <code>TreeSet</code></h3>
+          <pre><code class="lang-kotlin">TreeSet(): MutableSet&lt;T&gt; / TreeSet(other: Collection&lt;T&gt;): MutableSet&lt;T&gt;</code></pre>
+          <p>The ascending-order set constructor, as <code>sortedSetOf</code> builds.</p>
+          <pre><code class="lang-kotlin">println(TreeSet(listOf(3, 1, 2)))   // [1, 2, 3]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-21">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-21">#</a> <code>ArrayList</code></h3>
+          <pre><code class="lang-kotlin">ArrayList(): MutableList&lt;T&gt; / ArrayList(other: Collection&lt;T&gt;): MutableList&lt;T&gt;</code></pre>
+          <p>The <code>java.util.ArrayList</code> constructor — empty, or a copy of another collection. A list keeps position order however it was built, so it has no ordering surprise the way its <code>Set</code>/<code>Map</code> siblings do.</p>
+          <pre><code class="lang-kotlin">println(ArrayList(listOf(3, 1)))   // [3, 1]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-22">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-22">#</a> <code>emptyMap</code></h3>
           <pre><code class="lang-kotlin">emptyMap(): Map&lt;K, V&gt;</code></pre>
           <p>Builds an empty <code>Map</code>, which prints as <code>{}</code>.</p>
           <pre><code class="lang-kotlin">println(emptyMap&lt;String, Int&gt;())   // {}</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-functions-17">
-          <h3><a class="doc-anchor" href="#doc-builtin-functions-17">#</a> <code>arrayOf</code></h3>
+        <article class="doc-entry" id="doc-builtin-functions-23">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-23">#</a> <code>arrayOf</code></h3>
           <pre><code class="lang-kotlin">arrayOf(vararg elements: T): Array&lt;T&gt;</code></pre>
           <p>Builds a JVM-style array. The element values decide the descriptor at run time, so a boxed array prints as <code>[Ljava.lang.Integer;@n</code> and compares by identity.</p>
           <pre><code class="lang-kotlin">val a = arrayOf(1, 2, 3)
 println(a[1])   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-functions-18">
-          <h3><a class="doc-anchor" href="#doc-builtin-functions-18">#</a> <code>intArrayOf</code></h3>
+        <article class="doc-entry" id="doc-builtin-functions-24">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-24">#</a> <code>intArrayOf</code></h3>
           <pre><code class="lang-kotlin">intArrayOf(vararg elements: Int): IntArray</code></pre>
           <p>Builds a primitive <code>Int</code> array from the given elements.</p>
           <pre><code class="lang-kotlin">println(intArrayOf(1, 2).sum())   // 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-functions-19">
-          <h3><a class="doc-anchor" href="#doc-builtin-functions-19">#</a> <code>doubleArrayOf</code></h3>
+        <article class="doc-entry" id="doc-builtin-functions-25">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-25">#</a> <code>doubleArrayOf</code></h3>
           <pre><code class="lang-kotlin">doubleArrayOf(vararg elements: Double): DoubleArray</code></pre>
           <p>Builds a primitive <code>Double</code> array.</p>
           <pre><code class="lang-kotlin">println(doubleArrayOf(1.5, 2.5).sum())   // 4.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-functions-20">
-          <h3><a class="doc-anchor" href="#doc-builtin-functions-20">#</a> <code>booleanArrayOf</code></h3>
+        <article class="doc-entry" id="doc-builtin-functions-26">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-26">#</a> <code>booleanArrayOf</code></h3>
           <pre><code class="lang-kotlin">booleanArrayOf(vararg elements: Boolean): BooleanArray</code></pre>
           <p>Builds a primitive <code>Boolean</code> array.</p>
           <pre><code class="lang-kotlin">println(booleanArrayOf(true, false).size)   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-functions-21">
-          <h3><a class="doc-anchor" href="#doc-builtin-functions-21">#</a> <code>charArrayOf</code></h3>
+        <article class="doc-entry" id="doc-builtin-functions-27">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-27">#</a> <code>charArrayOf</code></h3>
           <pre><code class="lang-kotlin">charArrayOf(vararg elements: Char): CharArray</code></pre>
           <p>Builds a primitive <code>Char</code> array.</p>
           <pre><code class="lang-kotlin">println(charArrayOf('a', 'b').joinToString(""))   // ab</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-functions-22">
-          <h3><a class="doc-anchor" href="#doc-builtin-functions-22">#</a> <code>IntArray</code></h3>
+        <article class="doc-entry" id="doc-builtin-functions-28">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-28">#</a> <code>IntArray</code></h3>
           <pre><code class="lang-kotlin">IntArray(size: Int): IntArray
 IntArray(size: Int) { i -&gt; … }: IntArray</code></pre>
           <p>Builds a zero-filled <code>Int</code> array of the given size, or fills each slot with the lambda applied to its index. A negative size raises <code>NegativeArraySizeException</code>.</p>
           <pre><code class="lang-kotlin">println(IntArray(3).sum())              // 0
 println(IntArray(3) { it * 2 }.sum())   // 6</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-functions-23">
-          <h3><a class="doc-anchor" href="#doc-builtin-functions-23">#</a> <code>DoubleArray</code></h3>
+        <article class="doc-entry" id="doc-builtin-functions-29">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-29">#</a> <code>DoubleArray</code></h3>
           <pre><code class="lang-kotlin">DoubleArray(size: Int): DoubleArray
 DoubleArray(size: Int) { i -&gt; … }: DoubleArray</code></pre>
           <p>Builds a zero-filled <code>Double</code> array, or fills it from the index lambda.</p>
           <pre><code class="lang-kotlin">println(DoubleArray(2).sum())   // 0.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-functions-24">
-          <h3><a class="doc-anchor" href="#doc-builtin-functions-24">#</a> <code>BooleanArray</code></h3>
+        <article class="doc-entry" id="doc-builtin-functions-30">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-30">#</a> <code>BooleanArray</code></h3>
           <pre><code class="lang-kotlin">BooleanArray(size: Int): BooleanArray
 BooleanArray(size: Int) { i -&gt; … }: BooleanArray</code></pre>
           <p>Builds a zero-filled <code>Boolean</code> array, or fills it from the index lambda.</p>
           <pre><code class="lang-kotlin">println(BooleanArray(3).size)   // 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-functions-25">
-          <h3><a class="doc-anchor" href="#doc-builtin-functions-25">#</a> <code>CharArray</code></h3>
+        <article class="doc-entry" id="doc-builtin-functions-31">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-31">#</a> <code>CharArray</code></h3>
           <pre><code class="lang-kotlin">CharArray(size: Int): CharArray
 CharArray(size: Int) { i -&gt; … }: CharArray</code></pre>
           <p>Builds a zero-filled <code>Char</code> array, or fills it from the index lambda.</p>
           <pre><code class="lang-kotlin">println(CharArray(2).size)   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-builtin-functions-26">
-          <h3><a class="doc-anchor" href="#doc-builtin-functions-26">#</a> <code>Array</code></h3>
+        <article class="doc-entry" id="doc-builtin-functions-32">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-32">#</a> <code>Array</code></h3>
           <pre><code class="lang-kotlin">Array(size: Int) { i -&gt; … }: Array&lt;T&gt;</code></pre>
           <p>Builds a generic array from an index lambda. Unlike the four primitive builders it exists *only* in the initializer form — Kotlin has no zero-filled <code>Array(n)</code> — and its descriptor is inferred from the elements the lambda produced.</p>
           <pre><code class="lang-kotlin">println(Array(3) { it * 2 }.joinToString())   // 0, 2, 4</code></pre>
@@ -2046,8 +2083,20 @@ sumOf(selector: (T) -&gt; Double): Double</code></pre>
         <article class="doc-entry" id="doc-higher-order-collection-functions-27">
           <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-27">#</a> <code>groupBy</code></h3>
           <pre><code class="lang-kotlin">groupBy(keySelector: (T) -&gt; K): Map&lt;K, List&lt;T&gt;&gt;</code></pre>
-          <p>Buckets the elements by the lambda's result. Keys appear in first-encounter order and each bucket keeps its elements in input order. There is no <code>groupingBy</code>.</p>
+          <p>Buckets the elements by the lambda's result. Keys appear in first-encounter order and each bucket keeps its elements in input order.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3, 4).groupBy { it % 2 })   // {1=[1, 3], 0=[2, 4]}</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-28">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-28">#</a> <code>groupingBy</code></h3>
+          <pre><code class="lang-kotlin">groupingBy(keySelector: (T) -&gt; K): Grouping&lt;T, K&gt;</code></pre>
+          <p>Pairs the source with a key selector and does no work yet — the result is consumed by a terminal operation such as <code>eachCount</code>. That laziness is the difference from <code>groupBy</code>, which materializes the per-key lists.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3, 4).groupingBy { it % 2 }.eachCount())   // {1=2, 0=2}</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-29">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-29">#</a> <code>eachCount</code></h3>
+          <pre><code class="lang-kotlin">eachCount(): Map&lt;K, Int&gt;</code></pre>
+          <p>How many elements fell under each key of a <code>Grouping</code>. The keys come out in first-encounter order, as the <code>LinkedHashMap</code> it fills.</p>
+          <pre><code class="lang-kotlin">println(listOf("a", "bb", "cc").groupingBy { it.length }.eachCount())   // {1=1, 2=2}</code></pre>
         </article>
       </section>
 

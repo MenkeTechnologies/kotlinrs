@@ -2819,3 +2819,74 @@ fun main() {
 }";
     assert_eq!(prog(src), "LR5\nL5\n");
 }
+
+#[test]
+fn hash_collections_iterate_in_bucket_order_not_insertion_order() {
+    // `java.util.HashMap` iterates its bucket TABLE. Storing these in insertion
+    // order printed an order the reference toolchain never produces — a silent
+    // wrong answer that looked plausible because the entries were all there.
+    assert_eq!(
+        prog(
+            r#"fun main() { println(hashMapOf("banana" to 1, "apple" to 2, "cherry" to 3, "zebra" to 4)) }"#
+        ),
+        "{banana=1, zebra=4, apple=2, cherry=3}\n"
+    );
+    // The table a builder starts from is sized from the element count, not
+    // fixed at 16, and that changes the mask and so the order: the same five
+    // keys come out differently through `hashSetOf` than through repeated adds
+    // to a default-capacity `HashSet`.
+    assert_eq!(
+        prog("fun main() { println(hashSetOf(10, 3, 7, 1, 25)) }"),
+        "[1, 25, 10, 3, 7]\n"
+    );
+    assert_eq!(
+        prog("fun main() { val h = HashMap<Int, String>(); for (i in listOf(10, 3, 7, 1, 25)) h[i] = \"v\" + i; println(h) }"),
+        "{1=v1, 3=v3, 7=v7, 25=v25, 10=v10}\n"
+    );
+    // `linkedSetOf` IS insertion-ordered and `sortedSetOf` is a TreeSet — the
+    // three disciplines have to stay distinguishable.
+    assert_eq!(
+        prog(r#"fun main() { println(linkedSetOf("banana", "apple", "cherry")) }"#),
+        "[banana, apple, cherry]\n"
+    );
+    assert_eq!(
+        prog(r#"fun main() { println(sortedSetOf("banana", "apple", "cherry")) }"#),
+        "[apple, banana, cherry]\n"
+    );
+}
+
+#[test]
+fn jvm_collection_constructors_build_and_copy() {
+    let src = "\
+fun main() {
+    val m = HashMap<String, Int>()
+    m[\"a\"] = 1
+    println(m[\"a\"])
+    println(m.size)
+    println(LinkedHashMap(mapOf(\"b\" to 2)))
+    println(ArrayList(listOf(3, 1, 2)))
+    println(HashSet(listOf(\"zebra\", \"apple\")))
+    println(ArrayList<Int>())
+}";
+    assert_eq!(prog(src), "1\n1\n{b=2}\n[3, 1, 2]\n[zebra, apple]\n[]\n");
+}
+
+#[test]
+fn grouping_by_counts_per_key_in_first_encounter_order() {
+    // `eachCount` fills a LinkedHashMap, so the keys come out in the order they
+    // were first seen — not sorted, and not in the source's element order.
+    assert_eq!(
+        prog(
+            r#"fun main() { println(listOf("a", "bb", "cc", "d", "eee").groupingBy { it.length }.eachCount()) }"#
+        ),
+        "{1=2, 2=2, 3=1}\n"
+    );
+    assert_eq!(
+        prog("fun main() { println(listOf(1, 1, 2, 3, 3, 3).groupingBy { it }.eachCount()) }"),
+        "{1=2, 2=1, 3=3}\n"
+    );
+    assert_eq!(
+        prog("fun main() { println(emptyList<String>().groupingBy { it }.eachCount()) }"),
+        "{}\n"
+    );
+}
