@@ -149,7 +149,7 @@ pub const KT_TOSTRING_REG: u16 = 35;
 /// instead of the built-in structural compare.
 pub const KT_EQUALS_REG: u16 = 38;
 /// Register a class's `hashCode()` override. Stack: `[tagStr, subNameIdx]`.
-/// Consulted by [`hash_vm`], so a `List`/`Set`/`Map` fold over an instance
+/// Consulted by `hash_vm`, so a `List`/`Set`/`Map` fold over an instance
 /// picks up the user's answer the way the JVM's does.
 pub const KT_HASH_REG: u16 = 39;
 
@@ -2187,7 +2187,7 @@ impl SubRegistry {
 /// `a == b` compiles to `a?.equals(b) ?: (b === null)` on the JVM, so dispatch
 /// is on the LEFT operand's class. When that class declared an `equals`, its
 /// body runs through a nested `vm.run()` — the same re-entrant pattern
-/// [`display_vm`] uses for `toString` — and its answer is final. Otherwise the
+/// `display_vm` uses for `toString` — and its answer is final. Otherwise the
 /// structural walk recurses with `equal_vm` again, so an override still applies
 /// to a list element, a `Pair` half or a `Map` value, and anything with no
 /// overriding instance inside falls through to the VM-less [`value_eq`].
