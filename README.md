@@ -170,6 +170,17 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   (dispatched as native fusevm `Op::Call`s with an implicit `this`), property
   get/set (`p.x`, `p.y = …`), and implicit-`this` member access inside methods.
   `val`-property reassignment is a compile error.
+  Properties may also be declared in the class **body**
+  (`class C(val a: Int) { var c = 0; val d = a * 2 }`): each initializer runs per
+  instance, after the superclass constructor and in declaration order, and may
+  name a constructor parameter or an earlier body property. A `data class`'s
+  generated members deliberately do not see them — Kotlin derives
+  `toString`/`equals`/`hashCode`/`componentN` from the primary constructor alone,
+  so `data class D(val a: Int) { val b = 2 }` prints `D(a=1)` while `D(1).b`
+  still reads `2`.
+  A **`companion object`** (one per class, named or not) is hoisted to a
+  singleton reached through the class name — `C.K`, `C.of(…)` — and, from inside
+  the class, with no qualifier at all.
 - **Inheritance** — `open class`/`abstract class`/`sealed class`/`interface`,
   the `: Super(args), Iface1, Iface2` supertype list, `override`, `abstract`
   members with no body, interface members *with* a default body, and
@@ -291,7 +302,64 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   them one `Map.Entry` per element (`m.map { it.key }`), and `filter` re-wraps
   into the receiver's own kind — a filtered `Map` is a `Map`, a filtered `Set` a
   `Set` — as Kotlin's per-receiver overloads do.
-- **Scope functions** — the `it`-form `.let`/`.also`/`.takeIf` on any receiver.
+- **Scope functions** — both families, on any receiver. The `it`-form
+  `.let`/`.also`/`.takeIf`/`.takeUnless` passes the receiver as the lambda's
+  parameter; the `this`-form `.run`/`.apply` and the free `with(x) { … }` bind it
+  as the block's **`this`**, so the receiver's members are reachable with no
+  qualifier (`"abc".run { length }`, `Box(2, 3).apply { w = 5 }`). `run`/`let`
+  yield the block, `apply`/`also` the receiver. The receiverless `run { … }` is a
+  block evaluated on the spot for its value. The receiver's declared type reaches
+  the block, so an `Int` receiver's arithmetic still wraps at 32 bits inside it.
+- **Extension functions** — `fun Int.dbl(): Int = this * 2`,
+  `fun String.shout() = uppercase() + "!"`, `fun Person.label() = name`, with
+  defaults and `vararg` like any other function. Dispatch is by the receiver's
+  **static** type, which is what keeps an `Int` and a `Long` extension of one
+  name apart (they share a runtime representation) and what makes the `Int` one's
+  arithmetic wrap at 32 bits. A member function of the same name and arity wins,
+  as in Kotlin; inside the body `this` is the receiver, an unqualified name is a
+  member of it, and a user-class receiver's properties are in scope. A receiver
+  the frontend cannot type falls back to a sole program-wide extension of that
+  name, and an ambiguous one is a compile error rather than an arbitrary pick.
+- **Default, named and `vararg` parameters** — `fun f(a: Int, b: Int = 10)`,
+  `f(b = 3, a = 4)`, `fun total(vararg xs: Int)`, for functions, methods,
+  constructors and extensions alike. Defaults are evaluated at the CALL site, so
+  one may not name another parameter of the same callee; that form is rejected
+  rather than silently misbound. A `vararg` binds an array of its declared
+  element type and is supported as the last parameter.
+- **Local functions** — a `fun` declared inside another function's body. It
+  lowers to a real subroutine rather than a closure value, which is what lets it
+  **recurse** (a closure captures by value at creation, so a self-reference would
+  read an uninitialized slot). It takes defaults, shadows a top-level function of
+  its name for the rest of the enclosing body, and is callable from a lambda
+  there. It cannot close over the enclosing frame's locals — naming one is an
+  unresolved reference, not a wrong answer.
+- **`Pair` / `Triple`** — the constructor spellings beside `a to b`, with the
+  `data class` behaviour Kotlin gives them: `(a, b)` / `(a, b, c)` display,
+  structural equality, the `31`-fold `hashCode`, `first`/`second`/`third`, and
+  `componentN` so `val (a, b, c) = t` destructures.
+- **Captured `var` mutation** — a `var` of the enclosing frame that a lambda
+  *assigns* to is stored in a shared cell, so the write is visible to the frame
+  (`var n = 0; xs.forEach { n += it }`). This is what the JVM backend does with
+  its `Ref.IntRef` wrappers, and the boxed value keeps its declared width, so an
+  `Int` accumulation still wraps at 32 bits.
+- **Casts** — `x as T` and the safe `x as? T`. The runtime value is unchanged;
+  what the cast supplies is the **static** type, which then decides integer width
+  and `/` dispatch. A mismatch throws `ClassCastException`, where `as?` is
+  `null` — and a null `as? String` prints as the four characters `null`. `Int`
+  and `Long` are one runtime representation here, so a cast cannot tell them
+  apart (see the limitation note below).
+- **Top-level properties and `by lazy`** — `val K = 7` / `var counter = 0` at
+  file scope, initialized in declaration order before `main` and visible to every
+  function; a local of the same name shadows one. `val z: Int by lazy { … }` —
+  on a top-level or a class property — runs its block at the **first read** and
+  caches the result, so an initializer with an effect fires at use rather than at
+  startup. `lazy` is the only supported delegate; any other `by` is a compile
+  error.
+- **`runCatching` / `Result`** — `runCatching { … }` runs a block and packages
+  its outcome as `Success(v)` / `Failure(<throwable>)`, catching the runtime
+  faults this frontend raises as well as an explicit `throw`. The readers are
+  total: `isSuccess`/`isFailure`, `getOrNull()`/`exceptionOrNull()`,
+  `getOrElse { }`, `map { }`, `onSuccess { }`/`onFailure { }`.
 - **Control flow** — `if`/`else` (statement **and** expression, incl.
   `else if`); `when` (statement **and** expression) in subject and subjectless
   forms, with literal, comma-grouped, `in`/`!in` range, `is`/`!is` type (incl.
@@ -342,16 +410,30 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   and must be followed by `(`, which is how Kotlin resolves the same ambiguity).
 - **Comments** — `//` and nested `/* … */`.
 
-Not yet (see roadmap): generic *declarations* (type parameters on a `fun`/`class`
-are not accepted; only type arguments at a call site are), the `this`-receiver
-scope functions (`.apply`/`.run`), directly invoking a call result (`f()()`;
-bind it first), lambda element-type inference (an unannotated `it` is coarsely
-typed, so `/` and `%` on it default to float — annotate the parameter `Int` for
-integer semantics), class body property initializers (stored properties go in the
-primary constructor), secondary constructors, `as`/`as?` casts, named / default
-arguments, the collection functions on a `String` receiver (`"abc".map { … }`,
+Generic *declarations* are parsed but erased: `fun <T> f(x: T)` and
+`class Box<T>` compile with `T` reading as an untyped value, and the `inline` /
+`noinline` / `crossinline` / `tailrec` / `operator` / `infix` / `const`
+modifiers are accepted and discarded — each changes how the JVM compiles a
+declaration, not what it computes. A **reified** type test is the one case that
+cannot be erased quietly: `x is T` / `x as T` against a type parameter has no
+answer a coarse type system could give, and answering `false` (the shape a
+name-based lookup falls into) would be silently wrong — so it is a compile error.
+
+Not yet (see roadmap): `sequence { … }` / `yield` (a generator needs a
+continuation this VM has no opcode for, so an infinite sequence cannot be
+modelled by evaluating eagerly), real generic *typing*, secondary constructors,
+delegation other than `by lazy`, directly invoking a call result (`f()()`; bind
+it first), the collection functions on a `String` receiver (`"abc".map { … }`,
 `"abc".toCharArray()`, `"abc".first()`; `for (c in s)` and `s[i]` work), and the
-rest of the standard-library surface.
+rest of the standard-library surface. Each fails loudly rather than answering
+wrong.
+
+One limitation is a **representation** limit rather than a missing feature, and
+so is excluded from the fuzzer and the frozen corpus by design: every integer is
+one `i64` at runtime, so a cast that has to tell a boxed `Int` from a boxed
+`Long` (`anyHoldingAnInt as Long`, which Kotlin rejects at run time) cannot be
+checked. It is the same class of exclusion as `Map.values`, whose `equals` and
+`hashCode` the JVM leaves as identity.
 
 The inheritance **modifiers are enforced**, on the same four rules Kotlin
 applies: a class may only extend a `class` marked `open`/`abstract`/`sealed`
@@ -489,6 +571,24 @@ fusevm::VM  ──►  three-tier Cranelift JIT (linear · block · tracing)
   by truncating the value stack to the depth recorded at `try` entry. A program
   with no `try`/`throw` emits **zero** extra ops and keeps the native print op,
   so it pays nothing for the feature.
+- **A captured `var` lives in a cell.** A lambda is a heap closure that copies
+  its upvalues at creation, so a write inside it could never reach the frame that
+  declared the variable. Before lowering a body, the compiler collects every name
+  a lambda anywhere inside it assigns to; a `var` declared there under one of
+  those names is stored in a one-element heap cell instead, and every read and
+  write goes through it. Both sides then hold the same handle, which is exactly
+  what the JVM backend does with its `Ref.IntRef` wrappers. The analysis
+  over-approximates on purpose — a name that turns out to be the lambda's own
+  local costs one cell and nothing else — because under-approximating would mean
+  a silently stale number.
+- **Two differential harnesses, and neither may see our own output.** The live
+  `parity-fuzz` binary generates programs and diffs them against a real
+  `kotlinc` + `kotlin` pair; `tests/data/parity_expected.txt` freezes a curated
+  corpus of the same programs with the output that toolchain gave, so CI can
+  replay them with no JVM installed. `scripts/capture-parity.sh` is the only way
+  records enter that file, and it invokes the reference toolchain **exclusively**
+  — a corpus recorded from kotlinrs would be a record of our own behaviour rather
+  than of Kotlin's, and would pass forever no matter what broke.
 
 ## [0x06] STATUS & ROADMAP
 
@@ -550,11 +650,28 @@ was being lexed byte-per-character (`"café".length` read 5), and a safe call
 returning a `String` displayed a null result as the empty string rather than
 `null`.
 
-Next: the collection functions on a `String` receiver (`"abc".map { … }`),
-generics, the `this`-receiver scope functions (`apply`/`run`), lambda
-element-type inference, default arguments, `as` casts, class body property
-initializers, and a growing standard-library surface — alongside the sibling
-parity tooling (LSP/DAP, reference generator, differential harness).
+Also landed, each closing a construct that previously failed loudly, and each
+pinned by a new differential-harness mode and frozen corpus records captured
+from the reference toolchain: **class body properties** (with a `data class`'s
+derived members still taken from the primary constructor alone), **extension
+functions** dispatched by the receiver's static type, **`companion object`**,
+the `this`-receiver **scope functions** (`run`/`apply`/`with`) beside the
+existing `it`-form, **default / `vararg` parameters** for every callee kind,
+**local `fun`s** that can recurse, **`Pair`/`Triple`**, **captured-`var`
+mutation** from a lambda, **`as`/`as?` casts**, **top-level properties** and
+**`by lazy`**, and **`runCatching`/`Result`**. Generic declarations and the
+`inline`-family modifiers are now accepted and erased, with a reified type test
+rejected rather than answered.
+
+The harness caught one silent bug in the process: `Pair(a, b) == Pair(c, d)` was
+comparing two heap handles numerically — answering `true` for any two pairs —
+because the constructor spelling was not inferred as a heap object the way
+`a to b` was.
+
+Next: `sequence { … }`/`yield`, the collection functions on a `String` receiver
+(`"abc".map { … }`), real generic typing, secondary constructors, and a growing
+standard-library surface — alongside the sibling parity tooling (LSP/DAP,
+reference generator, differential harness).
 
 ## [0xFF] LICENSE
 

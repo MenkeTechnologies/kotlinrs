@@ -362,6 +362,27 @@ fun main() { println(absolute(-4)) }   // 4</code></pre>
     println(twice(21))   // 42
 }</code></pre>
         </article>
+        <article class="doc-entry" id="doc-keywords-declarations-42">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-42">#</a> <code>companion</code></h3>
+          <pre><code class="lang-kotlin">class C { companion object { val K = 7; fun of(…): C = … } }</code></pre>
+          <p>Declares the class's singleton companion. Its properties and functions are reached through the class name (<code>C.K</code>, <code>C.of(…)</code>) and, from inside the class, without any qualifier. One per class; a named companion is reached the same way.</p>
+          <pre><code class="lang-kotlin">class C { companion object { val K = 7 } }
+println(C.K)   // 7</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keywords-declarations-43">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-43">#</a> <code>vararg</code></h3>
+          <pre><code class="lang-kotlin">fun f(vararg xs: T)</code></pre>
+          <p>Collects the call's trailing positional arguments into an array of the declared element type, which the body iterates or measures like any array. Supported as the last parameter.</p>
+          <pre><code class="lang-kotlin">fun total(vararg xs: Int): Int { var t = 0; for (x in xs) t += x; return t }
+println(total(1, 2, 3))   // 6</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keywords-declarations-44">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-44">#</a> <code>by</code></h3>
+          <pre><code class="lang-kotlin">val name: T by lazy { … }</code></pre>
+          <p>Property delegation. Only <code>by lazy</code> is supported: the block runs at the FIRST read and its value is cached, so an initializer with an effect fires at use rather than at startup. <code>lazy</code> requires <code>val</code>; any other delegate is a compile error.</p>
+          <pre><code class="lang-kotlin">val z: Int by lazy { println("forcing"); 42 }
+fun main() { println("before"); println(z); println(z) }</code></pre>
+        </article>
       </section>
 
       <section class="tutorial-section" id="ch-operators">
@@ -643,6 +664,15 @@ println(n)   // 1</code></pre>
           <pre><code class="lang-kotlin">stmt; stmt</code></pre>
           <p>The optional statement separator. Newlines already terminate statements, so <code>;</code> matters only when two statements share a line — including inside a <code>when</code> arm list written on one line.</p>
           <pre><code class="lang-kotlin">var a = 1; a += 1; println(a)   // 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-39">
+          <h3><a class="doc-anchor" href="#doc-operators-39">#</a> <code>as</code></h3>
+          <pre><code class="lang-kotlin">value as T
+value as? T</code></pre>
+          <p>A checked cast. The runtime value is unchanged — what the cast supplies is the static type <code>T</code>, which then decides integer width and <code>/</code> dispatch downstream. A mismatch throws <code>ClassCastException</code>; the safe form <code>as?</code> yields <code>null</code> instead. <code>Int</code> and <code>Long</code> share one runtime representation here, so a cast cannot tell them apart.</p>
+          <pre><code class="lang-kotlin">val a: Any = 5
+println((a as Int) / 2)   // 2
+println(a as? String)     // null</code></pre>
         </article>
       </section>
 
@@ -1972,9 +2002,69 @@ sumOf(selector: (T) -&gt; Double): Double</code></pre>
         <article class="doc-entry" id="doc-scope-functions-3">
           <h3><a class="doc-anchor" href="#doc-scope-functions-3">#</a> <code>takeIf</code></h3>
           <pre><code class="lang-kotlin">T.takeIf(predicate: (T) -&gt; Boolean): T?</code></pre>
-          <p>Yields the receiver when the predicate returns <code>true</code>, and <code>null</code> otherwise. <code>takeUnless</code> — its negation — is not implemented.</p>
+          <p>Yields the receiver when the predicate returns <code>true</code>, and <code>null</code> otherwise.</p>
           <pre><code class="lang-kotlin">println(5.takeIf { it &gt; 3 })   // 5
 println(2.takeIf { it &gt; 3 })   // null</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-scope-functions-4">
+          <h3><a class="doc-anchor" href="#doc-scope-functions-4">#</a> <code>takeUnless</code></h3>
+          <pre><code class="lang-kotlin">T.takeUnless(predicate: (T) -&gt; Boolean): T?</code></pre>
+          <p>The negation of <code>takeIf</code>: yields the receiver when the predicate returns <code>false</code>, and <code>null</code> otherwise.</p>
+          <pre><code class="lang-kotlin">println(5.takeUnless { it &gt; 3 })   // null
+println(2.takeUnless { it &gt; 3 })   // 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-scope-functions-5">
+          <h3><a class="doc-anchor" href="#doc-scope-functions-5">#</a> <code>run</code></h3>
+          <pre><code class="lang-kotlin">T.run(block: T.() -&gt; R): R
+run(block: () -&gt; R): R</code></pre>
+          <p>Runs the block with the receiver bound to **<code>this</code>** — so the receiver's members are reachable without a qualifier — and yields the block's result. The receiverless form <code>run { … }</code> is a block evaluated on the spot for its value.</p>
+          <pre><code class="lang-kotlin">println("abc".run { length })   // 3
+println(run { 1 + 2 })         // 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-scope-functions-6">
+          <h3><a class="doc-anchor" href="#doc-scope-functions-6">#</a> <code>apply</code></h3>
+          <pre><code class="lang-kotlin">T.apply(block: T.() -&gt; Unit): T</code></pre>
+          <p>Runs the block with the receiver bound to **<code>this</code>** for its side effect and yields the **receiver** — the configure-then-return idiom. <code>also</code> is the same shape with the receiver as <code>it</code> instead.</p>
+          <pre><code class="lang-kotlin">class Box(var w: Int)
+println(Box(1).apply { w = 5 }.w)   // 5</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-scope-functions-7">
+          <h3><a class="doc-anchor" href="#doc-scope-functions-7">#</a> <code>with</code></h3>
+          <pre><code class="lang-kotlin">with(receiver: T, block: T.() -&gt; R): R</code></pre>
+          <p>The free-function spelling of <code>run</code>: the argument becomes the block's <code>this</code>, and the block's result is the value.</p>
+          <pre><code class="lang-kotlin">println(with("hello") { uppercase() + length })   // HELLO5</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-result">
+        <h2>Result</h2>
+        <article class="doc-entry" id="doc-result-1">
+          <h3><a class="doc-anchor" href="#doc-result-1">#</a> <code>runCatching</code></h3>
+          <pre><code class="lang-kotlin">runCatching(block: () -&gt; T): Result&lt;T&gt;</code></pre>
+          <p>Runs the block and packages its outcome: <code>Success(v)</code> for a normal return, <code>Failure(&lt;throwable&gt;)</code> for a <code>throw</code> — including the runtime faults this frontend raises, so <code>runCatching { 1 / 0 }</code> is a failure rather than a halt.</p>
+          <pre><code class="lang-kotlin">println(runCatching { 6 / 2 })   // Success(3)
+println(runCatching { 1 / 0 }.isFailure)   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-result-2">
+          <h3><a class="doc-anchor" href="#doc-result-2">#</a> <code>getOrNull</code></h3>
+          <pre><code class="lang-kotlin">Result&lt;T&gt;.getOrNull(): T?</code></pre>
+          <p>The success value, or <code>null</code> on failure. <code>exceptionOrNull()</code> is its mirror — the throwable, or <code>null</code> on success.</p>
+          <pre><code class="lang-kotlin">println(runCatching { 6 / 2 }.getOrNull())   // 3
+println(runCatching { 1 / 0 }.getOrNull())   // null</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-result-3">
+          <h3><a class="doc-anchor" href="#doc-result-3">#</a> <code>getOrElse</code></h3>
+          <pre><code class="lang-kotlin">Result&lt;T&gt;.getOrElse(onFailure: (Throwable) -&gt; T): T</code></pre>
+          <p>The success value, or the block applied to the throwable. The block does not run at all on success.</p>
+          <pre><code class="lang-kotlin">println(runCatching { 1 / 0 }.getOrElse { -1 })   // -1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-result-4">
+          <h3><a class="doc-anchor" href="#doc-result-4">#</a> <code>isSuccess</code></h3>
+          <pre><code class="lang-kotlin">Result&lt;T&gt;.isSuccess: Boolean
+Result&lt;T&gt;.isFailure: Boolean</code></pre>
+          <p>Which branch of the union the result holds. <code>onSuccess</code>/<code>onFailure</code> run a block for the matching branch and yield the result unchanged; <code>map</code> transforms a success and passes a failure through.</p>
+          <pre><code class="lang-kotlin">println(runCatching { 6 / 2 }.isSuccess)   // true
+println(runCatching { 6 / 2 }.map { it + 1 })   // Success(4)</code></pre>
         </article>
       </section>
 

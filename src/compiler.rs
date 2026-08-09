@@ -21,15 +21,17 @@
 
 use crate::ast::*;
 use crate::host::{
-    KT_ARRAY, KT_ARRAY_INIT, KT_ARRAY_NEW, KT_CHR_STRING, KT_CLASSOF, KT_CLOSURE_CALL, KT_COLL_HOF,
-    KT_DBG_LINE, KT_DDIV, KT_DISPLAY, KT_EXC_ABORT, KT_EXC_CUT, KT_EXC_DEPTH, KT_EXC_MATCH,
-    KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND,
-    KT_FFI_CALL, KT_FFI_COMPILE, KT_GETFIELD, KT_IDIV, KT_IMOD, KT_IN, KT_INDEX_GET, KT_INDEX_SET,
-    KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_JOIN, KT_LIST, KT_MAKE_CLOSURE, KT_MAP,
-    KT_MATH, KT_METHOD, KT_NEW, KT_NOTNULL, KT_OBJEQ, KT_PAIR, KT_PRINT, KT_PRINTLN, KT_RANGE,
-    KT_RANGE_STEP, KT_SCOPE_FN, KT_SET, KT_SETFIELD, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG,
+    KT_ARRAY, KT_ARRAY_INIT, KT_ARRAY_NEW, KT_AS, KT_CHR_STRING, KT_CLASSOF, KT_CLOSURE_CALL,
+    KT_COLL_HOF, KT_DBG_LINE, KT_DDIV, KT_DISPLAY, KT_EXC_ABORT, KT_EXC_CUT, KT_EXC_DEPTH,
+    KT_EXC_MATCH, KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW,
+    KT_EXC_UNSTASH, KT_EXTEND, KT_FFI_CALL, KT_FFI_COMPILE, KT_GETFIELD, KT_IDIV, KT_IMOD, KT_IN,
+    KT_INDEX_GET, KT_INDEX_SET, KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_JOIN, KT_LAZY_GET,
+    KT_LAZY_NEW, KT_LIST, KT_MAKE_CLOSURE, KT_MAP, KT_MATH, KT_METHOD, KT_NEW, KT_NOTNULL,
+    KT_OBJEQ, KT_PAIR, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_RESULT_HOF,
+    KT_RUN_CATCHING, KT_SCOPE_FN, KT_SET, KT_SETFIELD, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 /// The desugar target a `rust { ... }` block lowers to (see [`crate::rust_ffi`]).
@@ -54,6 +56,13 @@ struct Binding {
     /// STATIC TYPE, so an untyped lambda parameter is a place the frontend gave
     /// up, not a place the information was absent.
     elem: Type,
+    /// This `var` lives in a one-element heap cell rather than directly in its
+    /// slot, because a lambda in the same frame ASSIGNS to it. A closure
+    /// captures by value, so the only way a write inside the lambda can be seen
+    /// by the frame that declared the variable is for both to hold the same heap
+    /// handle and read/write through it — which is what the JVM backend does
+    /// with its `Ref.IntRef` wrappers.
+    boxed: bool,
 }
 
 /// A checkpoint of scope state, taken on block entry and restored on block exit
@@ -117,6 +126,7 @@ impl Scope {
                 mutable,
                 class,
                 elem,
+                boxed: false,
             },
         );
         self.undo.push((name.to_string(), prev));
@@ -180,10 +190,26 @@ impl Scope {
         let mut out: Vec<Captured> = self
             .map
             .iter()
-            .map(|(n, b)| (n.clone(), b.slot, b.ty, b.class.clone(), b.elem))
+            .map(|(n, b)| Captured {
+                name: n.clone(),
+                slot: b.slot,
+                ty: b.ty,
+                class: b.class.clone(),
+                elem: b.elem,
+                boxed: b.boxed,
+            })
             .collect();
-        out.sort_by_key(|(_, slot, _, _, _)| *slot);
+        out.sort_by_key(|c| c.slot);
         out
+    }
+    /// Move `name`'s binding into a heap cell (see [`Binding::boxed`]).
+    fn box_binding(&mut self, name: &str) {
+        if let Some(b) = self.map.get_mut(name) {
+            b.boxed = true;
+        }
+    }
+    fn is_boxed(&self, name: &str) -> bool {
+        self.map.get(name).is_some_and(|b| b.boxed)
     }
 }
 
@@ -194,6 +220,9 @@ struct PropMeta {
     ty: Type,
     class: Option<String>,
     mutable: bool,
+    /// Declared `by lazy` — the stored value is a cell, so every read forces it
+    /// (see [`crate::host::KT_LAZY_GET`]).
+    lazy: bool,
 }
 
 /// Static signature of a user function or class method.
@@ -202,9 +231,28 @@ struct FnSig {
     ret: Type,
     ret_class: Option<String>,
     arity: usize,
-    /// Parameter names, in declaration order — what a named argument
-    /// (`f(count = 3)`) binds against.
-    params: Vec<String>,
+    /// The parameters in declaration order. Names are what a named argument
+    /// (`f(count = 3)`) binds against; the defaults and the `vararg` marker are
+    /// what [`Compiler::expand_args`] fills an under-supplied call from.
+    params: Vec<Param>,
+}
+
+impl FnSig {
+    fn of(f: &FunDecl) -> FnSig {
+        FnSig {
+            ret: f.ret,
+            ret_class: f.ret_class.clone(),
+            arity: f.params.len(),
+            params: f.params.clone(),
+        }
+    }
+}
+
+/// The mangled sub name an extension function's body is emitted under. `$`
+/// cannot appear in a Kotlin identifier, so it can never collide with a free
+/// function, a method, or another receiver's extension of the same name.
+fn ext_sub_name(recv: &str, name: &str) -> String {
+    format!("{recv}$ext${name}")
 }
 
 /// Compile-time metadata for a `class` / `data class` / `object` / `interface`,
@@ -224,7 +272,13 @@ struct ClassMeta {
     props: Vec<PropMeta>,
     /// This class's own stored fields only — what its constructor contributes on
     /// top of the base instance. Equal to `props` for a class with no superclass.
+    /// Primary-constructor properties first, then the body ones.
     own_props: Vec<PropMeta>,
+    /// How many leading entries of `own_props` came from the primary
+    /// constructor. A `data class`'s `toString`/`equals`/`hashCode`/`componentN`
+    /// read only those — `data class D(val a: Int) { val b = 2 }` prints
+    /// `D(a=1)` — so the count travels to the runtime in the meta string.
+    data_len: usize,
     /// The primary-constructor parameters in declaration order, including the
     /// ones that are *not* stored properties (`class Dog(name: String, …)`,
     /// whose `name` is forwarded to the superclass rather than kept).
@@ -256,9 +310,13 @@ impl ClassMeta {
         self.props.iter().find(|p| p.name == name)
     }
     /// The `KT_NEW` / `KT_EXTEND` metadata string for this class's OWN fields:
-    /// `"Name\x1f(d|c)\x1fwidths\x1ffield0\x1f…"`. A subclass's base fields ride
-    /// on the base instance `KT_EXTEND` builds from, so they are not repeated
-    /// here.
+    /// `"Name\x1f(d|c)\x1fdataLen\x1fwidths\x1ffield0\x1f…"`. A subclass's base
+    /// fields ride on the base instance `KT_EXTEND` builds from, so they are not
+    /// repeated here.
+    ///
+    /// `dataLen` is how many of the own fields the primary constructor
+    /// contributed — the ones a `data class`'s derived members read (see
+    /// [`ClassMeta::data_len`]).
     ///
     /// `widths` is one character per own property, `'l'` for a declared `Long`
     /// and `'.'` otherwise. A `data class`'s generated `hashCode` needs it: the
@@ -269,6 +327,8 @@ impl ClassMeta {
         let mut s = self.name.clone();
         s.push('\u{1f}');
         s.push(if self.is_data { 'd' } else { 'c' });
+        s.push('\u{1f}');
+        s.push_str(&self.data_len.to_string());
         s.push('\u{1f}');
         for p in &self.own_props {
             s.push(if p.ty == Type::Long { 'l' } else { '.' });
@@ -336,8 +396,16 @@ pub struct Compiler {
     b: ChunkBuilder,
     /// name → signature for user functions, filled before lowering.
     fun_sig: HashMap<String, FnSig>,
+    /// `(receiver type name, function name)` → signature, for the extension
+    /// functions the program declares (`fun Int.dbl()`). Keyed on the receiver
+    /// because the same name may be extended onto several types.
+    extensions: HashMap<(String, String), FnSig>,
     /// class/object name → metadata, filled before lowering.
     classes: HashMap<String, ClassMeta>,
+    /// Top-level `val`/`var` properties by name. They live in chunk globals, so
+    /// every function sees them; a local of the same name shadows one, which is
+    /// why the slot lookup always runs first.
+    globals: HashMap<String, PropMeta>,
     /// method name → the `(runtime class tag, owning type)` pairs a call on that
     /// name may land in. Backs virtual dispatch; see [`build_method_index`].
     method_index: HashMap<String, Vec<(String, String)>>,
@@ -364,6 +432,25 @@ pub struct Compiler {
     pending_lambdas: Vec<PendingLambda>,
     /// Monotonic id for synthetic lambda sub names (`$lambda$0`, `$lambda$1`, …).
     lambdas_seen: u32,
+    /// Local `fun`s discovered while lowering, awaiting emission as ordinary
+    /// subroutines once the enclosing body is finished (emitting one mid-body
+    /// would splice it into the caller's instruction stream).
+    pending_local_funs: Vec<PendingLocalFun>,
+    /// Visible local-`fun` name → the unique sub its body was emitted under.
+    /// Saved and restored around each `fun` body, so a local name is visible for
+    /// the rest of its enclosing function and never leaks past it.
+    local_funs: HashMap<String, String>,
+    /// The signatures of those same local `fun`s. Kept apart from `fun_sig` so a
+    /// local declaration cannot leak into another function's name resolution;
+    /// it shadows a top-level function of the same name while in scope.
+    local_sigs: HashMap<String, FnSig>,
+    /// Monotonic id for the mangled local-`fun` sub names.
+    local_funs_seen: u32,
+    /// The names a lambda somewhere in the CURRENT frame's body assigns to. A
+    /// `var` declared in this frame under one of them is stored boxed, so the
+    /// lambda's write is visible to the frame (see [`Binding::boxed`]).
+    /// Recomputed on entry to each `fun`/lambda body.
+    boxed_vars: HashSet<String>,
     /// Parameter types for the NEXT lambda literal to be lowered, published by
     /// the call site that is about to consume it (see
     /// [`Compiler::compile_coll_hof`]) and taken by [`Compiler::compile_lambda`].
@@ -377,6 +464,13 @@ pub struct Compiler {
     /// when it is itself a sequence (a `windowed` group, a nested list) — the
     /// type of ITS elements, so a second lambda one level down is typed too.
     lambda_hint: Option<Vec<(Type, Type)>>,
+    /// The RECEIVER type for the next lambda literal, published by a
+    /// receiver-scope call site (`x.run { … }`, `x.apply { … }`,
+    /// `with(x) { … }`). It makes the block's first parameter `this` instead of
+    /// `it`, which is the only difference between the two families of scope
+    /// function — and what lets the block name the receiver's members with no
+    /// qualifier.
+    lambda_recv: Option<(Type, Option<String>)>,
     /// The `kotlin.math` names the program's imports brought into scope, as
     /// *visible spelling* → *runtime name*. Kotlin does NOT auto-import
     /// `kotlin.math`, so `abs`/`sqrt`/`PI` are compile errors without an import,
@@ -464,6 +558,17 @@ fn math_scope(imports: &[ImportDecl]) -> (HashMap<String, String>, bool) {
     (scope, star)
 }
 
+/// A local `fun` queued for emission, with the name environment its body must
+/// see. Both tables are snapshots taken at the declaration: the body has to
+/// resolve ITS OWN name (that is what makes a local `fun` able to recurse where
+/// a closure cannot) and every local `fun` declared before it, and nothing that
+/// the enclosing function declared afterwards.
+struct PendingLocalFun {
+    decl: FunDecl,
+    local_funs: HashMap<String, String>,
+    local_sigs: HashMap<String, FnSig>,
+}
+
 /// A lambda body queued for emission as a subroutine. `params` already has the
 /// implicit `it` injected when the literal had no explicit parameters. `captures`
 /// are the enclosing-frame bindings the lambda closes over (its upvalues), in the
@@ -478,12 +583,31 @@ struct PendingLambda {
     captures: Vec<Captured>,
     body: Vec<Stmt>,
     class: Option<String>,
+    /// The class/container name of a receiver-scope block's `this`, when the
+    /// frontend could name it. Distinct from `class`, which is the *user* class
+    /// whose members are in implicit scope: a `String` receiver names no user
+    /// class but still binds `this`.
+    recv_class: Option<String>,
+    /// The local-`fun` environment visible at the literal, snapshotted for the
+    /// same reason a queued local `fun` snapshots one: the body is emitted long
+    /// after the frame that declared those names finished lowering.
+    local_funs: HashMap<String, String>,
+    local_sigs: HashMap<String, FnSig>,
 }
 
-/// One captured binding as a lambda sees it: `(name, slot, type, class,
-/// element type)`. The slot is the ENCLOSING frame's, read at closure-creation
-/// time; the lambda body re-declares the name in its own frame.
-type Captured = (String, u16, Type, Option<String>, Type);
+/// One captured binding as a lambda sees it. `slot` is the ENCLOSING frame's,
+/// read at closure-creation time; the lambda body re-declares the name in its
+/// own frame. `boxed` travels because a captured heap cell must still be
+/// read/written through, not treated as the value itself.
+#[derive(Clone)]
+struct Captured {
+    name: String,
+    slot: u16,
+    ty: Type,
+    class: Option<String>,
+    elem: Type,
+    boxed: bool,
+}
 
 /// Backpatch bookkeeping for one enclosing loop. `break`/`continue` emit a
 /// `Jump(0)` and stash its op index here; the loop patches them once its exit
@@ -622,6 +746,7 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
             ty: p.ty,
             class: p.class.clone(),
             mutable: p.kind == PropKind::Var,
+            lazy: false,
         };
         // The superclass whose constructor this one chains to (interfaces have
         // none), and the built-in throwable the ancestry ultimately reaches.
@@ -652,23 +777,25 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
                 ty: Type::NullableString,
                 class: None,
                 mutable: false,
+                lazy: false,
             });
         }
-        if cd.is_object {
-            own_props.extend(cd.obj_props.iter().map(|(n, ty, class, _)| PropMeta {
-                name: n.clone(),
-                ty: *ty,
-                class: class.clone(),
-                mutable: true,
-            }));
-        } else {
-            own_props.extend(
-                cd.params
-                    .iter()
-                    .filter(|p| p.kind != PropKind::None)
-                    .map(own_field),
-            );
-        }
+        own_props.extend(
+            cd.params
+                .iter()
+                .filter(|p| p.kind != PropKind::None)
+                .map(own_field),
+        );
+        // Everything up to here comes from the primary constructor, which is
+        // exactly what a `data class`'s derived members read (see `data_len`).
+        let data_len = own_props.len();
+        own_props.extend(cd.obj_props.iter().map(|p| PropMeta {
+            name: p.name.clone(),
+            ty: p.ty,
+            class: p.class.clone(),
+            mutable: p.mutable,
+            lazy: p.lazy,
+        }));
 
         // The full field record, base-most first — the order `KT_EXTEND` builds
         // an instance in, so property lookup and `data` display agree with it.
@@ -680,6 +807,21 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
             for p in d.params.iter().filter(|p| p.kind != PropKind::None) {
                 if !props.iter().any(|x| x.name == p.name) {
                     props.push(own_field(p));
+                }
+            }
+            // An ancestor's body properties are stored fields too, and sit after
+            // its constructor ones — the same order its own constructor built
+            // them in, which is what keeps the flat record aligned with the
+            // instance.
+            for p in &d.obj_props {
+                if !props.iter().any(|x| x.name == p.name) {
+                    props.push(PropMeta {
+                        name: p.name.clone(),
+                        ty: p.ty,
+                        class: p.class.clone(),
+                        mutable: p.mutable,
+                        lazy: p.lazy,
+                    });
                 }
             }
         }
@@ -702,12 +844,9 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
                 continue;
             };
             for m in &d.methods {
-                methods.entry(m.name.clone()).or_insert(FnSig {
-                    ret: m.ret,
-                    ret_class: m.ret_class.clone(),
-                    arity: m.params.len(),
-                    params: m.params.iter().map(|p| p.name.clone()).collect(),
-                });
+                methods
+                    .entry(m.name.clone())
+                    .or_insert_with(|| FnSig::of(m));
             }
         }
         let own_methods = cd
@@ -727,6 +866,7 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
                 is_abstract: cd.is_abstract || cd.is_sealed,
                 props,
                 own_props,
+                data_len,
                 ctor_params: cd.params.clone(),
                 methods,
                 own_methods,
@@ -800,17 +940,44 @@ pub fn compile_debug(program: &Program) -> Result<Chunk, String> {
 /// Compile a program to a runnable chunk, optionally instrumented with debug
 /// line markers. Requires a `fun main`.
 pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
+    // Extensions live in their own table keyed by `(receiver type, name)`: they
+    // are NOT callable as free functions, and two receivers may each declare one
+    // of the same name.
     let mut fun_sig = HashMap::new();
+    let mut extensions: HashMap<(String, String), FnSig> = HashMap::new();
     for f in &program.funs {
-        fun_sig.insert(
-            f.name.clone(),
-            FnSig {
-                ret: f.ret,
-                ret_class: f.ret_class.clone(),
-                arity: f.params.len(),
-                params: f.params.iter().map(|p| p.name.clone()).collect(),
-            },
-        );
+        match &f.recv {
+            Some((recv, _, _)) => {
+                if extensions
+                    .insert((recv.clone(), f.name.clone()), FnSig::of(f))
+                    .is_some()
+                {
+                    return Err(format!("conflicting declarations for {recv}.{}", f.name));
+                }
+            }
+            None => {
+                fun_sig.insert(f.name.clone(), FnSig::of(f));
+            }
+        }
+    }
+
+    let mut globals: HashMap<String, PropMeta> = HashMap::new();
+    for p in &program.props {
+        if globals
+            .insert(
+                p.name.clone(),
+                PropMeta {
+                    name: p.name.clone(),
+                    ty: p.ty,
+                    class: p.class.clone(),
+                    mutable: p.mutable,
+                    lazy: p.lazy,
+                },
+            )
+            .is_some()
+        {
+            return Err(format!("conflicting declarations for top-level {}", p.name));
+        }
     }
 
     let classes = build_class_meta(program)?;
@@ -827,7 +994,9 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
     let mut c = Compiler {
         b: ChunkBuilder::new(),
         fun_sig,
+        extensions,
         classes,
+        globals,
         method_index,
         cur_class: None,
         debug,
@@ -835,7 +1004,13 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
         loops: Vec::new(),
         pending_lambdas: Vec::new(),
         lambdas_seen: 0,
+        pending_local_funs: Vec::new(),
+        local_funs: HashMap::new(),
+        local_sigs: HashMap::new(),
+        local_funs_seen: 0,
+        boxed_vars: HashSet::new(),
         lambda_hint: None,
+        lambda_recv: None,
         math_scope: HashMap::new(),
         math_star: false,
         has_try: uses_exceptions(program),
@@ -866,6 +1041,24 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
             c.build_object(cd)?;
         }
     }
+    // Top-level properties initialize in declaration order, before `main`. A
+    // `by lazy` one stores an unforced cell instead — its thunk runs at the
+    // first READ, which is the whole difference between the two forms.
+    for p in &program.props {
+        let mut sc = Scope::new();
+        let t = c.compile_expr(&mut sc, &p.init)?;
+        if p.lazy {
+            c.b.emit(Op::Extended(KT_LAZY_NEW, 0), 0);
+        } else if c.globals[&p.name].ty == Type::Unknown {
+            // An unannotated global takes the initializer's type.
+            if let Some(g) = c.globals.get_mut(&p.name) {
+                g.ty = t;
+            }
+        }
+        let g = c.b.add_name(&p.name);
+        c.b.emit(Op::SetVar(g), 0);
+    }
+
     let main_idx = c.b.add_name("main");
     for _ in &main.params {
         c.b.emit(Op::MakeArray(0), main.line);
@@ -903,8 +1096,24 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
     }
     // Lambda bodies emit as subroutine regions last. Draining may enqueue further
     // lambdas (one nested inside another), so loop until the queue is empty.
-    while let Some(pl) = c.pending_lambdas.pop() {
-        c.compile_lambda_body(pl)?;
+    // Lambda bodies and local `fun` bodies both emit after everything that can
+    // enqueue them, and each may enqueue the other, so the two queues drain
+    // together until both are empty.
+    loop {
+        if let Some(pl) = c.pending_lambdas.pop() {
+            c.compile_lambda_body(pl)?;
+            continue;
+        }
+        match c.pending_local_funs.pop() {
+            Some(pf) => {
+                c.local_funs = pf.local_funs;
+                c.local_sigs = pf.local_sigs;
+                c.compile_fun(&pf.decl, None)?;
+                c.local_funs.clear();
+                c.local_sigs.clear();
+            }
+            None => break,
+        }
     }
 
     let end = c.b.current_pos();
@@ -920,8 +1129,21 @@ impl Compiler {
         let meta_idx = self.b.add_constant(Value::str(meta.meta_string()));
         self.b.emit(Op::LoadConst(meta_idx), cd.line);
         let mut sc = Scope::new();
-        for (_, _, _, init) in &cd.obj_props {
-            self.compile_expr(&mut sc, init)?;
+        // Each initializer is evaluated in order and bound to a slot, so a later
+        // one can name an earlier property (`val a = 1; val b = a + 1`). The
+        // slots are read back below in field order.
+        for p in &cd.obj_props {
+            let t = self.compile_expr(&mut sc, &p.init)?;
+            if p.lazy {
+                self.b.emit(Op::Extended(KT_LAZY_NEW, 0), cd.line);
+            }
+            let ty = if p.ty == Type::Unknown { t } else { p.ty };
+            let slot = sc.declare_obj(&p.name, ty, p.mutable, p.class.clone());
+            self.b.emit(Op::SetSlot(slot), cd.line);
+        }
+        for p in &cd.obj_props {
+            let slot = sc.slot(&p.name).expect("body property just declared");
+            self.b.emit(Op::GetSlot(slot), cd.line);
         }
         self.b
             .emit(Op::Extended(KT_NEW, meta.own_props.len() as u8), cd.line);
@@ -993,6 +1215,21 @@ impl Compiler {
                 .emit(Op::Call(idx, meta.super_args.len() as u8), cd.line);
         }
 
+        // Body properties (`class C { var c = 0 }`) initialize after the
+        // superclass constructor has run — Kotlin's own order — and each binds a
+        // slot so a later initializer can name an earlier property. The base
+        // instance is already on the stack; every initializer is stack-neutral
+        // (push then `SetSlot`), so it stays put.
+        for p in &cd.obj_props {
+            let t = self.compile_expr(&mut sc, &p.init)?;
+            if p.lazy {
+                self.b.emit(Op::Extended(KT_LAZY_NEW, 0), cd.line);
+            }
+            let ty = if p.ty == Type::Unknown { t } else { p.ty };
+            let slot = sc.declare_obj(&p.name, ty, p.mutable, p.class.clone());
+            self.b.emit(Op::SetSlot(slot), cd.line);
+        }
+
         let midx = self.b.add_constant(Value::str(meta.meta_string()));
         self.b.emit(Op::LoadConst(midx), cd.line);
         // A throwable subclass's first own field is the synthetic `message`.
@@ -1058,18 +1295,25 @@ impl Compiler {
     /// `Some(name)`, adding an implicit `this` in slot 0).
     fn compile_fun(&mut self, f: &FunDecl, class: Option<&str>) -> Result<(), String> {
         let entry = self.b.current_pos();
-        let sub_name = match class {
-            Some(cls) => method_sub_name(cls, &f.name),
-            None => f.name.clone(),
+        let sub_name = match (class, &f.recv) {
+            (Some(cls), _) => method_sub_name(cls, &f.name),
+            (None, Some((recv, _, _))) => ext_sub_name(recv, &f.name),
+            (None, None) => f.name.clone(),
         };
         let name_idx = self.b.add_name(&sub_name);
         self.b.add_sub_entry(name_idx, entry);
 
         let mut sc = Scope::new();
         let mut nslots = f.params.len();
-        // A method receives `this` (the instance handle) as arg 0.
+        // A method receives `this` (the instance handle) as arg 0; an extension
+        // receives its receiver there under the same name, which is what makes
+        // `this` — and, for a user-class receiver, a bare property name — read
+        // inside the body exactly as it does inside a method.
         if let Some(cls) = class {
             sc.declare_obj("this", Type::Obj, false, Some(cls.to_string()));
+            nslots += 1;
+        } else if let Some((_, ty, cls)) = &f.recv {
+            sc.declare_obj("this", *ty, false, cls.clone());
             nslots += 1;
         }
         // Parameters occupy the following slots in declaration order. Kotlin
@@ -1082,7 +1326,14 @@ impl Compiler {
             self.b.emit(Op::SetSlot(i as u16), f.line);
         }
 
-        self.cur_class = class.map(|s| s.to_string());
+        // An extension on a user class puts that class's members in implicit
+        // scope too — `fun Person.loud() = name.uppercase()` reads `this.name`.
+        self.cur_class = class.map(|s| s.to_string()).or_else(|| {
+            f.recv
+                .as_ref()
+                .and_then(|(_, _, c)| c.clone())
+                .filter(|c| self.classes.contains_key(c))
+        });
         // The frame is its own unwind boundary: an exception with no handler
         // inside it leaves the frame, and the caller's check resumes the walk.
         // A `return` likewise belongs to this frame, so an enclosing `try`'s
@@ -1090,12 +1341,22 @@ impl Compiler {
         self.push_unwind(UnwindKind::Frame);
         let outer_returns = std::mem::take(&mut self.finally_returns);
         let outer_exits = std::mem::take(&mut self.finally_exits);
+        let outer_boxed = std::mem::replace(&mut self.boxed_vars, lambda_writes(&f.body));
+        // Local `fun` names belong to the body being lowered. The tables are
+        // snapshotted rather than cleared, because a queued local `fun`'s own
+        // body is compiled with the environment its declaration saw — which is
+        // what the drain loop installs before calling here.
+        let outer_locals = self.local_funs.clone();
+        let outer_local_sigs = self.local_sigs.clone();
         let res: Result<(), String> = (|| {
             for s in &f.body {
                 self.compile_stmt(&mut sc, s)?;
             }
             Ok(())
         })();
+        self.local_funs = outer_locals;
+        self.local_sigs = outer_local_sigs;
+        self.boxed_vars = outer_boxed;
         self.cur_class = None;
         self.finally_returns = outer_returns;
         self.finally_exits = outer_exits;
@@ -1198,6 +1459,31 @@ impl Compiler {
             self.b.emit(Op::Extended(KT_DBG_LINE, 0), s.line);
         }
         match &s.kind {
+            // A local `fun` emits no code here: it is registered under a unique
+            // sub name and queued for emission after the enclosing body, so a
+            // call to it — including a call from its own body — is an ordinary
+            // direct `Op::Call`. Registration happens at the declaration's
+            // position, which is where Kotlin makes the name visible.
+            StmtKind::LocalFun(lf) => {
+                if lf.recv.is_some() {
+                    return Err(format!(
+                        "local fun {}: an extension receiver is only supported at the top level",
+                        lf.name
+                    ));
+                }
+                let id = self.local_funs_seen;
+                self.local_funs_seen += 1;
+                let sub = format!("{}$local${id}", lf.name);
+                self.local_funs.insert(lf.name.clone(), sub.clone());
+                self.local_sigs.insert(lf.name.clone(), FnSig::of(lf));
+                let mut decl = lf.clone();
+                decl.name = sub;
+                self.pending_local_funs.push(PendingLocalFun {
+                    decl,
+                    local_funs: self.local_funs.clone(),
+                    local_sigs: self.local_sigs.clone(),
+                });
+            }
             StmtKind::Let {
                 name,
                 ty,
@@ -1224,7 +1510,18 @@ impl Compiler {
                     vty = Type::Obj;
                 }
                 self.lambda_hint = None;
+                // A `var` that a lambda in this frame writes to is stored in a
+                // one-element heap cell instead of directly in the slot, so the
+                // closure's captured copy of the HANDLE still reaches the same
+                // storage (see [`Binding::boxed`]).
+                let boxed = *mutable && self.boxed_vars.contains(name);
+                if boxed {
+                    self.b.emit(Op::Extended(KT_LIST, 1), 0);
+                }
                 let slot = sc.declare_full(name, vty, *mutable, class, elem);
+                if boxed {
+                    sc.box_binding(name);
+                }
                 // A raise inside the initializer must not commit its garbage
                 // result to the new binding.
                 self.unwind_check_dropping(1);
@@ -1255,9 +1552,46 @@ impl Compiler {
                         }
                     }
                 }
+                // A top-level `var`.
+                if sc.slot(name).is_none() {
+                    if let Some(p) = self.globals.get(name).cloned() {
+                        if !p.mutable {
+                            return Err(format!("val cannot be reassigned: {name}"));
+                        }
+                        let full = match op {
+                            None => value.clone(),
+                            Some(binop) => Expr::Binary {
+                                op: *binop,
+                                l: Box::new(Expr::Var(name.clone())),
+                                r: Box::new(value.clone()),
+                            },
+                        };
+                        self.compile_expr(sc, &full)?;
+                        let g = self.b.add_name(name);
+                        self.b.emit(Op::SetVar(g), 0);
+                        return Ok(());
+                    }
+                }
                 let slot = sc
                     .slot(name)
                     .ok_or_else(|| format!("unresolved reference: {name}"))?;
+                // A boxed `var` is written through its cell: the slot itself
+                // holds the handle and never changes.
+                if sc.is_boxed(name) {
+                    let full = match op {
+                        None => value.clone(),
+                        Some(binop) => Expr::Binary {
+                            op: *binop,
+                            l: Box::new(Expr::Var(name.clone())),
+                            r: Box::new(value.clone()),
+                        },
+                    };
+                    self.b.emit(Op::GetSlot(slot), 0);
+                    self.b.emit(Op::LoadInt(0), 0);
+                    self.compile_expr(sc, &full)?;
+                    self.b.emit(Op::Extended(KT_INDEX_SET, 0), 0);
+                    return Ok(());
+                }
                 match op {
                     None => {
                         self.compile_expr(sc, value)?;
@@ -1735,6 +2069,12 @@ impl Compiler {
             Expr::Var(name) => {
                 if let Some(slot) = sc.slot(name) {
                     self.b.emit(Op::GetSlot(slot), 0);
+                    // A boxed `var` holds a one-element cell; the value is
+                    // element 0 of it.
+                    if sc.is_boxed(name) {
+                        self.b.emit(Op::LoadInt(0), 0);
+                        self.b.emit(Op::Extended(KT_INDEX_GET, 0), 0);
+                    }
                     return Ok(sc.ty(name));
                 }
                 // Implicit `this`: a bare name that is a property of the class
@@ -1755,6 +2095,27 @@ impl Compiler {
                         );
                     }
                 }
+                // A companion property named without a qualifier from inside the
+                // owning class — `companion object { val K = 7 }` makes `K`
+                // visible to every member.
+                if let Some(comp) = self
+                    .cur_class
+                    .clone()
+                    .and_then(|c| self.companion_of(&c))
+                    .filter(|c| self.classes[c].prop(name).is_some())
+                {
+                    return self.compile_member(sc, &Expr::Var(comp), name, &[], false, 0);
+                }
+                // A top-level property. Declared after the local lookup, so a
+                // local of the same name shadows it as Kotlin's does.
+                if let Some(p) = self.globals.get(name).cloned() {
+                    let g = self.b.add_name(name);
+                    self.b.emit(Op::GetVar(g), 0);
+                    if p.lazy {
+                        self.b.emit(Op::CallBuiltin(KT_LAZY_GET, 0), 0);
+                    }
+                    return Ok(p.ty);
+                }
                 // A bare reference to an `object` singleton loads its global.
                 if self.classes.get(name).is_some_and(|m| m.is_object) {
                     let g = self.b.add_name(name);
@@ -1764,6 +2125,15 @@ impl Compiler {
                 // `kotlin.math.PI` / `.E`, in scope only under the import.
                 if let Some(rt) = self.resolve_math_const(name) {
                     return self.compile_math_const(&rt, 0);
+                }
+                // Inside a receiver scope whose receiver is NOT a user class — a
+                // `String`/`List`/range block from `run`/`apply`/`with`, or an
+                // extension on one — a bare name is a member of that receiver:
+                // `"abc".run { length }`. Restricted to that case so an
+                // unresolved name inside a class method keeps its compile-time
+                // diagnostic, where the member set IS statically known.
+                if sc.slot("this").is_some() && self.cur_class.is_none() {
+                    return self.compile_member(sc, &Expr::Var("this".into()), name, &[], false, 0);
                 }
                 Err(format!("unresolved reference: {name}"))
             }
@@ -1858,6 +2228,17 @@ impl Compiler {
                     self.b.emit(Op::LogNot, 0);
                 }
                 Ok(Type::Boolean)
+            }
+            // `x as T` — the value passes through unchanged; what the cast
+            // supplies is the STATIC type `T`, which is what decides integer
+            // width and `/` dispatch from here on. The runtime op only enforces
+            // the check (throw for `as`, null for `as?`).
+            Expr::As { value, ty, safe } => {
+                self.compile_expr(sc, value)?;
+                let nidx = self.b.add_constant(Value::str(ty.clone()));
+                self.b.emit(Op::LoadConst(nidx), 0);
+                self.b.emit(Op::Extended(KT_AS, u8::from(*safe)), 0);
+                Ok(cast_type(ty, *safe))
             }
             Expr::IncDec {
                 target,
@@ -2231,6 +2612,15 @@ impl Compiler {
                 _ => return Err(format!("unresolved reference: Math.{name}")),
             }
         }
+        // `Owner.member` where `Owner` names a class with a `companion object`:
+        // the companion singleton is the real receiver. A rewrite rather than a
+        // dedicated path, so property reads and method calls both reach it
+        // through what a named `object` already uses.
+        if let Expr::Var(cls) = recv {
+            if let Some(comp) = self.companion_of(cls) {
+                return self.compile_member(sc, &Expr::Var(comp), name, args, false, line);
+            }
+        }
         // A companion constant on a primitive type (`Int.MAX_VALUE`,
         // `Double.NaN`). These are compile-time literals, so they fold here
         // rather than paying a host dispatch — and the receiver is a *type*
@@ -2288,6 +2678,42 @@ impl Compiler {
                 return Ok(Type::String);
             }
         }
+        // An extension function on this receiver's type. Kotlin resolves a
+        // MEMBER of the same name first — an extension can never shadow one — so
+        // a receiver whose static class declares the name at this arity skips
+        // this arm and dispatches virtually below.
+        let member_wins = self.infer_class(sc, recv).is_some_and(|c| {
+            self.classes
+                .get(&c)
+                .and_then(|m| m.methods.get(name))
+                .is_some_and(|s| s.arity == args.len())
+        });
+        if !member_wins {
+            if let Some((sub, sig)) = self.resolve_ext(sc, recv, name) {
+                let full = self.expand_args(name, &sig.params, args)?;
+                self.compile_expr(sc, recv)?;
+                for a in &full {
+                    self.compile_expr(sc, a)?;
+                }
+                let idx = self.b.add_name(&sub);
+                self.b.emit(Op::Call(idx, (full.len() + 1) as u8), line);
+                return Ok(sig.ret);
+            }
+        }
+        // The lambda-taking `Result` members. Routed before the collection HOFs
+        // because `map`/`getOrElse` are spelled the same there and mean
+        // something else — the receiver's static class is what tells them apart.
+        if matches!(name, "getOrElse" | "onSuccess" | "onFailure" | "map")
+            && args.len() == 1
+            && self.infer_class(sc, recv).as_deref() == Some("Result")
+        {
+            self.compile_expr(sc, recv)?;
+            self.compile_expr(sc, &args[0])?;
+            let nidx = self.b.add_constant(Value::str(name.to_string()));
+            self.b.emit(Op::LoadConst(nidx), line);
+            self.b.emit(Op::CallBuiltin(KT_RESULT_HOF, 0), line);
+            return Ok(Type::Unknown);
+        }
         // Collection higher-order functions take a first-class lambda VALUE (a
         // trailing-lambda literal or a passed closure) and invoke it per element
         // at runtime via the `KT_COLL_HOF` builtin.
@@ -2298,11 +2724,25 @@ impl Compiler {
         if is_optional_hof(name) && args.last().is_some_and(is_lambda) {
             return self.compile_coll_hof(sc, recv, name, args, line);
         }
-        // `it`-form scope functions on any receiver: `x.let { … }` /
-        // `x.also { … }` / `x.takeIf { … }`.
-        if matches!(name, "let" | "also" | "takeIf") && args.len() == 1 {
+        // Scope functions on any receiver. They split two ways: `let`/`also`/
+        // `takeIf`/`takeUnless` hand the receiver to the block as the parameter
+        // `it`, while `run`/`apply` bind it as the block's `this` — which is
+        // what makes `"abc".run { length }` read a member with no qualifier.
+        // The two are one lowering: both invoke a one-parameter closure with the
+        // receiver, and only the parameter's NAME differs.
+        if is_scope_fn(name) && args.len() == 1 {
+            let rty = self.infer(sc, recv);
+            let relem = self.infer_elem(sc, recv);
+            let rcls = self.infer_class(sc, recv);
             self.compile_expr(sc, recv)?;
+            if is_recv_scope_fn(name) {
+                self.lambda_recv = Some((rty, rcls));
+            } else {
+                self.lambda_hint = Some(vec![(rty, relem)]);
+            }
             self.compile_expr(sc, &args[0])?; // the lambda → closure value
+            self.lambda_recv = None;
+            self.lambda_hint = None;
             let nidx = self.b.add_constant(Value::str(name.to_string()));
             self.b.emit(Op::LoadConst(nidx), line);
             self.b.emit(Op::CallBuiltin(KT_SCOPE_FN, 0), line);
@@ -2316,27 +2756,27 @@ impl Compiler {
                 // A user-declared method. The receiver's *runtime* class may be
                 // any subtype of its static one, so the call resolves against
                 // every candidate implementation (see [`Compiler::candidates`]).
-                if let Some(sig) = meta.methods.get(name) {
-                    if args.len() != sig.arity {
-                        return Err(format!(
-                            "method {name} on {cls} expects {} argument(s), got {}",
-                            sig.arity,
-                            args.len()
-                        ));
-                    }
-                    let cands = self.candidates(Some(cls), name, args.len());
+                if let Some(sig) = meta.methods.get(name).cloned() {
+                    let full =
+                        self.expand_args(&format!("method {name} on {cls}"), &sig.params, args)?;
+                    let cands = self.candidates(Some(cls), name, sig.arity);
                     if !cands.is_empty() {
-                        self.emit_virtual_call(sc, recv, name, args, &cands, line)?;
+                        self.emit_virtual_call(sc, recv, name, &full, &cands, line)?;
                         return Ok(sig.ret);
                     }
                 }
                 // A stored property read.
                 if args.is_empty() {
-                    if let Some(p) = meta.prop(name) {
+                    if let Some(p) = meta.prop(name).cloned() {
                         self.compile_expr(sc, recv)?;
                         let nidx = self.b.add_constant(Value::str(name.to_string()));
                         self.b.emit(Op::LoadConst(nidx), line);
                         self.b.emit(Op::Extended(KT_GETFIELD, 0), line);
+                        // A `by lazy` property stores a cell; reading it is what
+                        // runs the thunk, the first time.
+                        if p.lazy {
+                            self.b.emit(Op::CallBuiltin(KT_LAZY_GET, 0), line);
+                        }
                         return Ok(p.ty);
                     }
                 }
@@ -2660,8 +3100,11 @@ impl Compiler {
         params: &[(String, Type)],
         body: &[Stmt],
     ) -> Result<Type, String> {
+        // A receiver-scope block (`x.apply { … }`) takes the receiver as `this`
+        // rather than as `it`, so it gets no implicit `it` at all.
+        let recv = self.lambda_recv.take();
         // An unparameterized lambda has the single implicit parameter `it`.
-        let declared: Vec<(String, Type)> = if params.is_empty() {
+        let declared: Vec<(String, Type)> = if params.is_empty() && recv.is_none() {
             vec![("it".to_string(), Type::Unknown)]
         } else {
             params.to_vec()
@@ -2671,7 +3114,7 @@ impl Compiler {
         // `listOf(1, 2).map { … }` be an `Int` rather than a width the frontend
         // has to play safe with.
         let hint = self.lambda_hint.take().unwrap_or_default();
-        let effective: Vec<(String, Type, Type)> = declared
+        let mut effective: Vec<(String, Type, Type)> = declared
             .into_iter()
             .enumerate()
             .map(|(i, (n, t))| {
@@ -2682,26 +3125,44 @@ impl Compiler {
                 (n, if t == Type::Unknown { ht } else { t }, he)
             })
             .collect();
+        if let Some((rty, _)) = &recv {
+            effective.insert(0, ("this".to_string(), *rty, Type::Unknown));
+        }
         // Capture the whole visible enclosing environment (by value), minus names
         // the lambda's own parameters shadow. Captures use slots after the params
         // in the body; the push order here matches the body prologue's pop order.
         let caps: Vec<Captured> = sc
             .visible()
             .into_iter()
-            .filter(|(n, _, _, _, _)| !effective.iter().any(|(p, _, _)| p == n))
+            .filter(|c| !effective.iter().any(|(p, _, _)| *p == c.name))
             .collect();
-        for (_, slot, _, _, _) in &caps {
-            self.b.emit(Op::GetSlot(*slot), 0);
+        for c in &caps {
+            self.b.emit(Op::GetSlot(c.slot), 0);
         }
         let id = self.lambdas_seen;
         self.lambdas_seen += 1;
         let name_idx = self.b.add_name(&format!("$lambda${id}"));
+        let recv_class = recv.as_ref().and_then(|(_, c)| c.clone());
         self.pending_lambdas.push(PendingLambda {
             name_idx,
             params: effective.clone(),
             captures: caps.clone(),
             body: body.to_vec(),
-            class: self.cur_class.clone(),
+            // A receiver block over a user class puts THAT class's members in
+            // implicit scope, replacing any enclosing one.
+            class: recv_class
+                .clone()
+                .filter(|c| self.classes.contains_key(c))
+                .or_else(|| {
+                    if recv.is_some() {
+                        None
+                    } else {
+                        self.cur_class.clone()
+                    }
+                }),
+            recv_class,
+            local_funs: self.local_funs.clone(),
+            local_sigs: self.local_sigs.clone(),
         });
         self.b.emit(Op::LoadInt(name_idx as i64), 0);
         self.b.emit(Op::LoadInt(effective.len() as i64), 0);
@@ -2721,10 +3182,21 @@ impl Compiler {
 
         let mut sc = Scope::new();
         for (p, ty, elem) in &pl.params {
-            sc.declare_elem(p, *ty, false, *elem);
+            // `this` carries the receiver's class so member dispatch inside the
+            // block resolves as it would on the receiver itself.
+            if p == "this" {
+                sc.declare_obj(p, *ty, false, pl.recv_class.clone());
+            } else {
+                sc.declare_elem(p, *ty, false, *elem);
+            }
         }
-        for (n, _, ty, cl, elem) in &pl.captures {
-            sc.declare_full(n, *ty, false, cl.clone(), *elem);
+        for c in &pl.captures {
+            // A captured `var` stays mutable inside the lambda: the write goes
+            // through the shared cell, so the enclosing frame sees it.
+            sc.declare_full(&c.name, c.ty, c.boxed, c.class.clone(), c.elem);
+            if c.boxed {
+                sc.box_binding(&c.name);
+            }
         }
         let total = pl.params.len() + pl.captures.len();
         for i in (0..total).rev() {
@@ -2733,6 +3205,9 @@ impl Compiler {
 
         let saved = self.cur_class.take();
         self.cur_class = pl.class.clone();
+        let outer_locals = std::mem::replace(&mut self.local_funs, pl.local_funs.clone());
+        let outer_local_sigs = std::mem::replace(&mut self.local_sigs, pl.local_sigs.clone());
+        let outer_boxed = std::mem::replace(&mut self.boxed_vars, lambda_writes(&pl.body));
         // A lambda body is invoked through a nested `vm.run()`, so it is its own
         // frame for unwinding too: a raise inside it returns out, and the host
         // suppresses any further invocation while the exception is in flight.
@@ -2740,6 +3215,9 @@ impl Compiler {
         let outer_returns = std::mem::take(&mut self.finally_returns);
         let outer_exits = std::mem::take(&mut self.finally_exits);
         let res = self.compile_block_value(&mut sc, &pl.body);
+        self.local_funs = outer_locals;
+        self.local_sigs = outer_local_sigs;
+        self.boxed_vars = outer_boxed;
         self.cur_class = saved;
         self.finally_returns = outer_returns;
         self.finally_exits = outer_exits;
@@ -3205,6 +3683,45 @@ impl Compiler {
                 }
                 Ok(Type::Unit)
             }
+            // `with(x) { … }` — the free-function spelling of `x.run { … }`,
+            // and the only scope function written as a call rather than on a
+            // receiver. It routes through the same builtin.
+            "with" if args.len() == 2 && is_lambda(&args[1]) => {
+                self.compile_member(sc, &args[0], "run", &args[1..], false, line)
+            }
+            // `runCatching { … }` — run the block and package its outcome as a
+            // `Result`. It is a catch, so the program counts as using
+            // exceptions (see [`uses_exceptions`]) and the pending-slot
+            // machinery is emitted.
+            "runCatching" if args.len() == 1 && is_lambda(&args[0]) => {
+                self.compile_expr(sc, &args[0])?;
+                self.b.emit(Op::CallBuiltin(KT_RUN_CATCHING, 0), line);
+                Ok(Type::Obj)
+            }
+            // `run { … }` with no receiver: a block evaluated on the spot for
+            // its value. The closure takes no parameter at all, which is what
+            // separates it from the receiver form.
+            "run" if args.len() == 1 && is_lambda(&args[0]) => {
+                self.compile_expr(sc, &args[0])?;
+                self.b.emit(Op::CallBuiltin(KT_CLOSURE_CALL, 0), line);
+                Ok(Type::Unknown)
+            }
+            // `Pair(a, b)` / `Triple(a, b, c)` — the constructor spellings of
+            // what `a to b` already builds.
+            "Pair" if args.len() == 2 => {
+                for a in args {
+                    self.compile_expr(sc, a)?;
+                }
+                self.b.emit(Op::Extended(KT_PAIR, 0), line);
+                Ok(Type::Obj)
+            }
+            "Triple" if args.len() == 3 => {
+                for a in args {
+                    self.compile_expr(sc, a)?;
+                }
+                self.b.emit(Op::Extended(KT_PAIR, 1), line);
+                Ok(Type::Obj)
+            }
             // Collection builders → heap objects.
             "listOf" | "mutableListOf" | "arrayListOf" | "emptyList" => {
                 for a in args {
@@ -3310,17 +3827,40 @@ impl Compiler {
                     return self.compile_construct(sc, &meta, args, line);
                 }
                 // A free user function.
-                if let Some(sig) = self.fun_sig.get(name).cloned() {
-                    let slots = bind_args(&format!("function {name}"), &sig.params, args)?;
-                    for (i, slot) in slots.iter().enumerate() {
-                        let a = slot.ok_or_else(|| {
-                            format!("function {name} has no argument for `{}`", sig.params[i])
-                        })?;
+                if let Some(sig) = self
+                    .local_sigs
+                    .get(name)
+                    .or_else(|| self.fun_sig.get(name))
+                    .cloned()
+                {
+                    let full = self.expand_args(&format!("function {name}"), &sig.params, args)?;
+                    for a in &full {
                         self.compile_expr(sc, a)?;
                     }
-                    let idx = self.b.add_name(name);
+                    // A local `fun` shadows a top-level one of the same name and
+                    // lives under its mangled sub.
+                    let sub = self.local_funs.get(name).cloned();
+                    let idx = self.b.add_name(sub.as_deref().unwrap_or(name));
                     self.b.emit(Op::Call(idx, sig.arity as u8), line);
                     return Ok(sig.ret);
+                }
+                // An extension on the enclosing receiver, called without a
+                // qualifier from inside a method or another extension.
+                if sc.slot("this").is_some() {
+                    let this = Expr::Var("this".into());
+                    if self.resolve_ext(sc, &this, name).is_some() {
+                        return self.compile_member(sc, &this, name, args, false, line);
+                    }
+                }
+                // A companion method called without a qualifier from inside the
+                // owning class.
+                if let Some(comp) = self
+                    .cur_class
+                    .clone()
+                    .and_then(|c| self.companion_of(&c))
+                    .filter(|c| self.classes[c].methods.contains_key(name))
+                {
+                    return self.compile_member(sc, &Expr::Var(comp), name, args, false, line);
                 }
                 // Implicit `this.method(args)` inside a class method.
                 if let Some(cls) = self.cur_class.clone() {
@@ -3339,6 +3879,19 @@ impl Compiler {
                         );
                     }
                 }
+                // Inside a receiver scope whose receiver is not a user class, an
+                // unqualified call is a member of it: `with("x") { uppercase() }`.
+                // The `Expr::Var` arm applies the same rule to a bare name.
+                if sc.slot("this").is_some() && self.cur_class.is_none() {
+                    return self.compile_member(
+                        sc,
+                        &Expr::Var("this".into()),
+                        name,
+                        args,
+                        false,
+                        line,
+                    );
+                }
                 // Unknown name. With a `rust { ... }` block present it may be an
                 // FFI export registered at runtime, so lower to a by-name FFI
                 // dispatch; the args are pushed deepest-first, then the name.
@@ -3355,6 +3908,156 @@ impl Compiler {
                 }
                 Err(format!("unresolved reference: {name}"))
             }
+        }
+    }
+
+    /// Rewrite a call's argument list into one expression per declared
+    /// parameter, in declaration order — resolving named arguments, filling
+    /// omitted ones from their defaults, and packing a `vararg` tail into an
+    /// array literal.
+    ///
+    /// Doing it as an AST rewrite rather than at each emit site means every
+    /// caller (free function, method, constructor, extension) gets defaults and
+    /// `vararg` from one implementation, and the emit sites keep lowering a
+    /// plain positional list.
+    ///
+    /// A default is evaluated at the CALL site, so it may not name another
+    /// parameter of the callee. Kotlin evaluates it in the callee's frame, where
+    /// it can; that form is rejected loudly rather than silently misbound.
+    fn expand_args(
+        &self,
+        callee: &str,
+        params: &[Param],
+        args: &[Expr],
+    ) -> Result<Vec<Expr>, String> {
+        let vararg_at = params.iter().position(|p| p.vararg.is_some());
+        if let Some(v) = vararg_at {
+            if v + 1 != params.len() {
+                return Err(format!(
+                    "{callee}: a `vararg` parameter is only supported as the last one"
+                ));
+            }
+        }
+        // The positional arguments a trailing `vararg` collects: everything from
+        // its own position on, up to the first named argument.
+        let mut rest: Vec<Expr> = Vec::new();
+        let mut head: Vec<Expr> = args.to_vec();
+        if let Some(v) = vararg_at {
+            let split = head
+                .iter()
+                .position(|a| matches!(a, Expr::Named { .. }))
+                .unwrap_or(head.len())
+                .max(v);
+            if split > v {
+                rest = head.drain(v..split).collect();
+            }
+        }
+        let names = params.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+        let slots = bind_args(callee, &names, &head)?;
+        let mut out = Vec::with_capacity(params.len());
+        for (i, p) in params.iter().enumerate() {
+            match (slots[i], p.vararg, &p.default) {
+                // A `vararg` given as a single named/positional argument passes
+                // that value through — it is already the array (`f(xs = arr)`).
+                (Some(a), Some(_), _) if rest.is_empty() => out.push(a.clone()),
+                (Some(a), Some(elem), _) => {
+                    rest.insert(0, a.clone());
+                    out.push(vararg_array(elem, &rest));
+                }
+                (Some(a), None, _) => out.push(a.clone()),
+                (None, Some(elem), _) => out.push(vararg_array(elem, &rest)),
+                (None, _, Some(d)) => out.push(d.clone()),
+                (None, None, None) => {
+                    return Err(format!("{callee} has no argument for `{}`", p.name))
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The extension declared for `name` on the receiver's static type, if the
+    /// program has one: its `(mangled sub name, signature)`.
+    ///
+    /// Resolution is by the receiver's *spelled* type name so `fun Int.f()` and
+    /// `fun Long.f()` stay apart. A receiver the frontend cannot type falls back
+    /// to a sole program-wide extension of that name — the shape a generic or
+    /// container receiver takes — and an ambiguous one is a compile error rather
+    /// than an arbitrary pick.
+    fn resolve_ext(&self, sc: &Scope, recv: &Expr, name: &str) -> Option<(String, FnSig)> {
+        if self.extensions.is_empty() {
+            return None;
+        }
+        if let Some(tn) = self.recv_type_name(sc, recv) {
+            if let Some(sig) = self.extensions.get(&(tn.clone(), name.to_string())) {
+                return Some((ext_sub_name(&tn, name), sig.clone()));
+            }
+            // A user class inherits its supertypes' extensions.
+            if let Some(meta) = self.classes.get(&tn) {
+                for anc in meta.mro.iter().skip(1) {
+                    if let Some(sig) = self.extensions.get(&(anc.clone(), name.to_string())) {
+                        return Some((ext_sub_name(anc, name), sig.clone()));
+                    }
+                }
+            }
+        }
+        let mut hits = self
+            .extensions
+            .iter()
+            .filter(|((_, n), _)| n == name)
+            .map(|((r, n), s)| (ext_sub_name(r, n), s.clone()));
+        let first = hits.next()?;
+        hits.next().is_none().then_some(first)
+    }
+
+    /// The declared `(return type, return class)` of the extension a call
+    /// `recv.name(…)` resolves to, or `None` when it resolves to something else.
+    ///
+    /// It applies the same member-first rule as [`Compiler::compile_member`], so
+    /// the static type this reports and the code that site emits can never
+    /// disagree — which is what keeps integer narrowing and `/` dispatch correct
+    /// through an extension's result.
+    fn ext_ret(
+        &self,
+        sc: &Scope,
+        recv: &Expr,
+        name: &str,
+        argc: usize,
+    ) -> Option<(Type, Option<String>)> {
+        let member_wins = self.infer_class(sc, recv).is_some_and(|c| {
+            self.classes
+                .get(&c)
+                .and_then(|m| m.methods.get(name))
+                .is_some_and(|s| s.arity == argc)
+        });
+        if member_wins {
+            return None;
+        }
+        let (_, sig) = self.resolve_ext(sc, recv, name)?;
+        Some((sig.ret, sig.ret_class))
+    }
+
+    /// The hoisted singleton name of `cls`'s `companion object`, if it declared
+    /// one. `cls` must name a class rather than a value — a local of the same
+    /// name shadows the type, exactly as in Kotlin.
+    fn companion_of(&self, cls: &str) -> Option<String> {
+        let comp = companion_name(cls);
+        (self.classes.contains_key(cls) && self.classes.contains_key(&comp)).then_some(comp)
+    }
+
+    /// The receiver's spelled type name for extension lookup, or `None` when the
+    /// frontend cannot name it.
+    fn recv_type_name(&self, sc: &Scope, recv: &Expr) -> Option<String> {
+        if let Some(cls) = self.infer_class(sc, recv) {
+            return Some(cls);
+        }
+        match self.infer(sc, recv) {
+            Type::Int => Some("Int".into()),
+            Type::Long => Some("Long".into()),
+            Type::Double => Some("Double".into()),
+            Type::Boolean => Some("Boolean".into()),
+            Type::Char => Some("Char".into()),
+            Type::String | Type::NullableString => Some("String".into()),
+            _ => None,
         }
     }
 
@@ -3471,19 +4174,13 @@ impl Compiler {
             };
             return Err(format!("cannot construct {what} {}", meta.name));
         }
-        let names: Vec<String> = meta.ctor_params.iter().map(|p| p.name.clone()).collect();
-        let slots = bind_args(&format!("constructor {}", meta.name), &names, args)?;
-        for (i, slot) in slots.iter().enumerate() {
-            let a = slot.ok_or_else(|| {
-                format!(
-                    "constructor {} has no argument for `{}`",
-                    meta.name, names[i]
-                )
-            })?;
+        let params: Vec<Param> = meta.ctor_params.iter().map(|p| p.as_param()).collect();
+        let full = self.expand_args(&format!("constructor {}", meta.name), &params, args)?;
+        for a in &full {
             self.compile_expr(sc, a)?;
         }
         let idx = self.b.add_name(&ctor_sub_name(&meta.name));
-        self.b.emit(Op::Call(idx, names.len() as u8), line);
+        self.b.emit(Op::Call(idx, params.len() as u8), line);
         Ok(Type::Obj)
     }
 
@@ -3701,7 +4398,11 @@ impl Compiler {
             Expr::Null => Type::Unknown,
             Expr::Str(_) => Type::String,
             Expr::Var(n) => {
-                if sc.slot(n).is_none() && self.resolve_math_const(n).is_some() {
+                if sc.slot(n).is_some() {
+                    sc.ty(n)
+                } else if let Some(p) = self.globals.get(n) {
+                    p.ty
+                } else if self.resolve_math_const(n).is_some() {
                     Type::Double
                 } else {
                     sc.ty(n)
@@ -3757,6 +4458,16 @@ impl Compiler {
                 | "hashSetOf" | "linkedSetOf" | "sortedSetOf" | "emptySet" | "arrayOf"
                 | "intArrayOf" | "doubleArrayOf" | "booleanArrayOf" | "charArrayOf"
                 | "IntArray" | "DoubleArray" | "BooleanArray" | "CharArray" | "Array" => Type::Obj,
+                // `Pair`/`Triple`/`Result` are heap objects, and saying so is
+                // what routes `==` on them to STRUCTURAL equality: the native
+                // compare would coerce two handles to numbers and answer `true`
+                // for any two of them.
+                "Pair" if args.len() == 2 => Type::Obj,
+                "Triple" if args.len() == 3 => Type::Obj,
+                "runCatching" => Type::Obj,
+                // `with(x) { … }` / `run { … }` evaluate to their block, whose
+                // type the frontend does not track.
+                "with" | "run" => Type::Unknown,
                 _ if self.classes.contains_key(name) => Type::Obj, // constructor
                 // A math call keeps its `Int` overload for integral arguments —
                 // this is what makes `abs(-7) / 2` truncate rather than divide.
@@ -3764,17 +4475,29 @@ impl Compiler {
                     let tys: Vec<Type> = args.iter().map(|a| self.infer(sc, a)).collect();
                     math_ret_type(&self.resolve_math_fn(name).unwrap(), &tys)
                 }
-                _ => self
-                    .fun_sig
-                    .get(name)
-                    .map(|s| s.ret)
-                    .unwrap_or(Type::Unknown),
+                _ => {
+                    // An unqualified call inside an extension body is a call on
+                    // its receiver (`fun Int.quad() = dbl().dbl()`).
+                    if !self.fun_sig.contains_key(name) && sc.slot("this").is_some() {
+                        if let Some(t) =
+                            self.ext_ret(sc, &Expr::Var("this".into()), name, args.len())
+                        {
+                            return t.0;
+                        }
+                    }
+                    self.local_sigs
+                        .get(name)
+                        .or_else(|| self.fun_sig.get(name))
+                        .map(|s| s.ret)
+                        .unwrap_or(Type::Unknown)
+                }
             },
             Expr::Index { recv, .. } => self.index_elem_ty(sc, recv),
             Expr::Pair { .. } => Type::Obj,
             // A range and an array are heap objects; `in` is a predicate.
             Expr::Range { .. } | Expr::Step { .. } => Type::Obj,
             Expr::In { .. } | Expr::Is { .. } => Type::Boolean,
+            Expr::As { ty, safe, .. } => cast_type(ty, *safe),
             // `++`/`--` keep the target's type, so `d++` on a `Double` stays a
             // `Double` for display and `/` dispatch.
             Expr::IncDec { target, .. } => self.infer(sc, target),
@@ -3811,6 +4534,14 @@ impl Compiler {
                 safe,
                 ..
             } => {
+                // An extension function's declared return type. Checked with
+                // the same member-first rule `compile_member` applies, so the
+                // two agree on the node — an `Int` extension returning `Int` has
+                // to be inferable, or arithmetic on its result would skip the
+                // 32-bit narrowing the emitted code performs.
+                if let Some(t) = self.ext_ret(sc, recv, name, args.len()) {
+                    return t.0;
+                }
                 // `Math.round` returns a `Long`; the rest follow the shared
                 // math overload rule.
                 if self.is_java_math(sc, recv) {
@@ -4108,6 +4839,9 @@ impl Compiler {
                         return p.class.clone();
                     }
                 }
+                if let Some(c) = self.globals.get(n).and_then(|p| p.class.clone()) {
+                    return Some(c);
+                }
                 // An `object` singleton referenced by name.
                 if self.classes.get(n).is_some_and(|m| m.is_object) {
                     return Some(n.clone());
@@ -4130,6 +4864,9 @@ impl Compiler {
                     // The primitive array factories, whose name states the
                     // element type. `arrayOf`/`Array` are deliberately absent:
                     // their elements are unconstrained.
+                    "runCatching" => return Some("Result".to_string()),
+                    "Pair" => return Some("Pair".to_string()),
+                    "Triple" => return Some("Triple".to_string()),
                     "intArrayOf" | "IntArray" => return Some("IntArray".to_string()),
                     "doubleArrayOf" | "DoubleArray" => return Some("DoubleArray".to_string()),
                     "charArrayOf" | "CharArray" => return Some("CharArray".to_string()),
@@ -4145,7 +4882,12 @@ impl Compiler {
                     .and_then(|m| m.prop(name))
                     .and_then(|p| p.class.clone())
             }
-            Expr::MethodCall { recv, name, .. } => {
+            Expr::MethodCall {
+                recv, name, args, ..
+            } => {
+                if let Some((_, cls)) = self.ext_ret(sc, recv, name, args.len()) {
+                    return cls;
+                }
                 match name.as_str() {
                     "map" | "mapIndexed" | "flatMap" | "filter" | "filterNot" | "sortedBy"
                     | "sortedByDescending" | "toList" | "distinct" | "sorted"
@@ -4156,6 +4898,13 @@ impl Compiler {
                     "associate" | "associateBy" | "associateWith" | "groupBy" => {
                         return Some("Map".to_string())
                     }
+                    // The scope functions that hand back the RECEIVER keep its
+                    // class, which is what makes `Box(1, 2).apply { … }.area()`
+                    // dispatch as a `Box` rather than fall through to the host.
+                    "apply" | "also" | "takeIf" | "takeUnless" => {
+                        return self.infer_class(sc, recv)
+                    }
+                    "runCatching" => return Some("Result".to_string()),
                     _ => {}
                 }
                 let cls = self.infer_class(sc, recv)?;
@@ -4260,6 +5009,123 @@ fn join_ty(prev: Option<Type>, next: Type) -> Type {
 /// Kotlin's rule is that positional arguments come first and every named one
 /// binds a distinct parameter, both of which are enforced here: a mixed-up order
 /// or a duplicate/unknown name is a compile error, never a silent misbinding.
+/// The static type a cast target name gives its result. A user class or an
+/// unmodelled type is a heap object; the named primitives keep their width,
+/// which is the whole point of writing the cast.
+///
+/// A failing `as?` yields null, so a safe cast to `String` is a *nullable*
+/// String — the distinction the display path needs to render the four
+/// characters `null` rather than the empty string.
+fn cast_type(ty: &str, safe: bool) -> Type {
+    match Type::from_name(ty) {
+        Type::String if safe => Type::NullableString,
+        Type::Unknown => Type::Obj,
+        t => t,
+    }
+}
+
+/// True when any STATEMENT reachable from `body` satisfies `f` — the statement
+/// twin of [`body_any`], with the same reach: nested loop bodies, branch arms,
+/// `try` sections, and the bodies of lambdas written in expression position.
+/// The expression-borne blocks are found through [`body_any`] itself, so the two
+/// visitors stay in step as the AST grows.
+fn stmt_any(body: &[Stmt], f: &dyn Fn(&StmtKind) -> bool) -> bool {
+    body.iter().any(|s| {
+        f(&s.kind)
+            || match &s.kind {
+                StmtKind::While { body, .. }
+                | StmtKind::DoWhile { body, .. }
+                | StmtKind::For { body, .. }
+                | StmtKind::ForIn { body, .. } => stmt_any(body, f),
+                StmtKind::If(ie) => {
+                    stmt_any(&ie.then, f) || ie.els.as_deref().is_some_and(|e| stmt_any(e, f))
+                }
+                StmtKind::When(w) => w.arms.iter().any(|a| stmt_any(&a.body, f)),
+                StmtKind::LocalFun(lf) => stmt_any(&lf.body, f),
+                _ => false,
+            }
+            || body_any(std::slice::from_ref(s), &|e| match e {
+                Expr::Lambda { body, .. } => stmt_any(body, f),
+                Expr::If(ie) => {
+                    stmt_any(&ie.then, f) || ie.els.as_deref().is_some_and(|b| stmt_any(b, f))
+                }
+                Expr::When(w) => w.arms.iter().any(|a| stmt_any(&a.body, f)),
+                Expr::Try(t) => {
+                    stmt_any(&t.body, f)
+                        || t.catches.iter().any(|c| stmt_any(&c.body, f))
+                        || stmt_any(&t.finally_body, f)
+                }
+                _ => false,
+            })
+    })
+}
+
+/// Every name a lambda ANYWHERE inside `body` assigns to.
+///
+/// A `var` of the enclosing frame named here has to be boxed: a closure copies
+/// its captures by value, so a plain slot write inside the lambda would update
+/// the copy and leave the original untouched — a wrong answer rather than a
+/// loud one. Over-approximating (a name that turns out to be the lambda's own
+/// local, or a `val`) costs one heap cell and nothing else.
+fn lambda_writes(body: &[Stmt]) -> HashSet<String> {
+    let out = RefCell::new(HashSet::new());
+    let note = |e: &Expr| {
+        if let Expr::IncDec { target, .. } = e {
+            if let Expr::Var(n) = &**target {
+                out.borrow_mut().insert(n.clone());
+            }
+        }
+        false
+    };
+    body_any(body, &|e| {
+        if let Expr::Lambda { body, .. } = e {
+            stmt_any(body, &|k| {
+                if let StmtKind::Assign { name, .. } = k {
+                    out.borrow_mut().insert(name.clone());
+                }
+                false
+            });
+            // `x++` / `--x` are writes too, and reach their target through an
+            // expression rather than an `Assign`.
+            body_any(body, &note);
+        }
+        false
+    });
+    out.into_inner()
+}
+
+/// Whether `name` is one of the receiver-taking scope functions.
+fn is_scope_fn(name: &str) -> bool {
+    matches!(
+        name,
+        "let" | "also" | "takeIf" | "takeUnless" | "run" | "apply"
+    )
+}
+
+/// Whether the scope function binds the receiver as the block's `this` (rather
+/// than as the parameter `it`). `with` is the free-function spelling of `run`.
+fn is_recv_scope_fn(name: &str) -> bool {
+    matches!(name, "run" | "apply" | "with")
+}
+
+/// The array literal a `vararg` parameter's collected arguments pack into. The
+/// builder is chosen from the declared ELEMENT type so a `vararg xs: Int` binds
+/// an `IntArray`, as Kotlin's does.
+fn vararg_array(elem: Type, items: &[Expr]) -> Expr {
+    let name = match elem {
+        Type::Int | Type::Long => "intArrayOf",
+        Type::Double => "doubleArrayOf",
+        Type::Boolean => "booleanArrayOf",
+        Type::Char => "charArrayOf",
+        _ => "arrayOf",
+    };
+    Expr::Call {
+        name: name.to_string(),
+        args: items.to_vec(),
+        line: 0,
+    }
+}
+
 fn bind_args<'a>(
     callee: &str,
     params: &[String],
@@ -4521,6 +5387,7 @@ fn body_any(body: &[Stmt], f: &dyn Fn(&Expr) -> bool) -> bool {
             recv, index, value, ..
         } => expr_any(recv, f) || expr_any(index, f) || expr_any(value, f),
         StmtKind::Destructure { init, .. } => expr_any(init, f),
+        StmtKind::LocalFun(lf) => body_any(&lf.body, f),
         StmtKind::Return(Some(e)) => expr_any(e, f),
         StmtKind::Return(None) => false,
         StmtKind::While { cond, body, .. } | StmtKind::DoWhile { cond, body, .. } => {
@@ -4580,6 +5447,7 @@ fn expr_any(e: &Expr, f: &dyn Fn(&Expr) -> bool) -> bool {
             expr_any(recv, f) || args.iter().any(|a| expr_any(a, f))
         }
         Expr::Named { value, .. } => expr_any(value, f),
+        Expr::As { value, .. } => expr_any(value, f),
         Expr::Unary { expr, .. } => expr_any(expr, f),
         Expr::Binary { l, r, .. } => expr_any(l, f) || expr_any(r, f),
         Expr::Elvis { left, right } => expr_any(left, f) || expr_any(right, f),
@@ -4630,10 +5498,24 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
 /// free `fun`, a method, or a lambda body. Only such a program pays for the
 /// per-statement unwind checks and the suppressible print builtins.
 pub fn uses_exceptions(program: &Program) -> bool {
-    let has = |body: &[Stmt]| body_any(body, &|e| matches!(e, Expr::Try(_) | Expr::Throw(_)));
+    // `runCatching` catches, so a program containing one needs the pending-slot
+    // machinery even with no `try` written anywhere.
+    let has = |body: &[Stmt]| {
+        body_any(body, &|e| match e {
+            Expr::Try(_) | Expr::Throw(_) => true,
+            Expr::Call { name, .. } | Expr::MethodCall { name, .. } => name == "runCatching",
+            _ => false,
+        })
+    };
     program.funs.iter().any(|f| has(&f.body))
         || program
             .classes
             .iter()
             .any(|c| c.methods.iter().any(|m| has(&m.body)))
+        || program.props.iter().any(|p| {
+            body_any(
+                std::slice::from_ref(&Stmt::new(0, StmtKind::Expr(p.init.clone()))),
+                &|e| matches!(e, Expr::Try(_) | Expr::Throw(_)),
+            )
+        })
 }

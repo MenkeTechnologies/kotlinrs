@@ -41,6 +41,12 @@ pub struct Parser {
     /// return value because a function type may nest inside a generic argument
     /// several `type_ref` frames down, where the caller has nowhere to put it.
     fn_param_types: Vec<Type>,
+    /// The type-parameter names of the `fun` whose body is being parsed
+    /// (`fun <T> f(…)`). A runtime test against one of them — `x is T`, `x as T`
+    /// — needs a `reified` type argument the coarse type system cannot carry, so
+    /// it is rejected here rather than silently answering for a class named `T`
+    /// that does not exist.
+    type_params: Vec<String>,
 }
 
 /// The coarse type of one function-type parameter: a lone identifier reads as
@@ -72,6 +78,7 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
         toks,
         pos: 0,
         fn_param_types: Vec::new(),
+        type_params: Vec::new(),
     };
     let mut prog = Program::default();
     while !p.at(&Tok::Eof) {
@@ -79,6 +86,10 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
         // ordinary identifier meaning (an `import`/`package` line, say).
         if !p.at_decl_kw() && matches!(p.peek(), Tok::Ident(w) if is_modifier_word(w)) {
             let mods = p.modifiers();
+            if matches!(p.peek(), Tok::Val | Tok::Var) {
+                prog.props.push(p.body_prop()?);
+                continue;
+            }
             if p.at(&Tok::Fun) {
                 let f = p.fun_decl_mods(mods)?;
                 if f.is_abstract {
@@ -86,7 +97,7 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
                 }
                 prog.funs.push(f);
             } else {
-                prog.classes.push(p.class_decl_mods(mods)?);
+                prog.classes.push(p.class_decl_mods(mods, None)?);
             }
             continue;
         }
@@ -98,6 +109,7 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
                 }
                 prog.funs.push(f);
             }
+            Tok::Val | Tok::Var => prog.props.push(p.body_prop()?),
             Tok::Class | Tok::Data | Tok::Object => prog.classes.push(p.class_decl()?),
             Tok::Ident(w) if w == "interface" => prog.classes.push(p.class_decl()?),
             // `package a.b` / `import a.b.*` — a dotted path, optionally ending
@@ -121,6 +133,15 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
             }
         }
     }
+    // Hoist each `companion object` to the top level. From here on it is an
+    // ordinary singleton, and only the owner→companion NAME relation (which
+    // `companion_name` reconstructs) is needed to resolve `Owner.member`.
+    let hoisted: Vec<ClassDecl> = prog
+        .classes
+        .iter_mut()
+        .filter_map(|cd| cd.companion.take().map(|c| *c))
+        .collect();
+    prog.classes.extend(hoisted);
     Ok(prog)
 }
 
@@ -159,6 +180,17 @@ fn is_modifier_word(w: &str) -> bool {
             | "internal"
             | "protected"
             | "inner"
+            // Accepted and discarded: each affects how a declaration is COMPILED
+            // on the JVM (inlining, tail-call rewriting, call syntax,
+            // compile-time constants) without changing what it computes, and
+            // this frontend's lowering already differs from the JVM's.
+            | "inline"
+            | "noinline"
+            | "crossinline"
+            | "tailrec"
+            | "operator"
+            | "infix"
+            | "const"
     )
 }
 
@@ -249,7 +281,8 @@ impl Parser {
                 "abstract" => m.abstract_ = true,
                 "override" => m.override_ = true,
                 "sealed" => m.sealed = true,
-                "final" | "public" | "private" | "internal" | "protected" | "inner" => {}
+                "final" | "public" | "private" | "internal" | "protected" | "inner" | "inline"
+                | "noinline" | "crossinline" | "tailrec" | "operator" | "infix" | "const" => {}
                 _ => break,
             }
             self.bump();
@@ -271,10 +304,46 @@ impl Parser {
     fn fun_decl_mods(&mut self, mods: Mods) -> Result<FunDecl, String> {
         let line = self.line();
         self.eat(&Tok::Fun)?;
-        let name = self.ident()?;
+        // An optional generic parameter list, `fun <T> f(x: T)`. Coarse typing
+        // keeps no type variables, so the list is consumed and only the NAMES
+        // are kept — a `T`-typed parameter reads as `Unknown`, which is how the
+        // frontend already handles a value it cannot type.
+        let tps = self.type_params_decl();
+        let outer_tps = std::mem::replace(&mut self.type_params, tps);
+        // `fun Recv.name(…)` — an extension. The first identifier is the
+        // receiver type only when a `.` follows it.
+        let first = self.ident()?;
+        let mut recv = None;
+        let name = if self.at(&Tok::Dot) {
+            self.bump();
+            let (ty, class) = (Type::from_name(&first), None);
+            let class = if ty == Type::Unknown {
+                Some(first.clone())
+            } else {
+                class
+            };
+            recv = Some((
+                first,
+                if ty == Type::Unknown { Type::Obj } else { ty },
+                class,
+            ));
+            self.ident()?
+        } else if self.at(&Tok::Lt) {
+            // `fun List<Int>.sum2()` — a generic receiver keeps its head name.
+            self.skip_type_args();
+            self.eat(&Tok::Dot)?;
+            recv = Some((first.clone(), Type::Obj, None));
+            self.ident()?
+        } else {
+            first
+        };
         self.eat(&Tok::LParen)?;
         let mut params = Vec::new();
         while !self.at(&Tok::RParen) {
+            let is_vararg = matches!(self.peek(), Tok::Ident(w) if w == "vararg");
+            if is_vararg {
+                self.bump();
+            }
             let pname = self.ident()?;
             let (ty, class) = if self.at(&Tok::Colon) {
                 self.bump();
@@ -282,10 +351,22 @@ impl Parser {
             } else {
                 (Type::Unknown, None)
             };
+            // A default value, `fun f(a: Int, b: Int = 10)`.
+            let default = if self.at(&Tok::Assign) {
+                self.bump();
+                Some(self.expr()?)
+            } else {
+                None
+            };
             params.push(Param {
                 name: pname,
-                ty,
+                // A `vararg` parameter arrives as an array of the declared
+                // element type, so its own coarse type is a heap object; the
+                // element type rides in `vararg` for the body's `for` loop.
+                ty: if is_vararg { Type::Obj } else { ty },
                 class,
+                default,
+                vararg: is_vararg.then_some(ty),
             });
             if self.at(&Tok::Comma) {
                 self.bump();
@@ -325,8 +406,10 @@ impl Parser {
             None if is_expr_body => Type::Unknown,
             None => Type::Unit,
         };
+        self.type_params = outer_tps;
         Ok(FunDecl {
             name,
+            recv,
             params,
             ret,
             ret_class,
@@ -342,10 +425,17 @@ impl Parser {
     /// `interface I { ... }`, with the modifiers already consumed by
     /// [`Parser::modifiers`].
     fn class_decl(&mut self) -> Result<ClassDecl, String> {
-        self.class_decl_mods(Mods::default())
+        self.class_decl_mods(Mods::default(), None)
     }
 
-    fn class_decl_mods(&mut self, mods: Mods) -> Result<ClassDecl, String> {
+    /// `companion_of` names the enclosing class when this is a `companion
+    /// object`: the declaration is then an `object` whose name is synthesized
+    /// from the owner, because the companion may be written without one.
+    fn class_decl_mods(
+        &mut self,
+        mods: Mods,
+        companion_of: Option<&str>,
+    ) -> Result<ClassDecl, String> {
         let line = self.line();
         let is_data = if self.at(&Tok::Data) {
             self.bump();
@@ -367,7 +457,21 @@ impl Parser {
             self.eat(&Tok::Class)?;
             false
         };
-        let name = self.ident()?;
+        let name = match companion_of {
+            // `companion object { … }` may be anonymous, and a named one
+            // (`companion object Factory`) is still reached through the owner —
+            // so either way the declaration is hoisted under the owner's name.
+            Some(owner) => {
+                if matches!(self.peek(), Tok::Ident(_)) {
+                    self.bump();
+                }
+                companion_name(owner)
+            }
+            None => self.ident()?,
+        };
+        // A generic class keeps only its head name; the coarse type system
+        // carries no type variables.
+        self.skip_type_args();
 
         // Primary constructor (classes only). `object`s and `interface`s have
         // none.
@@ -389,11 +493,18 @@ impl Parser {
                 let pname = self.ident()?;
                 self.eat(&Tok::Colon)?;
                 let (ty, class) = self.type_ref()?;
+                let default = if self.at(&Tok::Assign) {
+                    self.bump();
+                    Some(self.expr()?)
+                } else {
+                    None
+                };
                 params.push(CtorProp {
                     name: pname,
                     ty,
                     class,
                     kind,
+                    default,
                 });
                 if self.at(&Tok::Comma) {
                     self.bump();
@@ -451,6 +562,7 @@ impl Parser {
         // Body: methods, plus (for `object`) property initializers.
         let mut methods = Vec::new();
         let mut obj_props = Vec::new();
+        let mut companion = None;
         if self.at(&Tok::LBrace) {
             self.bump();
             while !self.at(&Tok::RBrace) && !self.at(&Tok::Eof) {
@@ -458,27 +570,35 @@ impl Parser {
                     self.bump();
                     continue;
                 }
+                // `companion object [Name] { … }` — one per class.
+                if matches!(self.peek(), Tok::Ident(w) if w == "companion")
+                    && matches!(self.peek_at(1), Tok::Object)
+                {
+                    self.bump();
+                    if companion.is_some() {
+                        return Err(format!(
+                            "class {name}: only one companion object is allowed"
+                        ));
+                    }
+                    companion = Some(Box::new(
+                        self.class_decl_mods(Mods::default(), Some(&name))?,
+                    ));
+                    continue;
+                }
                 let mods = self.modifiers();
                 match self.peek() {
                     Tok::Fun => methods.push(self.fun_decl_mods(mods)?),
+                    // A body property: `val n = expr` / `var c: Int = expr`, in a
+                    // class as well as an `object`. An `interface` has no
+                    // storage to put one in, so it is rejected there.
                     Tok::Val | Tok::Var => {
-                        if !is_object {
+                        if is_interface {
                             return Err(format!(
-                                "class {name}: body properties are unsupported; declare stored \
-                                 properties in the primary constructor"
+                                "interface {name}: a property with an initializer needs storage; \
+                                 interfaces have none"
                             ));
                         }
-                        self.bump(); // val/var
-                        let pname = self.ident()?;
-                        let (ty, class) = if self.at(&Tok::Colon) {
-                            self.bump();
-                            self.type_ref()?
-                        } else {
-                            (Type::Unknown, None)
-                        };
-                        self.eat(&Tok::Assign)?;
-                        let init = self.expr()?;
-                        obj_props.push((pname, ty, class, init));
+                        obj_props.push(self.body_prop()?);
                     }
                     other => {
                         return Err(format!(
@@ -504,8 +624,91 @@ impl Parser {
             is_sealed: mods.sealed,
             parents,
             super_args,
+            companion,
             line,
         })
+    }
+
+    /// A stored property with an initializer: `val n: Int = 5`, `var c = 0`, or
+    /// the delegated form `val z: Int by lazy { … }`. Used for a class body, an
+    /// `object` body, and the top level alike — the three differ in WHERE the
+    /// initializer runs, not in how it is written.
+    fn body_prop(&mut self) -> Result<BodyProp, String> {
+        let mutable = matches!(self.bump(), Tok::Var);
+        let name = self.ident()?;
+        let (ty, class) = if self.at(&Tok::Colon) {
+            self.bump();
+            self.type_ref()?
+        } else {
+            (Type::Unknown, None)
+        };
+        // `by lazy { … }`. `by` is a soft keyword, so it only means delegation
+        // in this position.
+        if matches!(self.peek(), Tok::Ident(w) if w == "by") {
+            self.bump();
+            let what = self.ident()?;
+            if what != "lazy" {
+                return Err(format!(
+                    "property {name}: `by {what}` is not supported; only `by lazy` is"
+                ));
+            }
+            if mutable {
+                return Err(format!("property {name}: `by lazy` requires `val`"));
+            }
+            let init = self.lambda()?;
+            return Ok(BodyProp {
+                name,
+                ty,
+                class,
+                init,
+                mutable,
+                lazy: true,
+            });
+        }
+        self.eat(&Tok::Assign)?;
+        let init = self.expr()?;
+        Ok(BodyProp {
+            name,
+            ty,
+            class,
+            init,
+            mutable,
+            lazy: false,
+        })
+    }
+
+    /// Consume a `<…>` type-PARAMETER list if one is present, returning the
+    /// declared names. `<reified T>`/`<in T>`/`<T : Comparable<T>>` all reduce to
+    /// their bare names here; the bound and the variance carry no meaning for a
+    /// coarse type system.
+    fn type_params_decl(&mut self) -> Vec<String> {
+        let start = self.pos;
+        if !self.at(&Tok::Lt) {
+            return Vec::new();
+        }
+        self.skip_type_args();
+        let mut names = Vec::new();
+        let mut depth = 0i32;
+        let mut want = true;
+        for i in start..self.pos {
+            match &self.toks[i].tok {
+                Tok::Lt => {
+                    depth += 1;
+                    want = depth == 1;
+                }
+                Tok::Gt => depth -= 1,
+                Tok::Comma if depth == 1 => want = true,
+                // A modifier or a bound is not the parameter's own name.
+                Tok::Ident(w) if want && depth == 1 => {
+                    if !matches!(w.as_str(), "reified" | "in" | "out") {
+                        names.push(w.clone());
+                        want = false;
+                    }
+                }
+                _ => want = false,
+            }
+        }
+        names
     }
 
     /// Consume a `<…>` type-argument list if one is present, discarding it.
@@ -676,6 +879,8 @@ impl Parser {
         }
         let kind = match self.peek() {
             Tok::Val | Tok::Var => self.let_decl()?,
+            // A local `fun`, declared inside another function's body.
+            Tok::Fun => StmtKind::LocalFun(self.fun_decl()?),
             Tok::Return => {
                 self.bump();
                 // `return@label` — a LOCAL return from the lambda (or `fun`)
@@ -1066,11 +1271,7 @@ impl Parser {
                     self.bump();
                 }
                 self.bump(); // is
-                let ty = self.ident()?;
-                self.skip_type_args();
-                if self.at(&Tok::Question) {
-                    self.bump(); // `is String?`
-                }
+                let ty = self.is_type()?;
                 l = Expr::Is {
                     value: Box::new(l),
                     ty,
@@ -1210,7 +1411,7 @@ impl Parser {
     }
 
     fn multiplicative(&mut self) -> Result<Expr, String> {
-        let mut l = self.unary()?;
+        let mut l = self.as_expr()?;
         loop {
             let op = match self.peek() {
                 Tok::Star => BinOp::Mul,
@@ -1219,7 +1420,7 @@ impl Parser {
                 _ => break,
             };
             self.bump();
-            let r = self.unary()?;
+            let r = self.as_expr()?;
             l = Expr::Binary {
                 op,
                 l: Box::new(l),
@@ -1227,6 +1428,27 @@ impl Parser {
             };
         }
         Ok(l)
+    }
+
+    /// `value as Type` / `value as? Type`. Kotlin binds the cast tighter than
+    /// every binary operator, so `a as Int * 2` is `(a as Int) * 2` — hence its
+    /// own level directly above `unary`.
+    fn as_expr(&mut self) -> Result<Expr, String> {
+        let mut e = self.unary()?;
+        while matches!(self.peek(), Tok::Ident(w) if w == "as") {
+            self.bump();
+            let safe = self.at(&Tok::Question);
+            if safe {
+                self.bump();
+            }
+            let ty = self.is_type()?;
+            e = Expr::As {
+                value: Box::new(e),
+                ty,
+                safe,
+            };
+        }
+        Ok(e)
     }
 
     fn unary(&mut self) -> Result<Expr, String> {
@@ -1832,6 +2054,13 @@ impl Parser {
         if self.at(&Tok::Question) {
             self.bump();
         }
+        if self.type_params.contains(&ty) {
+            return Err(format!(
+                "a runtime test against the type parameter `{ty}` needs a reified \
+                 type argument, which is not supported (line {})",
+                self.line()
+            ));
+        }
         Ok(ty)
     }
 
@@ -1889,6 +2118,7 @@ impl Parser {
                 StrPart::Expr(src) => {
                     let toks = Lexer::new(src).tokenize()?;
                     let mut sub = Parser {
+                        type_params: Vec::new(),
                         toks,
                         pos: 0,
                         fn_param_types: Vec::new(),

@@ -75,6 +75,10 @@ impl Type {
 pub struct Program {
     pub classes: Vec<ClassDecl>,
     pub funs: Vec<FunDecl>,
+    /// Top-level `val`/`var` properties, in declaration order. They initialize
+    /// before `main` runs and live in chunk globals rather than frame slots,
+    /// which is what lets every function see them.
+    pub props: Vec<BodyProp>,
     /// `import` declarations in source order. Kotlin resolves `abs`/`sqrt`/`PI`
     /// ONLY when `kotlin.math` is imported — without the import the reference is
     /// a compile error — so the compiler gates those names on this list rather
@@ -118,11 +122,24 @@ pub struct Param {
     /// The class name when `ty == Type::Obj` and the annotation named a user
     /// class (e.g. `p: Person`).
     pub class: Option<String>,
+    /// The default value of `fun f(b: Int = 10)`. A call that omits the argument
+    /// evaluates this expression instead.
+    pub default: Option<Expr>,
+    /// `vararg xs: Int` — the ELEMENT type. The parameter itself binds an array
+    /// of them, which the call site packs from its trailing arguments.
+    pub vararg: Option<Type>,
 }
 
 #[derive(Debug, Clone)]
 pub struct FunDecl {
     pub name: String,
+    /// `fun Int.dbl(): Int` — the extension receiver as `(spelled type name,
+    /// coarse type, user class)`. The spelled name is kept because that is what
+    /// a call site matches against: `Int` and `Long` share a runtime
+    /// representation and a coarse `is_int`, so only the written name says which
+    /// of two same-named extensions applies. Inside the body the receiver is
+    /// bound as `this`.
+    pub recv: Option<(String, Type, Option<String>)>,
     pub params: Vec<Param>,
     pub ret: Type,
     /// The return class name when `ret == Type::Obj` and it named a user class.
@@ -162,8 +179,12 @@ pub struct ClassDecl {
     pub name: String,
     /// Primary-constructor parameters (empty for an `object`).
     pub params: Vec<CtorProp>,
-    /// `object` singleton properties with initializer expressions.
-    pub obj_props: Vec<(String, Type, Option<String>, Expr)>,
+    /// Properties declared in the class BODY rather than the primary
+    /// constructor — an `object`'s singleton properties, and a class's
+    /// `class C { var c = 0 }` form. Both are stored fields with an initializer
+    /// that runs at construction time; they differ only in when that is (once,
+    /// for an `object`; per instance, for a class).
+    pub obj_props: Vec<BodyProp>,
     pub methods: Vec<FunDecl>,
     pub is_data: bool,
     pub is_object: bool,
@@ -185,7 +206,46 @@ pub struct ClassDecl {
     /// The superclass constructor arguments of `: Super(a, b)`. Empty when the
     /// supertype list holds only interfaces or a parameterless superclass.
     pub super_args: Vec<Expr>,
+    /// `companion object { … }`, parsed as an ordinary `object` named
+    /// `Owner$Companion`. [`crate::parser::parse_program`] hoists it to the top level, where it
+    /// becomes a singleton like any other; `Owner.member` then resolves through
+    /// it. `$` cannot appear in a Kotlin identifier, so the synthetic name can
+    /// never collide with a declared one.
+    pub companion: Option<Box<ClassDecl>>,
     pub line: u32,
+}
+
+/// The synthetic top-level name a class's `companion object` is hoisted under.
+pub fn companion_name(owner: &str) -> String {
+    format!("{owner}$Companion")
+}
+
+/// A property declared in a class or `object` body: `var c = 0`, `val n: Int = f()`.
+///
+/// Unlike a [`CtorProp`] its value comes from an initializer expression rather
+/// than a constructor argument, and that expression is evaluated in a scope
+/// where the constructor parameters and the *earlier* body properties are
+/// already bound — which is Kotlin's own initialization order.
+///
+/// A `data class`'s derived members deliberately do NOT see these: Kotlin
+/// derives `toString`/`equals`/`hashCode`/`componentN` from the primary
+/// constructor alone, so `data class D(val a: Int) { val b = 2 }` prints
+/// `D(a=1)`. The instance records where the data fields end for exactly that
+/// reason (see `HeapObj::Instance::data_len`).
+#[derive(Debug, Clone)]
+pub struct BodyProp {
+    pub name: String,
+    pub ty: Type,
+    /// The class name when `ty == Type::Obj` and the annotation named a user class.
+    pub class: Option<String>,
+    pub init: Expr,
+    /// `var` (reassignable) rather than `val`.
+    pub mutable: bool,
+    /// `val x: T by lazy { … }` — `init` then holds the lambda, and the stored
+    /// value is a cell that computes and caches on first READ. The distinction
+    /// is observable whenever the initializer has an effect or would fail: an
+    /// eagerly-evaluated `lazy` would run it at startup instead of at first use.
+    pub lazy: bool,
 }
 
 /// A primary-constructor parameter with its property kind.
@@ -195,6 +255,22 @@ pub struct CtorProp {
     pub ty: Type,
     pub class: Option<String>,
     pub kind: PropKind,
+    /// The default value of `class C(val a: Int = 5)`.
+    pub default: Option<Expr>,
+}
+
+impl CtorProp {
+    /// The constructor parameter as an ordinary [`Param`], for the shared
+    /// argument-binding path. A constructor takes no `vararg` here.
+    pub fn as_param(&self) -> Param {
+        Param {
+            name: self.name.clone(),
+            ty: self.ty,
+            class: self.class.clone(),
+            default: self.default.clone(),
+            vararg: None,
+        }
+    }
 }
 
 /// A statement plus the 1-based source line it started on. The line drives
@@ -303,6 +379,15 @@ pub enum StmtKind {
     If(IfExpr),
     /// A `when` used as a statement (its value, if any, is discarded).
     When(WhenExpr),
+    /// A local `fun` declared inside another function's body.
+    ///
+    /// It is emitted as an ordinary subroutine rather than as a closure value,
+    /// which is what lets it call ITSELF: a closure captures by value at
+    /// creation time, so a recursive local lambda would capture an
+    /// uninitialized slot. The consequence is that it cannot close over the
+    /// enclosing frame's locals — naming one is an unresolved reference, which
+    /// is a loud failure rather than a wrong answer.
+    LocalFun(FunDecl),
     /// An expression evaluated for effect (e.g. a `println(...)` call).
     Expr(Expr),
 }
@@ -507,6 +592,19 @@ pub enum Expr {
         value: Box<Expr>,
         ty: String,
         negated: bool,
+    },
+    /// `value as Type` / `value as? Type` — a checked cast.
+    ///
+    /// It is mostly a STATIC construct: the runtime representation does not
+    /// change, and what the program gains is that the result has a written type
+    /// — which is what decides integer width and `/` dispatch downstream. The
+    /// runtime half is the check itself: a failing `as` throws
+    /// `ClassCastException`, a failing `as?` evaluates to null.
+    As {
+        value: Box<Expr>,
+        ty: String,
+        /// `as?` — yield null instead of throwing on a mismatch.
+        safe: bool,
     },
     /// `x++` / `x--` / `++x` / `--x`. The expression's value is the target's
     /// value *before* the update for the postfix forms and *after* it for the

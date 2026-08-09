@@ -2013,3 +2013,315 @@ fun main() {
 }";
     assert_eq!(prog(src), "h\no\ntrue\ni\n101\nhello\nX\noob\n");
 }
+
+// ── Class bodies, extensions, and the scope functions ─────────────────────
+//
+// Each of these was a loud "unsupported" before; the assertions below are the
+// answers the reference toolchain gives (see `tests/data/parity_expected.txt`
+// for the frozen record of the same programs).
+
+#[test]
+fn class_body_properties_are_per_instance_and_not_data_members() {
+    // A body property is stored, initialized per instance in declaration order,
+    // and may name a constructor parameter — but a `data class`'s generated
+    // members read the PRIMARY CONSTRUCTOR alone, so `extra` is absent from
+    // `toString`, `equals`, and `hashCode` while still being readable.
+    let src = "\
+class C(val a: Int) {
+    var c = 0
+    val d = a * 2
+    fun bump(): Int { c = c + 1; return c }
+}
+data class D(val a: Int) { val extra = a + 1 }
+fun main() {
+    val x = C(3)
+    x.bump()
+    println(x.bump())
+    println(x.c)
+    println(x.d)
+    println(D(1))
+    println(D(1) == D(2).copy(a = 1))
+    println(D(1).extra)
+    println(D(4).copy(a = 9).extra)
+}";
+    assert_eq!(prog(src), "2\n2\n6\nD(a=1)\ntrue\n2\n10\n");
+}
+
+#[test]
+fn extension_dispatch_is_by_the_receivers_static_type() {
+    // `Int` and `Long` share one runtime representation, so only the DECLARED
+    // receiver decides which body runs — and with it whether the arithmetic
+    // wraps at 32 bits. An extension calling another unqualified goes through
+    // its own receiver.
+    let src = "\
+fun Int.dbl(): Int = this * 2
+fun Long.dbl(): Long = this * 2
+fun Int.quad(): Int = dbl().dbl()
+fun String.shout(): String = uppercase() + \"!\"
+fun main() {
+    println(3.dbl())
+    println(2000000000.dbl())
+    println(2000000000L.dbl())
+    println(2000000000.quad())
+    println(\"hi\".shout())
+    println(7.dbl() / 4)
+}";
+    assert_eq!(prog(src), "6\n-294967296\n4000000000\n-589934592\nHI!\n3\n");
+}
+
+#[test]
+fn companion_members_are_reachable_with_and_without_the_class_name() {
+    let src = "\
+class Counter(val start: Int) {
+    var n = start
+    companion object {
+        val ZERO = 0
+        fun of(k: Int): Counter = Counter(k)
+    }
+    fun reset(): Int { n = ZERO; return n }
+    fun clone2(): Counter = of(n)
+}
+fun main() {
+    println(Counter.ZERO)
+    println(Counter.of(5).n)
+    println(Counter(2).reset())
+    println(Counter(7).clone2().n)
+}";
+    assert_eq!(prog(src), "0\n5\n0\n7\n");
+}
+
+#[test]
+fn scope_functions_split_between_it_and_this() {
+    // `run`/`apply`/`with` bind the receiver as `this`, so an unqualified name
+    // inside reads a MEMBER of it; `let`/`also`/`takeIf` pass it as `it`.
+    // `apply`/`also` yield the receiver, `run`/`let` the block — and the
+    // receiver's declared width still reaches the block's arithmetic.
+    let src = "\
+class Box(var w: Int, var h: Int) { fun area(): Int = w * h }
+fun main() {
+    println(\"abc\".run { length })
+    println(with(\"hello\") { uppercase() + length })
+    println(run { 1 + 2 })
+    println(Box(2, 3).apply { w = 5 }.area())
+    println(Box(2, 3).run { area() + w })
+    println(\"abc\".let { it.length })
+    println(7.takeIf { it > 3 })
+    println(7.takeUnless { it > 3 })
+    println(2000000000.let { it + it })
+    println(2000000000L.let { it + it })
+}";
+    assert_eq!(
+        prog(src),
+        "3\nHELLO5\n3\n15\n8\n3\n7\nnull\n-294967296\n4000000000\n"
+    );
+}
+
+#[test]
+fn default_named_and_vararg_arguments_bind_by_declaration() {
+    // A default fills an omitted slot, a named argument binds by NAME (so an
+    // out-of-order pair cannot silently swap), and a `vararg` collects the
+    // positional tail — including none at all.
+    let src = "\
+fun greet(who: String, times: Int = 2, sep: String = \"-\"): String {
+    var s = \"\"
+    for (i in 1..times) s = s + who + sep
+    return s
+}
+fun total(vararg xs: Int): Int { var t = 0; for (x in xs) t += x; return t }
+fun mixed(a: Int, vararg rest: Int): Int { var t = a * 100; for (x in rest) t += x; return t }
+data class Cfg(val a: Int = 1, val b: String = \"x\")
+fun main() {
+    println(greet(\"x\"))
+    println(greet(\"y\", 3))
+    println(greet(sep = \"+\", who = \"z\"))
+    println(greet(\"q\", sep = \"*\"))
+    println(total())
+    println(total(1, 2, 3))
+    println(mixed(1))
+    println(mixed(1, 2, 3))
+    println(Cfg())
+    println(Cfg(b = \"z\"))
+}";
+    assert_eq!(
+        prog(src),
+        "x-x-\ny-y-y-\nz+z+\nq*q*\n0\n6\n100\n105\nCfg(a=1, b=x)\nCfg(a=1, b=z)\n"
+    );
+}
+
+#[test]
+fn pair_and_triple_are_data_classes_that_print_as_tuples() {
+    // Both render `(a, b[, c])` rather than `Name(x=…)`, compare structurally,
+    // and fold their `hashCode` the way a `data class` does — three places a
+    // frontend that reuses another heap kind answers something plausible.
+    let src = "\
+fun main() {
+    println(Pair(1, \"a\"))
+    println(Triple(1, 2, \"z\"))
+    println(Pair(1, \"a\") == Pair(1, \"a\"))
+    println(Triple(1, 2, \"z\") == Triple(2, 1, \"z\"))
+    println(Pair(1, 2).hashCode())
+    println(Triple(1, 2, 3).hashCode())
+    println((1 to 2) == Pair(1, 2))
+    val (a, b, c) = Triple(1, 2, \"z\")
+    println(\"\" + a + b + c)
+}";
+    assert_eq!(
+        prog(src),
+        "(1, a)\n(1, 2, z)\ntrue\nfalse\n33\n1026\ntrue\n12z\n"
+    );
+}
+
+#[test]
+fn a_lambda_write_reaches_the_enclosing_var() {
+    // A closure copies its captures by value, so a `var` a lambda ASSIGNS to has
+    // to live in shared storage — and keep its declared width while it does.
+    let src = "\
+fun main() {
+    var n = 0
+    listOf(1, 2, 3).forEach { n += it }
+    println(n)
+    var s = \"\"
+    listOf(\"a\", \"b\").forEach { s = s + it }
+    println(s)
+    var c = 0
+    (1..5).forEach { if (it % 2 == 0) c++ }
+    println(c)
+    var big = 2000000000
+    listOf(1).forEach { big += big }
+    println(big)
+    var lbig = 2000000000L
+    listOf(1).forEach { lbig += lbig }
+    println(lbig)
+}";
+    assert_eq!(prog(src), "6\nab\n2\n-294967296\n4000000000\n");
+}
+
+#[test]
+fn a_cast_supplies_the_static_type_and_checks_at_runtime() {
+    // The value is unchanged; what the cast gives is the type that then decides
+    // `/` dispatch. `as` throws on a mismatch where `as?` is null — and a null
+    // `as? String` has to PRINT as `null`, not as the empty string.
+    let src = "\
+fun anyAt(i: Int): Any = listOf<Any>(7, \"ab\", 2.5)[i]
+fun main() {
+    println((anyAt(0) as Int) + 1)
+    println(anyAt(0) as Int / 2)
+    println(anyAt(2) as Double / 2)
+    println((anyAt(1) as String).length)
+    println(anyAt(0) as? String)
+    println(anyAt(1) as? Int)
+    println((anyAt(1) as? Int) ?: -1)
+    try { println(anyAt(1) as Int) } catch (e: ClassCastException) { println(\"cce\") }
+}";
+    assert_eq!(prog(src), "8\n3\n1.25\n2\nnull\nnull\n-1\ncce\n");
+}
+
+#[test]
+fn top_level_properties_initialize_before_main_and_by_lazy_does_not() {
+    // A plain top-level property runs its initializer at startup; a `by lazy`
+    // one runs at the FIRST READ and caches, so the marker lands between the
+    // prints rather than before them, and only once.
+    let src = "\
+val K = 7
+val NAME: String = \"kt\"
+val DERIVED = K * 3
+var counter = 0
+val z: Int by lazy { println(\"forcing\"); 41 + 1 }
+fun bump(): Int { counter += 1; return counter }
+fun main() {
+    println(K)
+    println(NAME.uppercase())
+    println(DERIVED)
+    println(K / 2)
+    println(bump())
+    println(bump())
+    counter = 100
+    println(counter)
+    println(\"before\")
+    println(z)
+    println(z)
+}";
+    assert_eq!(
+        prog(src),
+        "7\nKT\n21\n3\n1\n2\n100\nbefore\nforcing\n42\n42\n"
+    );
+}
+
+#[test]
+fn run_catching_packages_both_outcomes_as_a_result() {
+    // Every reader of a `Result` is total: `getOrNull` is null on failure,
+    // `exceptionOrNull` null on success, `map` transforms only a success. A
+    // throw inside the block must be CAUGHT, not escape the program.
+    let src = "\
+fun rboom(n: Int): Int {
+    if (n < 0) throw IllegalStateException(\"neg\")
+    return n * 2
+}
+fun main() {
+    val ok = runCatching { rboom(3) }
+    val bad = runCatching { rboom(-1) }
+    println(ok)
+    println(bad)
+    println(ok.isSuccess)
+    println(bad.isFailure)
+    println(ok.getOrNull())
+    println(bad.getOrNull())
+    println(bad.exceptionOrNull())
+    println(bad.getOrElse { -99 })
+    println(ok.map { it + 1 })
+    println(bad.map { it + 1 })
+    println(runCatching { 1 / 0 }.isFailure)
+}";
+    assert_eq!(
+        prog(src),
+        "Success(6)\n\
+         Failure(java.lang.IllegalStateException: neg)\n\
+         true\ntrue\n6\nnull\n\
+         java.lang.IllegalStateException: neg\n\
+         -99\nSuccess(7)\n\
+         Failure(java.lang.IllegalStateException: neg)\n\
+         true\n"
+    );
+}
+
+#[test]
+fn a_local_fun_is_a_subroutine_so_it_can_recurse() {
+    // Lowered as a real sub rather than a closure value: a closure captures by
+    // value at creation, so a self-reference would read an uninitialized slot.
+    // It still takes defaults, shadows a top-level function of its name, and is
+    // callable from a lambda in the same body.
+    let src = "\
+fun shadowed(n: Int): Int = n * 1000
+fun main() {
+    fun g(x: Int): Int = x * 3
+    println(g(4))
+    fun fact(n: Int): Int = if (n <= 1) 1 else n * fact(n - 1)
+    println(fact(5))
+    fun tag(k: Int, sep: String = \"-\"): String = sep + k
+    println(tag(2) + tag(2, \"+\"))
+    fun shadowed(k: Int): Int = k + 1
+    println(shadowed(4))
+    println(listOf(1, 2, 3).map { g(it) })
+    fun outer(k: Int): Int {
+        fun inner(j: Int): Int = j + 3
+        return inner(k) * 2
+    }
+    println(outer(3))
+}";
+    assert_eq!(prog(src), "12\n120\n-2+2\n5\n[3, 6, 9]\n12\n");
+}
+
+#[test]
+fn a_reified_type_test_is_rejected_rather_than_answered() {
+    // The coarse type system carries no type arguments, so `x is T` inside a
+    // generic function has no answer it could give — and answering `false` (the
+    // shape a name-based lookup falls into) would be silently wrong. It is a
+    // compile error instead.
+    let err = prog_err(
+        "inline fun <reified T> isA(x: Any): Boolean = x is T\nfun main() { println(isA<Int>(5)) }",
+    );
+    assert!(
+        err.contains("type parameter `T`") && err.contains("reified"),
+        "unexpected diagnostic: {err}"
+    );
+}

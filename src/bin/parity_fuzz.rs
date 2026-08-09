@@ -1126,6 +1126,288 @@ fn g_predicate(r: &mut Rng, _idx: usize) -> String {
     }
 }
 
+/// `body` — properties declared in a class BODY rather than the primary
+/// constructor, and the `companion object` that reaches a class's members
+/// without an instance.
+///
+/// The silent difference this hunts is what a `data class`'s generated members
+/// see: Kotlin derives `toString`/`equals`/`hashCode`/`componentN` from the
+/// PRIMARY CONSTRUCTOR alone, so a body property is stored, readable, and
+/// printable — and still absent from every derived member. A frontend that
+/// appends body properties to the same field record answers `DBody(a=1, extra=2)`
+/// and compares `extra` too, which is wrong in a way nothing else reveals.
+fn g_body(r: &mut Rng, _idx: usize) -> String {
+    let k = pick(r, RINTS);
+    match r.below(14) {
+        0 => p(format!("Acc({k}).bump()")),
+        1 => p(format!("Acc({k}).doubled")),
+        2 => p(format!("Acc({k}).tot()")),
+        // Two bumps on ONE instance: a body property is per-instance state, so a
+        // frontend that built it once (as an `object`'s is) answers 1 twice.
+        3 => format!("run {{ val a = Acc({k}); a.bump(); println(a.bump()) }}"),
+        4 => format!("run {{ val a = Acc({k}); a.bump(); println(a.tot()) }}"),
+        5 => p("Acc.ZERO".to_string()),
+        6 => p(format!("Acc.of({k}).doubled")),
+        7 => p(format!("Acc.of({k}).n")),
+        8 => p("Acc.describe()".to_string()),
+        9 => p(format!("DBody({k})")),
+        10 => p(format!("DBody({k}) == DBody({k})")),
+        11 => p(format!("DBody({k}).hashCode()")),
+        12 => p(format!("DBody({k}).extra")),
+        _ => p(format!("DBody({k}).copy(a = {}).extra", pick(r, RINTS))),
+    }
+}
+
+/// `ext` — extension functions. A `fun Int.dbl()` is dispatched by the
+/// receiver's STATIC type, so `Int` and `Long` versions of one name must stay
+/// apart even though both receivers are one `i64` at runtime — and the `Int`
+/// one's arithmetic still has to wrap at 32 bits, which is only knowable from
+/// the declared receiver.
+fn g_ext(r: &mut Rng, _idx: usize) -> String {
+    match r.below(12) {
+        0 => p(format!("{}.dbl()", pick(r, INTS))),
+        // The width probe: `Int.dbl` wraps, `Long.dbl` does not, from the same
+        // written body.
+        1 => p("2000000000.dbl()".to_string()),
+        2 => p("2000000000L.dbl()".to_string()),
+        3 => p(format!("{}L.dbl()", pick(r, INTS))),
+        4 => p(format!("{}.shout()", pick(r, STRS))),
+        5 => p(format!("{}.rep({})", pick(r, STRS), pick(r, STEPS))),
+        6 => p(format!("Pt({}, {}).label()", pick(r, INTS), pick(r, STRS))),
+        7 => p(format!("{}.half()", pick(r, DBLS))),
+        8 => p(format!("{}.plusN()", pick(r, INTS))),
+        9 => p(format!("{}.plusN({})", pick(r, INTS), pick(r, INTS))),
+        // An extension calling another on the same receiver, unqualified.
+        10 => p(format!("{}.quad()", pick(r, INTS))),
+        _ => p(format!("{}.shout().length", pick(r, STRS))),
+    }
+}
+
+/// `scope` — the scope functions. They split into the `it`-form
+/// (`let`/`also`/`takeIf`/`takeUnless`) and the `this`-form (`run`/`apply`/
+/// `with`), and the two differ in exactly one place a frontend can get wrong
+/// silently: whether an unqualified name inside the block reads a member of the
+/// receiver or an enclosing binding. `apply` additionally yields the RECEIVER
+/// where `run` yields the block, so confusing them answers a plausible value of
+/// the wrong thing.
+fn g_scope(r: &mut Rng, _idx: usize) -> String {
+    let s = pick(r, STRS);
+    let n = pick(r, INTS);
+    let k = pick(r, RINTS);
+    match r.below(16) {
+        0 => p(format!("{s}.run {{ length }}")),
+        1 => p(format!("{s}.run {{ uppercase() + length }}")),
+        2 => p(format!("with({s}) {{ length * 2 }}")),
+        3 => p(format!("with({s}) {{ this + \"!\" }}")),
+        // The receiver is parenthesized because `-1.takeIf { … }` parses as
+        // `-(1.takeIf { … })` in Kotlin, and negating the resulting `Int?` is a
+        // type error there — a program the reference toolchain rejects is not a
+        // parity signal.
+        4 => p(format!("({n}).let {{ it * it }}")),
+        5 => p(format!("({n}).also {{ it }}")),
+        6 => p(format!("({n}).takeIf {{ it > 0 }}")),
+        7 => p(format!("({n}).takeUnless {{ it > 0 }}")),
+        8 => p("run { 1 + 2 }".to_string()),
+        9 => p(format!("Acc({k}).apply {{ n = {} }}.tot()", pick(r, RINTS))),
+        10 => p(format!("Acc({k}).run {{ tot() + doubled }}")),
+        11 => p(format!("Acc({k}).also {{ it.bump() }}.n")),
+        12 => p(format!("listOf({k}, {}).run {{ size }}", pick(r, RINTS))),
+        13 => p(format!(
+            "listOf({k}, {}).let {{ it.sum() }}",
+            pick(r, RINTS)
+        )),
+        // Width inside a receiver block: the receiver's declared type has to
+        // reach the block's arithmetic.
+        14 => p("2000000000.let { it + it }".to_string()),
+        _ => p("2000000000L.let { it + it }".to_string()),
+    }
+}
+
+/// `params` — default, named, and `vararg` parameters. Each is a way for the
+/// ARGUMENT LIST at a call site not to match the parameter list, and the wrong
+/// answers are quiet: a dropped default binds nothing, a named argument bound
+/// positionally swaps two values of the same type, and a `vararg` that collects
+/// the wrong tail changes a sum rather than failing.
+fn g_params(r: &mut Rng, _idx: usize) -> String {
+    let a = pick(r, RINTS);
+    let b = pick(r, RINTS);
+    let c = pick(r, RINTS);
+    match r.below(14) {
+        0 => p(format!("pad({})", pick(r, STRS))),
+        1 => p(format!("pad({}, {})", pick(r, STRS), pick(r, STEPS))),
+        2 => p(format!("pad({}, {}, \"*\")", pick(r, STRS), pick(r, STEPS))),
+        3 => p(format!("pad(sep = \"*\", s = {})", pick(r, STRS))),
+        4 => p(format!("pad({}, sep = \"+\")", pick(r, STRS))),
+        5 => p("total()".to_string()),
+        6 => p(format!("total({a})")),
+        7 => p(format!("total({a}, {b}, {c})")),
+        8 => p(format!("mixed({a})")),
+        9 => p(format!("mixed({a}, {b}, {c})")),
+        10 => p("Cfg().b".to_string()),
+        11 => p(format!("Cfg({a}).a")),
+        12 => p(format!("Cfg(b = \"z\").a + Cfg({a}).a")),
+        _ => p(format!("Cfg({a}, \"q\")")),
+    }
+}
+
+/// `tuple` — `Pair` and `Triple`. Both are `data class`es whose display is
+/// `(a, b)` rather than `Name(x=…)`, and whose `hashCode` is the `data class`
+/// fold — three separate places a frontend that reuses another heap kind for
+/// them answers something plausible and wrong.
+fn g_tuple(r: &mut Rng, _idx: usize) -> String {
+    let a = pick(r, RINTS);
+    let b = pick(r, RINTS);
+    let s = pick(r, STRS);
+    match r.below(14) {
+        0 => p(format!("Pair({a}, {s})")),
+        1 => p(format!("Triple({a}, {b}, {s})")),
+        2 => p(format!("Pair({a}, {b}).first + Pair({a}, {b}).second")),
+        3 => p(format!("Triple({a}, {b}, {a}).third")),
+        4 => p(format!("Pair({a}, {s}) == Pair({a}, {s})")),
+        5 => p(format!("Triple({a}, {b}, {s}) == Triple({a}, {b}, {s})")),
+        6 => p(format!("Triple({a}, {b}, {s}) == Triple({b}, {a}, {s})")),
+        7 => p(format!("Pair({a}, {b}).hashCode()")),
+        8 => p(format!("Triple({a}, {b}, {a}).hashCode()")),
+        // A `Pair` and a `Triple` are NOT interchangeable with the `to` form or
+        // with a `Map.Entry`.
+        9 => p(format!("({a} to {b}) == Pair({a}, {b})")),
+        10 => format!("run {{ val (x, y, z) = Triple({a}, {b}, {s}); println(\"\" + x + y + z) }}"),
+        11 => p(format!("listOf(Pair({a}, {b}), Pair({b}, {a}))")),
+        12 => p(format!("Triple({a}, {b}, {s}).component2()")),
+        _ => p(format!("listOf(Triple({a}, {b}, {a})).first().second")),
+    }
+}
+
+/// `capture` — a `var` of the enclosing frame that a lambda ASSIGNS to.
+///
+/// A closure copies its captures by value, so the write has to reach shared
+/// storage or the enclosing frame keeps the pre-lambda value — a wrong number,
+/// not an error. The `Int` cases additionally require the boxed value to keep
+/// its declared width, so the accumulation still wraps at 32 bits.
+fn g_capture(r: &mut Rng, _idx: usize) -> String {
+    let xs = format!(
+        "listOf({}, {}, {})",
+        pick(r, RINTS),
+        pick(r, RINTS),
+        pick(r, RINTS)
+    );
+    match r.below(10) {
+        0 => format!("run {{ var n = 0; {xs}.forEach {{ n += it }}; println(n) }}"),
+        1 => format!("run {{ var n = 1; {xs}.forEach {{ n *= it }}; println(n) }}"),
+        2 => format!("run {{ var s = \"\"; {xs}.forEach {{ s = s + it }}; println(s) }}"),
+        3 => format!("run {{ var c = 0; {xs}.forEach {{ if (it > 0) c++ }}; println(c) }}"),
+        4 => format!("run {{ var d = 0.0; {xs}.forEach {{ d += it }}; println(d) }}"),
+        5 => format!("run {{ var n = 2000000000; {xs}.forEach {{ n += n }}; println(n) }}"),
+        6 => format!("run {{ var n = 2000000000L; {xs}.forEach {{ n += n }}; println(n) }}"),
+        7 => format!("run {{ var n = 0; {xs}.map {{ n += it; n }}.forEach {{ println(it) }} }}"),
+        8 => format!(
+            "run {{ var n = 0; for (i in 1..3) {{ {xs}.forEach {{ n += it }} }}; println(n) }}"
+        ),
+        _ => {
+            format!("run {{ var n = 0; {xs}.let {{ l -> l.forEach {{ n += it }} }}; println(n) }}")
+        }
+    }
+}
+
+/// `cast` — `x as T` and `x as? T`. The cast changes no representation; what it
+/// supplies is the STATIC type, which then decides `/` dispatch and integer
+/// width downstream. The failure paths differ (`ClassCastException` vs null),
+/// and `as? String` yielding null has to PRINT as `null` rather than as the
+/// empty string a non-null String coercion would give.
+fn g_cast(r: &mut Rng, _idx: usize) -> String {
+    let i = r.below(3);
+    let any = format!("anyAt({i})");
+    match r.below(12) {
+        0 => p(format!("({any} as? Int)")),
+        1 => p(format!("({any} as? String)")),
+        2 => p(format!("({any} as? Double)")),
+        3 => p("(anyAt(0) as Int) + 1".to_string()),
+        4 => p("anyAt(0) as Int / 2".to_string()),
+        5 => p("(anyAt(2) as Double) / 2".to_string()),
+        6 => p("(anyAt(1) as String).length".to_string()),
+        7 => p("(anyAt(1) as String) + \"!\"".to_string()),
+        8 => p("(bigAny() as Int) + (bigAny() as Int)".to_string()),
+        9 => p("((bigAny() as Int).toLong()) + (bigAny() as Int)".to_string()),
+        10 => "try { println(anyAt(1) as Int) } catch (e: ClassCastException) { println(\"cce\") }"
+            .to_string(),
+        _ => p(format!("({any} as? Int) ?: -1")),
+    }
+}
+
+/// `lazyprop` — top-level properties and `by lazy`.
+///
+/// A top-level `val` initializes before `main`; a `by lazy` one does NOT — its
+/// thunk runs at the first READ and caches. Evaluating it eagerly gives the same
+/// value and a different program: the observable difference is WHEN the thunk's
+/// output appears, and whether it appears twice.
+fn g_lazyprop(r: &mut Rng, _idx: usize) -> String {
+    let k = pick(r, RINTS);
+    match r.below(10) {
+        0 => p("GK".to_string()),
+        1 => p("GK * 2".to_string()),
+        2 => p("GNAME.uppercase()".to_string()),
+        3 => p("GDERIVED".to_string()),
+        4 => format!("run {{ GC = {k}; println(GC) }}"),
+        5 => format!("run {{ GC = {k}; GC += 1; println(GC) }}"),
+        6 => p(format!("Lz({k}).v")),
+        // The forcing-order probe: a fresh instance per probe keeps it local,
+        // and the thunk's print must land between the two markers.
+        7 => format!(
+            "run {{ val z = Lz({k}); println(\"a\"); println(z.v); println(z.v); println(\"b\") }}"
+        ),
+        8 => p(format!("Lz({k}).v + Lz({k}).v")),
+        _ => p(format!("Lz({k}).doubled()")),
+    }
+}
+
+/// `result` — `runCatching` and the `Result` it yields.
+///
+/// `Result` is a union that renders as `Success(v)` / `Failure(<throwable>)`,
+/// and every reader of it is total: `getOrNull` is null on failure,
+/// `exceptionOrNull` is null on success, `map` transforms only a success. A
+/// frontend that lets the exception escape, or that reports success for a
+/// caught throw, answers the wrong branch rather than failing.
+fn g_result(r: &mut Rng, _idx: usize) -> String {
+    let n = pick(r, RINTS);
+    let block = if r.below(2) == 0 {
+        format!("rboom({n})")
+    } else {
+        "rboom(-1)".to_string()
+    };
+    match r.below(12) {
+        0 => p(format!("runCatching {{ {block} }}")),
+        1 => p(format!("runCatching {{ {block} }}.isSuccess")),
+        2 => p(format!("runCatching {{ {block} }}.isFailure")),
+        3 => p(format!("runCatching {{ {block} }}.getOrNull()")),
+        4 => p(format!("runCatching {{ {block} }}.exceptionOrNull()")),
+        5 => p(format!("runCatching {{ {block} }}.getOrElse {{ -1 }}")),
+        6 => p(format!("runCatching {{ {block} }}.map {{ it + 1 }}")),
+        7 => p(format!("runCatching {{ {block} }}.getOrNull() ?: -7")),
+        8 => p("runCatching { 1 / 0 }.isFailure".to_string()),
+        9 => p("runCatching { listOf(1).first { it > 9 } }.isFailure".to_string()),
+        10 => format!("runCatching {{ {block} }}.onSuccess {{ println(\"s\" + it) }}"),
+        _ => format!("runCatching {{ {block} }}.onFailure {{ println(\"f\") }}"),
+    }
+}
+
+/// `localfn` — a `fun` declared inside another function's body. It is a
+/// subroutine rather than a closure value, which is what lets it recurse; the
+/// probes exercise the recursion, the defaults it still gets, and the shadowing
+/// of a top-level function of the same name.
+fn g_localfn(r: &mut Rng, _idx: usize) -> String {
+    let n = pick(r, STEPS);
+    match r.below(8) {
+        0 => p(format!("withLocal({n})")),
+        1 => p(format!("localFact({n})")),
+        2 => p(format!("localFib({n})")),
+        3 => p(format!("localDefault({n})")),
+        4 => p("localDefaultBare()".to_string()),
+        5 => p(format!("localShadow({n})")),
+        6 => p(format!("localInLambda({n})")),
+        _ => p(format!("localNested({n})")),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     All,
@@ -1168,6 +1450,16 @@ enum Mode {
     StrSearch,
     CollArg,
     Predicate,
+    Body,
+    Ext,
+    Scope,
+    Params,
+    Tuple,
+    Capture,
+    Cast,
+    LazyProp,
+    Result,
+    LocalFn,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -1210,6 +1502,16 @@ const CONCRETE: &[Mode] = &[
     Mode::StrSearch,
     Mode::CollArg,
     Mode::Predicate,
+    Mode::Body,
+    Mode::Ext,
+    Mode::Scope,
+    Mode::Params,
+    Mode::Tuple,
+    Mode::Capture,
+    Mode::Cast,
+    Mode::LazyProp,
+    Mode::Result,
+    Mode::LocalFn,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -1254,6 +1556,16 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::StrSearch => "strsearch",
         Mode::CollArg => "collarg",
         Mode::Predicate => "predicate",
+        Mode::Body => "body",
+        Mode::Ext => "ext",
+        Mode::Scope => "scope",
+        Mode::Params => "params",
+        Mode::Tuple => "tuple",
+        Mode::Capture => "capture",
+        Mode::Cast => "cast",
+        Mode::LazyProp => "lazyprop",
+        Mode::Result => "result",
+        Mode::LocalFn => "localfn",
     }
 }
 
@@ -1310,6 +1622,16 @@ fn gen_probe(r: &mut Rng, mode: Mode, idx: usize) -> String {
         Mode::StrSearch => g_strsearch(r, idx),
         Mode::CollArg => g_collarg(r, idx),
         Mode::Predicate => g_predicate(r, idx),
+        Mode::Body => g_body(r, idx),
+        Mode::Ext => g_ext(r, idx),
+        Mode::Scope => g_scope(r, idx),
+        Mode::Params => g_params(r, idx),
+        Mode::Tuple => g_tuple(r, idx),
+        Mode::Capture => g_capture(r, idx),
+        Mode::Cast => g_cast(r, idx),
+        Mode::LazyProp => g_lazyprop(r, idx),
+        Mode::Result => g_result(r, idx),
+        Mode::LocalFn => g_localfn(r, idx),
         Mode::All => unreachable!("resolved above"),
     }
 }
@@ -1328,6 +1650,190 @@ fn gen_probes(seed: u64, mode: Mode, n: usize) -> Vec<String> {
 /// The `kotlin.math` import is unconditional: Kotlin does not auto-import that
 /// package, so the math probes need it, and an unused import is only a warning
 /// (never a compile failure) for the programs that contain no math probe.
+/// The top-level declarations the newer modes need, each emitted only when a
+/// probe names it — the same rule the class blocks follow, so `minimize` keeps
+/// producing programs the reference toolchain still compiles.
+///
+/// A top-level `val`/`var` is emitted whenever ANY probe reads one, because the
+/// `lazyprop` probes share them; every mutation probe writes and reads inside
+/// one `run { … }`, so the answer does not depend on which other probes survive
+/// a reduction.
+fn extra_declarations(probes: &[String]) -> String {
+    let mut out = String::new();
+    let named = |m: &str| probes.iter().any(|p| p.contains(m));
+    if named("Acc(") || named("Acc.") {
+        out.push_str(
+            "class Acc(val base: Int) {\n\
+             \x20   var n = 0\n\
+             \x20   val doubled = base * 2\n\
+             \x20   companion object {\n\
+             \x20       val ZERO = 0\n\
+             \x20       fun of(k: Int): Acc = Acc(k)\n\
+             \x20       fun describe(): String = \"acc/\" + ZERO\n\
+             \x20   }\n\
+             \x20   fun bump(): Int { n = n + 1; return n }\n\
+             \x20   fun tot(): Int = n + doubled\n\
+             }\n",
+        );
+    }
+    if named("DBody(") {
+        out.push_str("data class DBody(val a: Int) {\n\x20   val extra = a + 1\n}\n");
+    }
+    if named(".dbl()")
+        || named(".shout()")
+        || named(".rep(")
+        || named(".label()")
+        || named(".half()")
+        || named(".plusN(")
+        || named(".quad()")
+    {
+        out.push_str(
+            "fun Int.dbl(): Int = this * 2\n\
+             fun Long.dbl(): Long = this * 2\n\
+             fun Int.plusN(n: Int = 3): Int = this + n\n\
+             fun Int.quad(): Int = dbl().dbl()\n\
+             fun String.shout(): String = uppercase() + \"!\"\n\
+             fun String.rep(n: Int): String {\n\
+             \x20   var s = \"\"\n\
+             \x20   for (i in 1..n) s += this\n\
+             \x20   return s\n\
+             }\n\
+             fun Double.half(): Double = this / 2\n",
+        );
+    }
+    // Kept separate from the block above so a reduction down to a probe that
+    // names no `Pt` does not emit an extension on an undeclared type — the
+    // reduced program has to stay compilable for the oracle.
+    if named(".label()") {
+        out.push_str("fun Pt.label(): String = x.toString() + \"/\" + y\n");
+    }
+    if named("pad(") {
+        out.push_str(
+            "fun pad(s: String, n: Int = 2, sep: String = \"-\"): String {\n\
+             \x20   var out = s\n\
+             \x20   for (i in 1..n) out = out + sep\n\
+             \x20   return out\n\
+             }\n",
+        );
+    }
+    if named("total(") {
+        out.push_str(
+            "fun total(vararg xs: Int): Int {\n\
+             \x20   var t = 0\n\
+             \x20   for (x in xs) t += x\n\
+             \x20   return t\n\
+             }\n",
+        );
+    }
+    if named("mixed(") {
+        out.push_str(
+            "fun mixed(a: Int, vararg rest: Int): Int {\n\
+             \x20   var t = a * 100\n\
+             \x20   for (x in rest) t += x\n\
+             \x20   return t\n\
+             }\n",
+        );
+    }
+    if named("Cfg(") {
+        out.push_str("data class Cfg(val a: Int = 1, val b: String = \"x\")\n");
+    }
+    if named("anyAt(") {
+        out.push_str("fun anyAt(i: Int): Any = listOf<Any>(7, \"ab\", 2.5)[i]\n");
+    }
+    if named("bigAny(") {
+        out.push_str("fun bigAny(): Any = 2000000000\n");
+    }
+    if named("GK") || named("GNAME") || named("GDERIVED") || named("GC") {
+        out.push_str(
+            "val GK = 7\n\
+             val GNAME = \"kt\"\n\
+             val GDERIVED = GK * 3\n\
+             var GC = 0\n",
+        );
+    }
+    if named("Lz(") {
+        out.push_str(
+            "class Lz(val k: Int) {\n\
+             \x20   val v: Int by lazy { println(\"force\" + k); k * 10 }\n\
+             \x20   fun doubled(): Int = v + v\n\
+             }\n",
+        );
+    }
+    if named("rboom(") {
+        out.push_str(
+            "fun rboom(n: Int): Int {\n\
+             \x20   if (n < 0) throw IllegalStateException(\"neg\")\n\
+             \x20   return n * 2\n\
+             }\n",
+        );
+    }
+    if named("withLocal(") {
+        out.push_str(
+            "fun withLocal(n: Int): Int {\n\
+             \x20   fun sq(x: Int): Int = x * x\n\
+             \x20   return sq(n) + 1\n\
+             }\n",
+        );
+    }
+    if named("localFact(") {
+        out.push_str(
+            "fun localFact(n: Int): Int {\n\
+             \x20   fun f(k: Int): Int = if (k <= 1) 1 else k * f(k - 1)\n\
+             \x20   return f(n)\n\
+             }\n",
+        );
+    }
+    if named("localFib(") {
+        out.push_str(
+            "fun localFib(n: Int): Int {\n\
+             \x20   fun fib(k: Int): Int = if (k < 2) k else fib(k - 1) + fib(k - 2)\n\
+             \x20   return fib(n)\n\
+             }\n",
+        );
+    }
+    if named("localDefault(") || named("localDefaultBare(") {
+        out.push_str(
+            "fun localDefault(n: Int): String {\n\
+             \x20   fun tag(k: Int, sep: String = \"-\"): String = sep + k\n\
+             \x20   return tag(n) + tag(n, \"+\")\n\
+             }\n\
+             fun localDefaultBare(): String {\n\
+             \x20   fun tag(k: Int = 4): String = \"t\" + k\n\
+             \x20   return tag()\n\
+             }\n",
+        );
+    }
+    if named("localShadow(") {
+        out.push_str(
+            "fun shadowed(n: Int): Int = n * 1000\n\
+             fun localShadow(n: Int): Int {\n\
+             \x20   fun shadowed(k: Int): Int = k + 1\n\
+             \x20   return shadowed(n)\n\
+             }\n",
+        );
+    }
+    if named("localInLambda(") {
+        out.push_str(
+            "fun localInLambda(n: Int): Int {\n\
+             \x20   fun step(x: Int): Int = x * 2 + 1\n\
+             \x20   return listOf(n, n + 1).map { step(it) }.sum()\n\
+             }\n",
+        );
+    }
+    if named("localNested(") {
+        out.push_str(
+            "fun localNested(n: Int): Int {\n\
+             \x20   fun outer(x: Int): Int {\n\
+             \x20       fun inner(y: Int): Int = y + 3\n\
+             \x20       return inner(x) * 2\n\
+             \x20   }\n\
+             \x20   return outer(n)\n\
+             }\n",
+        );
+    }
+    out
+}
+
 /// Top-level declarations a probe may reference are emitted only when some probe
 /// actually names them, so an unrelated program stays minimal and [`minimize`]
 /// keeps producing compilable reductions: the `Pt` `data class`, and one
@@ -1336,6 +1842,7 @@ fn gen_probes(seed: u64, mode: Mode, n: usize) -> Vec<String> {
 /// probes and would otherwise renumber them.
 fn declarations(probes: &[String]) -> String {
     let mut out = String::new();
+    out.push_str(&extra_declarations(probes));
     if probes.iter().any(|p| p.contains("Pt(")) {
         out.push_str("data class Pt(val x: Int, val y: String)\n");
     }

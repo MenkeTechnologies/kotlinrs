@@ -242,6 +242,37 @@ pub const KT_EXC_UNSTASH: u16 = 118;
 /// `Exception in thread "main" …` line and halts, so the process exits non-zero.
 pub const KT_EXC_ABORT: u16 = 119;
 
+/// `KT_AS`: the runtime half of `x as T` / `x as? T`. Stack (top-down):
+/// `typeName, value`; `arg == 1` for the safe (`as?`) form.
+///
+/// The value itself is never converted — a cast does not change a
+/// representation in Kotlin either — so all this does is check the type and
+/// decide what a mismatch means: `ClassCastException` for `as`, null for `as?`.
+/// The cast's real work is static, in the type the compiler gives the result.
+pub const KT_AS: u16 = 120;
+
+/// `KT_LAZY_NEW`: wrap a thunk closure in an unforced `by lazy` cell.
+pub const KT_LAZY_NEW: u16 = 121;
+
+/// `KT_RUN_CATCHING`: run a block and capture its outcome as a `Result`.
+///
+/// Stack: `closure`. The block's own frame already unwinds a raise back to
+/// here — the pending slot is how this frontend carries an exception — so all
+/// this does is read that slot, clear it, and package either outcome.
+pub const KT_RUN_CATCHING: u16 = 123;
+
+/// `KT_RESULT_HOF`: the lambda-taking `Result` members. Stack (top-down):
+/// `nameStr, closure, result`.
+pub const KT_RESULT_HOF: u16 = 124;
+
+/// `KT_LAZY_GET`: read a `by lazy` cell, running its thunk the first time.
+///
+/// A BUILTIN rather than an extension op because forcing runs user code, and
+/// only a builtin can re-enter the VM. A value that is not a cell passes
+/// straight through, so the op is safe to emit on any read of a property the
+/// compiler believes is lazy.
+pub const KT_LAZY_GET: u16 = 122;
+
 thread_local! {
     /// Set by a runtime fault (e.g. integer divide-by-zero) so the CLI can
     /// report it as an uncaught exception after `VM::run` returns.
@@ -328,6 +359,13 @@ enum HeapObj {
         /// reads the inherited field. The record stays flat (property lookup
         /// wants every field); this marks where the derived members start.
         data_from: usize,
+        /// How many fields from `data_from` the primary constructor supplied.
+        /// The record continues past them with the class's BODY properties
+        /// (`class C(val a: Int) { val b = 2 }`), which Kotlin's derived members
+        /// deliberately do not see — `data class D(val a: Int) { val b = 2 }`
+        /// prints `D(a=1)` and compares only `a`. So the derived members read
+        /// `fields[data_from .. data_from + data_len]`, not the whole tail.
+        data_len: usize,
     },
     List(Vec<Value>),
     /// A `Set`, kept as its insertion-ordered distinct elements. Kotlin's
@@ -345,6 +383,25 @@ enum HeapObj {
     /// `mapOf(1 to "a").entries.first() == (1 to "a")` is `false`. Sharing one
     /// variant made all three wrong.
     Entry(Value, Value),
+    /// A `Result`: the success value, or the throwable a `runCatching` block
+    /// raised. Kotlin's `Result` is an inline class over exactly this union, and
+    /// it renders as `Success(v)` / `Failure(<throwable>)`.
+    Res {
+        value: Value,
+        err: Option<Value>,
+    },
+    /// A `by lazy` cell: the thunk that computes the value, and the value once
+    /// it has been computed. The distinction from an eagerly-stored value is
+    /// observable — the thunk runs at first READ, not at declaration — so the
+    /// cell has to exist at runtime rather than being folded away.
+    Lazy {
+        thunk: Value,
+        value: Option<Value>,
+    },
+    /// A `Triple`. Kotlin's `Pair`/`Triple` are ordinary `data class`es, but
+    /// they render as `(a, b)` / `(a, b, c)` rather than `Name(x=…)`, so they
+    /// get their own variants instead of riding on [`HeapObj::Instance`].
+    Triple(Value, Value, Value),
     /// A first-class lambda: the body's chunk name-pool index (resolved to an
     /// entry via `Chunk::find_sub` at call time), its parameter count, and the
     /// values captured from the enclosing frame at creation (its upvalues, stored
@@ -1224,6 +1281,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let mut it = meta.split('\u{1f}');
             let class = it.next().unwrap_or("").to_string();
             let is_data = it.next() == Some("d");
+            let data_len = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
             register_widths(&class, it.next().unwrap_or(""));
             let fields: Vec<(String, Value)> = it.map(|s| s.to_string()).zip(vals).collect();
             vm.push(alloc(HeapObj::Instance {
@@ -1232,6 +1290,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
                 fields,
                 // No superclass, so every field is this class's own.
                 data_from: 0,
+                data_len,
             }));
         }
         KT_TYPE_REG => {
@@ -1258,6 +1317,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let mut it = meta.split('\u{1f}');
             let class = it.next().unwrap_or("").to_string();
             let is_data = it.next() == Some("d");
+            let data_len = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
             register_widths(&class, it.next().unwrap_or(""));
             // The base's fields come first, so a subclass's record reads
             // base-most first — the order the compiler's flattened property
@@ -1274,6 +1334,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
                 is_data,
                 fields,
                 data_from,
+                data_len,
             }));
         }
         KT_CLASSOF => {
@@ -1371,6 +1432,14 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             }
             vm.push(alloc(HeapObj::Map(entries)));
         }
+        // `a to b` / `Pair(a, b)` with `arg == 0`; `Triple(a, b, c)` with
+        // `arg == 1`. One op because the two differ only in arity.
+        KT_PAIR if arg == 1 => {
+            let c = vm.pop();
+            let b = vm.pop();
+            let a = vm.pop();
+            vm.push(alloc(HeapObj::Triple(a, b, c)));
+        }
         KT_PAIR => {
             let b = vm.pop();
             let a = vm.pop();
@@ -1421,6 +1490,32 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let ty = vm.pop().to_str();
             let v = vm.pop();
             vm.push(Value::Bool(value_is_type(&v, &ty)));
+        }
+        KT_LAZY_NEW => {
+            let thunk = vm.pop();
+            vm.push(alloc(HeapObj::Lazy { thunk, value: None }));
+        }
+        KT_AS => {
+            let ty = vm.pop().to_str();
+            let v = vm.pop();
+            // Kotlin's `null as T?` succeeds and `null as? T` is null; the
+            // parser drops the `?`, so a null value passes a safe cast and
+            // fails an unsafe one exactly as the JVM's would.
+            let matched = value_is_type(&v, &ty);
+            if matched {
+                vm.push(v);
+            } else if arg == 1 {
+                vm.push(Value::Undef);
+            } else {
+                let from = obj_label(&v);
+                fault(
+                    vm,
+                    format!(
+                        "java.lang.ClassCastException: class {from} cannot be cast to class {ty}"
+                    ),
+                );
+                vm.push(Value::Undef);
+            }
         }
         KT_CHR_STRING => {
             let v = vm.pop();
@@ -1643,6 +1738,9 @@ fn register_builtins(vm: &mut VM) {
     vm.register_builtin(KT_CLOSURE_CALL, b_closure_call);
     vm.register_builtin(KT_COLL_HOF, b_coll_hof);
     vm.register_builtin(KT_SCOPE_FN, b_scope_fn);
+    vm.register_builtin(KT_LAZY_GET, b_lazy_get);
+    vm.register_builtin(KT_RUN_CATCHING, b_run_catching);
+    vm.register_builtin(KT_RESULT_HOF, b_result_hof);
     vm.register_builtin(KT_ARRAY_INIT, b_array_init);
     vm.register_builtin(KT_PRINTLN, b_println);
     vm.register_builtin(KT_PRINT, b_print);
@@ -2145,6 +2243,114 @@ fn b_coll_hof(vm: &mut VM, argc: u8) -> Value {
     }
 }
 
+/// `KT_RUN_CATCHING` — see [`KT_RUN_CATCHING`].
+fn b_run_catching(vm: &mut VM, _argc: u8) -> Value {
+    let clo = vm.pop();
+    // Already unwinding: `runCatching` is not reached at all in Kotlin either,
+    // because the enclosing statement never runs.
+    if unwinding() {
+        return Value::Undef;
+    }
+    let out = invoke_closure(vm, &clo, &[]);
+    // A raise inside the block parked itself in the pending slot; taking it is
+    // what makes `runCatching` a catch.
+    if let Some(err) = PENDING.with(|p| p.borrow_mut().take()) {
+        return alloc(HeapObj::Res {
+            value: Value::Undef,
+            err: Some(err),
+        });
+    }
+    match out {
+        Ok(v) => alloc(HeapObj::Res {
+            value: v,
+            err: None,
+        }),
+        Err(e) => {
+            fault(vm, e);
+            Value::Undef
+        }
+    }
+}
+
+/// The `(value, error)` of a `Result` receiver.
+fn result_parts(v: &Value) -> Option<(Value, Option<Value>)> {
+    with_obj(v, |o| match o {
+        HeapObj::Res { value, err } => Some((value.clone(), err.clone())),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// `KT_RESULT_HOF` — see [`KT_RESULT_HOF`].
+fn b_result_hof(vm: &mut VM, _argc: u8) -> Value {
+    let name = vm.pop().to_str();
+    let clo = vm.pop();
+    let recv = vm.pop();
+    let Some((value, err)) = result_parts(&recv) else {
+        fault(vm, format!("unresolved reference: {name}"));
+        return Value::Undef;
+    };
+    let res = match (name.as_str(), &err) {
+        // `getOrElse` hands the FAILURE to the block; a success skips it.
+        ("getOrElse", Some(e)) => invoke_closure(vm, &clo, std::slice::from_ref(e)),
+        ("getOrElse", None) => Ok(value),
+        // `onSuccess`/`onFailure` run for their effect and yield the receiver.
+        ("onSuccess", None) => invoke_closure(vm, &clo, &[value]).map(|_| recv),
+        ("onFailure", Some(e)) => invoke_closure(vm, &clo, std::slice::from_ref(e)).map(|_| recv),
+        ("onSuccess", Some(_)) | ("onFailure", None) => Ok(recv),
+        // `map` transforms a success and passes a failure through unchanged.
+        ("map", None) => invoke_closure(vm, &clo, &[value]).map(|v| {
+            alloc(HeapObj::Res {
+                value: v,
+                err: None,
+            })
+        }),
+        ("map", Some(_)) => Ok(recv),
+        _ => Err(format!("unresolved reference: {name}")),
+    };
+    match res {
+        Ok(v) => v,
+        Err(e) => {
+            fault(vm, e);
+            Value::Undef
+        }
+    }
+}
+
+/// `KT_LAZY_GET`: the value of a `by lazy` cell, computing and caching it on the
+/// first read. Stack: `cell`.
+fn b_lazy_get(vm: &mut VM, _argc: u8) -> Value {
+    let cell = vm.pop();
+    let state = with_obj(&cell, |o| match o {
+        HeapObj::Lazy { thunk, value } => Some((thunk.clone(), value.clone())),
+        _ => None,
+    })
+    .flatten();
+    // Not a cell: the read was of an ordinary value, so hand it back untouched.
+    let Some((thunk, cached)) = state else {
+        return cell;
+    };
+    if let Some(v) = cached {
+        return v;
+    }
+    // The thunk runs with the heap borrow released — it is user code and may
+    // allocate, or read this very cell.
+    match invoke_closure(vm, &thunk, &[]) {
+        Ok(v) => {
+            with_obj_mut(&cell, |o| {
+                if let HeapObj::Lazy { value, .. } = o {
+                    *value = Some(v.clone());
+                }
+            });
+            v
+        }
+        Err(e) => {
+            fault(vm, e);
+            Value::Undef
+        }
+    }
+}
+
 /// `KT_SCOPE_FN`: an `it`-form scope function on any receiver. Stack (top-down):
 /// `nameStr, closure, recv`.
 fn b_scope_fn(vm: &mut VM, _argc: u8) -> Value {
@@ -2153,17 +2359,25 @@ fn b_scope_fn(vm: &mut VM, _argc: u8) -> Value {
     let recv = vm.pop();
     let res = match name.as_str() {
         // `let` — run the block with `it` = receiver, yield the block's result.
-        "let" => invoke_closure(vm, &clo, std::slice::from_ref(&recv)),
+        // `run` is the same call with the receiver bound as the block's `this`;
+        // the compiler decided which by naming the block's parameter, so the two
+        // are one arm here.
+        "let" | "run" => invoke_closure(vm, &clo, std::slice::from_ref(&recv)),
         // `also` — run the block for its side effect, yield the receiver.
-        "also" => invoke_closure(vm, &clo, std::slice::from_ref(&recv)).map(|_| recv),
-        // `takeIf` — yield the receiver when the predicate holds, else null.
-        "takeIf" => invoke_closure(vm, &clo, std::slice::from_ref(&recv)).map(|p| {
-            if truthy(&p) {
-                recv
-            } else {
-                Value::Undef
-            }
-        }),
+        // `apply` is the `this`-form of the same.
+        "also" | "apply" => invoke_closure(vm, &clo, std::slice::from_ref(&recv)).map(|_| recv),
+        // `takeIf`/`takeUnless` — yield the receiver when the predicate holds
+        // (or fails to), else null.
+        "takeIf" | "takeUnless" => {
+            let want = name == "takeIf";
+            invoke_closure(vm, &clo, std::slice::from_ref(&recv)).map(|p| {
+                if truthy(&p) == want {
+                    recv
+                } else {
+                    Value::Undef
+                }
+            })
+        }
         _ => Err(format!("unresolved reference: {name}")),
     };
     match res {
@@ -3745,6 +3959,20 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         // through `it.key`/`it.value`.
         (HeapObj::Pair(a, _), "first" | "key") => Some(a.clone()),
         (HeapObj::Pair(_, b), "second" | "value") => Some(b.clone()),
+        // ── Result ──
+        (HeapObj::Res { err, .. }, "isSuccess") => Some(Value::Bool(err.is_none())),
+        (HeapObj::Res { err, .. }, "isFailure") => Some(Value::Bool(err.is_some())),
+        // `getOrNull()` is null on failure; `exceptionOrNull()` is null on
+        // success. Both are the total readers of the union.
+        (HeapObj::Res { value, err }, "getOrNull") => Some(match err {
+            Some(_) => Value::Undef,
+            None => value.clone(),
+        }),
+        (HeapObj::Res { err, .. }, "exceptionOrNull") => Some(err.clone().unwrap_or(Value::Undef)),
+        // ── Triple ──
+        (HeapObj::Triple(a, _, _), "first") => Some(a.clone()),
+        (HeapObj::Triple(_, b, _), "second") => Some(b.clone()),
+        (HeapObj::Triple(_, _, c), "third") => Some(c.clone()),
         // A `Map.Entry` has `key`/`value` and — unlike a `Pair` — no
         // `first`/`second`.
         (HeapObj::Entry(k, _), "key") => Some(k.clone()),
@@ -4018,13 +4246,27 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
         // `componentN` counts from the first primary-constructor property, so
         // destructuring an inheriting `data class` skips its inherited fields.
         HeapObj::Instance {
-            fields, data_from, ..
-        } => fields.get(data_from + n - 1).map(|(_, v)| v.clone()),
+            fields,
+            data_from,
+            data_len,
+            ..
+        } => (n <= *data_len)
+            .then(|| fields.get(data_from + n - 1).map(|(_, v)| v.clone()))
+            .flatten(),
         HeapObj::List(items) | HeapObj::Set(items) | HeapObj::Array { items, .. } => {
             items.get(n - 1).cloned()
         }
         // `for ((k, v) in map)` destructures an entry exactly as it does a
         // pair — the two differ in display and equality, not in arity.
+        // A `by lazy` cell has no components; the compiler forces every read of
+        // one, so it never reaches user code in the first place.
+        HeapObj::Lazy { .. } | HeapObj::Res { .. } => None,
+        HeapObj::Triple(a, b, c) => match n {
+            1 => Some(a.clone()),
+            2 => Some(b.clone()),
+            3 => Some(c.clone()),
+            _ => None,
+        },
         HeapObj::Pair(a, b) | HeapObj::Entry(a, b) => match n {
             1 => Some(a.clone()),
             2 => Some(b.clone()),
@@ -4167,6 +4409,15 @@ pub fn value_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// The primary-constructor slice of an instance's field record — what every
+/// `data class`-derived member reads. Clamped so a malformed record cannot
+/// panic.
+fn data_slice(fields: &[(String, Value)], from: usize, len: usize) -> &[(String, Value)] {
+    let from = from.min(fields.len());
+    let to = (from + len).min(fields.len());
+    &fields[from..to]
+}
+
 /// Structural equality between two heap objects.
 fn heap_eq(a: &HeapObj, b: &HeapObj) -> bool {
     match (a, b) {
@@ -4175,20 +4426,23 @@ fn heap_eq(a: &HeapObj, b: &HeapObj) -> bool {
                 class: ca,
                 fields: fa,
                 data_from: da,
+                data_len: la,
                 is_data: ia,
             },
             HeapObj::Instance {
                 class: cb,
                 fields: fb,
                 data_from: db,
+                data_len: lb,
                 ..
             },
         ) => {
             // A `data class`'s generated `equals` compares the primary-
-            // constructor properties only, so an inherited field is not part of
-            // the comparison even though the record carries it.
+            // constructor properties only, so neither an inherited field nor a
+            // body property is part of the comparison even though the record
+            // carries both.
             let (fa, fb) = if *ia {
-                (&fa[*da..], &fb[(*db).min(fb.len())..])
+                (data_slice(fa, *da, *la), data_slice(fb, *db, *lb))
             } else {
                 (&fa[..], &fb[..])
             };
@@ -4205,6 +4459,9 @@ fn heap_eq(a: &HeapObj, b: &HeapObj) -> bool {
             xa.len() == xb.len() && xa.iter().all(|x| xb.iter().any(|y| value_eq(x, y)))
         }
         (HeapObj::Pair(a1, a2), HeapObj::Pair(b1, b2)) => value_eq(a1, b1) && value_eq(a2, b2),
+        (HeapObj::Triple(a1, a2, a3), HeapObj::Triple(b1, b2, b3)) => {
+            value_eq(a1, b1) && value_eq(a2, b2) && value_eq(a3, b3)
+        }
         // An entry equals an entry, never a pair: `mapOf(1 to "a").entries
         // .first() == (1 to "a")` is `false` in Kotlin.
         (HeapObj::Entry(k1, v1), HeapObj::Entry(k2, v2)) => value_eq(k1, k2) && value_eq(v1, v2),
@@ -4311,13 +4568,14 @@ fn obj_hash(recv: &Value) -> Option<i32> {
         HeapObj::Instance {
             fields,
             data_from,
+            data_len,
             is_data,
             ..
         } => {
             if !*is_data {
                 return None;
             }
-            let own = &fields[*data_from..];
+            let own = data_slice(fields, *data_from, *data_len);
             let mut h: i32 = 0;
             for (i, (_, v)) in own.iter().enumerate() {
                 let long = widths
@@ -4348,6 +4606,9 @@ fn obj_hash(recv: &Value) -> Option<i32> {
         HeapObj::Map(entries) => Some(entries.iter().fold(0i32, |h, (k, v)| {
             h.wrapping_add(value_hash(k, false) ^ value_hash(v, false))
         })),
+        // A `by lazy` cell inherits `Object.hashCode` — identity, which
+        // `value_hash` reports by answering `None`.
+        HeapObj::Lazy { .. } | HeapObj::Res { .. } => None,
         // `Map.Entry.hashCode()` is `key ^ value`; a `Pair` is a `data class`,
         // so it folds like one.
         HeapObj::Entry(k, v) => Some(value_hash(k, false) ^ value_hash(v, false)),
@@ -4355,6 +4616,14 @@ fn obj_hash(recv: &Value) -> Option<i32> {
             value_hash(a, false)
                 .wrapping_mul(31)
                 .wrapping_add(value_hash(b, false)),
+        ),
+        // A `Triple` folds like the three-property `data class` it is.
+        HeapObj::Triple(a, b, c) => Some(
+            value_hash(a, false)
+                .wrapping_mul(31)
+                .wrapping_add(value_hash(b, false))
+                .wrapping_mul(31)
+                .wrapping_add(value_hash(c, false)),
         ),
         // An empty progression hashes to -1. `IntRange` folds `31 * first +
         // last`; `IntProgression` adds the step, `31 * (31 * first + last) +
@@ -4391,6 +4660,9 @@ fn obj_label(recv: &Value) -> String {
         HeapObj::Set(_) => "Set".to_string(),
         HeapObj::Map(_) => "Map".to_string(),
         HeapObj::Pair(_, _) => "Pair".to_string(),
+        HeapObj::Triple(_, _, _) => "Triple".to_string(),
+        HeapObj::Lazy { .. } => "Lazy".to_string(),
+        HeapObj::Res { .. } => "Result".to_string(),
         HeapObj::Entry(_, _) => "Map.Entry".to_string(),
         HeapObj::Closure { .. } => "Function".to_string(),
         HeapObj::Range(r) => match (r.is_char, r.progression) {
@@ -4420,11 +4692,12 @@ fn display_obj(id: u32) -> String {
                 is_data,
                 fields,
                 data_from,
+                data_len,
             } => {
                 if *is_data {
                     // Only the primary-constructor properties, which is what
                     // Kotlin's generated `toString` renders.
-                    let body = fields[*data_from..]
+                    let body = data_slice(fields, *data_from, *data_len)
                         .iter()
                         .map(|(n, v)| format!("{n}={}", kotlin_string(v)))
                         .collect::<Vec<_>>()
@@ -4460,6 +4733,23 @@ fn display_obj(id: u32) -> String {
                 format!("{{{body}}}")
             }
             HeapObj::Pair(a, b) => format!("({}, {})", kotlin_string(a), kotlin_string(b)),
+            // Kotlin's `Lazy.toString()` reports whether the value has been
+            // computed; a forced cell renders as the value it holds.
+            // Kotlin renders a `Result` as `Success(v)` / `Failure(<throwable>)`.
+            HeapObj::Res { value, err } => match err {
+                Some(e) => format!("Failure({})", throwable_str(e)),
+                None => format!("Success({})", kotlin_string(value)),
+            },
+            HeapObj::Lazy { value, .. } => match value {
+                Some(v) => kotlin_string(v),
+                None => "Lazy value not initialized yet.".to_string(),
+            },
+            HeapObj::Triple(a, b, c) => format!(
+                "({}, {}, {})",
+                kotlin_string(a),
+                kotlin_string(b),
+                kotlin_string(c)
+            ),
             // `Map.Entry.toString()` is `key=value` — the form a printed `Map`
             // is built from, and NOT the pair's `(key, value)`.
             HeapObj::Entry(k, v) => format!("{}={}", kotlin_string(k), kotlin_string(v)),
@@ -4530,6 +4820,7 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         "Set" | "MutableSet" => with_obj(v, |o| matches!(o, HeapObj::Set(_))).unwrap_or(false),
         "Map" | "MutableMap" => with_obj(v, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false),
         "Pair" => with_obj(v, |o| matches!(o, HeapObj::Pair(_, _))).unwrap_or(false),
+        "Triple" => with_obj(v, |o| matches!(o, HeapObj::Triple(_, _, _))).unwrap_or(false),
         "Array" | "IntArray" | "DoubleArray" | "CharArray" | "BooleanArray" => {
             with_obj(v, |o| matches!(o, HeapObj::Array { .. })).unwrap_or(false)
         }
