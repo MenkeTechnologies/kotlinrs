@@ -663,6 +663,36 @@ struct LoopCtx {
 /// "overrides nothing" check below must let them through.
 const ANY_MEMBERS: &[&str] = &["toString", "equals", "hashCode"];
 
+/// Where a virtual call may land, and whether the receiver's class is known.
+///
+/// `static_recv` is what decides if the runtime class-tag test may be skipped
+/// for a single candidate: with a KNOWN receiver class every instance reaching
+/// the site runs the same body, while with an unknown one the receiver may not
+/// be a candidate at all and the test is load-bearing.
+#[derive(Clone, Copy)]
+struct Targets<'a> {
+    cands: &'a [(String, String)],
+    static_recv: bool,
+}
+
+impl<'a> Targets<'a> {
+    /// The receiver's static class picked these candidates.
+    fn statik(cands: &'a [(String, String)]) -> Self {
+        Self {
+            cands,
+            static_recv: true,
+        }
+    }
+
+    /// The receiver's class is unknown; these are every class declaring the name.
+    fn dynamic(cands: &'a [(String, String)]) -> Self {
+        Self {
+            cands,
+            static_recv: false,
+        }
+    }
+}
+
 /// Enforce Kotlin's inheritance modifiers on `cd`.
 ///
 /// Four rules, each rejecting a program `kotlinc` also rejects:
@@ -3028,7 +3058,14 @@ impl Compiler {
                         self.expand_args(&format!("method {name} on {cls}"), &sig.params, args)?;
                     let cands = self.candidates(Some(cls), name, sig.arity);
                     if !cands.is_empty() {
-                        self.emit_virtual_call(sc, recv, name, &full, &cands, line)?;
+                        self.emit_virtual_call(
+                            sc,
+                            recv,
+                            name,
+                            &full,
+                            Targets::statik(&cands),
+                            line,
+                        )?;
                         return Ok(sig.ret);
                     }
                 }
@@ -3098,7 +3135,7 @@ impl Compiler {
         if static_cls.is_none() {
             let cands = self.candidates(None, name, args.len());
             if !cands.is_empty() {
-                self.emit_virtual_call(sc, recv, name, args, &cands, line)?;
+                self.emit_virtual_call(sc, recv, name, args, Targets::dynamic(&cands), line)?;
                 return Ok(self.virtual_ret_type(&cands, name));
             }
         }
@@ -3223,11 +3260,22 @@ impl Compiler {
         recv: &Expr,
         name: &str,
         args: &[Expr],
-        cands: &[(String, String)],
+        targets: Targets<'_>,
         line: u32,
     ) -> Result<(), String> {
+        let Targets { cands, static_recv } = targets;
         let owners: HashSet<&str> = cands.iter().map(|(_, o)| o.as_str()).collect();
-        if owners.len() == 1 {
+        // One owner and a receiver whose class is already known: every instance
+        // reaching this site runs the same body, so the call is direct and the
+        // program pays nothing for the hierarchy.
+        //
+        // With an UNKNOWN receiver it is not the same call. The candidate set is
+        // then "every class that declares `name`", and the receiver may be none
+        // of them — so a direct call sends an `Int` into a user body. One class
+        // declaring `hashCode` was enough to make `(0).hashCode()` run it and
+        // fail with `unresolved reference` on the class's own field, in any
+        // program that declared such an override.
+        if owners.len() == 1 && static_recv {
             let owner = cands[0].1.clone();
             self.compile_expr(sc, recv)?;
             for a in args {

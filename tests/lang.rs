@@ -2631,3 +2631,38 @@ fun main() {
 }";
     assert_eq!(prog(src), "2\n1\n2\n1\n2\n2\n");
 }
+
+#[test]
+fn any_members_on_a_non_instance_receiver_ignore_user_overrides() {
+    // Virtual dispatch skipped the runtime class-tag test whenever exactly ONE
+    // class in the program declared the member — sound only when the receiver's
+    // static class is already known to be that class. With an unknown receiver
+    // the candidate set is "every class declaring the name", and the receiver
+    // may be none of them, so a single `hashCode` override anywhere made
+    // `(0).hashCode()` call it and die on the class's own field. The same held
+    // for `toString` and `equals`.
+    let src = "\
+class Both(val a: Int) {
+    override fun equals(other: Any?): Boolean = other is Both && other.a == a
+    override fun hashCode(): Int = a
+    override fun toString(): String = \"B\" + a
+}
+fun main() {
+    println((0).hashCode())
+    println((-1).hashCode())
+    println(\"s\".hashCode())
+    println(listOf(1, 2).hashCode())
+    println(mapOf(0 to \"x\", 0 to \"y\").keys.hashCode())
+    println(Both(7).hashCode())
+    println(1.toString())
+    println(listOf(1).toString())
+    println(Both(7).toString())
+    println((1).equals(1))
+    println(\"a\".equals(\"a\"))
+    println(Both(7).equals(Both(7)))
+}";
+    assert_eq!(
+        prog(src),
+        "0\n-1\n115\n994\n0\n7\n1\n[1]\nB7\ntrue\ntrue\ntrue\n"
+    );
+}

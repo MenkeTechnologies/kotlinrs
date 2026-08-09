@@ -2242,6 +2242,14 @@ fn declarations(probes: &[String]) -> String {
             "Shp" => probes
                 .iter()
                 .any(|p| p.contains("Shp") || p.contains("Sq(") || p.contains("Ci(")),
+            // `Br(`/`Wd(` share the `Nd` block with `Lf(`, and a batch can draw
+            // one without the other. Keying the block on `Lf(` alone emitted
+            // `Br(...)` with no declaration, which `kotlinc` rejects — so those
+            // batches were never compared at all, and scored as clean runs
+            // until the barren gate started reporting them.
+            "Lf(" => probes
+                .iter()
+                .any(|p| p.contains("Lf(") || p.contains("Br(") || p.contains("Wd(")),
             _ => probes.iter().any(|p| p.contains(marker)),
         };
         if named {
