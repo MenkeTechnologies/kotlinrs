@@ -3655,6 +3655,15 @@ impl Compiler {
                 return Ok(self.virtual_ret_type(&cands, name));
             }
         }
+        // A `data class` `copy` whose receiver's class the frontend cannot see.
+        // `xs.map { it.copy(y = 5) }` and `xs[0].copy(9)` are the canonical
+        // Kotlin update idiom and neither has a written-down type: `copy` is
+        // GENERATED rather than declared, so it is in no candidate set, and
+        // every form of it — named, positional, and bare — was an unresolved
+        // reference here.
+        if name == "copy" && static_cls.is_none() {
+            return self.compile_dynamic_copy(sc, recv, args, line);
+        }
         // `f.invoke(args)` on a function value — the explicit spelling of
         // `f(args)`. A user class declaring its own `invoke` was already
         // dispatched above, so reaching here means the receiver is a closure.
@@ -3842,6 +3851,115 @@ impl Compiler {
         }
         sc.exit(mark);
         Ok(())
+    }
+
+    /// Lower a `copy` whose receiver's class is not known until run time.
+    ///
+    /// A declared method reaches [`Self::emit_virtual_call`], which switches on
+    /// the runtime class tag. `copy` cannot: it is GENERATED for every `data
+    /// class` rather than declared, so it appears in no candidate set. This is
+    /// the same switch built over the data classes instead — and it has to be a
+    /// switch rather than one host-side field splice, for two reasons that both
+    /// come from the receiver's own class:
+    ///
+    ///   * Kotlin's generated `copy` CALLS THE PRIMARY CONSTRUCTOR, so a class
+    ///     with an `init` block or a body property re-runs them. Splicing
+    ///     fields would skip both.
+    ///   * Each class binds its OWN parameter names, so `it.copy(y = 5)` means
+    ///     a different slot per class. That is why every arm compiles the
+    ///     arguments itself, exactly as `emit_virtual_call` does.
+    ///
+    /// Only the classes whose parameter list ACCEPTS these arguments get an
+    /// arm; if none does, the binding error from the first data class is
+    /// reported rather than a silent fall-through to the unresolved-reference
+    /// fault.
+    fn compile_dynamic_copy(
+        &mut self,
+        sc: &mut Scope,
+        recv: &Expr,
+        args: &[Expr],
+        line: u32,
+    ) -> Result<Type, String> {
+        // Deterministic order: the switch is over string tags, so two
+        // compilations of one program must lay the arms out the same way.
+        let mut datas: Vec<ClassMeta> = self
+            .classes
+            .values()
+            .filter(|m| m.is_data)
+            .cloned()
+            .collect();
+        datas.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let mut arms: Vec<(ClassMeta, Vec<Option<&Expr>>)> = Vec::new();
+        let mut first_err = None;
+        for meta in datas {
+            let names: Vec<String> = meta.ctor_params.iter().map(|p| p.name.clone()).collect();
+            match bind_args(&format!("{}.copy", meta.name), &names, args) {
+                Ok(slots) => arms.push((meta, slots)),
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            };
+        }
+        if arms.is_empty() {
+            return Err(
+                first_err.unwrap_or_else(|| "copy: no data class in this program".to_string())
+            );
+        }
+
+        let mark = sc.enter();
+        self.compile_expr(sc, recv)?;
+        let rslot = sc.temp();
+        self.b.emit(Op::SetSlot(rslot), line);
+        self.b.emit(Op::GetSlot(rslot), line);
+        self.b.emit(Op::Extended(KT_CLASSOF, 0), line);
+        let cslot = sc.temp();
+        self.b.emit(Op::SetSlot(cslot), line);
+
+        let mut done: Vec<usize> = Vec::new();
+        for (meta, slots) in &arms {
+            self.b.emit(Op::GetSlot(cslot), line);
+            let c = self.b.add_constant(Value::str(meta.name.clone()));
+            self.b.emit(Op::LoadConst(c), line);
+            self.b.emit(Op::StrEq, line);
+            let miss = self.b.emit(Op::JumpIfFalse(0), line);
+            for (i, p) in meta.ctor_params.iter().enumerate() {
+                match slots[i] {
+                    Some(a) => {
+                        self.compile_expr(sc, a)?;
+                    }
+                    None => {
+                        // Unwritten parameters keep the receiver's value, read
+                        // back off the instance the way the static lowering
+                        // reads them.
+                        self.b.emit(Op::GetSlot(rslot), line);
+                        let nidx = self.b.add_constant(Value::str(p.name.clone()));
+                        self.b.emit(Op::LoadConst(nidx), line);
+                        self.b.emit(Op::Extended(KT_GETFIELD, 0), line);
+                    }
+                }
+            }
+            let idx = self.b.add_name(&ctor_sub_name(&meta.name));
+            self.b
+                .emit(Op::Call(idx, meta.ctor_params.len() as u8), line);
+            done.push(self.b.emit(Op::Jump(0), line));
+            let next = self.b.current_pos();
+            self.b.patch_jump(miss, next);
+        }
+        // No arm matched: the receiver is not one of the data classes whose
+        // parameters these arguments fit. Fall through to the host member
+        // dispatch, which raises the same `unresolved reference: copy on X`
+        // any other unknown member does — naming the class it actually was.
+        self.b.emit(Op::GetSlot(rslot), line);
+        let nidx = self.b.add_constant(Value::str("copy".to_string()));
+        self.b.emit(Op::LoadConst(nidx), line);
+        self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 0), line);
+        let end = self.b.current_pos();
+        for j in done {
+            self.b.patch_jump(j, end);
+        }
+        sc.exit(mark);
+        Ok(Type::Obj)
     }
 
     /// Lower `super.m(args)` inside a method: resolve `m` against the enclosing

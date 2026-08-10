@@ -73,8 +73,10 @@ cargo build --release
 # the binary is target/release/kotlin
 ```
 
-Requires a stable Rust toolchain. The only dependency is `fusevm` (which pulls
-Cranelift for the JIT); everything else is std.
+Requires a stable Rust toolchain. The language itself depends on `fusevm` alone
+(which pulls Cranelift for the JIT); `lsp-server` and `lsp-types` back the
+editor server in `src/lsp.rs` and reach no part of the runtime. Everything else
+is std.
 
 ## [0x02] USAGE
 
@@ -129,7 +131,13 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 - **Call arguments** — positional and named (`f(count = 3)`, `p.copy(y = 2)`)
   for user functions, constructors and the `data class` `copy`, with Kotlin's
   rules enforced: positional arguments come first and each name binds a distinct
-  parameter exactly once.
+  parameter exactly once. `copy` reaches a receiver whose class is only known at
+  RUN time as well — `xs.map { it.copy(y = 5) }`, `xs[0].copy(9)` — by switching
+  on the runtime class tag over the program's `data class`es, because `copy` is
+  generated rather than declared and so belongs to no candidate set. Each arm
+  binds the names against its own parameter list and calls that class's PRIMARY
+  CONSTRUCTOR, which is what Kotlin's generated `copy` does: an `init` block, a
+  body property and a `: Super(…)` header all re-run on the copy.
 - **`Char`** — a runtime type of its own, not an `Int` in disguise, so it stays
   a character in *every* position, including the ones where the compiler can see
   no type: `println(listOf('a'))` is `[a]`, a `Map` key prints as `{a=1}`, and
@@ -384,7 +392,10 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 - **`Pair` / `Triple`** — the constructor spellings beside `a to b`, with the
   `data class` behaviour Kotlin gives them: `(a, b)` / `(a, b, c)` display,
   structural equality, the `31`-fold `hashCode`, `first`/`second`/`third`, and
-  `componentN` so `val (a, b, c) = t` destructures.
+  `componentN` so `val (a, b, c) = t` destructures. Their generated `copy` is
+  the one member not modelled — `Pair(1, 2).copy(second = 9)` is an unresolved
+  reference here, where a DECLARED `data class`'s `copy` is supported in both
+  argument forms.
 - **Captured `var` mutation** — a `var` of the enclosing frame that a lambda
   *assigns* to is stored in a shared cell, so the write is visible to the frame
   (`var n = 0; xs.forEach { n += it }`). This is what the JVM backend does with
@@ -1057,6 +1068,16 @@ because the read-only members re-optimize at 0 and 1 elements, the tag records
 WHICH member built the list rather than testing its length. `"%,d"` was an
 `UnknownFormatConversionException` outright; grouping now reaches `%d` and `%f`
 and is refused on the five conversions the JVM refuses it on.
+
+A third came out of auditing the README's own claims rather than the code:
+`copy` on a receiver with no written-down type — `xs.map { it.copy(y = 5) }`,
+the canonical Kotlin update — was an unresolved reference in every argument
+form, because `copy` is GENERATED and so appears in no candidate set for the
+runtime-tag dispatch that carries declared methods. It now gets that switch
+built over the program's data classes, with each arm binding the names against
+its own parameter list and calling that class's primary constructor, so an
+`init` block, a body property and a `: Super(…)` header all re-run on the copy
+exactly as Kotlin's generated `copy` makes them.
 
 Two harness gaps closed with them, both of the kind a green run hides. The
 differential fuzzer ran its oracle under whatever JVM and locale the shell
