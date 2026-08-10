@@ -1953,6 +1953,34 @@ impl Parser {
         } else {
             (None, Vec::new(), None)
         };
+        // `val x by lazy { … }` on a LOCAL, the same soft-keyword position a
+        // class property uses. Only `lazy` is accepted here: the general
+        // `getValue`/`setValue` delegate protocol needs a property to hand the
+        // delegate, and a local has none.
+        if matches!(self.peek(), Tok::Ident(w) if w == "by") {
+            self.bump();
+            if !matches!(self.peek(), Tok::Ident(w) if w == "lazy")
+                || !matches!(self.peek_at(1), Tok::LBrace)
+            {
+                return Err(format!(
+                    "local {name}: only `by lazy {{ … }}` is supported after `by`"
+                ));
+            }
+            self.bump();
+            if mutable {
+                return Err(format!("local {name}: `by lazy` requires `val`"));
+            }
+            let init = self.lambda()?;
+            return Ok(StmtKind::Let {
+                name,
+                ty,
+                fn_params,
+                fn_ret,
+                init,
+                mutable,
+                lazy: true,
+            });
+        }
         self.eat(&Tok::Assign)?;
         let init = self.expr()?;
         Ok(StmtKind::Let {
@@ -1962,6 +1990,7 @@ impl Parser {
             fn_ret,
             init,
             mutable,
+            lazy: false,
         })
     }
 

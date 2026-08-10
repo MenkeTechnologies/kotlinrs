@@ -119,6 +119,9 @@ struct Binding {
     /// handle and read/write through it — which is what the JVM backend does
     /// with its `Ref.IntRef` wrappers.
     boxed: bool,
+    /// This `val` was declared `by lazy`, so the slot holds an unforced cell
+    /// and every read forces it (see [`crate::host::KT_LAZY_GET`]).
+    lazy: bool,
 }
 
 /// A checkpoint of scope state, taken on block entry and restored on block exit
@@ -185,6 +188,7 @@ impl Scope {
                 fn_ret: Type::Unknown,
                 type_args: Vec::new(),
                 boxed: false,
+                lazy: false,
             },
         );
         self.undo.push((name.to_string(), prev));
@@ -298,6 +302,14 @@ impl Scope {
     }
     fn is_boxed(&self, name: &str) -> bool {
         self.map.get(name).is_some_and(|b| b.boxed)
+    }
+    fn mark_lazy(&mut self, name: &str) {
+        if let Some(b) = self.map.get_mut(name) {
+            b.lazy = true;
+        }
+    }
+    fn is_lazy(&self, name: &str) -> bool {
+        self.map.get(name).is_some_and(|b| b.lazy)
     }
 }
 
@@ -2013,6 +2025,7 @@ impl Compiler {
                 fn_ret,
                 init,
                 mutable,
+                lazy,
             } => {
                 let class = self.infer_class(sc, init);
                 // Read the initializer's element type BEFORE lowering, while
@@ -2045,9 +2058,19 @@ impl Compiler {
                 if boxed {
                     self.b.emit(Op::Extended(KT_LIST, 1), 0);
                 }
+                // `val x by lazy { … }`: the slot holds the unforced CELL, not
+                // the value, so the thunk on the stack is wrapped rather than
+                // called. Every read of the binding forces it below.
+                if *lazy {
+                    self.b.emit(Op::Extended(KT_LAZY_NEW, 0), 0);
+                    vty = Type::Unknown;
+                }
                 let slot = sc.declare_full(name, vty, *mutable, class, elem);
                 if !type_args.is_empty() {
                     sc.set_type_args(name, type_args);
+                }
+                if *lazy {
+                    sc.mark_lazy(name);
                 }
                 if let Some(r) = fn_ret {
                     sc.set_fn_ret(name, *r);
@@ -2651,6 +2674,11 @@ impl Compiler {
                     if sc.is_boxed(name) {
                         self.b.emit(Op::LoadInt(0), 0);
                         self.b.emit(Op::CallBuiltin(KT_INDEX_GET_VM, 2), 0);
+                    }
+                    // A `by lazy` local holds a cell too, and reading it is what
+                    // runs the thunk — the first read only.
+                    if sc.is_lazy(name) {
+                        self.b.emit(Op::CallBuiltin(KT_LAZY_GET, 0), 0);
                     }
                     return Ok(sc.ty(name));
                 }

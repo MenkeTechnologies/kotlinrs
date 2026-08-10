@@ -2322,7 +2322,7 @@ const CORPUS: &[Entry] = &[
         "by",
         "Keywords & Declarations",
         "val name: T by lazy { … }",
-        "Property delegation. Only `by lazy` is supported: the block runs at the FIRST read and its value is cached, so an initializer with an effect fires at use rather than at startup. `lazy` requires `val`; any other delegate is a compile error.",
+        "Property delegation, on a top-level property, a class property or a local `val`. Only `by lazy` is supported: the block runs at the FIRST read and its value is cached, so an initializer with an effect fires at use rather than at startup. `lazy` requires `val`; any other delegate is a compile error.",
         "val z: Int by lazy { println(\"forcing\"); 42 }\nfun main() { println(\"before\"); println(z); println(z) }",
     ),
     (

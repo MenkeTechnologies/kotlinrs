@@ -373,10 +373,11 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 - **Top-level properties and `by lazy`** — `val K = 7` / `var counter = 0` at
   file scope, initialized in declaration order before `main` and visible to every
   function; a local of the same name shadows one. `val z: Int by lazy { … }` —
-  on a top-level or a class property — runs its block at the **first read** and
-  caches the result, so an initializer with an effect fires at use rather than at
-  startup. `lazy` is the only supported delegate; any other `by` is a compile
-  error.
+  on a top-level property, a class property **or a local `val`** — runs its block
+  at the **first read** and caches the result, so an initializer with an effect
+  fires at use rather than at startup. `lazy` is the only supported delegate; any
+  other `by` is a compile error, and on a local it is the only one accepted at
+  all (a local has no property object to hand a `getValue` delegate).
 - **`runCatching` / `Result`** — `runCatching { … }` runs a block and packages
   its outcome as `Success(v)` / `Failure(<throwable>)`, catching the runtime
   faults this frontend raises as well as an explicit `throw`. The readers are

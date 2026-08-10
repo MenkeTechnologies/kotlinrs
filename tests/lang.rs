@@ -3636,3 +3636,49 @@ fn sorted_with_still_takes_a_plain_two_argument_lambda() {
         "[3, 2, 1]\n"
     );
 }
+
+#[test]
+fn a_local_by_lazy_runs_its_thunk_at_the_first_read_and_only_then() {
+    // The whole observable difference from an ordinary initializer: the thunk
+    // has not run when the declaration is passed, runs once at the first read,
+    // and does not run again.
+    let src = r#"
+fun main() {
+    var n = 0
+    val v by lazy { n += 1; n }
+    println(n)
+    println(v)
+    println(v)
+    println(n)
+}"#;
+    assert_eq!(stdout(src), "0\n1\n1\n1\n");
+    // The forced value is an ordinary value: members resolve on it.
+    assert_eq!(
+        stdout(r#"fun main() { val s by lazy { "hi" }; println(s.uppercase()) }"#),
+        "HI\n"
+    );
+    assert_eq!(
+        stdout("fun main() { val xs by lazy { listOf(1,2,3) }; println(xs.map { it * 2 }) }"),
+        "[2, 4, 6]\n"
+    );
+}
+
+#[test]
+fn by_on_a_local_accepts_only_lazy_and_only_on_a_val() {
+    // A local has no property object to hand a general `getValue` delegate, so
+    // the other `by` forms are rejected rather than silently mis-lowered.
+    let out = eval("var x by lazy { 1 }; println(x)");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("`by lazy` requires `val`"),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = eval("val x by foo { 1 }; println(x)");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("only `by lazy"),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

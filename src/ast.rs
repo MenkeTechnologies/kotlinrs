@@ -424,6 +424,11 @@ pub enum StmtKind {
         fn_ret: Option<Type>,
         init: Expr,
         mutable: bool,
+        /// Declared `val x by lazy { … }`. The slot holds an unforced CELL and
+        /// every read forces it, so the thunk runs at the first read rather
+        /// than at the declaration — which is the whole observable difference
+        /// between `by lazy` and an ordinary initializer.
+        lazy: bool,
     },
     /// `name (op)= value`, where `op` is `None` for a plain `=`.
     Assign {
