@@ -4672,3 +4672,56 @@ fn floor_division_and_sign_follow_the_divisor_not_the_dividend() {
     assert_eq!(p("0.sign"), "0\n");
     assert_eq!(p("(-7).sign"), "-1\n");
 }
+
+#[test]
+fn build_list_and_the_one_argument_list_of_not_null_have_their_own_classes() {
+    // Two rows the provenance table was missing, both re-judged this round.
+    //
+    // `buildList { … }` hands back a `kotlin.collections.builders.ListBuilder`,
+    // which collapses at NO size and words its bounds fault lowercase and
+    // comma-separated — `index: 9, size: 2` — where every other `List` says
+    // `Index 9 out of bounds for length 2`.
+    let idx = |expr: &str| {
+        prog(&format!(
+            "fun main() {{ val i = 9; try {{ {expr}[i] }} \
+             catch (e: Throwable) {{ println(e) }} }}"
+        ))
+    };
+    for n in 0..3 {
+        assert_eq!(
+            idx(&format!("buildList {{ for (k in 1..{n}) add(k) }}")),
+            format!("java.lang.IndexOutOfBoundsException: index: 9, size: {n}\n"),
+            "for buildList of {n}"
+        );
+    }
+    // `listOfNotNull` declares TWO overloads that hand back different classes.
+    // The ONE-argument one is `if (element != null) listOf(element) else
+    // emptyList()`, so it collapses like a literal…
+    assert_eq!(
+        idx("listOfNotNull(1)"),
+        "java.lang.IndexOutOfBoundsException: Index: 9, Size: 1\n"
+    );
+    assert_eq!(
+        idx("listOfNotNull<Int>(null)"),
+        "java.lang.IndexOutOfBoundsException: Empty list doesn't contain element at index 9.\n"
+    );
+    // …while the VARARG one is `filterNotNull()`, a plain `ArrayList`, at every
+    // size including zero. Arity decides, not the surviving element count.
+    assert_eq!(
+        idx("listOfNotNull<Int>(null, null)"),
+        "java.lang.IndexOutOfBoundsException: Index 9 out of bounds for length 0\n"
+    );
+    assert_eq!(
+        idx("listOfNotNull(1, null)"),
+        "java.lang.IndexOutOfBoundsException: Index 9 out of bounds for length 1\n"
+    );
+    assert_eq!(
+        idx("listOfNotNull(1, null, 2)"),
+        "java.lang.IndexOutOfBoundsException: Index 9 out of bounds for length 2\n"
+    );
+    // The values themselves are unchanged by the tagging.
+    assert_eq!(
+        prog("fun main() { println(buildList { add(1); add(2) }); println(listOfNotNull(1)) }"),
+        "[1, 2]\n[1]\n"
+    );
+}

@@ -300,6 +300,16 @@ pub const KT_GENSEQ: u16 = 134;
 /// the receiver's implementation class, which its out-of-range diagnostic then
 /// names; see the `ListImpl` table in this module.
 pub const KT_LIST_RO: u16 = 135;
+/// Record an already-built `List`'s implementation class. Stack: `[list, tag]`,
+/// `tag` on top; pushes the list back.
+///
+/// [`KT_LIST_RO`] can only tag a list it BUILDS from stack elements, and the two
+/// callers here produce theirs some other way: `buildList { … }` desugars to
+/// `mutableListOf().apply { … }`, and the one-argument `listOfNotNull(x)`
+/// overload to `listOf(x).filterNotNull()`. Both hand back a fresh, untagged
+/// handle, so the class their out-of-range diagnostic should name is lost
+/// unless it is applied afterwards.
+pub const KT_LIST_TAG: u16 = 136;
 
 /// Kotlin `==` over heap objects. Stack: `[a, b]`; pushes a `Bool`.
 ///
@@ -496,6 +506,13 @@ enum ListImpl {
     /// an `Iterable` and not a `Collection`, so it misses that fast path and
     /// gets the `toMutableList().apply { sort() }` branch — a real `ArrayList`.
     Sorted,
+    /// The list `buildList { … }` hands back. Kotlin's builder is neither of
+    /// the two above and does not collapse at ANY size: it is a
+    /// `kotlin.collections.builders.ListBuilder`, and its bounds check writes a
+    /// lowercase, comma-separated message all of its own — `index: 9, size: 2`,
+    /// where every other `List` here says `Index 9 out of bounds for length 2`.
+    /// Measured on kotlinc 2.4.10 / JDK 21.0.12 at sizes 0, 1 and 2.
+    Builder,
 }
 
 /// Record `list`'s implementation class. A no-op for a non-handle.
@@ -2279,6 +2296,15 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let list = alloc(HeapObj::List(pop_n(vm, arg)));
             tag_list_impl(&list, ListImpl::Literal);
             vm.push(list);
+        }
+        KT_LIST_TAG => {
+            let tag = vm.pop().to_str();
+            let list = vm.pop();
+            let which = match tag.as_str() {
+                "builder" => ListImpl::Builder,
+                _ => ListImpl::Literal,
+            };
+            vm.push(tag_if_list(list, which));
         }
         KT_SET => {
             let n = arg as usize;
@@ -7063,6 +7089,11 @@ fn index_fault(kind: SeqKind, recv: Option<&Value>, i: i64, len: usize) -> Strin
                 _ => None,
             });
             match (which, len) {
+                // The builder collapses at NO size and words the fault its own
+                // way, so it is decided before the two small-size rows.
+                (Some(ListImpl::Builder), _) => {
+                    format!("java.lang.IndexOutOfBoundsException: index: {i}, size: {len}")
+                }
                 // `optimizeReadOnlyList` collapses BOTH read-only kinds at the
                 // two small sizes, so the constructor stops mattering there.
                 (Some(_), 0) => format!(
@@ -8251,6 +8282,9 @@ fn runtime_jvm_class(v: &Value) -> Option<(String, bool)> {
         HeapObj::List(_) => {
             let n = len.unwrap_or(0);
             Some(match (impl_tag, n) {
+                (Some(ListImpl::Builder), _) => {
+                    ("kotlin.collections.builders.ListBuilder".to_string(), false)
+                }
                 // `optimizeReadOnlyList` collapses every read-only builder at
                 // the two small sizes, exactly as the index diagnostics do.
                 (Some(_), 0) => ("kotlin.collections.EmptyList".to_string(), false),

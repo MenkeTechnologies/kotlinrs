@@ -28,10 +28,10 @@ use crate::host::{
     KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND, KT_FFI_CALL, KT_FFI_COMPILE, KT_GENSEQ, KT_GETFIELD,
     KT_HASH_REG, KT_IDENTITY, KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS,
     KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_JOIN, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO,
-    KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OPER_VM,
-    KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_RESULT_HOF,
-    KT_RUN_CATCHING, KT_SCOPE_FN, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG, KT_TO_STRING,
-    KT_TYPE_REG,
+    KT_LIST_TAG, KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL,
+    KT_OBJEQ_VM, KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP,
+    KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG,
+    KT_TO_STRING, KT_TYPE_REG,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
@@ -4993,7 +4993,14 @@ impl Compiler {
                     line,
                 };
                 if name == "buildList" {
-                    return self.compile_expr(sc, &filled).map(|_| Type::Obj);
+                    self.compile_expr(sc, &filled)?;
+                    // The builder's own class, which does not collapse at any
+                    // size and words its bounds fault differently from every
+                    // other `List` — see `host::ListImpl::Builder`.
+                    let tidx = self.b.add_constant(Value::str("builder"));
+                    self.b.emit(Op::LoadConst(tidx), line);
+                    self.b.emit(Op::Extended(KT_LIST_TAG, 0), line);
+                    return Ok(Type::Obj);
                 }
                 self.compile_member(sc, &filled, "toString", &[], false, line)?;
                 Ok(Type::String)
@@ -5042,6 +5049,19 @@ impl Compiler {
                 let nidx = self.b.add_constant(Value::str("filterNotNull".to_string()));
                 self.b.emit(Op::LoadConst(nidx), line);
                 self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 0), line);
+                // Kotlin declares TWO overloads and they hand back different
+                // classes. The vararg one is `filterNotNull()`, a plain
+                // `ArrayList` — what the above already produces. The
+                // ONE-argument one is `if (element != null) listOf(element)
+                // else emptyList()`, so it collapses onto `EmptyList` or
+                // `SingletonList` and words its out-of-range fault the way a
+                // literal does. Which one runs is decided by arity here, not by
+                // any runtime value.
+                if args.len() == 1 {
+                    let tidx = self.b.add_constant(Value::str("literal"));
+                    self.b.emit(Op::LoadConst(tidx), line);
+                    self.b.emit(Op::Extended(KT_LIST_TAG, 0), line);
+                }
                 Ok(Type::Obj)
             }
             // `ArrayList(other)` copies a collection, where `ArrayList()` builds
