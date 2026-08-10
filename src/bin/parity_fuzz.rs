@@ -70,6 +70,32 @@
 //!     share one `main`, so an escaping throw would truncate the whole program
 //!     and test the harness instead of the frontend.
 //!
+//! WHAT THIS HARNESS STRUCTURALLY CANNOT REPORT. Every generator invariant
+//! above is also a blind spot, and so is every field the comparison drops.
+//! Naming them is the only thing that keeps a clean run from reading as
+//! "no divergences exist" rather than "none in what is looked at":
+//!
+//!   * **stderr.** [`capture`] pipes it and then returns only `stdout`, and
+//!     [`differs`] compares `stdout` and the success bool. So the TEXT of an
+//!     uncaught exception, the stack shape under it, and any warning either
+//!     side prints are invisible. Only probes that CATCH and `println` a
+//!     message put a fault's wording in front of the comparison — which is why
+//!     [`g_exc`] and friends always catch.
+//!   * **The exit code's value.** `ok` is `status.success()`, one bit. An
+//!     oracle exiting 1 and a frontend exiting 134 agree here.
+//!   * **Interleaving.** stdout and stderr are captured on separate pipes, so
+//!     the order a terminal would show them in is not compared at all.
+//!   * **Anything the generators never emit** — the determinism rules above bar
+//!     `Random`, the clock, identity hashes, unordered containers, printing an
+//!     array directly, and integer overflow outside `width`. Those are not
+//!     "known good"; they are unlooked-at.
+//!   * **A hang.** [`capture`]'s timeout kills the child and reports
+//!     `ok = false` with whatever it had printed, which reads as an abort.
+//!
+//! The two axes that USED to be blind here are now gated: the oracle's JVM
+//! (both of them — see [`check_oracle_jvms`]) and the run step's locale and
+//! console charset (see [`ORACLE_JVM_PINS`]).
+//!
 //! Subprocess-only: this binary never links the kotlinrs library.
 //!
 //! Build:  cargo build --bin parity-fuzz
@@ -2760,6 +2786,74 @@ fn run_ours(ours: &Path, src: &str, timeout: Duration) -> RunOut {
     }
 }
 
+/// The oldest JVM whose answers this harness treats as the reference, matching
+/// `scripts/capture-parity.sh`'s floor. Below it the oracle speaks an older
+/// dialect — `Double.toString` took the shortest-representation algorithm in
+/// JDK 19 and the index faults moved onto `Preconditions` in JDK 21 — so a
+/// divergence report would name the JDK rather than this frontend.
+const ORACLE_JVM_FLOOR: u32 = 21;
+
+/// The properties that pin the run step's locale and console charset, the same
+/// set `scripts/capture-parity.sh` freezes the corpus under.
+///
+/// `%f`/`%e`/`%,d` read their separators from `Locale.getDefault()`, and from
+/// JDK 19 on the console streams take their charset from `stdout.encoding` /
+/// `stderr.encoding` rather than from `file.encoding` — so `LANG=C` alone turns
+/// `println("café")` into `caf?`. kotlinrs has no locale and always writes
+/// UTF-8 the `en_US` way; without these the `strfmt` mode reports the AMBIENT
+/// locale as a frontend bug.
+const ORACLE_JVM_PINS: &[&str] = &[
+    "-J-Duser.language=en",
+    "-J-Duser.country=US",
+    "-J-Dfile.encoding=UTF-8",
+    "-J-Dstdout.encoding=UTF-8",
+    "-J-Dstderr.encoding=UTF-8",
+];
+
+/// The feature release named by a `(JRE 21.0.12)` / `(JRE 17.0.4.1+9-LTS)`
+/// parenthesis, which both Kotlin launchers print in their `-version` banner.
+///
+/// Pure so the parse can be tested without a toolchain installed.
+fn jre_feature(banner: &str) -> Option<u32> {
+    let tail = banner.split("(JRE ").nth(1)?;
+    let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// The JVM a launcher resolved for ITSELF, measured rather than inferred.
+///
+/// There are two JVMs in the oracle and `JAVA_HOME` is only *expected* to steer
+/// both: a `const val` is folded into the class file under the COMPILER's
+/// `Double.toString` while an identical literal read at run time renders under
+/// the RUNTIME's, so the same source compiled and run across 17/21 gives four
+/// distinct answer pairs. Each launcher is therefore asked separately.
+fn launcher_jre(tool: &Path) -> Option<u32> {
+    let out = Command::new(tool).arg("-version").output().ok()?;
+    let banner =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    jre_feature(&banner)
+}
+
+/// Refuse an oracle older than [`ORACLE_JVM_FLOOR`] on either side.
+fn check_oracle_jvms(kotlinc: &Path, kotlin: &Path) {
+    for (label, tool) in [("kotlinc", kotlinc), ("kotlin", kotlin)] {
+        match launcher_jre(tool) {
+            Some(v) if v >= ORACLE_JVM_FLOOR => {
+                eprintln!("parity-fuzz: {label} runs on JRE {v}");
+            }
+            other => {
+                let seen = other.map_or("unknown".to_string(), |v| v.to_string());
+                eprintln!(
+                    "parity-fuzz: {label} runs on JRE {seen}; the oracle needs \
+                     {ORACLE_JVM_FLOOR} or newer"
+                );
+                eprintln!("parity-fuzz: export JAVA_HOME=/path/to/jdk{ORACLE_JVM_FLOOR}+");
+                std::process::exit(2);
+            }
+        }
+    }
+}
+
 /// Run through the reference toolchain: compile with `kotlinc`, then run the
 /// generated `TKt` class. A compile failure reports `Stage::Rejected`, which is
 /// a different defect from a program that compiled and then aborted.
@@ -2782,7 +2876,11 @@ fn run_oracle(kotlinc: &Path, kotlin: &Path, src: &str, timeout: Duration) -> Ru
     }
 
     let mut r = Command::new(kotlin);
-    r.arg("-classpath").arg(&out).arg("TKt").current_dir(&dir);
+    r.args(ORACLE_JVM_PINS)
+        .arg("-classpath")
+        .arg(&out)
+        .arg("TKt")
+        .current_dir(&dir);
     let res = capture(&mut r, timeout);
     let _ = std::fs::remove_dir_all(&dir);
     match res {
@@ -2978,6 +3076,8 @@ fn main() {
         }
     };
 
+    check_oracle_jvms(&kotlinc, &kotlin);
+
     let t = Tools {
         ours,
         kotlinc,
@@ -3108,6 +3208,68 @@ mod tests {
         // whole point of counting them apart from a pass.
         for o in [&rejected, &aborted, &silent] {
             assert!(barren_reason(o).is_some());
+        }
+    }
+
+    /// The JVM floor is only enforceable if the banner parse is, and both
+    /// launchers spell their JRE the same way in two different shapes: a bare
+    /// `21.0.12` and a vendor-suffixed `17.0.4.1+9-LTS`. Every string here is a
+    /// real banner observed from `kotlinc -version` / `kotlin -version`, plus
+    /// the shapes a missing or unparseable banner takes — those must answer
+    /// `None` so the caller refuses rather than reading them as a pass.
+    #[test]
+    fn a_launcher_banner_names_its_jre() {
+        let cases: &[(&str, Option<u32>)] = &[
+            ("info: kotlinc-jvm 2.4.10 (JRE 21.0.12)", Some(21)),
+            ("info: kotlinc-jvm 2.4.10 (JRE 17.0.4.1+9-LTS)", Some(17)),
+            ("Kotlin version 2.4.10-release-377 (JRE 21.0.12)", Some(21)),
+            (
+                "Kotlin version 2.4.10-release-377 (JRE 17.0.4.1+9-LTS)",
+                Some(17),
+            ),
+            ("Kotlin version 2.4.10-release-377 (JRE 8u402-b06)", Some(8)),
+            // A three-digit feature release has to survive the parse too, or
+            // the floor starts rejecting the newest JVMs in 2100.
+            ("info: kotlinc-jvm 9.9.9 (JRE 127.0.1)", Some(127)),
+            ("", None),
+            ("info: kotlinc-jvm 2.4.10", None),
+            ("info: kotlinc-jvm 2.4.10 (JRE unknown)", None),
+        ];
+        assert!(cases.len() >= 9, "the banner corpus lost cases");
+        for (banner, want) in cases {
+            assert_eq!(jre_feature(banner), *want, "banner: {banner:?}");
+        }
+        // The floor itself is what the parse feeds, so pin the comparison too:
+        // every banner below it must be rejected and every one at or above it
+        // accepted.
+        assert!(jre_feature(cases[1].0).unwrap() < ORACLE_JVM_FLOOR);
+        assert!(jre_feature(cases[0].0).unwrap() >= ORACLE_JVM_FLOOR);
+    }
+
+    /// The run step's pins are what make a `%f` probe measure the FRONTEND
+    /// rather than the capturing machine's `LANG`. Losing any of the five puts
+    /// an ambient axis back into the comparison: the first two decide `%f`'s
+    /// decimal separator and `%,d`'s grouping, and from JDK 19 on the last two
+    /// decide the console charset, which `file.encoding` no longer does.
+    #[test]
+    fn the_run_step_pins_every_ambient_axis() {
+        for want in [
+            "-J-Duser.language=en",
+            "-J-Duser.country=US",
+            "-J-Dfile.encoding=UTF-8",
+            "-J-Dstdout.encoding=UTF-8",
+            "-J-Dstderr.encoding=UTF-8",
+        ] {
+            assert!(
+                ORACLE_JVM_PINS.contains(&want),
+                "the oracle stopped pinning {want}"
+            );
+        }
+        assert_eq!(ORACLE_JVM_PINS.len(), 5);
+        // Every pin has to reach the JVM rather than the program, or it becomes
+        // a stray argv entry the class never sees.
+        for p in ORACLE_JVM_PINS {
+            assert!(p.starts_with("-J-D"), "{p} is not a JVM property flag");
         }
     }
 

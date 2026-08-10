@@ -44,6 +44,25 @@
 #
 # The floor is JDK 21 — the newest of the two cutoffs above — and the script
 # refuses to run below it rather than silently recording an older dialect.
+#
+# THERE ARE TWO JVMs, NOT ONE, and a single program can show both at once. A
+# `const val` is folded by the COMPILER, so its rendering is frozen into the
+# class file under the compiler's `Double.toString`, while an identical literal
+# read at run time renders under the RUNTIME's. Compiling the same file under
+# 17 and 21 and running each build under 17 and 21 gives four distinct
+# (folded, runtime) pairs:
+#
+#   compiled=17 run=17   folded=6.0372357323402578E18  runtime=6.0372357323402578E18
+#   compiled=17 run=21   folded=6.0372357323402578E18  runtime=6.037235732340258E18
+#   compiled=21 run=17   folded=6.037235732340258E18   runtime=6.0372357323402578E18
+#   compiled=21 run=21   folded=6.037235732340258E18   runtime=6.037235732340258E18
+#
+# Exporting `JAVA_HOME` is *expected* to steer both, because both `kotlinc` and
+# `kotlin` are launcher scripts that read it — but that is an inference about
+# two shell scripts, not a measurement, and it is the inference that would fail
+# silently if either launcher ever resolved its JVM another way. So the floor is
+# checked twice: once against the `java` `JAVA_HOME` names (the run step) and
+# once against the JRE `kotlinc -version` reports for ITSELF (the compile step).
 emulate -L zsh
 set -uo pipefail
 
@@ -72,18 +91,44 @@ if [[ -z $jver ]] || (( jver < 21 )); then
     print -u2 "capture-parity: set CAPTURE_JAVA_HOME to a JDK 21+ home"
     exit 2
 fi
-print -u2 "capture-parity: oracle $($kotlinc -version 2>&1 | tail -1)"
+# The COMPILER's JVM, measured rather than inferred. `kotlinc -version` spells
+# it in its own banner: `info: kotlinc-jvm 2.4.10 (JRE 21.0.12)`.
+kver=$($kotlinc -version 2>&1 | tail -1)
+cver=$(print -r -- "$kver" | command perl -ne 'print $1 and last if /\(JRE (\d+)/')
+if [[ -z $cver ]] || (( cver < 21 )); then
+    print -u2 "capture-parity: kotlinc runs on JRE ${cver:-unknown}; the corpus needs 21 or newer"
+    print -u2 "capture-parity: $kver"
+    print -u2 "capture-parity: set CAPTURE_JAVA_HOME to a JDK 21+ home"
+    exit 2
+fi
+print -u2 "capture-parity: oracle $kver"
 
 # THE LOCALE IS PART OF THE ORACLE TOO. `String.format`'s `%f`/`%e`/`%,d` take
 # their decimal separator and grouping from `Locale.getDefault()`, so the same
 # program prints `3.14` on an `en_US` machine and `3,14` on a `de_DE` one — five
 # records in the corpus go through `%f`/`%e` and would have frozen whichever the
 # capturing machine happened to have. kotlinrs has no locale and always formats
-# the `en_US` way, so that is what the oracle is pinned to; the charset is
-# pinned with it so a non-ASCII record cannot depend on the terminal either.
+# the `en_US` way, so that is what the oracle is pinned to.
 # (`Double.toString`, `uppercase()`/`lowercase()` and `sorted()` are NOT
 # locale-sensitive — Kotlin's no-argument case members use `Locale.ROOT`.)
-jvmflags=(-J-Duser.language=en -J-Duser.country=US -J-Dfile.encoding=UTF-8)
+#
+# AND SO IS THE CONSOLE CHARSET, which `file.encoding` does NOT pin. Through
+# JDK 18 it did; JDK 19 split the console streams onto their own
+# `stdout.encoding`/`stderr.encoding`, defaulted from the terminal's locale and
+# NOT from `file.encoding`. Measured on JDK 21.0.12: with only the three flags
+# above, `LANG=C` leaves `file.encoding=UTF-8` but `stdout.encoding=US-ASCII`,
+# and `println("café")` writes the bytes `c a f ?`. Three corpus records carry
+# non-ASCII text (one of them an astral `😀`), so a capture on a `LANG=C`
+# machine would have frozen `?` substitutions that look like real output and
+# that no locale can reproduce. Pinning the two console streams as well is what
+# actually makes the charset independent of the terminal.
+jvmflags=(
+    -J-Duser.language=en
+    -J-Duser.country=US
+    -J-Dfile.encoding=UTF-8
+    -J-Dstdout.encoding=UTF-8
+    -J-Dstderr.encoding=UTF-8
+)
 
 work=$(mktemp -d) || exit 2
 trap 'rm -rf -- $work' EXIT
