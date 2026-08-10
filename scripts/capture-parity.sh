@@ -105,21 +105,22 @@ print -u2 "capture-parity: oracle $kver"
 
 # THE LOCALE IS PART OF THE ORACLE TOO. `String.format`'s `%f`/`%e`/`%,d` take
 # their decimal separator and grouping from `Locale.getDefault()`, so the same
-# program prints `3.14` on an `en_US` machine and `3,14` on a `de_DE` one — five
-# records in the corpus go through `%f`/`%e` and would have frozen whichever the
-# capturing machine happened to have. kotlinrs has no locale and always formats
-# the `en_US` way, so that is what the oracle is pinned to.
+# program prints `3.14` on an `en_US` machine and `3,14` on a `de_DE` one, and
+# every corpus record that goes through `%f`/`%e`/`%,d` would otherwise have
+# frozen whichever the capturing machine happened to have. kotlinrs has no
+# locale and always formats the `en_US` way, so that is what the oracle is
+# pinned to.
 # (`Double.toString`, `uppercase()`/`lowercase()` and `sorted()` are NOT
 # locale-sensitive — Kotlin's no-argument case members use `Locale.ROOT`.)
 #
 # AND SO IS THE CONSOLE CHARSET, which `file.encoding` does NOT pin. Through
 # JDK 18 it did; JDK 19 split the console streams onto their own
 # `stdout.encoding`/`stderr.encoding`, defaulted from the terminal's locale and
-# NOT from `file.encoding`. Measured on JDK 21.0.12: with only the three flags
-# above, `LANG=C` leaves `file.encoding=UTF-8` but `stdout.encoding=US-ASCII`,
-# and `println("café")` writes the bytes `c a f ?`. Three corpus records carry
-# non-ASCII text (one of them an astral `😀`), so a capture on a `LANG=C`
-# machine would have frozen `?` substitutions that look like real output and
+# NOT from `file.encoding`. Measured on JDK 21.0.12: with the locale flags but
+# without the two console ones, `LANG=C` leaves `file.encoding=UTF-8` but
+# `stdout.encoding=US-ASCII`, and `println("café")` writes the bytes `c a f ?`.
+# The corpus carries non-ASCII records (one an astral `😀`), so a capture on a
+# `LANG=C` machine would have frozen `?` substitutions that look like real output and
 # that no locale can reproduce. Pinning the two console streams as well is what
 # actually makes the charset independent of the terminal.
 jvmflags=(
