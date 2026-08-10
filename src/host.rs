@@ -298,7 +298,7 @@ pub const KT_GENSEQ: u16 = 134;
 /// Build a READ-ONLY `List` literal — `listOf(…)` / `emptyList()`. Stack: `n`
 /// elements; pushes the handle. Identical to [`KT_LIST`] except that it records
 /// the receiver's implementation class, which its out-of-range diagnostic then
-/// names; see [`ListImpl`].
+/// names; see the `ListImpl` table in this module.
 pub const KT_LIST_RO: u16 = 135;
 
 /// Kotlin `==` over heap objects. Stack: `[a, b]`; pushes a `Bool`.
