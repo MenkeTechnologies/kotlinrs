@@ -2516,6 +2516,48 @@ fn build_program(probes: &[String]) -> String {
 struct RunOut {
     stdout: Vec<u8>,
     ok: bool,
+    /// How far this side got. See [`Stage`].
+    stage: Stage,
+}
+
+/// How far a side got before it stopped.
+///
+/// Only the ORACLE can stop at `Rejected`: it is a two-command toolchain
+/// (`kotlinc`, then `kotlin`), and which of the two failed is the difference
+/// between two unrelated defects — a generated program the reference compiler
+/// REJECTS is a bug in this generator, while one it compiles and then aborts on
+/// is a run-time difference worth reading. Collapsed into a single count the two
+/// read identically in the summary, which is how a whole mode's worth of them
+/// goes unread. Our frontend is one command, so it always reports `Ran`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Stage {
+    /// The reference compiler rejected the program; nothing ran.
+    Rejected,
+    /// The program was compiled (or, for our side, accepted) and executed.
+    Ran,
+}
+
+/// Why the reference toolchain produced no answer to compare against, or `None`
+/// when it did produce one — exit 0 and non-empty stdout.
+///
+/// A run that produced none is **barren**, not a pass. Two failing sides compare
+/// equal, so a `kotlinc` that rejected the generated program (or a `kotlin` that
+/// timed out) scores as agreement under [`differs`] and quietly inflates the
+/// clean count. Sibling frontends have been burned by exactly this: a whole fuzz
+/// session reporting `divergences: 0` across hundreds of oracle timeouts. Barren
+/// programs are counted and reported separately, and they fail the run — split
+/// by WHICH of the three ways they were barren, because those are three
+/// different defects.
+///
+/// Pure in its input so the classification can be tested without a toolchain on
+/// PATH; the inputs themselves are what `run_oracle` observes.
+fn barren_reason(oracle: &RunOut) -> Option<&'static str> {
+    match (oracle.stage, oracle.ok, oracle.stdout.is_empty()) {
+        (Stage::Rejected, _, _) => Some("kotlinc REJECTED the program (a generator bug)"),
+        (Stage::Ran, true, false) => None,
+        (Stage::Ran, true, true) => Some("the program ran and printed nothing"),
+        (Stage::Ran, false, _) => Some("the program compiled and then ABORTED"),
+    }
 }
 
 static TMP_CTR: AtomicU64 = AtomicU64::new(0);
@@ -2563,17 +2605,22 @@ fn run_ours(ours: &Path, src: &str, timeout: Duration) -> RunOut {
     let r = capture(&mut cmd, timeout);
     let _ = std::fs::remove_dir_all(&dir);
     match r {
-        Some((stdout, ok)) => RunOut { stdout, ok },
+        Some((stdout, ok)) => RunOut {
+            stdout,
+            ok,
+            stage: Stage::Ran,
+        },
         None => RunOut {
             stdout: Vec::new(),
             ok: false,
+            stage: Stage::Ran,
         },
     }
 }
 
 /// Run through the reference toolchain: compile with `kotlinc`, then run the
-/// generated `TKt` class. A compile failure reports `ok == false` with no
-/// stdout — exactly how a parse error surfaces on our side too.
+/// generated `TKt` class. A compile failure reports `Stage::Rejected`, which is
+/// a different defect from a program that compiled and then aborted.
 fn run_oracle(kotlinc: &Path, kotlin: &Path, src: &str, timeout: Duration) -> RunOut {
     let dir = workdir();
     let path = dir.join("T.kt");
@@ -2588,6 +2635,7 @@ fn run_oracle(kotlinc: &Path, kotlin: &Path, src: &str, timeout: Duration) -> Ru
         return RunOut {
             stdout: Vec::new(),
             ok: false,
+            stage: Stage::Rejected,
         };
     }
 
@@ -2596,10 +2644,15 @@ fn run_oracle(kotlinc: &Path, kotlin: &Path, src: &str, timeout: Duration) -> Ru
     let res = capture(&mut r, timeout);
     let _ = std::fs::remove_dir_all(&dir);
     match res {
-        Some((stdout, ok)) => RunOut { stdout, ok },
+        Some((stdout, ok)) => RunOut {
+            stdout,
+            ok,
+            stage: Stage::Ran,
+        },
         None => RunOut {
             stdout: Vec::new(),
             ok: false,
+            stage: Stage::Ran,
         },
     }
 }
@@ -2629,19 +2682,6 @@ fn compare(probes: &[String], t: &Tools, timeout: Duration) -> (RunOut, RunOut) 
 fn diverges(probes: &[String], t: &Tools, timeout: Duration) -> bool {
     let (a, b) = compare(probes, t, timeout);
     differs(&a, &b)
-}
-
-/// Whether the reference toolchain actually PRODUCED an answer to compare
-/// against — exit 0 and non-empty stdout.
-///
-/// A run where it did not is **barren**, not a pass. Two failing sides compare
-/// equal, so a `kotlinc` that rejected the generated program (or a `kotlin` that
-/// timed out) scores as agreement under `differs` and quietly inflates the
-/// clean count. Sibling frontends have been burned by exactly this: a whole
-/// fuzz session reporting `divergences: 0` across hundreds of oracle timeouts.
-/// Barren programs are counted and reported separately, and they fail the run.
-fn oracle_answered(oracle: &RunOut) -> bool {
-    oracle.ok && !oracle.stdout.is_empty()
 }
 
 fn minimize(probes: &[String], t: &Tools, timeout: Duration) -> Vec<String> {
@@ -2816,6 +2856,9 @@ fn main() {
     let mut probes_run = 0usize;
     let mut probes_compared = 0usize;
     let mut barren = 0usize;
+    // The two halves of `barren`, which are unrelated defects — see `Stage`.
+    let mut rejected = 0usize;
+    let mut aborted = 0usize;
 
     for k in 0..iters {
         let seed = if args.once {
@@ -2830,12 +2873,15 @@ fn main() {
             continue;
         }
         let (oracle, ours) = compare(&probes, &t, args.timeout);
-        if !oracle_answered(&oracle) {
+        if let Some(why) = barren_reason(&oracle) {
             // Never scored as a pass — see `oracle_answered`.
             barren += 1;
+            match oracle.stage {
+                Stage::Rejected => rejected += 1,
+                Stage::Ran => aborted += 1,
+            }
             eprintln!(
-                "seed {seed}: BARREN — the reference toolchain produced no output \
-                 (ok={}, {} byte(s)); {} probe(s) NOT compared",
+                "seed {seed}: BARREN — {why} (ok={}, {} byte(s)); {} probe(s) NOT compared",
                 oracle.ok,
                 oracle.stdout.len(),
                 probes.len()
@@ -2865,11 +2911,80 @@ fn main() {
 
     eprintln!(
         "parity-fuzz: {iters} program(s), {probes_run} probe(s) generated, \
-         {probes_compared} compared, {failures} divergence(s), {barren} barren"
+         {probes_compared} compared, {failures} divergence(s), \
+         {barren} barren ({rejected} rejected by kotlinc, {aborted} aborted at run time)"
     );
     // A barren program is a hole in the measurement, not a pass, so it fails the
     // run just as a divergence does.
     if failures > 0 || barren > 0 {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three ways the oracle can fail to answer are three different
+    /// defects, and a single `barren` count spells them the same. A program
+    /// `kotlinc` REJECTS means this generator emitted something Kotlin does not
+    /// accept; one that compiles and then ABORTS means the program ran and
+    /// died; one that ran and printed nothing means the probes produced no
+    /// output at all. Only the last two can ever be a frontend's fault, and the
+    /// first is the one a clean-looking summary hides.
+    #[test]
+    fn barren_reasons_are_told_apart() {
+        let rejected = RunOut {
+            stdout: Vec::new(),
+            ok: false,
+            stage: Stage::Rejected,
+        };
+        let aborted = RunOut {
+            stdout: b"partial\n".to_vec(),
+            ok: false,
+            stage: Stage::Ran,
+        };
+        let silent = RunOut {
+            stdout: Vec::new(),
+            ok: true,
+            stage: Stage::Ran,
+        };
+        let answered = RunOut {
+            stdout: b"7\n".to_vec(),
+            ok: true,
+            stage: Stage::Ran,
+        };
+        let why = |o: &RunOut| barren_reason(o).unwrap_or("answered");
+        assert_eq!(
+            why(&rejected),
+            "kotlinc REJECTED the program (a generator bug)"
+        );
+        assert_eq!(why(&aborted), "the program compiled and then ABORTED");
+        assert_eq!(why(&silent), "the program ran and printed nothing");
+        assert_eq!(barren_reason(&answered), None);
+        // …and none of the three is ever scored as agreement, which is the
+        // whole point of counting them apart from a pass.
+        for o in [&rejected, &aborted, &silent] {
+            assert!(barren_reason(o).is_some());
+        }
+    }
+
+    /// A run that aborts AFTER printing is the case a plain
+    /// `stdout != stdout` comparison scores as agreement whenever our side
+    /// aborts too — which is why it is barren rather than compared.
+    #[test]
+    fn an_abort_with_output_is_barren_not_a_pass() {
+        let oracle = RunOut {
+            stdout: b"1\n".to_vec(),
+            ok: false,
+            stage: Stage::Ran,
+        };
+        let ours = RunOut {
+            stdout: b"1\n".to_vec(),
+            ok: false,
+            stage: Stage::Ran,
+        };
+        assert!(!differs(&oracle, &ours));
+        assert!(barren_reason(&oracle).is_some());
     }
 }
