@@ -40,43 +40,6 @@ use std::collections::{HashMap, HashSet};
 /// The desugar target a `rust { ... }` block lowers to (see [`crate::rust_ffi`]).
 const RUST_COMPILE: &str = "__rust_compile";
 
-/// A generic type ARGUMENT — the concrete type a type variable stands for at one
-/// instantiation, together with the class it names and (recursively) that
-/// class's own arguments.
-///
-/// Kotlin's integer width is a property of the STATIC type, and for a generic
-/// class the static type is fixed by the construction site: `Box(65536)` makes
-/// `T` an `Int`, so `Box(65536).v * Box(2000000000).v` is `Int` arithmetic that
-/// wraps at 32 bits. Without this the read of a `T`-typed property was untyped
-/// and the product widened past 32 bits.
-///
-/// It is recursive because a type argument can itself be a generic instance —
-/// `Box(Box(65536))` — and the inner read has to reach the inner `Int`.
-#[derive(Clone, PartialEq)]
-struct TypeArg {
-    ty: Type,
-    /// The class name when `ty == Type::Obj`, as [`Compiler::infer_class`] would
-    /// answer for a value of this type.
-    class: Option<String>,
-    /// That class's own type arguments, one per declared type parameter.
-    args: Vec<TypeArg>,
-}
-
-impl TypeArg {
-    /// A non-generic type: no arguments of its own.
-    fn plain(ty: Type, class: Option<String>) -> TypeArg {
-        TypeArg {
-            ty,
-            class,
-            args: Vec::new(),
-        }
-    }
-    /// The join for a position no type argument was resolved for.
-    fn unknown() -> TypeArg {
-        TypeArg::plain(Type::Unknown, None)
-    }
-}
-
 /// A single name binding: its slot, coarse type, and whether it is a `var`
 /// (reassignable) or a `val` (write-once).
 #[derive(Clone)]
@@ -335,7 +298,18 @@ struct PropMeta {
     /// `None` in the flattened record below: the index is positional against the
     /// ANCESTOR's list, and the subclass's own list need not agree with it —
     /// `class Sub(x: Int) : Box<Int>(x)` has no type parameters at all.
+    ///
+    /// …unless the subclass WROTE the argument, which is exactly what
+    /// `: Box<Int>` does. That case is resolved when the record is flattened:
+    /// the index is substituted away and the concrete type lands in `ty` /
+    /// `class` / `type_args` below, so what survives here is only the
+    /// still-positional case.
     type_param_of: Option<usize>,
+    /// The type arguments this property's declared type WROTE — the `[Int]` of
+    /// `val b: Box<Int>`. Concrete rather than positional, so unlike
+    /// `type_param_of` it survives inheritance untouched. See
+    /// [`crate::ast::TypeArg`].
+    type_args: Vec<TypeArg>,
 }
 
 /// Static signature of a user function or class method.
@@ -350,6 +324,10 @@ struct FnSig {
     /// owning class's type-parameter list a type-variable result names, read off
     /// the RECEIVER's type argument.
     ret_class_type_param_of: Option<usize>,
+    /// See [`crate::ast::FunDecl::ret_type_args`] — the arguments the return
+    /// annotation wrote, which is the only source of a generic result's width
+    /// when neither an argument nor the receiver carries one.
+    ret_type_args: Vec<TypeArg>,
     arity: usize,
     /// The parameters in declaration order. Names are what a named argument
     /// (`f(count = 3)`) binds against; the defaults and the `vararg` marker are
@@ -364,6 +342,7 @@ impl FnSig {
             ret_class: f.ret_class.clone(),
             ret_type_param_of: f.ret_type_param_of,
             ret_class_type_param_of: f.ret_class_type_param_of,
+            ret_type_args: f.ret_type_args.clone(),
             arity: f.params.len(),
             params: f.params.clone(),
         }
@@ -1011,12 +990,7 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
             lazy: false,
             delegate: None,
             type_param_of: p.type_param_of,
-        };
-        // The same field seen from a SUBCLASS, where the type-variable index no
-        // longer means anything (see [`PropMeta::type_param_of`]).
-        let inherited_field = |p: &CtorProp| PropMeta {
-            type_param_of: None,
-            ..own_field(p)
+            type_args: p.type_args.clone(),
         };
         // The superclass whose constructor this one chains to (interfaces have
         // none), and the built-in throwable the ancestry ultimately reaches.
@@ -1051,6 +1025,7 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
                 delegate: None,
                 // A throwable's `message` is a `String?`, never a type variable.
                 type_param_of: None,
+                type_args: Vec::new(),
             });
         }
         own_props.extend(
@@ -1078,11 +1053,49 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
             // The delegate's class, taken from the initializer — `by Upper()`
             // names `Upper`, whose `getValue`/`setValue` the accesses call.
             delegate: p.delegate.then(|| delegate_class_of(&p.init)).flatten(),
-            // A BODY property is not a constructor parameter, so no
-            // construction site fixes a type argument through it. `class
-            // Box<T>(v: T) { val w: T = v }` therefore reads `w` untyped.
-            type_param_of: None,
+            // A BODY property does not FIX a type argument — it is not a
+            // constructor parameter — but it does READ the one the construction
+            // site fixed, exactly as a `T`-returning method does off its
+            // receiver. `class Box<T>(v: T) { val w: T = v }` therefore answers
+            // `Int` for `Box(65536).w`.
+            type_param_of: p.type_param_of,
+            type_args: p.type_args.clone(),
         }));
+
+        // The type argument this class WROTE for a DIRECT supertype's `k`th type
+        // parameter: `class Sub : Box<Int>()` answers `Int` for `("Box", 0)`.
+        //
+        // Only a direct parent is substituted. A grandparent's variable is
+        // positional against the parent's list, and carrying it further would
+        // mean composing substitutions through an intermediate class that may
+        // pass its OWN variable up (`class B<U> : A<U>()`) — a type expression
+        // the coarse system cannot represent. Every unsubstituted position stays
+        // as it was, which narrows nothing.
+        let written_arg = |anc: &str, k: usize| -> Option<TypeArg> {
+            let at = cd.parents.iter().position(|p| p == anc)?;
+            let arg = cd.parent_args.get(at)?.get(k)?;
+            (!arg.is_unknown()).then(|| arg.clone())
+        };
+        // The same field seen from a SUBCLASS. A type-variable index is
+        // positional against the ANCESTOR's list, which the subclass's own need
+        // not share, so it is dropped — unless the subclass wrote the argument
+        // in its supertype list, in which case the variable resolves to it and
+        // the field is concrete from here down.
+        let inherited = |anc: &str, p: &PropMeta| -> PropMeta {
+            match p.type_param_of.and_then(|k| written_arg(anc, k)) {
+                Some(arg) => PropMeta {
+                    ty: arg.ty,
+                    class: arg.class,
+                    type_param_of: None,
+                    type_args: arg.args,
+                    ..p.clone()
+                },
+                None => PropMeta {
+                    type_param_of: None,
+                    ..p.clone()
+                },
+            }
+        };
 
         // The full field record, base-most first — the order `KT_EXTEND` builds
         // an instance in, so property lookup and `data` display agree with it.
@@ -1093,7 +1106,7 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
             };
             for p in d.params.iter().filter(|p| p.kind != PropKind::None) {
                 if !props.iter().any(|x| x.name == p.name) {
-                    props.push(inherited_field(p));
+                    props.push(inherited(anc, &own_field(p)));
                 }
             }
             // An ancestor's body properties are stored fields too, and sit after
@@ -1102,15 +1115,19 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
             // instance.
             for p in &d.obj_props {
                 if !props.iter().any(|x| x.name == p.name) {
-                    props.push(PropMeta {
-                        name: p.name.clone(),
-                        ty: p.ty,
-                        class: p.class.clone(),
-                        mutable: p.mutable,
-                        lazy: p.lazy,
-                        delegate: p.delegate.then(|| delegate_class_of(&p.init)).flatten(),
-                        type_param_of: None,
-                    });
+                    props.push(inherited(
+                        anc,
+                        &PropMeta {
+                            name: p.name.clone(),
+                            ty: p.ty,
+                            class: p.class.clone(),
+                            mutable: p.mutable,
+                            lazy: p.lazy,
+                            delegate: p.delegate.then(|| delegate_class_of(&p.init)).flatten(),
+                            type_param_of: p.type_param_of,
+                            type_args: p.type_args.clone(),
+                        },
+                    ));
                 }
             }
         }
@@ -1138,6 +1155,7 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
                     lazy: false,
                     delegate: None,
                     type_param_of: None,
+                    type_args: p.type_args.clone(),
                 });
             }
         }
@@ -1292,6 +1310,7 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
                     // A top-level property belongs to no class, so it has no
                     // type parameter to name.
                     type_param_of: None,
+                    type_args: p.type_args.clone(),
                 },
             )
             .is_some()
@@ -1855,6 +1874,12 @@ impl Compiler {
         // function parameters are read-only (`val`), so declared immutable.
         for p in &f.params {
             sc.declare_obj(&p.name, p.ty, false, p.class.clone());
+            // `fun f(b: Box<Int>)` — the annotation is the only place the width
+            // of a read through `b` is written down; the caller's construction
+            // site is on the other side of the call.
+            if !p.type_args.is_empty() {
+                sc.set_type_args(&p.name, p.type_args.clone());
+            }
         }
         // Bind args (stack top = last arg) into slots, deepest last.
         for i in (0..nslots).rev() {
@@ -2024,6 +2049,7 @@ impl Compiler {
                 ty,
                 fn_params,
                 fn_ret,
+                type_args: annotated,
                 init,
                 mutable,
                 lazy,
@@ -2036,7 +2062,15 @@ impl Compiler {
                 // Likewise the TYPE ARGUMENTS, when the initializer constructs a
                 // generic class: `val b = Box(65536)` binds `T` to `Int` for
                 // every read of a `T`-typed member through `b`.
-                let type_args = self.gen_ty(sc, init).args;
+                //
+                // A WRITTEN annotation wins: `val b: Box<Int> = mk()` states the
+                // static type outright, and the initializer need not reveal it
+                // (a call through an opaque `fun mk(): Box<Int>` does not).
+                let type_args = if annotated.is_empty() {
+                    self.gen_ty(sc, init).args
+                } else {
+                    annotated.clone()
+                };
                 // `val f: (Int) -> Int = { it * 2 }` — the annotation IS the
                 // lambda's parameter list, so publish it the same way a
                 // collection HOF publishes its element type.
@@ -2889,7 +2923,9 @@ impl Compiler {
             // supplies is the STATIC type `T`, which is what decides integer
             // width and `/` dispatch from here on. The runtime op only enforces
             // the check (throw for `as`, null for `as?`).
-            Expr::As { value, ty, safe } => {
+            Expr::As {
+                value, ty, safe, ..
+            } => {
                 self.compile_expr(sc, value)?;
                 let nidx = self.b.add_constant(Value::str(ty.clone()));
                 self.b.emit(Op::LoadConst(nidx), 0);
@@ -6391,13 +6427,25 @@ impl Compiler {
         match e {
             Expr::Var(n) => {
                 let args = sc.type_args_of(n);
-                if args.is_empty() {
+                if !args.is_empty() {
+                    return Some(TypeArg {
+                        ty: sc.ty(n),
+                        class: sc.class_of(n),
+                        args,
+                    });
+                }
+                // A top-level property, whose annotation is the only place its
+                // arguments were ever written (`val b: Box<Int> = mk()`). Only
+                // consulted when the name is not a local, so a shadowing binding
+                // still answers for itself.
+                if sc.slot(n).is_some() {
                     return None;
                 }
+                let g = self.globals.get(n)?;
                 Some(TypeArg {
-                    ty: sc.ty(n),
-                    class: sc.class_of(n),
-                    args,
+                    ty: g.ty,
+                    class: g.class.clone(),
+                    args: nonempty(g.type_args.clone())?,
                 })
             }
             Expr::Call { name, args, .. } if self.classes.contains_key(name) => Some(TypeArg {
@@ -6405,19 +6453,42 @@ impl Compiler {
                 class: Some(name.clone()),
                 args: self.ctor_type_args(sc, name, args),
             }),
-            // A stored `T`-typed property, or a computed one — the zero-argument
-            // method a `val d: T get() = …` lowers to.
+            // A call to a user function whose RETURN annotation wrote its type
+            // arguments: `fun mk(): Box<Int>` makes `mk().v * 2000000000` `Int`
+            // arithmetic, with nothing at the call site to say so.
+            Expr::Call { name, .. } => {
+                let sig = self
+                    .local_sigs
+                    .get(name)
+                    .or_else(|| self.fun_sig.get(name))?;
+                Some(TypeArg {
+                    ty: sig.ret,
+                    class: sig.ret_class.clone(),
+                    args: nonempty(sig.ret_type_args.clone())?,
+                })
+            }
+            // A stored `T`-typed property, a property whose annotation wrote its
+            // arguments, or a computed one — the zero-argument method a
+            // `val d: T get() = …` lowers to.
             Expr::Member { recv, name, .. } => {
-                if let Some(k) = self.member_type_param(sc, recv, name) {
-                    return Some(self.type_arg_at(sc, recv, k));
+                if let Some(p) = self.member_prop(sc, recv, name) {
+                    if let Some(k) = p.type_param_of {
+                        return Some(self.type_arg_at(sc, recv, k));
+                    }
+                    if !p.type_args.is_empty() {
+                        return Some(TypeArg {
+                            ty: p.ty,
+                            class: p.class.clone(),
+                            args: p.type_args.clone(),
+                        });
+                    }
                 }
                 let cls = self.infer_class(sc, recv)?;
                 let sig = self.classes.get(&cls)?.methods.get(name)?;
-                if sig.ret != Type::Unknown || sig.arity != 0 {
+                if sig.arity != 0 {
                     return None;
                 }
-                let t = self.type_arg_at(sc, recv, sig.ret_class_type_param_of?);
-                (t.ty != Type::Unknown).then_some(t)
+                self.generic_result(sc, recv, sig, &[])
             }
             Expr::MethodCall {
                 recv, name, args, ..
@@ -6426,48 +6497,88 @@ impl Compiler {
                 // extension or a stdlib member reaches none of this.
                 let cls = self.infer_class(sc, recv)?;
                 let sig = self.classes.get(&cls)?.methods.get(name)?;
-                if sig.ret != Type::Unknown {
-                    return None;
-                }
-                if let Some(k) = sig.ret_class_type_param_of {
-                    let t = self.type_arg_at(sc, recv, k);
-                    if t.ty != Type::Unknown {
-                        return Some(t);
-                    }
-                }
-                // A type variable the ARGUMENTS supply, the shape
-                // `Compiler::call_ret` resolves for a free function.
-                let i = sig.ret_type_param_of?;
-                let a = args.get(i)?;
-                if args.iter().any(|a| matches!(a, Expr::Named { .. })) {
-                    return None;
-                }
-                Some(self.gen_ty(sc, a))
+                self.generic_result(sc, recv, sig, args)
             }
+            // `x as Box<Int>` — the JVM erases the argument, but the cast's
+            // STATIC type is what the width downstream is read off.
+            Expr::As {
+                ty,
+                type_args,
+                safe: false,
+                ..
+            } if !type_args.is_empty() => Some(TypeArg {
+                ty: Type::Obj,
+                class: Some(ty.clone()),
+                args: type_args.clone(),
+            }),
             _ => None,
         }
     }
 
-    /// The index into the receiver class's type-parameter list that the property
-    /// `name` was declared with, or `None` when it has a concrete type (or the
-    /// receiver's class is not known).
-    fn member_type_param(&self, sc: &Scope, recv: &Expr, name: &str) -> Option<usize> {
+    /// The generic type a call to `sig` on `recv` yields, from whichever of the
+    /// three sources named it: the arguments the return annotation WROTE, the
+    /// receiver's type argument for a `T`-typed result, or the argument that
+    /// carries the result's type variable.
+    ///
+    /// The written annotation comes first because it is the only one that is
+    /// concrete on its own; the other two are positional and resolve to
+    /// `Unknown` wherever the instantiation could not be traced.
+    fn generic_result(
+        &self,
+        sc: &Scope,
+        recv: &Expr,
+        sig: &FnSig,
+        args: &[Expr],
+    ) -> Option<TypeArg> {
+        if !sig.ret_type_args.is_empty() {
+            return Some(TypeArg {
+                ty: sig.ret,
+                class: sig.ret_class.clone(),
+                args: sig.ret_type_args.clone(),
+            });
+        }
+        if sig.ret != Type::Unknown {
+            return None;
+        }
+        if let Some(k) = sig.ret_class_type_param_of {
+            let t = self.type_arg_at(sc, recv, k);
+            if t.ty != Type::Unknown {
+                return Some(t);
+            }
+        }
+        // A type variable the ARGUMENTS supply, the shape `Compiler::call_ret`
+        // resolves for a free function.
+        let i = sig.ret_type_param_of?;
+        let a = args.get(i)?;
+        if args.iter().any(|a| matches!(a, Expr::Named { .. })) {
+            return None;
+        }
+        Some(self.gen_ty(sc, a))
+    }
+
+    /// The stored property `name` of `recv`'s class, or `None` when the
+    /// receiver's class is not known or declares no such property.
+    fn member_prop(&self, sc: &Scope, recv: &Expr, name: &str) -> Option<&PropMeta> {
         let cls = self.infer_class(sc, recv)?;
-        self.classes.get(&cls)?.prop(name)?.type_param_of
+        self.classes.get(&cls)?.prop(name)
     }
 
     /// The type arguments a construction site `Class(args)` fixes, by matching
     /// each argument against the type variable its constructor parameter was
     /// declared with.
     ///
-    /// Deliberately conservative — an unresolved position stays `Unknown`, which
-    /// is what the frontend answered for every position before this existed:
+    /// The parameter list matched is the one [`Compiler::select_ctor`] answers,
+    /// so a call that runs a SECONDARY constructor reads its type argument off
+    /// that constructor's parameters rather than off the primary's — the two
+    /// need not agree on what any position means, and asking the selector is the
+    /// only way to know which is which.
+    ///
+    /// Otherwise deliberately conservative — an unresolved position stays
+    /// `Unknown`, which is what the frontend answered for every position before
+    /// this existed:
     ///
     /// * NAMED arguments defeat the positional match, exactly as they do in
     ///   [`Compiler::call_ret`].
-    /// * A call whose arity matches a SECONDARY constructor is not matched
-    ///   against the primary's parameters at all — the two need not agree on
-    ///   what any position means.
     /// * Two parameters naming the same variable must agree on the type they
     ///   supply; Kotlin would infer their common supertype, which the coarse
     ///   type system cannot name.
@@ -6479,15 +6590,12 @@ impl Compiler {
             return Vec::new();
         }
         let mut out = vec![TypeArg::unknown(); meta.type_param_count];
-        if !meta.has_primary
-            || meta.sec_arities.contains(&args.len())
-            || args.len() > meta.ctor_params.len()
-            || args.iter().any(|a| matches!(a, Expr::Named { .. }))
-        {
+        if args.iter().any(|a| matches!(a, Expr::Named { .. })) {
             return out;
         }
+        let (_, params) = self.select_ctor(sc, meta, args);
         let mut seen = vec![false; meta.type_param_count];
-        for (p, a) in meta.ctor_params.iter().zip(args) {
+        for (p, a) in params.iter().zip(args) {
             let Some(k) = p.type_param_of.filter(|k| *k < out.len()) else {
                 continue;
             };
@@ -6626,7 +6734,10 @@ impl Compiler {
                 // A `T`-typed property names whatever class the receiver's type
                 // argument does — `Box(Person("a")).v.name` has to reach
                 // `Person` for the read to dispatch as one.
-                if let Some(k) = self.member_type_param(sc, recv, name) {
+                if let Some(k) = self
+                    .member_prop(sc, recv, name)
+                    .and_then(|p| p.type_param_of)
+                {
                     return self.type_arg_at(sc, recv, k).class;
                 }
                 let cls = self.infer_class(sc, recv)?;
@@ -6692,6 +6803,19 @@ impl Compiler {
             }
             Expr::NotNull(inner) => self.infer_class(sc, inner),
             Expr::Elvis { left, .. } => self.infer_class(sc, left),
+            // `x as Person` — naming a static type the expression did not
+            // already have is the whole point of the cast, so the class it names
+            // is the class of the result. [`Compiler::infer`] already answers
+            // `Obj` here through `cast_type`; without this the CLASS half stayed
+            // unknown, so a member read through a cast dispatched dynamically
+            // and no type argument could be read off it.
+            //
+            // Only the non-`?` form: `x as? Person` may yield null, whose class
+            // is nothing, and every read through it is a safe call whose result
+            // this would over-narrow.
+            Expr::As {
+                ty, safe: false, ..
+            } if Type::from_name(ty) == Type::Unknown => Some(ty.clone()),
             Expr::Pair { .. } => Some("Pair".to_string()),
             // Container names for dispatch. None of these is a user class, so
             // member access on them falls through to the host method table.
@@ -7102,6 +7226,12 @@ fn is_primitive_recv(t: Type) -> bool {
 /// [`Type::Unknown`] is deliberately excluded: a value whose type the frontend
 /// could not resolve may well be a `Long`, and truncating one to 32 bits would
 /// be a far worse error than leaving a rare `Int` overflow unwrapped.
+/// `Some(v)` when the list has entries, `None` when it is empty — the shape a
+/// resolver that must fall through to its next source needs.
+fn nonempty(v: Vec<TypeArg>) -> Option<Vec<TypeArg>> {
+    (!v.is_empty()).then_some(v)
+}
+
 fn is_int_width(t: Type) -> bool {
     matches!(t, Type::Int | Type::Char)
 }

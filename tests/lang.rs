@@ -3324,6 +3324,141 @@ fun main() {
 }
 
 #[test]
+fn a_written_down_type_argument_carries_the_width_a_construction_site_never_showed() {
+    // The construction site is one of two sources of a type argument; the other
+    // is the annotation. Each line below reaches a source the other cannot: the
+    // result of a function whose body the call site never sees, a parameter
+    // whose caller is across the call, a property of another class, a supertype
+    // a subclass with no type parameters of its own extends, a top-level `val`,
+    // a local annotation over an opaque initializer, and a cast.
+    //
+    // Every one has a `Long` twin at the same magnitudes, and the twins are
+    // asserted in the same run on purpose — a rule that fixes the `Int` case by
+    // narrowing whatever a written annotation touches gets every odd line right
+    // and every even line wrong.
+    let src = r#"class Box<T>(val v: T) {
+    fun get(): T = v
+    val once: T get() = v
+}
+open class Open<T>(val v: T)
+class Sub : Open<Int>(65536)
+class SubL : Open<Long>(65536L)
+class Hold(val b: Box<Int>, val bl: Box<Long>)
+fun mkInt(): Box<Int> = Box(65536)
+fun mkLong(): Box<Long> = Box(65536L)
+fun takeInt(b: Box<Int>): Int = b.v * 2000000000
+fun takeLong(b: Box<Long>): Long = b.v * 2000000000L
+fun anyOf(x: Any): Any = Box(x)
+val TOPI: Box<Int> = mkInt()
+val TOPL: Box<Long> = mkLong()
+fun main() {
+    println(mkInt().v * 2000000000)
+    println(mkLong().v * 2000000000L)
+    println(mkInt().get() * mkInt().once)
+    println(mkLong().get() * mkLong().once)
+    println(takeInt(Box(65536)))
+    println(takeLong(Box(65536L)))
+    println(Hold(Box(65536), Box(1L)).b.v * 2000000000)
+    println(Hold(Box(1), Box(65536L)).bl.v * 2000000000L)
+    println(Sub().v * 2000000000)
+    println(SubL().v * 2000000000L)
+    println(TOPI.v * 2000000000)
+    println(TOPL.v * 2000000000L)
+    val a: Box<Int> = mkInt()
+    val b: Box<Long> = mkLong()
+    println(a.v * 2000000000)
+    println(b.v * 2000000000L)
+    println((anyOf(65536) as Box<Int>).v * 2000000000)
+    println((anyOf(65536L) as Box<Long>).v * 2000000000L)
+}"#;
+    assert_eq!(
+        stdout(src),
+        "-1811939328\n131072000000000\n0\n4294967296\n\
+         -1811939328\n131072000000000\n-1811939328\n131072000000000\n\
+         -1811939328\n131072000000000\n-1811939328\n131072000000000\n\
+         -1811939328\n131072000000000\n-1811939328\n131072000000000\n"
+    );
+}
+
+#[test]
+fn a_secondary_constructor_and_a_body_property_carry_the_type_argument_too() {
+    // Two holes the construction-site path left. A call that selects a SECONDARY
+    // constructor was matched against the PRIMARY's parameters — which take a
+    // different count and mean something else — so it resolved nothing; the
+    // parameters matched are now the ones the constructor selector answers. And
+    // a BODY property is not a constructor parameter at all, so nothing fixed
+    // its argument even though it reads the one the receiver already carries.
+    //
+    // The `Long` twins are what keep either fix from being "narrow it".
+    let src = r#"class Box<T>(v: T) {
+    val w: T = v
+}
+class Sec<T>(val v: T) {
+    constructor(a: T, b: T) : this(a)
+}
+fun main() {
+    println(Box(65536).w * Box(65536).w)
+    println(Box(65536L).w * Box(65536L).w)
+    println(Sec(65536, 46341).v * 2000000000)
+    println(Sec(65536L, 46341L).v * 2000000000L)
+    println(Sec(65536).v * 2000000000)
+}"#;
+    assert_eq!(
+        stdout(src),
+        "0\n4294967296\n-1811939328\n131072000000000\n-1811939328\n"
+    );
+}
+
+#[test]
+fn a_written_type_argument_that_is_not_an_int_is_left_alone() {
+    // The written-down source obeys the same allow-list as the inferred one:
+    // only an `Int`-width argument may reach the 32-bit wrap. A `String` must
+    // concatenate, a `Double` must divide by IEEE rules rather than truncate,
+    // and a nested argument must reach the width two levels down rather than
+    // narrowing the outer read.
+    let src = r#"class Box<T>(val v: T) {
+    val w: T = v
+}
+fun mkStr(): Box<String> = Box("s")
+fun mkDbl(): Box<Double> = Box(7.0)
+fun mkNest(): Box<Box<Int>> = Box(Box(70000))
+fun takeStr(b: Box<String>): String = b.v + b.w
+fun main() {
+    println(mkStr().v + mkStr().w)
+    println(mkDbl().v / 2)
+    println(takeStr(Box("ab")))
+    println(mkNest().v.v * 46341)
+    println(mkNest().v.v.toLong() * 46341L)
+}"#;
+    assert_eq!(stdout(src), "ss\n3.5\nabab\n-1051097296\n3243870000\n");
+}
+
+#[test]
+fn a_type_argument_list_the_parser_cannot_read_is_skipped_not_rejected() {
+    // The `<…>` list is now parsed rather than skipped, and Kotlin's type
+    // grammar has corners this frontend has never read. A list that fails to
+    // parse must rewind to the old token-depth skip and leave the annotation
+    // with no arguments — narrowing nothing — rather than failing the program.
+    //
+    // A star projection and a variance modifier are read (as unresolved and as
+    // their bare type); a function type nested in an argument must NOT publish
+    // its signature as if the annotation itself were callable, which would make
+    // a list-valued binding lower as a closure.
+    let src = r#"fun main() {
+    val a: List<*> = listOf(1, 2)
+    val b: List<out Number> = listOf(3)
+    val c: List<(Int) -> Int> = listOf({ x: Int -> x * 2 })
+    val d: Map<String, List<Int>> = mapOf("k" to listOf(4, 5))
+    println(a)
+    println(b)
+    println(c.size)
+    println(c[0](21))
+    println(d["k"])
+}"#;
+    assert_eq!(stdout(src), "[1, 2]\n[3]\n1\n42\n[4, 5]\n");
+}
+
+#[test]
 fn a_computed_property_is_typed_by_its_declared_result() {
     // `val d: Int get() = k` is a zero-argument method wearing property syntax.
     // `compile_member` always resolved it as one, but inference did not look

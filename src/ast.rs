@@ -69,6 +69,53 @@ impl Type {
     }
 }
 
+/// A type together with the type ARGUMENTS it was instantiated with — the
+/// resolved form of `Box<Int>`, whether that came from a construction site
+/// (`Box(65536)`) or from a written-down annotation (`fun mk(): Box<Int>`).
+///
+/// Kotlin's integer width is a property of the static type, and for a generic
+/// class the static type is fixed by whichever of those two sources named it:
+/// `Box<Int>.v * 2000000000` is `Int` arithmetic that wraps at 32 bits. Without
+/// the argument the read of a `T`-typed member is untyped and the product widens
+/// past 32 bits.
+///
+/// It is recursive because a type argument can itself be a generic instance —
+/// `Box<Box<Int>>` — and the inner read has to reach the inner `Int`.
+///
+/// One type serves both sources deliberately: a written annotation and an
+/// inferred instantiation produce the same value, so the resolver has a single
+/// shape to read rather than two that must be kept in agreement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeArg {
+    pub ty: Type,
+    /// The class name when `ty == Type::Obj`, as the compiler's `infer_class`
+    /// would answer for a value of this type.
+    pub class: Option<String>,
+    /// That class's own type arguments, one per declared type parameter.
+    pub args: Vec<TypeArg>,
+}
+
+impl TypeArg {
+    /// A non-generic type: no arguments of its own.
+    pub fn plain(ty: Type, class: Option<String>) -> TypeArg {
+        TypeArg {
+            ty,
+            class,
+            args: Vec::new(),
+        }
+    }
+    /// The join for a position no type argument was resolved for.
+    pub fn unknown() -> TypeArg {
+        TypeArg::plain(Type::Unknown, None)
+    }
+    /// Whether this carries no information at all — the state every position
+    /// was in before type arguments were resolved, and the one that narrows
+    /// nothing.
+    pub fn is_unknown(&self) -> bool {
+        self.ty == Type::Unknown && self.class.is_none() && self.args.is_empty()
+    }
+}
+
 /// A whole compilation unit: the top-level `class`/`object` declarations and
 /// free `fun`s. Execution still enters `fun main`.
 #[derive(Debug, Clone, Default)]
@@ -128,6 +175,17 @@ pub struct Param {
     /// `vararg xs: Int` — the ELEMENT type. The parameter itself binds an array
     /// of them, which the call site packs from its trailing arguments.
     pub vararg: Option<Type>,
+    /// The type arguments the annotation WROTE — `fun f(b: Box<Int>)` records
+    /// `[Int]`, so a read of `b.v` inside the body has the width the caller's
+    /// construction site never had to reveal. Empty when the annotation named
+    /// no generic type. See [`TypeArg`].
+    pub type_args: Vec<TypeArg>,
+    /// The index into the enclosing CLASS's type-parameter list this parameter
+    /// was declared with, for a SECONDARY constructor's parameter — the same
+    /// role [`CtorProp::type_param_of`] plays for the primary's. `C(a, b)` that
+    /// selects a secondary reads its type argument off the secondary's
+    /// parameters, which need not agree with the primary's.
+    pub type_param_of: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +222,12 @@ pub struct FunDecl {
     /// `None` for a free function, and for a method whose result is not one of
     /// its class's type variables.
     pub ret_class_type_param_of: Option<usize>,
+    /// The type arguments the RETURN annotation wrote — `fun mk(): Box<Int>`
+    /// records `[Int]`. This is the one source of a generic result's width when
+    /// the call site has no argument to read it from and the body is opaque:
+    /// `mk().v * 2000000000` wraps because the signature says `Int`, not
+    /// because anything at the call site does. See [`TypeArg`].
+    pub ret_type_args: Vec<TypeArg>,
     pub body: Vec<Stmt>,
     pub line: u32,
     /// `abstract fun m(): T` (or an `interface` member with no body) — the
@@ -231,6 +295,11 @@ pub struct ClassDecl {
     /// A superclass (the one carrying constructor arguments) may only be first,
     /// which is Kotlin's own rule.
     pub parents: Vec<String>,
+    /// The type arguments each entry of `parents` was written with, parallel to
+    /// it — `class Sub : Box<Int>()` records `[[Int]]`. A subclass declares no
+    /// type parameters of its own, so this annotation is the ONLY thing that
+    /// fixes the inherited `T`-typed members' width. See [`TypeArg`].
+    pub parent_args: Vec<Vec<TypeArg>>,
     /// The superclass constructor arguments of `: Super(a, b)`. Empty when the
     /// supertype list holds only interfaces or a parameterless superclass.
     pub super_args: Vec<Expr>,
@@ -352,6 +421,16 @@ pub struct BodyProp {
     /// its own. `by lazy` is the one delegate with a dedicated lowering and
     /// sets [`BodyProp::lazy`] instead.
     pub delegate: bool,
+    /// The type arguments the annotation wrote — `val b: Box<Int> = mk()`.
+    /// See [`TypeArg`].
+    pub type_args: Vec<TypeArg>,
+    /// The index into the enclosing class's type-parameter list the annotation
+    /// named — `class Box<T>(v: T) { val w: T = v }` records `Some(0)` for `w`.
+    ///
+    /// A body property is not a constructor parameter, so it does not FIX a
+    /// type argument; it READS the one the construction site already fixed,
+    /// exactly as a `T`-returning method does off its receiver.
+    pub type_param_of: Option<usize>,
 }
 
 /// A primary-constructor parameter with its property kind.
@@ -373,6 +452,12 @@ pub struct CtorProp {
     /// the product widened past 32 bits (`131072000000000` for the reference
     /// toolchain's `-1811939328`).
     pub type_param_of: Option<usize>,
+    /// The type arguments the annotation wrote — `class Holder(val b: Box<Int>)`
+    /// records `[Int]` for `b`, which is what a read of `h.b.v` resolves
+    /// against. Distinct from `type_param_of`: that one is positional against
+    /// the OWNING class's variables and only a construction site can resolve
+    /// it, while these are concrete already. See [`TypeArg`].
+    pub type_args: Vec<TypeArg>,
 }
 
 impl CtorProp {
@@ -385,6 +470,8 @@ impl CtorProp {
             class: self.class.clone(),
             default: self.default.clone(),
             vararg: None,
+            type_args: self.type_args.clone(),
+            type_param_of: self.type_param_of,
         }
     }
 }
@@ -422,6 +509,10 @@ pub enum StmtKind {
         /// it `val f: (Int) -> Int` made `f(7) / f(2)` an untyped division —
         /// answering `3.5` where Kotlin truncates to `3`.
         fn_ret: Option<Type>,
+        /// The type arguments the annotation wrote — `val b: Box<Int> = mk()`.
+        /// The annotation IS the static type, so it takes precedence over
+        /// whatever the initializer would have revealed. See [`TypeArg`].
+        type_args: Vec<TypeArg>,
         init: Expr,
         mutable: bool,
         /// Declared `val x by lazy { … }`. The slot holds an unforced CELL and
@@ -750,6 +841,11 @@ pub enum Expr {
     As {
         value: Box<Expr>,
         ty: String,
+        /// The type arguments the cast wrote — `x as Box<Int>`. The JVM erases
+        /// them at run time (which is why `kotlinc` calls the cast unchecked),
+        /// but they are part of the STATIC type the cast produces, and that is
+        /// what decides the width of `(x as Box<Int>).v * 2000000000`.
+        type_args: Vec<TypeArg>,
         /// `as?` — yield null instead of throwing on a mismatch.
         safe: bool,
     },

@@ -1686,6 +1686,28 @@ const CONCRETE: &[Mode] = &[
 /// arguments, and a second type parameter off a different position of the same
 /// argument list. A generator that declared only `class GBox<T>(val v: T)` said
 /// nothing about any of the others.
+///
+/// The second SOURCE of a type argument is the one written down in SOURCE, and
+/// it reaches places no construction site can: the result of a function whose
+/// body the call site never sees (`fun mkInt(): GBox<Int>`), a parameter whose
+/// caller is on the other side of the call (`fun takeInt(b: GBox<Int>)`), a
+/// property of another class (`class GHold(val b: GBox<Int>)`), a supertype a
+/// subclass with no type parameters of its own extends (`class GSub :
+/// GOpen<Int>()`), a top-level `val`, a local annotation, and a cast. The
+/// generator wrote NONE of them: every generic probe read its argument off a
+/// construction, so a clean run said nothing about the annotation path at all.
+///
+/// Two further shapes the construction path itself did not reach: a SECONDARY
+/// constructor's parameters (the primary's were the only ones matched, so a call
+/// selecting a secondary resolved nothing) and a BODY property declared with a
+/// type variable (`class GBox<T>(v: T) { val w: T = v }`), which is not a
+/// constructor parameter.
+///
+/// Every one of them has a `Long` twin written the same way and at the same
+/// magnitudes, which must NOT narrow — and a `String`/`Double` instantiation
+/// that must reach neither the wrap nor the integer division — so a rule that
+/// fixes the `Int` case by narrowing everything a written annotation touches
+/// fails the twin instead of passing.
 fn g_generic(r: &mut Rng, idx: usize) -> String {
     let big = pick(r, BIGINTS);
     let op = pick(r, AOPS);
@@ -1694,7 +1716,7 @@ fn g_generic(r: &mut Rng, idx: usize) -> String {
     // case right by narrowing everything.
     let lbig = format!("{}L", pick(r, BIGINTS));
     let lbig2 = format!("{}L", pick(r, BIGINTS));
-    match r.below(20) {
+    match r.below(45) {
         0 => format!("println(gid({}) {op} gid({}))", pick(r, BIGINTS), big),
         1 => format!("println(gid({}) / gid({}))", pick(r, INTS), pick(r, DIVS)),
         2 => format!("println(gid({}) % gid({}))", pick(r, INTS), pick(r, DIVS)),
@@ -1761,14 +1783,63 @@ fn g_generic(r: &mut Rng, idx: usize) -> String {
             pick(r, INTS),
             pick(r, INTS)
         ),
-        // The leading `""` is required, not cosmetic: `+` is resolved against
-        // the LEFT operand, and `Double.plus` has no `String` overload — so
-        // `gid(2.5) + "|"` is a compile error in Kotlin, not a parity probe.
-        _ => format!(
+        19 => format!(
             "println(\"\" + gid({}) + \"|\" + gid({}))",
             pick(r, DBLS),
             pick(r, INTS)
         ),
+        // ── the type argument WRITTEN DOWN, one shape per source ──
+        //
+        // A function RESULT. The call site passes nothing, and the body is a
+        // separate declaration, so the annotation is the only place the width
+        // is stated.
+        20 => format!("println(gmkInt().v {op} {big})"),
+        21 => format!("println(gmkLong().v {op} {lbig})"),
+        // …read through the method and the computed property as well, which
+        // resolve off the receiver rather than off the annotation directly.
+        22 => format!("println(gmkInt().get() {op} gmkInt().once)"),
+        23 => format!("println(gmkLong().get() {op} gmkLong().once)"),
+        // A PARAMETER. The construction the caller wrote is on the other side
+        // of the call; inside the body only the annotation says `Int`.
+        24 => format!("println(gtakeInt(GBox({big})))"),
+        25 => format!("println(gtakeLong(GBox({lbig})))"),
+        // A PROPERTY of another class, whose own type is written out in full.
+        26 => format!("println(GHold(GBox({big}), GBox(1L)).b.v {op} {big})"),
+        27 => format!("println(GHold(GBox(1), GBox({lbig})).bl.v {op} {lbig})"),
+        // A SUPERTYPE. `GSub` declares no type parameters at all, so nothing but
+        // `: GOpen<Int>(…)` fixes the inherited property's width.
+        28 => format!("println(GSub().v {op} {big})"),
+        29 => format!("println(GSubL().v {op} {lbig})"),
+        // A top-level `val` and a LOCAL annotation, whose initializers are
+        // opaque calls — so the annotation, not the initializer, is the source.
+        30 => format!("println(GTOPI.v {op} {big})"),
+        31 => format!("println(GTOPL.v {op} {lbig})"),
+        32 => format!("val ga{idx}: GBox<Int> = gmkInt(); println(ga{idx}.v {op} {big})"),
+        33 => format!("val gb{idx}: GBox<Long> = gmkLong(); println(gb{idx}.v {op} {lbig})"),
+        // A CAST. The JVM erases the argument — `kotlinc` warns the cast is
+        // unchecked — but the static type it produces still decides the width.
+        34 => format!("println((gany({big}) as GBox<Int>).v {op} {big})"),
+        35 => format!("println((gany({lbig}) as GBox<Long>).v {op} {lbig})"),
+        // A SECONDARY constructor supplies the type argument from ITS OWN
+        // parameters; the primary's take a different count and mean nothing
+        // here.
+        36 => format!("println(GSec({big}, {}).v {op} {big})", pick(r, BIGINTS)),
+        37 => format!("println(GSec({lbig}, {lbig2}).v {op} {lbig})"),
+        // A BODY property declared with the class's type variable, which is not
+        // a constructor parameter and so was left untyped by everything above.
+        38 => format!("println(GBox({big}).w {op} GBox({}).w)", pick(r, BIGINTS)),
+        39 => format!("println(GBox({lbig}).w {op} GBox({lbig2}).w)"),
+        // The written argument at a NON-integer type, through the same
+        // annotation paths: neither may reach the 32-bit wrap or the integer
+        // division. The leading `""` is required, not cosmetic: `+` is resolved
+        // against the LEFT operand, and `Double.plus` has no `String` overload —
+        // so `gmkDbl().v + "|"` is a compile error in Kotlin, not a parity probe.
+        40 => "println(gmkStr().v + \"|\" + gmkStr().w)".to_string(),
+        41 => format!("println(gmkDbl().v / {})", pick(r, DIVS)),
+        42 => format!("println(\"\" + (gmkDbl().get() {op} 0.0))"),
+        43 => format!("println(gtakeStr(GBox({})))", pick(r, STRS)),
+        // A NESTED written argument, where the width lives two levels down.
+        _ => format!("println(gmkNest().v.v {op} {big})"),
     }
 }
 
@@ -2106,11 +2177,82 @@ fn extra_declarations(probes: &[String]) -> String {
     // syntax, whose declared result is the class's type variable. It resolves
     // its width from the receiver exactly as `get()` does, and it is a separate
     // lowering path — reads of it go through the member node, not the call one.
-    if named("GBox(") {
+    // `w` is a BODY property declared with the class's type variable. It is not
+    // a constructor parameter, so nothing the construction site does fixes it
+    // directly — it reads the argument off the receiver, as `once` does.
+    //
+    // The gate lists every marker that TRANSITIVELY needs the class, not just
+    // the probes that spell it: `println(GTOPL.v - 1L)` names no `GBox` at all,
+    // yet it pulls in `val GTOPL: GBox<Long>` and `fun gmkLong(): GBox<Long>`
+    // below. Missing one leaves the reference toolchain with an unresolved
+    // reference, which is a BARREN program — the fuzzer reported exactly that on
+    // seed 24323 before this line listed `GTOP`.
+    if named("GBox")
+        || named("GHold(")
+        || named("gmk")
+        || named("gtake")
+        || named("gany(")
+        || named("GTOP")
+    {
         out.push_str(
             "class GBox<T>(val v: T) {\n\
              \x20   fun get(): T = v\n\
              \x20   val once: T get() = v\n\
+             \x20   val w: T = v\n\
+             }\n",
+        );
+    }
+    // The written-down sources, each in its own declaration so a reduction to a
+    // single probe still emits only what that probe names.
+    if named("gmkInt(") || named("GTOPI") || named("GBox<Int>") {
+        out.push_str("fun gmkInt(): GBox<Int> = GBox(65536)\n");
+    }
+    if named("gmkLong(") || named("GTOPL") || named("GBox<Long>") {
+        out.push_str("fun gmkLong(): GBox<Long> = GBox(65536L)\n");
+    }
+    if named("gmkStr(") {
+        out.push_str("fun gmkStr(): GBox<String> = GBox(\"gs\")\n");
+    }
+    if named("gmkDbl(") {
+        out.push_str("fun gmkDbl(): GBox<Double> = GBox(2.5)\n");
+    }
+    if named("gmkNest(") {
+        out.push_str("fun gmkNest(): GBox<GBox<Int>> = GBox(GBox(70000))\n");
+    }
+    if named("gtakeInt(") {
+        out.push_str("fun gtakeInt(b: GBox<Int>): Int = b.v * 2000000000\n");
+    }
+    if named("gtakeLong(") {
+        out.push_str("fun gtakeLong(b: GBox<Long>): Long = b.v * 2000000000L\n");
+    }
+    if named("gtakeStr(") {
+        out.push_str("fun gtakeStr(b: GBox<String>): String = b.v + b.w\n");
+    }
+    if named("gany(") {
+        out.push_str("fun gany(x: Any): Any = GBox(x)\n");
+    }
+    if named("GHold(") {
+        out.push_str("class GHold(val b: GBox<Int>, val bl: GBox<Long>)\n");
+    }
+    if named("GSub(") || named("GSubL(") {
+        out.push_str(
+            "open class GOpen<T>(val v: T)\n\
+             class GSub : GOpen<Int>(65536)\n\
+             class GSubL : GOpen<Long>(65536L)\n",
+        );
+    }
+    if named("GTOPI") {
+        out.push_str("val GTOPI: GBox<Int> = gmkInt()\n");
+    }
+    if named("GTOPL") {
+        out.push_str("val GTOPL: GBox<Long> = gmkLong()\n");
+    }
+    // A class whose SECONDARY constructor is the one a two-argument call
+    // selects; its parameters, not the primary's, name the type variable.
+    if named("GSec(") {
+        out.push_str(
+            "class GSec<T>(val v: T) {\n\
+             \x20   constructor(a: T, b: T) : this(a)\n\
              }\n",
         );
     }

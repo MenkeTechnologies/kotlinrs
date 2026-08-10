@@ -307,6 +307,11 @@ fn expand_interface_delegation(prog: &mut Program) -> Result<(), String> {
                     mutable: false,
                     lazy: false,
                     delegate: false,
+                    // The synthesized delegate field is typed only as a heap
+                    // object; the interface it holds was written without the
+                    // frontend keeping its arguments.
+                    type_args: Vec::new(),
+                    type_param_of: None,
                 },
             );
             let mut inherited = Vec::new();
@@ -345,6 +350,9 @@ fn expand_interface_delegation(prog: &mut Program) -> Result<(), String> {
                     // leaves such a call untyped, which is the answer the
                     // frontend already gives everywhere it cannot name a width.
                     ret_class_type_param_of: None,
+                    // …and the written-down arguments of the result travel
+                    // fine, being concrete rather than positional.
+                    ret_type_args: m.ret_type_args.clone(),
                     body: vec![Stmt::new(m.line, StmtKind::Return(Some(call)))],
                     line: m.line,
                     is_abstract: false,
@@ -594,13 +602,18 @@ impl Parser {
                 self.bump();
             }
             let pname = self.ident()?;
-            let (ty, class) = if self.at(&Tok::Colon) {
+            let ann = if self.at(&Tok::Colon) {
                 self.bump();
                 self.type_ref()?
             } else {
                 self.last_type_param = None;
-                (Type::Unknown, None)
+                TypeArg::unknown()
             };
+            let TypeArg {
+                ty,
+                class,
+                args: type_args,
+            } = ann;
             // A `vararg T` arrives as an array, so the result of a call is not
             // the parameter's own type — it cannot supply a type argument.
             param_tps.push(if is_vararg {
@@ -624,6 +637,13 @@ impl Parser {
                 class,
                 default,
                 vararg: is_vararg.then_some(ty),
+                // A `vararg T` binds an ARRAY of the declared type, so the
+                // annotation's own arguments do not describe the binding.
+                type_args: if is_vararg { Vec::new() } else { type_args },
+                // A free function's parameter names no CLASS type variable —
+                // only a secondary constructor's does, and that is parsed
+                // elsewhere.
+                type_param_of: None,
             });
             if self.at(&Tok::Comma) {
                 self.bump();
@@ -632,12 +652,12 @@ impl Parser {
             }
         }
         self.eat(&Tok::RParen)?;
-        let (ret_annot, ret_class, ret_tp) = if self.at(&Tok::Colon) {
+        let (ret_annot, ret_class, ret_type_args, ret_tp) = if self.at(&Tok::Colon) {
             self.bump();
-            let (t, c) = self.type_ref()?;
-            (Some(t), c, self.last_type_param.take())
+            let t = self.type_ref()?;
+            (Some(t.ty), t.class, t.args, self.last_type_param.take())
         } else {
-            (None, None, None)
+            (None, None, Vec::new(), None)
         };
         // Pair the result's type variable with the parameter that carries it.
         let ret_type_param_of = ret_tp.as_ref().and_then(|r| {
@@ -689,6 +709,7 @@ impl Parser {
             ret_class,
             ret_type_param_of,
             ret_class_type_param_of,
+            ret_type_args,
             body,
             line,
             is_abstract: bodyless,
@@ -785,7 +806,11 @@ impl Parser {
                 };
                 let pname = self.ident()?;
                 self.eat(&Tok::Colon)?;
-                let (ty, class) = self.type_ref()?;
+                let TypeArg {
+                    ty,
+                    class,
+                    args: type_args,
+                } = self.type_ref()?;
                 // The type variable this parameter was declared with, as an
                 // index into the class's list — what a construction site reads
                 // the type argument off (see [`CtorProp::type_param_of`]).
@@ -807,6 +832,7 @@ impl Parser {
                     kind,
                     default,
                     type_param_of,
+                    type_args,
                 });
                 if self.at(&Tok::Comma) {
                     self.bump();
@@ -839,6 +865,7 @@ impl Parser {
                     default: None,
                     // The two properties `Enum` declares are not generic.
                     type_param_of: None,
+                    type_args: Vec::new(),
                 });
             }
         }
@@ -852,14 +879,18 @@ impl Parser {
         // entry may carry constructor arguments — Kotlin's own rule, since a
         // class has exactly one superclass and interfaces have no constructor.
         let mut parents = Vec::new();
+        let mut parent_args: Vec<Vec<TypeArg>> = Vec::new();
         let mut super_args = Vec::new();
         let mut delegates: Vec<(String, Expr)> = Vec::new();
         if self.at(&Tok::Colon) {
             self.bump();
             loop {
                 let pname = self.ident()?;
-                // A generic supertype (`Comparable<T>`) keeps only its head name.
-                self.skip_type_args();
+                // A generic supertype (`Box<Int>`) keeps its head name AND its
+                // written arguments: a subclass declares no type parameters of
+                // its own, so this is the only place the inherited `T`-typed
+                // members' width is named.
+                let pargs = self.type_args_list();
                 if self.at(&Tok::LParen) {
                     if !parents.is_empty() {
                         return Err(format!(
@@ -890,6 +921,7 @@ impl Parser {
                     delegates.push((pname.clone(), d?));
                 }
                 parents.push(pname);
+                parent_args.push(pargs);
                 if self.at(&Tok::Comma) {
                     self.bump();
                 } else {
@@ -1043,6 +1075,7 @@ impl Parser {
             is_open,
             is_sealed: mods.sealed,
             parents,
+            parent_args,
             super_args,
             delegates,
             companion,
@@ -1164,6 +1197,7 @@ impl Parser {
                 is_open: false,
                 is_sealed: false,
                 parents: Vec::new(),
+                parent_args: Vec::new(),
                 super_args: Vec::new(),
                 delegates: Vec::new(),
                 companion: None,
@@ -1217,6 +1251,9 @@ impl Parser {
                         is_open: false,
                         is_sealed: false,
                         parents: vec![cls.to_string()],
+                        // An `enum class` cannot declare type parameters, so
+                        // its constant subclass writes none either.
+                        parent_args: vec![Vec::new()],
                         super_args: args,
                         delegates: Vec::new(),
                         companion: None,
@@ -1244,6 +1281,10 @@ impl Parser {
                 mutable: false,
                 lazy: false,
                 delegate: false,
+                // A constant is an instance of its own enum, which declares no
+                // type parameters.
+                type_args: Vec::new(),
+                type_param_of: None,
             });
         }
 
@@ -1271,6 +1312,8 @@ impl Parser {
             mutable: false,
             lazy: false,
             delegate: false,
+            type_args: Vec::new(),
+            type_param_of: None,
         });
         props.append(&mut comp.obj_props);
         comp.obj_props = props;
@@ -1287,6 +1330,7 @@ impl Parser {
             // that enum, never a type variable.
             ret_type_param_of: None,
             ret_class_type_param_of: None,
+            ret_type_args: Vec::new(),
             body: vec![Stmt::new(
                 line,
                 StmtKind::Return(Some(Expr::Call {
@@ -1342,12 +1386,15 @@ impl Parser {
                 class: None,
                 default: None,
                 vararg: None,
+                type_args: Vec::new(),
+                type_param_of: None,
             }],
             ret: Type::Obj,
             ret_class: Some(cls.to_string()),
             // Likewise: `valueOf` answers the enum itself.
             ret_type_param_of: None,
             ret_class_type_param_of: None,
+            ret_type_args: Vec::new(),
             body: vec![Stmt::new(
                 line,
                 StmtKind::Return(Some(Expr::When(WhenExpr {
@@ -1379,7 +1426,19 @@ impl Parser {
         while !self.at(&Tok::RParen) {
             let pname = self.ident()?;
             self.eat(&Tok::Colon)?;
-            let (ty, class) = self.type_ref()?;
+            let TypeArg {
+                ty,
+                class,
+                args: type_args,
+            } = self.type_ref()?;
+            // The class type variable this parameter was declared with, exactly
+            // as a primary-constructor property records it — a construction site
+            // that selects THIS constructor fixes the type argument through it.
+            let type_param_of = self.last_type_param.take().and_then(|r| {
+                self.class_type_params
+                    .iter()
+                    .position(|p| p.as_str() == r.as_str())
+            });
             let default = if self.at(&Tok::Assign) {
                 self.bump();
                 Some(self.expr()?)
@@ -1392,6 +1451,8 @@ impl Parser {
                 class,
                 default,
                 vararg: None,
+                type_args,
+                type_param_of,
             });
             if self.at(&Tok::Comma) {
                 self.bump();
@@ -1460,14 +1521,13 @@ impl Parser {
         let start = self.pos;
         let line = self.line();
         self.bump(); // `val` / `var`
-        let parsed = (|| -> Result<Option<(String, Type, Option<String>)>, String> {
+        let parsed = (|| -> Result<Option<(String, TypeArg)>, String> {
             let name = self.ident()?;
             if !self.at(&Tok::Colon) {
                 return Ok(None);
             }
             self.bump();
-            let (ty, class) = self.type_ref()?;
-            Ok(Some((name, ty, class)))
+            Ok(Some((name, self.type_ref()?)))
         })();
         // The type variable the annotation named, read while it is still fresh
         // (only the `Ok(Some(_))` path below ran `type_ref`, and the others
@@ -1479,7 +1539,7 @@ impl Parser {
         });
         let is_get = matches!(self.peek(), Tok::Ident(w) if w == "get")
             && matches!(self.peek_at(1), Tok::LParen);
-        let Ok(Some((name, ty, class))) = parsed else {
+        let Ok(Some((name, annot))) = parsed else {
             self.pos = start;
             return Ok(None);
         };
@@ -1510,13 +1570,16 @@ impl Parser {
             name,
             recv: None,
             params: Vec::new(),
-            ret: ty,
-            ret_class: class,
+            ret: annot.ty,
+            ret_class: annot.class,
             // A computed property's getter takes no arguments, so an ARGUMENT
             // can never supply its type variable — but the receiver can, when
             // the variable is one of the enclosing class's.
             ret_type_param_of: None,
             ret_class_type_param_of,
+            // `val b: Box<Int> get() = …` — the getter's result carries the
+            // arguments its annotation wrote, like any other declared result.
+            ret_type_args: annot.args,
             body,
             line,
             is_abstract: false,
@@ -1541,14 +1604,13 @@ impl Parser {
         };
         // An untyped declaration cannot be abstract: with no initializer there
         // would be nothing to take the type from.
-        let parsed = (|| -> Result<Option<(String, Type, Option<String>)>, String> {
+        let parsed = (|| -> Result<Option<(String, TypeArg)>, String> {
             let name = self.ident()?;
             if !self.at(&Tok::Colon) {
                 return Ok(None);
             }
             self.bump();
-            let (ty, class) = self.type_ref()?;
-            Ok(Some((name, ty, class)))
+            Ok(Some((name, self.type_ref()?)))
         })();
         // `=` (an initializer), `by` (a delegate) and `get`/`set` (an accessor)
         // each make the property something other than a bare declaration.
@@ -1556,16 +1618,19 @@ impl Parser {
             && !self.at(&Tok::Assign)
             && !matches!(self.peek(), Tok::Ident(w) if w == "by" || w == "get" || w == "set");
         match parsed {
-            Ok(Some((name, ty, class))) if bare => Ok(Some(CtorProp {
+            Ok(Some((name, annot))) if bare => Ok(Some(CtorProp {
                 name,
-                ty,
-                class,
+                ty: annot.ty,
+                class: annot.class,
                 kind,
                 default: None,
                 // An abstract or interface property declaration owns no
                 // storage, so no construction site fixes a type argument
                 // through it.
                 type_param_of: None,
+                // Its written arguments are concrete, though, and an
+                // implementor's storage answers with the same static type.
+                type_args: annot.args,
             })),
             _ => {
                 self.pos = start;
@@ -1577,12 +1642,29 @@ impl Parser {
     fn body_prop(&mut self) -> Result<BodyProp, String> {
         let mutable = matches!(self.bump(), Tok::Var);
         let name = self.ident()?;
-        let (ty, class) = if self.at(&Tok::Colon) {
+        let TypeArg {
+            ty,
+            class,
+            args: type_args,
+        } = if self.at(&Tok::Colon) {
             self.bump();
             self.type_ref()?
         } else {
-            (Type::Unknown, None)
+            self.last_type_param = None;
+            TypeArg::unknown()
         };
+        // The class type variable the annotation named — `class Box<T>(v: T) {
+        // val w: T = v }` records `Some(0)` for `w`. A body property is not a
+        // constructor parameter, so it fixes nothing; it READS the argument the
+        // construction site already fixed, off the receiver.
+        //
+        // Empty at the top level and in an `object`, where no class type
+        // parameters are in scope.
+        let type_param_of = self.last_type_param.take().and_then(|r| {
+            self.class_type_params
+                .iter()
+                .position(|p| p.as_str() == r.as_str())
+        });
         // `by lazy { … }`. `by` is a soft keyword, so it only means delegation
         // in this position.
         if matches!(self.peek(), Tok::Ident(w) if w == "by") {
@@ -1606,6 +1688,8 @@ impl Parser {
                     mutable,
                     lazy: true,
                     delegate: false,
+                    type_args,
+                    type_param_of,
                 });
             }
             let init = self.expr()?;
@@ -1617,6 +1701,8 @@ impl Parser {
                 mutable,
                 lazy: false,
                 delegate: true,
+                type_args,
+                type_param_of,
             });
         }
         self.eat(&Tok::Assign)?;
@@ -1629,6 +1715,8 @@ impl Parser {
             mutable,
             lazy: false,
             delegate: false,
+            type_args,
+            type_param_of,
         })
     }
 
@@ -1688,19 +1776,83 @@ impl Parser {
         }
     }
 
-    /// A type reference — `Int`, `String`, `Array<String>`, `Int?`, … Generic
-    /// args are consumed but ignored (coarse typing), and a trailing `?`
-    /// (nullable) is accepted and discarded — nullability is tracked at the
+    /// A type reference — `Int`, `String`, `Array<String>`, `Int?`, … A trailing
+    /// `?` (nullable) is accepted and discarded — nullability is tracked at the
     /// value/flow level, not in the coarse static type.
     fn type_name(&mut self) -> Result<Type, String> {
-        Ok(self.type_ref()?.0)
+        Ok(self.type_ref()?.ty)
     }
 
-    /// Like [`Parser::type_name`], but also returns the raw type name when it is
-    /// not a builtin primitive — a heap-object type (`Type::Obj`) whose class /
-    /// container name the compiler needs for method dispatch (`Person`,
-    /// `List`, `Map`, …).
-    fn type_ref(&mut self) -> Result<(Type, Option<String>), String> {
+    /// The `<…>` argument list of a generic type, PARSED rather than skipped —
+    /// `Box<Int>` answers `[Int]`, `Box<Box<Int>>` answers `[Box<[Int]>]`.
+    ///
+    /// Every position that cannot be read as a plain type answers
+    /// [`TypeArg::unknown`], which narrows nothing: a star projection (`List<*>`),
+    /// and a whole list that fails to parse at all. The failing list is rewound
+    /// and skipped by the old token-depth scan, so no annotation that parsed
+    /// before this existed can now be rejected — Kotlin's type grammar has
+    /// corners (`T & Any`, annotated types) this frontend has never read.
+    ///
+    /// A function type NESTED in an argument (`List<(Int) -> Int>`) does not
+    /// publish its signature on the `fn_param_types` / `fn_ret_types` side
+    /// channels: those describe the annotation's OWN shape, and the enclosing
+    /// `val f: List<(Int) -> Int>` binds a list, not a callable. The channels are
+    /// truncated back to where the list started, which is exactly where skipping
+    /// used to leave them.
+    fn type_args_list(&mut self) -> Vec<TypeArg> {
+        if !self.at(&Tok::Lt) {
+            return Vec::new();
+        }
+        let start = self.pos;
+        let params_at = self.fn_param_types.len();
+        let rets_at = self.fn_ret_types.len();
+        let parsed = (|| -> Result<Vec<TypeArg>, String> {
+            self.bump(); // `<`
+            let mut out = Vec::new();
+            loop {
+                // `in`/`out` variance is a use-site modifier on the argument,
+                // not part of the type it names.
+                while matches!(self.peek(), Tok::Ident(w) if w == "in" || w == "out")
+                    || self.at(&Tok::In)
+                {
+                    self.bump();
+                }
+                if self.at(&Tok::Star) {
+                    self.bump(); // `List<*>` — a star projection names no type
+                    out.push(TypeArg::unknown());
+                } else {
+                    out.push(self.type_ref()?);
+                }
+                match self.peek() {
+                    Tok::Comma => {
+                        self.bump();
+                    }
+                    Tok::Gt => {
+                        self.bump();
+                        return Ok(out);
+                    }
+                    other => return Err(format!("unexpected {other:?} in type arguments")),
+                }
+            }
+        })();
+        self.fn_param_types.truncate(params_at);
+        self.fn_ret_types.truncate(rets_at);
+        match parsed {
+            Ok(args) => args,
+            Err(_) => {
+                self.pos = start;
+                self.skip_type_args();
+                Vec::new()
+            }
+        }
+    }
+
+    /// Like [`Parser::type_name`], but answers the full [`TypeArg`]: the coarse
+    /// type, the raw type name when it is not a builtin primitive (a heap-object
+    /// type whose class / container name the compiler needs for method dispatch
+    /// — `Person`, `List`, `Map`, …), and the type ARGUMENTS the annotation
+    /// wrote.
+    fn type_ref(&mut self) -> Result<TypeArg, String> {
         // A function type `(T1, …) -> R` (chainable: `(Int) -> (Int) -> Int`).
         // The coarse type can't carry a signature, so the parameter/return types
         // are consumed and discarded; the annotation only needs to mark the
@@ -1770,32 +1922,17 @@ impl Parser {
             // on the side channel AFTER the recursive call, so a nested arrow
             // leaves the outermost result last — see `fn_ret_types`.
             let ret = self.type_ref()?;
-            self.fn_ret_types.push(ret.0);
+            self.fn_ret_types.push(ret.ty);
             if self.at(&Tok::Question) {
                 self.bump(); // nullable function type `((Int) -> Int)?`
             }
             // The annotation is a function type, NOT the type variable its
             // result may have mentioned — clear what the recursive call left.
             self.last_type_param = None;
-            return Ok((Type::Unknown, Some("Function".to_string())));
+            return Ok(TypeArg::plain(Type::Unknown, Some("Function".to_string())));
         }
         let name = self.ident()?;
-        if self.at(&Tok::Lt) {
-            let mut depth = 0;
-            loop {
-                match self.bump() {
-                    Tok::Lt => depth += 1,
-                    Tok::Gt => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    Tok::Eof => return Err("unterminated type argument list".into()),
-                    _ => {}
-                }
-            }
-        }
+        let args = self.type_args_list();
         let nullable = if self.at(&Tok::Question) {
             self.bump(); // nullable marker `T?`
             true
@@ -1822,15 +1959,21 @@ impl Parser {
         // `is_int_width`) precisely because the concrete type is not known.
         if self.type_params.contains(&name) {
             self.last_type_param = Some(name);
-            return Ok((Type::Unknown, None));
+            return Ok(TypeArg::unknown());
         }
         self.last_type_param = None;
         // A non-primitive annotation names a heap object (a user class or a
         // container like `List`/`Map`); keep its name for dispatch.
         if ty == Type::Unknown {
-            Ok((Type::Obj, Some(name)))
+            Ok(TypeArg {
+                ty: Type::Obj,
+                class: Some(name),
+                args,
+            })
         } else {
-            Ok((ty, None))
+            // A primitive carries no type arguments of its own; anything written
+            // inside `<…>` after one is not a type this frontend can name.
+            Ok(TypeArg::plain(ty, None))
         }
     }
 
@@ -1940,18 +2083,19 @@ impl Parser {
             return Ok(StmtKind::Destructure { names, init });
         }
         let name = self.ident()?;
-        let (ty, fn_params, fn_ret) = if self.at(&Tok::Colon) {
+        let (ty, type_args, fn_params, fn_ret) = if self.at(&Tok::Colon) {
             self.bump();
             let before = self.fn_param_types.len();
             let ret_before = self.fn_ret_types.len();
-            let t = self.type_name()?;
+            let t = self.type_ref()?;
             (
-                Some(t),
+                Some(t.ty),
+                t.args,
                 self.fn_param_types.split_off(before),
                 self.fn_ret_types.split_off(ret_before).pop(),
             )
         } else {
-            (None, Vec::new(), None)
+            (None, Vec::new(), Vec::new(), None)
         };
         // `val x by lazy { … }` on a LOCAL, the same soft-keyword position a
         // class property uses. Only `lazy` is accepted here: the general
@@ -1976,6 +2120,7 @@ impl Parser {
                 ty,
                 fn_params,
                 fn_ret,
+                type_args,
                 init,
                 mutable,
                 lazy: true,
@@ -1988,6 +2133,7 @@ impl Parser {
             ty,
             fn_params,
             fn_ret,
+            type_args,
             init,
             mutable,
             lazy: false,
@@ -2299,7 +2445,8 @@ impl Parser {
                     self.bump();
                 }
                 self.bump(); // is
-                let ty = self.is_type()?;
+                             // The type arguments are dropped: the check is by erased class.
+                let (ty, _) = self.is_type()?;
                 l = Expr::Is {
                     value: Box::new(l),
                     ty,
@@ -2469,10 +2616,11 @@ impl Parser {
             if safe {
                 self.bump();
             }
-            let ty = self.is_type()?;
+            let (ty, type_args) = self.is_type()?;
             e = Expr::As {
                 value: Box::new(e),
                 ty,
+                type_args,
                 safe,
             };
         }
@@ -3123,7 +3271,7 @@ impl Parser {
                 }
                 Tok::Is => {
                     self.bump();
-                    let ty = self.is_type()?;
+                    let (ty, _) = self.is_type()?;
                     return Ok(WhenCond::Is { negated: false, ty });
                 }
                 // `!in` / `!is` — a `!` immediately followed by `in`/`is`.
@@ -3135,7 +3283,7 @@ impl Parser {
                 Tok::Not if matches!(self.peek_at(1), Tok::Is) => {
                     self.bump();
                     self.bump();
-                    let ty = self.is_type()?;
+                    let (ty, _) = self.is_type()?;
                     return Ok(WhenCond::Is { negated: true, ty });
                 }
                 _ => {}
@@ -3144,13 +3292,18 @@ impl Parser {
         Ok(WhenCond::Expr(self.expr()?))
     }
 
-    /// The type after `is`/`!is`: a name, optionally with type arguments
-    /// (`List<*>`) and a nullable marker (`String?`). The check is by erased
-    /// class, so both decorations are consumed and discarded — matching the JVM,
-    /// where `is List<String>` can only test that the value is a `List`.
-    fn is_type(&mut self) -> Result<String, String> {
+    /// The type after `is`/`!is`/`as`: a name, optionally with type arguments
+    /// (`List<*>`) and a nullable marker (`String?`).
+    ///
+    /// The RUNTIME check is by erased class, so an `is` discards the arguments —
+    /// matching the JVM, where `is List<String>` can only test that the value is
+    /// a `List`. An `as` keeps them: erased or not, they are part of the static
+    /// type the cast produces, and that is what decides the width of
+    /// `(x as Box<Int>).v * 2000000000`. They are answered alongside the name so
+    /// each caller states which it is.
+    fn is_type(&mut self) -> Result<(String, Vec<TypeArg>), String> {
         let ty = self.ident()?;
-        self.skip_type_args();
+        let args = self.type_args_list();
         if self.at(&Tok::Question) {
             self.bump();
         }
@@ -3161,7 +3314,7 @@ impl Parser {
                 self.line()
             ));
         }
-        Ok(ty)
+        Ok((ty, args))
     }
 
     /// The range after `in`/`!in` in a `when` arm — `a..b`, `a until b`, or

@@ -428,9 +428,10 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 - **Imports** — `package` and `import` declarations, including `a.b.*` and
   `a.b.c as d`, parsed and used for name resolution.
 - **Type arguments** — explicit call type arguments (`listOf<Int>()`,
-  `emptyMap<String, Int>()`) are parsed and ignored; typing stays coarse, and
-  `a < b` still parses as a comparison (a type-argument list may hold only names
-  and must be followed by `(`, which is how Kotlin resolves the same ambiguity).
+  `emptyMap<String, Int>()`) are parsed; `a < b` still parses as a comparison (a
+  type-argument list may hold only names and must be followed by `(`, which is
+  how Kotlin resolves the same ambiguity). A type argument written in a type
+  ANNOTATION carries its width — see below.
 - **Comments** — `//` and nested `/* … */`.
 
 Generic *declarations* carry no type variable in the coarse type itself, but a
@@ -444,16 +445,27 @@ resolved:
   matching argument's type is.
 - **The receiver's type argument**, for a member of a generic class. A
   construction fixes it (`Box(65536)` makes `T` an `Int`), and a read of a
-  `T`-typed stored property, `var` property, computed property (`val v: T get()
-  = …`) or method result (`fun get(): T`) answers with it. Nested
-  instantiations (`Box(Box(65536)).v.v`) and classes with several type
-  parameters (`Pair2<A, B>`) resolve per position.
+  `T`-typed stored property, `var` property, body property (`val w: T = v`),
+  computed property (`val v: T get() = …`) or method result (`fun get(): T`)
+  answers with it. Nested instantiations (`Box(Box(65536)).v.v`) and classes
+  with several type parameters (`Pair2<A, B>`) resolve per position, and a call
+  that selects a SECONDARY constructor reads the argument off that
+  constructor's parameters rather than the primary's.
+- **A type argument written down in SOURCE**, which reaches everywhere no
+  construction site can: a function result (`fun mk(): Box<Int>`), a parameter
+  (`fun f(b: Box<Int>)`), a property of another class (`class Hold(val b:
+  Box<Int>)`), a supertype (`class Sub : Box<Int>()`, whose subclass declares no
+  type parameters of its own), a top-level or local `val` annotation, and a cast
+  (`x as Box<Int>` — the JVM erases the argument, but the static type it
+  produces still decides the width). The annotation wins over the initializer,
+  because it IS the static type.
 
 Everything the frontend cannot resolve stays untyped, which narrows nothing —
-so a `String` or `Double` type argument is never mistaken for an `Int`. Type
-arguments written down rather than inferred are still discarded: `val b:
-Box<Int> = …` and `fun f(): Box<Int>` reach their members untyped unless the
-construction is in hand.
+so a `String` or `Double` type argument is never mistaken for an `Int`. A
+supertype's argument is substituted for a DIRECT parent only; a grandparent's
+type variable is positional against the parent's list, and composing the two
+through a class that passes its own variable up (`class B<U> : A<U>()`) is not a
+type this coarse system can name.
 
 The `inline` / `noinline` / `crossinline` / `tailrec` / `operator` / `infix` /
 `const` modifiers are accepted and discarded — each changes how the JVM compiles
@@ -464,9 +476,7 @@ name-based lookup falls into) would be silently wrong — so it is a compile err
 
 Not yet (see roadmap): `sequence { … }` / `yield` (a generator needs a
 continuation this VM has no opcode for, so an infinite sequence cannot be
-modelled by evaluating eagerly), a type argument written down rather than
-inferred from a construction (`val b: Box<Int> = …`, `class Sub : Box<Int>()`),
-variance and bounds,
+modelled by evaluating eagerly), variance and bounds,
 `kotlin.properties.Delegates.observable` / `vetoable` (a property delegate that
 is not a constructor call has no class whose `getValue` could be resolved at
 compile time, and no host-side delegate object backs the stdlib factories yet),
@@ -969,7 +979,27 @@ without a conflict and the later handler silently replaces the earlier one. The
 guard fails on a duplicate id, on an id with no dispatch home or two of them,
 and on an emit site that routes an id through the wrong table.
 
-Next: `sequence { … }`/`yield`, written-down type arguments,
+A **type argument written down in source** now carries its width. The
+construction site was the only source the frontend read, so `fun mkInt():
+Box<Int>` reached `mkInt().v * 2000000000` untyped and answered
+`131072000000000` where the reference toolchain wraps to `-1811939328` — and the
+same for a parameter, a property of another class, a generic supertype, a
+top-level or local annotation, and a cast. Two holes in the CONSTRUCTION path
+closed with it: a call that selects a secondary constructor was matched against
+the primary's parameters (it now asks the same selector the emitter uses), and a
+body property (`class Box<T>(v: T) { val w: T = v }`) is not a constructor
+parameter, so nothing had fixed its argument.
+
+The generator declared no written-down type argument anywhere, so a clean run
+said nothing about any of it. Widened, it reports **12 divergences over 1080
+probes** against the pre-change binary. The barren bucket is now split by WHY
+the reference toolchain gave no answer — a program `kotlinc` REJECTS is a
+generator bug, one it compiles and then aborts is not — and the split
+immediately paid for itself: the widened generator emitted a probe whose
+declaration gate missed a transitive dependency, and the run reported it rather
+than scoring it clean.
+
+Next: `sequence { … }`/`yield`, variance and bounds,
 `Delegates.observable`/`vetoable`, and a growing standard-library surface —
 alongside the sibling parity tooling (LSP/DAP, reference generator, differential
 harness).
