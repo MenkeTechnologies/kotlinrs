@@ -109,10 +109,10 @@ fn while_and_compound_assign() {
 
 #[test]
 fn integer_divide_by_zero_is_uncaught() {
-    let out = eval("val z = 0; println(10 / z)");
-    assert!(!out.status.success());
-    let err = String::from_utf8(out.stderr).unwrap();
-    assert!(err.contains("ArithmeticException"), "stderr was: {err}");
+    assert_eq!(
+        uncaught_line("fun main() { val z = 0; println(10 / z) }"),
+        "Exception in thread \"main\" java.lang.ArithmeticException: / by zero"
+    );
 }
 
 #[test]
@@ -440,13 +440,11 @@ fn null_safety_operators() {
 
 #[test]
 fn not_null_assertion_throws_on_null() {
-    // `!!` on null raises an uncaught NullPointerException.
-    let out = eval("val s: String? = null; println(s!!)");
-    assert!(!out.status.success());
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("NullPointerException"),
-        "stderr was: {}",
-        String::from_utf8_lossy(&out.stderr)
+    // `!!` on null raises an uncaught NullPointerException — and this one is
+    // MESSAGELESS, which `contains("NullPointerException")` could not check.
+    assert_eq!(
+        uncaught_line("fun main() { val s: String? = null; println(s!!) }"),
+        "Exception in thread \"main\" java.lang.NullPointerException"
     );
 }
 
@@ -499,6 +497,23 @@ fn prog_err(src: &str) -> String {
     let out = eval(src);
     assert!(!out.status.success(), "expected failure, got success");
     String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// The FIRST stderr line of a run that ended in an uncaught throw, with the
+/// `kotlin: ` prefix removed — which is the whole line the JVM writes before
+/// its stack trace.
+///
+/// This exists because `stderr.contains("SomeException")` is a predicate the
+/// wrong answer also satisfies. It cannot tell `IndexOutOfBoundsException` from
+/// `ArrayIndexOutOfBoundsException`, cannot see the detail message, cannot see
+/// the package, and passes whether or not the `Exception in thread "main"`
+/// report line is there at all — so it scores a bare `ArithmeticException` and
+/// the JVM's `Exception in thread "main" java.lang.ArithmeticException: / by
+/// zero` as the same answer. Every caller below compares the whole line.
+fn uncaught_line(src: &str) -> String {
+    let err = prog_err(src);
+    let first = err.lines().next().unwrap_or_default();
+    first.strip_prefix("kotlin: ").unwrap_or(first).to_string()
 }
 
 #[test]
@@ -957,8 +972,40 @@ fun main() {
 
 #[test]
 fn index_out_of_bounds_throws() {
-    let err = prog_err("fun main() { val xs = listOf(1, 2); println(xs[5]) }");
-    assert!(err.contains("IndexOutOfBounds"), "stderr was: {err}");
+    // WHICH subclass, and with which numbers. A `listOf` of two or more is
+    // array-backed (`Arrays$ArrayList`) and raises the ARRAY subclass, where
+    // the `ArrayList` a `mutableListOf` builds raises the plain one — the same
+    // Kotlin expression shape, two different class names. So does the result of
+    // a `sorted…`, which takes `Iterable.sorted`'s `Collection` fast path and
+    // comes back wrapping a bare array. Asserting `contains("IndexOutOfBounds")`
+    // scored all three the same, and it is a substring of the array subclass's
+    // name too, so it could not fail whichever one was raised.
+    assert_eq!(
+        uncaught_line("fun main() { val xs = listOf(1, 2); println(xs[5]) }"),
+        "Exception in thread \"main\" java.lang.ArrayIndexOutOfBoundsException: \
+         Index 5 out of bounds for length 2"
+    );
+    assert_eq!(
+        uncaught_line("fun main() { val xs = mutableListOf(1, 2); println(xs[5]) }"),
+        "Exception in thread \"main\" java.lang.IndexOutOfBoundsException: \
+         Index 5 out of bounds for length 2"
+    );
+    assert_eq!(
+        uncaught_line("fun main() { val xs = listOf(3, 1, 2).sorted(); println(xs[5]) }"),
+        "Exception in thread \"main\" java.lang.ArrayIndexOutOfBoundsException: \
+         Index 5 out of bounds for length 3"
+    );
+    // The two small sizes collapse onto `optimizeReadOnlyList`'s own classes,
+    // which word the fault a third and fourth way.
+    assert_eq!(
+        uncaught_line("fun main() { val xs = listOf<Int>(); println(xs[5]) }"),
+        "Exception in thread \"main\" java.lang.IndexOutOfBoundsException: \
+         Empty list doesn't contain element at index 5."
+    );
+    assert_eq!(
+        uncaught_line("fun main() { val xs = listOf(1); println(xs[5]) }"),
+        "Exception in thread \"main\" java.lang.IndexOutOfBoundsException: Index: 5, Size: 1"
+    );
 }
 
 #[test]
@@ -1245,8 +1292,10 @@ fn typed_lambda_param_uses_integer_division() {
         stdout("val d = { a: Int, b: Int -> a / b }\nprintln(d(7, 2))"),
         "3\n"
     );
-    let err = prog_err("fun main() { val d = { a: Int, b: Int -> a / b }; println(d(10, 0)) }");
-    assert!(err.contains("ArithmeticException"), "stderr was: {err}");
+    assert_eq!(
+        uncaught_line("fun main() { val d = { a: Int, b: Int -> a / b }; println(d(10, 0)) }"),
+        "Exception in thread \"main\" java.lang.ArithmeticException: / by zero"
+    );
 }
 
 // ── Scope functions ─────────────────────────────────────────────────────────
@@ -4257,4 +4306,369 @@ fun main() {
         "stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+// ── Round 6: what the frontend hardcoded about the reference ────────────────
+//
+// Every expectation below was READ OFF `kotlinc` 2.4.10 running on OpenJDK
+// 21.0.12, not written from the documentation. Where a value is also pinned
+// against older JVMs the comment says so; where it is NOT, the point is that no
+// JVM ever produced what kotlinrs used to answer.
+
+#[test]
+fn unicode_escapes_work_in_string_literals_and_not_only_in_char_ones() {
+    // The escape table was written out twice and only the `Char` copy carried
+    // `\u` and `\b`, so `"A"` lexed as the five characters `u0041` while
+    // `'A'` lexed as `A`. Both spellings now read one table.
+    assert_eq!(stdout(r#"println("A")"#), "A\n");
+    assert_eq!(stdout(r#"println('A')"#), "A\n");
+    assert_eq!(stdout(r#"println("\u00a0".length)"#), "1\n");
+    assert_eq!(stdout(r#"println("abc")"#), "abc\n");
+    // `\b` and the escaped quote that only the other table used to accept.
+    assert_eq!(stdout(r#"println("x\by".length)"#), "3\n");
+    assert_eq!(stdout(r#"println("\'".length)"#), "1\n");
+    assert_eq!(stdout(r#"println('\"'.code)"#), "34\n");
+}
+
+#[test]
+fn negative_array_size_names_the_length_it_was_asked_for() {
+    // `java.lang.NegativeArraySizeException: -3`, on every JVM measured (17,
+    // 21, 26). The bare form kotlinrs used to raise is not an older dialect —
+    // no JVM produces it.
+    for builder in [
+        "IntArray(n)",
+        "DoubleArray(n)",
+        "CharArray(n)",
+        "BooleanArray(n)",
+    ] {
+        let src = format!(
+            "fun main() {{ val n = -3; try {{ {builder} }} \
+             catch (e: Throwable) {{ println(e) }} }}"
+        );
+        assert_eq!(
+            prog(&src),
+            "java.lang.NegativeArraySizeException: -3\n",
+            "for {builder}"
+        );
+    }
+    assert_eq!(
+        prog(
+            "fun main() { val n = -3; try { Array(n) { 0 } } \
+             catch (e: Throwable) { println(e) } }"
+        ),
+        "java.lang.NegativeArraySizeException: -3\n"
+    );
+    // The detail message is the bare number, not a sentence.
+    assert_eq!(
+        prog(
+            "fun main() { val n = -3; try { IntArray(n) } \
+             catch (e: NegativeArraySizeException) { println(e.message) } }"
+        ),
+        "-3\n"
+    );
+}
+
+#[test]
+fn unknown_format_conversion_always_names_a_character() {
+    // Two ways to reach this fault and neither is bare. A complete spec names
+    // its conversion; a spec that runs off the end names the character right
+    // after the `%`, or `%` itself when the string ends there.
+    let probe = |fmt: &str| {
+        prog(&format!(
+            "fun main() {{ try {{ println(String.format({fmt})) }} \
+             catch (e: Throwable) {{ println(e) }} }}"
+        ))
+    };
+    let unknown =
+        |c: char| format!("java.util.UnknownFormatConversionException: Conversion = '{c}'\n");
+    assert_eq!(probe(r#""%q", 1"#), unknown('q'));
+    assert_eq!(probe(r#""%5q", 1"#), unknown('q'));
+    assert_eq!(probe(r#""%-5.2q", 1"#), unknown('q'));
+    assert_eq!(probe(r#""%""#), unknown('%'));
+    assert_eq!(probe(r#""abc%""#), unknown('%'));
+    assert_eq!(probe(r#""%5""#), unknown('5'));
+    assert_eq!(probe(r#""%-""#), unknown('-'));
+    assert_eq!(probe(r#""%.2""#), unknown('.'));
+    assert_eq!(probe(r#""%5.2""#), unknown('5'));
+    // `%%` and `%n` take no argument but DO take the width and the `-` flag.
+    assert_eq!(probe(r#""%5%""#), "    %\n");
+    assert_eq!(probe(r#""%-5%""#), "%    \n");
+    assert_eq!(probe(r#""100%%""#), "100%\n");
+    assert_eq!(probe(r#""a%nb""#), "a\nb\n");
+}
+
+#[test]
+fn a_primitive_array_renders_its_primitive_descriptor() {
+    // `intArrayOf(1, 2)` is an `int[]`. Its `Object.toString` is `[I@…`, and
+    // `[Ljava.lang.Integer;@…` — what inferring the descriptor from the boxed
+    // element values produced — is what an `Array<Int>` renders, not this.
+    let desc = |expr: &str| {
+        prog(&format!(
+            "fun main() {{ println({expr}.toString().substringBefore(\"@\")) }}"
+        ))
+    };
+    assert_eq!(desc("intArrayOf(1, 2)"), "[I\n");
+    assert_eq!(desc("doubleArrayOf(1.0)"), "[D\n");
+    assert_eq!(desc("booleanArrayOf(true)"), "[Z\n");
+    assert_eq!(desc("charArrayOf('a')"), "[C\n");
+    assert_eq!(desc("IntArray(2)"), "[I\n");
+    assert_eq!(desc("CharArray(2)"), "[C\n");
+    assert_eq!(desc("\"ab\".toCharArray()"), "[C\n");
+    // `arrayOf` really is the boxed one, and `Array(n) { … }` infers from what
+    // the lambda produced — so this is not "always primitive now".
+    assert_eq!(desc("arrayOf(1, 2)"), "[Ljava.lang.Integer;\n");
+    assert_eq!(desc("arrayOf(\"a\")"), "[Ljava.lang.String;\n");
+    assert_eq!(desc("Array(1) { 0 }"), "[Ljava.lang.Integer;\n");
+    // A `CharArray` slot defaults to the NUL character, not the integer 0.
+    assert_eq!(prog("fun main() { println(CharArray(2)[0].code) }"), "0\n");
+}
+
+#[test]
+fn a_failed_cast_names_the_receivers_real_jvm_class() {
+    // `class List cannot be cast to class String` is a sentence no JVM writes.
+    // The class a container handle really is depends on how it was built, and
+    // that provenance is already recorded for the index diagnostics.
+    let cce = |expr: &str| {
+        prog(&format!(
+            "fun main() {{ try {{ val a: Any = {expr}; a as String }} \
+             catch (e: Throwable) {{ println(e) }} }}"
+        ))
+    };
+    let base = |c: &str| {
+        format!(
+            "java.lang.ClassCastException: class {c} cannot be cast to class java.lang.String \
+             ({c} and java.lang.String are in module java.base of loader 'bootstrap')\n"
+        )
+    };
+    let app = |c: &str| {
+        format!(
+            "java.lang.ClassCastException: class {c} cannot be cast to class java.lang.String \
+             ({c} is in unnamed module of loader 'app'; java.lang.String is in module \
+             java.base of loader 'bootstrap')\n"
+        )
+    };
+    assert_eq!(cce("listOf<Int>()"), app("kotlin.collections.EmptyList"));
+    assert_eq!(
+        cce("listOf(1)"),
+        base("java.util.Collections$SingletonList")
+    );
+    assert_eq!(cce("listOf(1, 2)"), base("java.util.Arrays$ArrayList"));
+    assert_eq!(cce("mutableListOf(1, 2)"), base("java.util.ArrayList"));
+    assert_eq!(cce("listOf(1, 2).toList()"), base("java.util.ArrayList"));
+    assert_eq!(
+        cce("listOf(2, 1).sorted()"),
+        base("java.util.Arrays$ArrayList")
+    );
+    assert_eq!(cce("intArrayOf(1)"), base("[I"));
+    assert_eq!(cce("arrayOf(1)"), base("[Ljava.lang.Integer;"));
+    assert_eq!(cce("1 to 2"), app("kotlin.Pair"));
+    assert_eq!(cce("Triple(1, 2, 3)"), app("kotlin.Triple"));
+    assert_eq!(cce("1..3"), app("kotlin.ranges.IntRange"));
+    assert_eq!(cce("5 downTo 1"), app("kotlin.ranges.IntProgression"));
+    assert_eq!(cce("'a'..'c'"), app("kotlin.ranges.CharRange"));
+}
+
+#[test]
+fn double_ordering_is_the_total_order_and_not_ieee_comparison() {
+    // `partial_cmp(…).unwrap_or(Equal)` scores every NaN comparison as a tie
+    // and cannot separate the signed zeros. `Double.compare` is a TOTAL order:
+    // NaN above everything, `-0.0` below `0.0`.
+    let p = |e: &str| prog(&format!("fun main() {{ println({e}) }}"));
+    assert_eq!(p("Double.NaN.compareTo(1.0)"), "1\n");
+    assert_eq!(p("1.0.compareTo(Double.NaN)"), "-1\n");
+    assert_eq!(p("Double.NaN.compareTo(Double.NaN)"), "0\n");
+    assert_eq!(p("0.0.compareTo(-0.0)"), "1\n");
+    assert_eq!(p("(-0.0).compareTo(0.0)"), "-1\n");
+    assert_eq!(
+        p("listOf(1.0, Double.NaN, 0.0, -0.0).sorted()"),
+        "[-0.0, 0.0, 1.0, NaN]\n"
+    );
+    assert_eq!(
+        p("listOf(Double.NaN, 1.0).sortedDescending()"),
+        "[NaN, 1.0]\n"
+    );
+    // …while `==` on two `Double`-typed operands stays IEEE, because Kotlin
+    // compiles that to the primitive comparison and not to `equals`.
+    assert_eq!(p("Double.NaN == Double.NaN"), "false\n");
+    assert_eq!(p("0.0 == -0.0"), "true\n");
+    // `min`/`max` over a floating receiver take the `Math` overload, which
+    // PROPAGATES NaN rather than ordering it — so `min` disagrees with the
+    // comparator even though `max` happens to agree with it.
+    assert_eq!(p("listOf(1.0, Double.NaN, 2.0).max()"), "NaN\n");
+    assert_eq!(p("listOf(1.0, Double.NaN, 2.0).min()"), "NaN\n");
+    assert_eq!(p("minOf(Double.NaN, 1.0)"), "NaN\n");
+    assert_eq!(p("maxOf(1.0, Double.NaN)"), "NaN\n");
+    assert_eq!(p("Math.max(0.0, -0.0)"), "0.0\n");
+    assert_eq!(p("Math.min(0.0, -0.0)"), "-0.0\n");
+    // A `Long` past the 53-bit mantissa must not compare as a `Double`.
+    assert_eq!(p("9007199254740993L.compareTo(9007199254740992L)"), "1\n");
+    assert_eq!(
+        p("listOf(9007199254740993L, 9007199254740992L).sorted()"),
+        "[9007199254740992, 9007199254740993]\n"
+    );
+}
+
+#[test]
+fn collection_membership_uses_boxed_equality_not_ieee() {
+    // `Double.equals` compares `doubleToLongBits`, so it disagrees with `==` on
+    // exactly two values — and every membership test goes through it.
+    let p = |e: &str| prog(&format!("fun main() {{ println({e}) }}"));
+    assert_eq!(p("Double.NaN.equals(Double.NaN)"), "true\n");
+    assert_eq!(p("0.0.equals(-0.0)"), "false\n");
+    assert_eq!(p("listOf(Double.NaN).contains(Double.NaN)"), "true\n");
+    assert_eq!(p("listOf(0.0).contains(-0.0)"), "false\n");
+    assert_eq!(p("listOf(-0.0).indexOf(0.0)"), "-1\n");
+    assert_eq!(p("listOf(Double.NaN, Double.NaN).distinct().size"), "1\n");
+    assert_eq!(p("listOf(0.0, -0.0).distinct().size"), "2\n");
+    assert_eq!(p("setOf(Double.NaN, Double.NaN).size"), "1\n");
+    assert_eq!(p("setOf(0.0, -0.0).size"), "2\n");
+    assert_eq!(p("mapOf(0.0 to 1, -0.0 to 2).size"), "2\n");
+    assert_eq!(p("listOf(Double.NaN) == listOf(Double.NaN)"), "true\n");
+    assert_eq!(p("listOf(0.0) == listOf(-0.0)"), "false\n");
+}
+
+#[test]
+fn math_round_is_the_jdk_algorithm_and_not_floor_of_x_plus_half() {
+    // `floor(x + 0.5)` is the documentation, not the implementation. The
+    // addition itself rounds `0.49999999999999994` up to `1.0`, so the floor
+    // form answers 1 where every JVM since the JDK 8 fix answers 0.
+    let p = |e: &str| prog(&format!("fun main() {{ println({e}) }}"));
+    assert_eq!(p("Math.round(0.49999999999999994)"), "0\n");
+    assert_eq!(p("0.49999999999999994.roundToInt()"), "0\n");
+    assert_eq!(p("Math.round(0.5)"), "1\n");
+    assert_eq!(p("Math.round(-0.5)"), "0\n");
+    assert_eq!(p("Math.round(-1.5)"), "-1\n");
+    assert_eq!(p("Math.round(2.5)"), "3\n");
+    assert_eq!(p("Math.round(4503599627370495.5)"), "4503599627370496\n");
+    // `kotlin.math.round` is a DIFFERENT function — half to even, `Double` out.
+    assert_eq!(p("kotlin.math.round(2.5)"), "2.0\n");
+    assert_eq!(p("kotlin.math.round(-0.5)"), "-0.0\n");
+    // Kotlin's two wrappers add guards `Math.round` does not have: NaN is
+    // refused rather than answered as 0, and `roundToInt` clamps to `Int`.
+    assert_eq!(p("Math.round(Double.NaN)"), "0\n");
+    assert_eq!(p("Double.POSITIVE_INFINITY.roundToInt()"), "2147483647\n");
+    assert_eq!(p("Double.NEGATIVE_INFINITY.roundToInt()"), "-2147483648\n");
+    for m in ["roundToInt", "roundToLong"] {
+        assert_eq!(
+            prog(&format!(
+                "fun main() {{ try {{ println(Double.NaN.{m}()) }} \
+                 catch (e: Throwable) {{ println(e) }} }}"
+            )),
+            "java.lang.IllegalArgumentException: Cannot round NaN value.\n",
+            "for {m}"
+        );
+    }
+}
+
+#[test]
+fn coerce_in_refuses_a_crossed_pair_and_clamps_with_kotlins_comparisons() {
+    let p = |e: &str| prog(&format!("fun main() {{ println({e}) }}"));
+    // `f64::max` then `f64::min` quietly answered 1 here.
+    assert_eq!(
+        prog(
+            "fun main() { try { println(5.coerceIn(3, 1)) } \
+             catch (e: Throwable) { println(e) } }"
+        ),
+        "java.lang.IllegalArgumentException: Cannot coerce value to an empty range: \
+         maximum 1 is less than minimum 3.\n"
+    );
+    // Kotlin clamps with `<`/`>` and hands the receiver back when neither
+    // fires, so a NaN receiver survives and `-0.0` is not below `0.0`.
+    assert_eq!(p("Double.NaN.coerceIn(1.0, 3.0)"), "NaN\n");
+    assert_eq!(p("(-0.0).coerceIn(0.0, 1.0)"), "-0.0\n");
+    assert_eq!(p("0.0.coerceIn(-0.0, 1.0)"), "0.0\n");
+    assert_eq!(p("5.coerceIn(1, 3)"), "3\n");
+    assert_eq!(p("5.coerceAtMost(3)"), "3\n");
+    assert_eq!(p("5.coerceAtLeast(9)"), "9\n");
+}
+
+#[test]
+fn whitespace_is_javas_set_and_not_unicodes() {
+    // Kotlin's predicate is `Character.isWhitespace || Character.isSpaceChar`,
+    // which differs from Unicode's `White_Space` — Rust's set — at both ends.
+    // Written as `\u` escapes so this file stays ASCII and no invisible
+    // character can drift.
+    let p = |e: &str| prog(&format!("fun main() {{ println({e}) }}"));
+    // Java-only: the C0 file/group/record/unit separators.
+    assert_eq!(p(r#"'\u001c'.isWhitespace()"#), "true\n");
+    assert_eq!(p(r#"'\u001f'.isWhitespace()"#), "true\n");
+    // Unicode-only: NEL. Rust says true, Kotlin says false.
+    assert_eq!(p(r#"'\u0085'.isWhitespace()"#), "false\n");
+    // The no-break spaces, which `isWhitespace` alone would drop and the union
+    // keeps.
+    assert_eq!(p(r#"'\u00a0'.isWhitespace()"#), "true\n");
+    assert_eq!(p(r#"'\u202f'.isWhitespace()"#), "true\n");
+    assert_eq!(p(r#"'\u3000'.isWhitespace()"#), "true\n");
+    // Not a separator at all: zero-width space is a format character.
+    assert_eq!(p(r#"'\u200b'.isWhitespace()"#), "false\n");
+    // `trim` / `isBlank` key on the same predicate, so they inherit both edges.
+    assert_eq!(p(r#""\u00a0x\u00a0".trim().length"#), "1\n");
+    assert_eq!(p(r#""\u001cx".trim().length"#), "1\n");
+    assert_eq!(p(r#""\u1680x".trim().length"#), "1\n");
+    assert_eq!(p(r#""\u0085x".trim().length"#), "2\n");
+    assert_eq!(p(r#""\u200bx".trim().length"#), "2\n");
+    assert_eq!(p(r#""\u00a0".isBlank()"#), "true\n");
+    assert_eq!(p(r#""\u200b".isBlank()"#), "false\n");
+}
+
+#[test]
+fn parse_double_follows_javas_grammar_and_not_rusts() {
+    let p = |e: &str| prog(&format!("fun main() {{ println({e}) }}"));
+    // Java accepts a type suffix and hexadecimal floating point; Rust rejects
+    // both.
+    assert_eq!(p(r#""1.5d".toDouble()"#), "1.5\n");
+    assert_eq!(p(r#""1.5F".toDouble()"#), "1.5\n");
+    assert_eq!(p(r#""0x1p3".toDouble()"#), "8.0\n");
+    assert_eq!(p(r#""0X1.8p1".toDouble()"#), "3.0\n");
+    // …exactly one suffix, and the `p` exponent is mandatory.
+    assert_eq!(p(r#""1.5dd".toDoubleOrNull()"#), "null\n");
+    assert_eq!(p(r#""0x1".toDoubleOrNull()"#), "null\n");
+    // Rust accepts short infinity spellings that Java's grammar does not.
+    assert_eq!(p(r#""inf".toDoubleOrNull()"#), "null\n");
+    assert_eq!(p(r#""infinity".toDoubleOrNull()"#), "null\n");
+    assert_eq!(p(r#""nan".toDoubleOrNull()"#), "null\n");
+    assert_eq!(p(r#""Infinity".toDouble()"#), "Infinity\n");
+    assert_eq!(p(r#""-Infinity".toDouble()"#), "-Infinity\n");
+    assert_eq!(p(r#""NaN".toDouble()"#), "NaN\n");
+    // An empty (or all-whitespace) input has its OWN message here, unlike every
+    // other numeric parse.
+    for input in [r#""""#, r#""   ""#] {
+        assert_eq!(
+            prog(&format!(
+                "fun main() {{ try {{ println({input}.toDouble()) }} \
+                 catch (e: Throwable) {{ println(e) }} }}"
+            )),
+            "java.lang.NumberFormatException: empty String\n",
+            "for {input}"
+        );
+    }
+    assert_eq!(
+        prog(r#"fun main() { try { println("".toInt()) } catch (e: Throwable) { println(e) } }"#),
+        "java.lang.NumberFormatException: For input string: \"\"\n"
+    );
+}
+
+#[test]
+fn floor_division_and_sign_follow_the_divisor_not_the_dividend() {
+    // `/` and `%` truncate toward zero; `floorDiv`/`floorMod`/`mod` round
+    // toward negative infinity, which flips the remainder's sign.
+    let p = |e: &str| prog(&format!("fun main() {{ println({e}) }}"));
+    assert_eq!(p("-7 / 2"), "-3\n");
+    assert_eq!(p("-7 % 2"), "-1\n");
+    assert_eq!(p("Math.floorDiv(-7, 2)"), "-4\n");
+    assert_eq!(p("Math.floorMod(-7, 2)"), "1\n");
+    assert_eq!(p("(-7).mod(2)"), "1\n");
+    assert_eq!(p("7 / -2"), "-3\n");
+    assert_eq!(p("7 % -2"), "1\n");
+    assert_eq!(p("Math.floorDiv(7, -2)"), "-4\n");
+    assert_eq!(p("Math.floorMod(7, -2)"), "-1\n");
+    // `sign` keeps the sign of a zero and answers NaN for NaN, where Rust's
+    // `signum` answers ±1.0 and 1.0 respectively.
+    assert_eq!(p("kotlin.math.sign(0.0)"), "0.0\n");
+    assert_eq!(p("kotlin.math.sign(-0.0)"), "-0.0\n");
+    assert_eq!(p("kotlin.math.sign(Double.NaN)"), "NaN\n");
+    assert_eq!(p("kotlin.math.sign(-3.5)"), "-1.0\n");
+    assert_eq!(p("Math.signum(-0.0)"), "-0.0\n");
+    assert_eq!(p("0.sign"), "0\n");
+    assert_eq!(p("(-7).sign"), "-1\n");
 }
