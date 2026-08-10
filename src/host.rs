@@ -295,6 +295,11 @@ pub const KT_COMPARATOR: u16 = 133;
 /// `HeapObj::Gen` handle. `step` is a one-parameter closure answering the next
 /// element or Kotlin `null` to end the sequence.
 pub const KT_GENSEQ: u16 = 134;
+/// Build a READ-ONLY `List` literal — `listOf(…)` / `emptyList()`. Stack: `n`
+/// elements; pushes the handle. Identical to [`KT_LIST`] except that it records
+/// the receiver's implementation class, which its out-of-range diagnostic then
+/// names; see [`ListImpl`].
+pub const KT_LIST_RO: u16 = 135;
 
 /// Kotlin `==` over heap objects. Stack: `[a, b]`; pushes a `Bool`.
 ///
@@ -431,6 +436,90 @@ thread_local! {
     /// IDENTITY, not of its contents.
     static COLL_ORDER: RefCell<std::collections::HashMap<u32, CollOrder>> =
         RefCell::new(std::collections::HashMap::new());
+
+    /// Heap handle → which JVM `List` implementation that handle stands for,
+    /// for the two that are not `java.util.ArrayList`. See [`ListImpl`].
+    ///
+    /// A side table for the same reason [`COLL_ORDER`] is one: `HeapObj::List`
+    /// is matched at ~80 sites that want the elements and nothing else, and
+    /// which class produced the list is a property of its IDENTITY.
+    static LIST_IMPL: RefCell<std::collections::HashMap<u32, ListImpl>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Which JVM class backs a Kotlin `List`, to the extent a program can observe
+/// it — which is exactly one place: the message an out-of-range index raises.
+///
+/// Kotlin's `List` is an interface over at least four implementations, and each
+/// one words the fault differently. Measured on JDK 21.0.12:
+///
+/// | receiver | class | fault |
+/// | --- | --- | --- |
+/// | `listOf()`, `emptyList()` | `kotlin.collections.EmptyList` | `IndexOutOfBoundsException: Empty list doesn't contain element at index 9.` |
+/// | `listOf(1)` | `java.util.Collections$SingletonList` | `IndexOutOfBoundsException: Index: 9, Size: 1` |
+/// | `listOf(1, 2)` | `java.util.Arrays$ArrayList` | `ArrayIndexOutOfBoundsException: Index 9 out of bounds for length 2` |
+/// | `mutableListOf(1, 2)`, `map`, `filter`, `subList` | `java.util.ArrayList` | `IndexOutOfBoundsException: Index 9 out of bounds for length 2` |
+///
+/// So the SIZE decides as much as the constructor does, and it decides it twice
+/// over: a read-only list of 0 or 1 elements is never the class its builder
+/// nominally returns, because `optimizeReadOnlyList` collapses it. That is why
+/// this is a provenance tag and not a size test — `listOf(1, 2)` and
+/// `listOf(1, 2).toList()` are the same two elements and different classes.
+///
+/// An untagged handle is the `ArrayList` row, which is what every list this
+/// runtime builds for a member result is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ListImpl {
+    /// A `listOf(…)` / `emptyList()` LITERAL. Collapses to `EmptyList` at 0 and
+    /// `SingletonList` at 1; at 2 or more it is `Arrays$ArrayList`, the one
+    /// `List` whose `get` reaches a bare array and so raises the ARRAY
+    /// subclass.
+    Literal,
+    /// The result of a member that ends in Kotlin's `optimizeReadOnlyList` —
+    /// `toList`, `sorted`, `sortedBy`, `sortedWith`, `sortedDescending`,
+    /// `reversed`, `distinct`, `take`, `drop`, `takeLast`, `dropLast`, `slice`,
+    /// `listOfNotNull`. Same collapse at 0 and 1, but at 2 or more it is the
+    /// `ArrayList` the member built, NOT an array-backed one — which is the
+    /// whole reason this is a second tag rather than a flag on [`Literal`].
+    ReadOnly,
+}
+
+/// Record `list`'s implementation class. A no-op for a non-handle.
+fn tag_list_impl(list: &Value, which: ListImpl) {
+    if let Value::Obj(id) = list {
+        LIST_IMPL.with(|t| t.borrow_mut().insert(*id, which));
+    }
+}
+
+/// Allocate a `List` that a read-only member produced, tagged so its
+/// out-of-range diagnostic names the class Kotlin would have handed back.
+fn alloc_ro_list(items: Vec<Value>) -> Value {
+    let v = alloc(HeapObj::List(items));
+    tag_list_impl(&v, ListImpl::ReadOnly);
+    v
+}
+
+/// Pop `n` operands and hand them back in SOURCE order. The stack yields them
+/// last-first, so a collection builder that skipped the reverse would store
+/// `listOf(1, 2)` as `[2, 1]`.
+fn pop_n(vm: &mut VM, n: u8) -> Vec<Value> {
+    let n = n as usize;
+    let mut vals = Vec::with_capacity(n);
+    for _ in 0..n {
+        vals.push(vm.pop());
+    }
+    vals.reverse();
+    vals
+}
+
+/// Tag `v` as read-only when it IS a `List`, and leave every other kind alone —
+/// for the members that answer their receiver's own kind rather than always a
+/// list.
+fn ro_if_list(v: Value) -> Value {
+    if with_obj(&v, |o| matches!(o, HeapObj::List(_))).unwrap_or(false) {
+        tag_list_impl(&v, ListImpl::ReadOnly);
+    }
+    v
 }
 
 /// How a `Map`/`Set` orders its own iteration.
@@ -978,6 +1067,7 @@ fn difference_modulo(a: i64, b: i64, c: i64) -> i64 {
 fn reset_heap() {
     HEAP.with(|h| h.borrow_mut().clear());
     COLL_ORDER.with(|c| c.borrow_mut().clear());
+    LIST_IMPL.with(|t| t.borrow_mut().clear());
     TYPES.with(|t| t.borrow_mut().clear());
     TOSTRING_SUBS.with(|t| t.borrow_mut().clear());
     EQUALS_SUBS.with(|t| t.borrow_mut().clear());
@@ -1925,13 +2015,13 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             }
         }
         KT_LIST => {
-            let n = arg as usize;
-            let mut vals = Vec::with_capacity(n);
-            for _ in 0..n {
-                vals.push(vm.pop());
-            }
-            vals.reverse();
-            vm.push(alloc(HeapObj::List(vals)));
+            let list = alloc(HeapObj::List(pop_n(vm, arg)));
+            vm.push(list);
+        }
+        KT_LIST_RO => {
+            let list = alloc(HeapObj::List(pop_n(vm, arg)));
+            tag_list_impl(&list, ListImpl::Literal);
+            vm.push(list);
         }
         KT_SET => {
             let n = arg as usize;
@@ -4270,9 +4360,7 @@ fn coll_hof(
                 keyed.push((key, it));
             }
             keyed.sort_by(|a, b| value_cmp(&a.0, &b.0));
-            Ok(alloc(HeapObj::List(
-                keyed.into_iter().map(|(_, it)| it).collect(),
-            )))
+            Ok(alloc_ro_list(keyed.into_iter().map(|(_, it)| it).collect()))
         }
         "minByOrNull" | "minBy" => {
             let mut best: Option<(Value, Value)> = None;
@@ -4366,9 +4454,7 @@ fn coll_hof(
             // Kotlin keeps them in input order, so the comparison is flipped
             // instead.
             keyed.sort_by(|a, b| value_cmp(&b.0, &a.0));
-            Ok(alloc(HeapObj::List(
-                keyed.into_iter().map(|(_, it)| it).collect(),
-            )))
+            Ok(alloc_ro_list(keyed.into_iter().map(|(_, it)| it).collect()))
         }
         // `associate` takes the lambda's `Pair` result as the entry; `associateBy`
         // takes its result as the KEY and the element as the value — the mirror
@@ -4651,10 +4737,10 @@ fn coll_hof(
             }
             match err {
                 Some(e) => Err(e),
-                None => Ok(same_kind_as(
+                None => Ok(ro_if_list(same_kind_as(
                     recv,
                     order.into_iter().map(|i| items[i].clone()).collect(),
-                )),
+                ))),
             }
         }
         // The transform-taking forms of the grouping/rendering members. Each has
@@ -4781,6 +4867,38 @@ fn format_fixed(x: f64, prec: usize) -> String {
     }
 }
 
+/// Insert `en_US` thousands separators into the INTEGER part of an already
+/// rendered number, leaving a leading sign and any fraction alone.
+///
+/// The grouping is fixed at three digits with a `,` because this runtime has no
+/// locale: `String.format`'s separator and group size come from
+/// `Locale.getDefault()` on the JVM, and `scripts/capture-parity.sh` pins the
+/// oracle to `en_US` for exactly that reason.
+fn group_thousands(body: &str) -> String {
+    let (sign, rest) = match body.strip_prefix('-') {
+        Some(r) => ("-", r),
+        None => ("", body),
+    };
+    let (int, frac) = match rest.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (rest, None),
+    };
+    let digits: Vec<char> = int.chars().collect();
+    let mut grouped = String::with_capacity(int.len() + int.len() / 3);
+    for (n, c) in digits.iter().enumerate() {
+        // A separator precedes every digit whose distance from the end is a
+        // positive multiple of three, which is what leaves `123` untouched.
+        if n > 0 && (digits.len() - n) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(*c);
+    }
+    match frac {
+        Some(f) => format!("{sign}{grouped}.{f}"),
+        None => format!("{sign}{grouped}"),
+    }
+}
+
 /// `String.format(args…)` / `java.util.Formatter`, over the conversions a
 /// Kotlin program actually reaches for: `%d %s %f %e %x %X %o %c %b %%`, each
 /// accepting the `-` (left-justify), `0` (zero-pad), `+` and space flags, a
@@ -4798,12 +4916,14 @@ fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
             continue;
         }
         let (mut left, mut zero, mut plus, mut space) = (false, false, false, false);
+        let mut group = false;
         while let Some(f) = it.peek() {
             match f {
                 '-' => left = true,
                 '0' => zero = true,
                 '+' => plus = true,
                 ' ' => space = true,
+                ',' => group = true,
                 _ => break,
             }
             it.next();
@@ -4876,6 +4996,23 @@ fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
                 ))
             }
         };
+        // `,` groups the INTEGER part in threes, and the JVM accepts it on the
+        // two decimal conversions only: `%,e`, `%,x`, `%,o`, `%,s` and `%,b`
+        // are each a `FormatFlagsConversionMismatchException` rather than a
+        // silently-ignored flag. Grouping runs before the sign and the width,
+        // so `%,+d` reads `+1,234,567` and `%,015d` pads with UNGROUPED zeros
+        // out to the full width.
+        if group {
+            match conv {
+                'd' | 'f' => body = group_thousands(&body),
+                other => {
+                    return Err(format!(
+                        "java.util.FormatFlagsConversionMismatchException: \
+                         Conversion = {other}, Flags = ,"
+                    ))
+                }
+            }
+        }
         // The sign flags apply to the numeric conversions only, and `+` wins
         // over ` ` when both are given (as in the JVM).
         if matches!(conv, 'd' | 'f' | 'e' | 'E') && !body.starts_with('-') {
@@ -5785,7 +5922,7 @@ fn charseq_member(
         let list = alloc(HeapObj::List(chars));
         return Some(coll_hof_str_groups(name, &list, args).map(|g| alloc(HeapObj::List(g))));
     }
-    sequence_member(vm, &chars, SeqKind::CharSeq, None, name, args)
+    sequence_member(vm, &chars, None, SeqKind::CharSeq, None, name, args)
 }
 
 /// The `kotlin.Char` members, on the code unit `code`.
@@ -6252,6 +6389,7 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         if let Some(v) = sequence_member(
             vm,
             &items,
+            Some(recv),
             kind,
             range.map(|r| (r.wrap(r.first), r.wrap(r.last()))),
             name,
@@ -6485,21 +6623,46 @@ fn seq_kind_of(v: &Value) -> SeqKind {
 
 /// The out-of-range diagnostic for `get`/`elementAt` on a `kind` receiver.
 ///
-/// Three different exceptions, because three different stdlib declarations
-/// answer the call. A `List`'s `get` is the JVM's, and `listOf` builds an
-/// ARRAY-backed list, so its fault is an `ArrayIndexOutOfBoundsException` — the
-/// same one an array itself raises. A `Set` or a progression has no positional
+/// Four different exceptions, because four different stdlib declarations answer
+/// the call. An ARRAY's `get` is the JVM's `aaload`, so it raises
+/// `ArrayIndexOutOfBoundsException`. A `Set` or a progression has no positional
 /// access at all: `Iterable.elementAt` walks and reports having run out. A
-/// `CharSequence` raises the `String` subclass.
+/// `CharSequence` raises the `String` subclass. And a `List` raises whichever
+/// its IMPLEMENTATION does — see [`ListImpl`] for the table, which `recv`
+/// carries the provenance for.
 ///
-/// `mutableListOf(…)[9]` is the case this cannot get right: `ArrayList.get`
-/// raises the PLAIN `IndexOutOfBoundsException`, and one `HeapObj::List`
-/// carries both list kinds, so the array-backed answer is the one both get.
-fn index_fault(kind: SeqKind, i: i64, len: usize) -> String {
+/// `recv` is `None` for the `String`-as-characters caller, which has no handle
+/// and needs none.
+fn index_fault(kind: SeqKind, recv: Option<&Value>, i: i64, len: usize) -> String {
+    let plain =
+        format!("java.lang.IndexOutOfBoundsException: Index {i} out of bounds for length {len}");
     match kind {
-        SeqKind::List | SeqKind::Array => format!(
+        SeqKind::Array => format!(
             "java.lang.ArrayIndexOutOfBoundsException: Index {i} out of bounds for length {len}"
         ),
+        SeqKind::List => {
+            let which = recv.and_then(|v| match v {
+                Value::Obj(id) => LIST_IMPL.with(|t| t.borrow().get(id).copied()),
+                _ => None,
+            });
+            match (which, len) {
+                // `optimizeReadOnlyList` collapses BOTH read-only kinds at the
+                // two small sizes, so the constructor stops mattering there.
+                (Some(_), 0) => format!(
+                    "java.lang.IndexOutOfBoundsException: \
+                     Empty list doesn't contain element at index {i}."
+                ),
+                (Some(_), 1) => {
+                    format!("java.lang.IndexOutOfBoundsException: Index: {i}, Size: 1")
+                }
+                // Only a literal of two or more is array-backed.
+                (Some(ListImpl::Literal), _) => format!(
+                    "java.lang.ArrayIndexOutOfBoundsException: \
+                     Index {i} out of bounds for length {len}"
+                ),
+                _ => plain,
+            }
+        }
         SeqKind::Set | SeqKind::Range | SeqKind::Seq => format!(
             "java.lang.IndexOutOfBoundsException: Collection doesn't contain element at index {i}."
         ),
@@ -6518,6 +6681,9 @@ fn index_fault(kind: SeqKind, i: i64, len: usize) -> String {
 fn sequence_member(
     vm: &mut VM,
     items: &[Value],
+    // The receiver handle, for the diagnostics that name its implementation
+    // class. `None` from the `String`-as-characters caller, which has none.
+    recv: Option<&Value>,
     kind: SeqKind,
     range: Option<(Value, Value)>,
     name: &str,
@@ -6556,7 +6722,7 @@ fn sequence_member(
             return Some(
                 match usize::try_from(i).ok().and_then(|i| items.get(i).cloned()) {
                     Some(v) => Ok(v),
-                    None => Err(index_fault(kind, i, items.len())),
+                    None => Err(index_fault(kind, recv, i, items.len())),
                 },
             );
         }
@@ -6591,7 +6757,7 @@ fn sequence_member(
                     }
                 }
             }
-            return Some(Ok(alloc(HeapObj::List(out))));
+            return Some(Ok(alloc_ro_list(out)));
         }
         "subList" => {
             let from = args.first().map(|v| v.to_int()).unwrap_or(0);
@@ -6717,7 +6883,13 @@ fn sequence_member(
                 partial,
             )))));
         }
-        "toList" | "toMutableList" | "toTypedArray" | "asList" | "asIterable" | "asSequence" => {
+        // `toList` re-optimizes and its four neighbours do not: Kotlin's
+        // `toList` ends in `optimizeReadOnlyList`, so a one-element receiver
+        // comes back a `SingletonList`, while `toMutableList` is an `ArrayList`
+        // by definition and the `as…` views wrap the receiver. Same elements,
+        // different class, and the difference shows in an out-of-range message.
+        "toList" => return Some(Ok(alloc_ro_list(items.to_vec()))),
+        "toMutableList" | "toTypedArray" | "asList" | "asIterable" | "asSequence" => {
             return Some(Ok(alloc(HeapObj::List(items.to_vec()))))
         }
         // `withIndex()` pairs each element with its position. Kotlin's element
@@ -6766,7 +6938,7 @@ fn sequence_member(
         "toSet" | "toMutableSet" | "toHashSet" => {
             return Some(Ok(alloc(HeapObj::Set(distinct(vm, items)))))
         }
-        "distinct" => return Some(Ok(alloc(HeapObj::List(distinct(vm, items))))),
+        "distinct" => return Some(Ok(alloc_ro_list(distinct(vm, items)))),
         // `filterNotNull` drops Kotlin `null` (carried as `Undef`) and always
         // answers a `List`, whichever kind the receiver was — it is the
         // type-narrowing member, not a `filter` overload.
@@ -6802,7 +6974,7 @@ fn sequence_member(
             if name == "sortedDescending" {
                 out.reverse();
             }
-            return Some(Ok(alloc(HeapObj::List(out))));
+            return Some(Ok(alloc_ro_list(out)));
         }
         // `take`/`drop` clamp rather than fault: Kotlin returns the whole
         // sequence for an oversized `take` and an empty one for an oversized
@@ -6820,7 +6992,7 @@ fn sequence_member(
             } else {
                 items[n..].to_vec()
             };
-            return Some(Ok(alloc(HeapObj::List(out))));
+            return Some(Ok(alloc_ro_list(out)));
         }
         // The from-the-end pair. Same clamping and the same message on a
         // negative count as `take`/`drop`, counted from the other end: for a
@@ -6839,7 +7011,7 @@ fn sequence_member(
             } else {
                 items[..cut].to_vec()
             };
-            return Some(Ok(alloc(HeapObj::List(out))));
+            return Some(Ok(alloc_ro_list(out)));
         }
         // `unzip` is `zip` run backwards: a list of pairs becomes a PAIR of
         // lists, `[(1, a), (2, b)]` → `([1, 2], [a, b])`.
@@ -6889,7 +7061,7 @@ fn sequence_member(
                     progression: true,
                     is_char: is_char(&first),
                 })),
-                None => alloc(HeapObj::List(items.iter().rev().cloned().collect())),
+                None => alloc_ro_list(items.iter().rev().cloned().collect()),
             }));
         }
         _ => return None,
@@ -6993,19 +7165,22 @@ fn index_get(vm: &mut VM, recv: &Value, index: &Value) -> Result<Value, String> 
             })
             .unwrap_or(Value::Undef));
     }
-    let out = with_obj(recv, |o| match o {
-        HeapObj::List(items) | HeapObj::Set(items) | HeapObj::Array { items, .. } => {
-            let i = index.to_int();
-            if i < 0 || i as usize >= items.len() {
-                Err(format!(
-                    "java.lang.ArrayIndexOutOfBoundsException: Index {i} out of bounds for length {}",
-                    items.len()
-                ))
-            } else {
-                Ok(items[i as usize].clone())
-            }
+    // `xs[i]` and `xs.get(i)` are the same call in Kotlin and must fault
+    // identically, so both route through [`index_fault`] — which for a `List`
+    // names the implementation class its provenance recorded. The array arm
+    // keeps the JVM's `aaload` exception; a `Set` reaches here only defensively
+    // (Kotlin gives it no positional `get`) and is read as an array.
+    let out = with_obj(recv, |o| {
+        let (items, kind) = match o {
+            HeapObj::List(items) => (items, SeqKind::List),
+            HeapObj::Set(items) | HeapObj::Array { items, .. } => (items, SeqKind::Array),
+            _ => return Err(format!("{} does not support indexing", obj_label(recv))),
+        };
+        let i = index.to_int();
+        match usize::try_from(i).ok().and_then(|i| items.get(i)) {
+            Some(v) => Ok(v.clone()),
+            None => Err(index_fault(kind, Some(recv), i, items.len())),
         }
-        _ => Err(format!("{} does not support indexing", obj_label(recv))),
     });
     out.unwrap_or_else(|| Err("indexing a non-object value".to_string()))
 }

@@ -162,9 +162,14 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
    an optional radix whose own `2..36` check is an `IllegalArgumentException`
    that even the `…OrNull` forms raise — and
   `.format(args…)` — the `java.util.Formatter` conversions `%d %s %f %e %x %X
-  %o %c %b %%` with the `-`/`0`/`+`/space flags, a width and a precision, where
-  `%f` rounds HALF_UP over the value's shortest decimal form exactly as the JVM
-  does (so `"%.0f".format(2.5)` is `3`, not `2`). Numerically,
+  %o %c %b %%` with the `-`/`0`/`+`/space/`,` flags, a width and a precision,
+  where `%f` rounds HALF_UP over the value's shortest decimal form exactly as
+  the JVM does (so `"%.0f".format(2.5)` is `3`, not `2`). The `,` grouping flag
+  separates the integer part in threes and reaches `%d` and `%f` only —
+  `"%,d".format(1234567)` is `1,234,567` and `"%,015d"` of the same is
+  `0000001,234,567`, while `%,e`/`%,x`/`%,o`/`%,s`/`%,b` are each a
+  `FormatFlagsConversionMismatchException` as on the JVM rather than a silently
+  ignored flag. Numerically,
   `.coerceIn()`/`.coerceAtLeast()`/`.coerceAtMost()`, `.pow()`,
   `.absoluteValue`, `.roundToInt()`; plus `Char.code`, `Int.toChar()`, and
   `Any.toString()`.
@@ -252,7 +257,9 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `String` is the `31`-polynomial over UTF-16 units, a `List` folds `31`, a `Set`
   and a `Map` SUM (so insertion order cannot matter), a `Map.Entry` is
   `key xor value`, an `IntRange` is `31 * first + last` and an `IntProgression`
-  adds its step. The identity-hashed kinds — a non-`data` class instance, an
+  folds that once more before adding its step, `31 * (31 * first + last) + step`
+  (so `(1..5).hashCode()` is `36` and `(1..9 step 2).hashCode()` is `1242`, not
+  `42`). The identity-hashed kinds — a non-`data` class instance, an
   array, a lambda — answer their heap handle, which is what the JVM does too
   (and is why no such value is fuzzed or frozen).
 - **`Map.Entry`** — a distinct type from `Pair`, because all three observable
@@ -281,6 +288,20 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `…OrNull` members answer `null` where their plain counterparts throw:
   `.maxOrNull()`/`.minOrNull()`, `.firstOrNull()`/`.lastOrNull()`,
   `.getOrNull(i)`/`.elementAtOrNull(i)` beside `.elementAt(i)`.
+  An out-of-range `xs[i]` / `.get(i)` / `.elementAt(i)` names the **`List`
+  implementation**, because Kotlin's `List` is an interface over four JVM
+  classes and each words the fault differently: `listOf()` is an `EmptyList`
+  (`Empty list doesn't contain element at index 9.`), `listOf(1)` a
+  `Collections$SingletonList` (`Index: 9, Size: 1`), `listOf(1, 2)` an
+  array-backed `Arrays$ArrayList` (an `ArrayIndexOutOfBoundsException`), and
+  `mutableListOf`/`map`/`filter`/`subList` a plain `ArrayList` (the same message
+  under the plain `IndexOutOfBoundsException`). Size decides as much as the
+  constructor does: the members that end in Kotlin's `optimizeReadOnlyList` —
+  `toList`, `sorted`/`sortedBy`/`sortedWith`/`sortedDescending`/
+  `sortedByDescending`, `reversed`, `distinct`, `take`/`drop`,
+  `takeLast`/`dropLast`, `slice` — collapse to the empty and singleton classes
+  at 0 and 1 elements, so `listOf(1, 2).take(1)` faults as a `SingletonList`
+  while `listOf(1, 2).filter { true }` faults as an `ArrayList`.
 - **`Set`** — `setOf`/`mutableSetOf` build a `LinkedHashSet`, so iteration and
   display follow *insertion* order (`setOf(3, 1, 2, 3)` prints `[3, 1, 2]`) while
   equality ignores it (`setOf(1, 2) == setOf(2, 1)`). `MutableSet.add` answers
@@ -1023,6 +1044,31 @@ generator bug, one it compiles and then aborts is not — and the split
 immediately paid for itself: the widened generator emitted a probe whose
 declaration gate missed a transitive dependency, and the run reported it rather
 than scoring it clean.
+
+Also landed, from auditing what the harnesses cannot see rather than what they
+report: **the `List` implementation a fault names** and **the `,` grouping
+flag**. Kotlin's `List` is an interface over four JVM classes and every one of
+them words an out-of-range index differently, but one `HeapObj::List` carried
+all four, so five of the six shapes answered an array-backed
+`ArrayIndexOutOfBoundsException` — including `mutableListOf(1)[9]`, where the
+JVM raises the plain one, and `listOf(1)[9]`, where a `SingletonList` says
+`Index: 9, Size: 1`. A provenance tag on the handle now picks among them, and
+because the read-only members re-optimize at 0 and 1 elements, the tag records
+WHICH member built the list rather than testing its length. `"%,d"` was an
+`UnknownFormatConversionException` outright; grouping now reaches `%d` and `%f`
+and is refused on the five conversions the JVM refuses it on.
+
+Two harness gaps closed with them, both of the kind a green run hides. The
+differential fuzzer ran its oracle under whatever JVM and locale the shell
+exported — so on a JDK 17 machine it compared this frontend against a JDK 17
+Kotlin, and on a `de_DE` one it read `3,14` as a frontend bug; it now measures
+BOTH launchers' JREs (the compiler's answer is folded into the class file, the
+runtime's is not, and the same file across 17/21 gives four distinct answers)
+and refuses below 21. And `file.encoding=UTF-8` stopped pinning the console in
+JDK 19, which moved onto `stdout.encoding` — under `LANG=C` the capture script
+would have frozen `caf?` for `café`, so both console streams are pinned now
+too. The replay test's `n > 0` floor became a real one, and it now checks the
+frontend's exit code and stderr rather than one success bit.
 
 Next: `sequence { … }`/`yield`, variance and bounds,
 `Delegates.observable`/`vetoable`, and a growing standard-library surface —

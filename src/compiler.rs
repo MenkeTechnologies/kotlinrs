@@ -27,7 +27,7 @@ use crate::host::{
     KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE,
     KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND, KT_FFI_CALL, KT_FFI_COMPILE, KT_GENSEQ, KT_GETFIELD,
     KT_HASH_REG, KT_IDENTITY, KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS,
-    KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_JOIN, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST,
+    KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_JOIN, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO,
     KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OPER_VM,
     KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_RESULT_HOF,
     KT_RUN_CATCHING, KT_SCOPE_FN, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG, KT_TO_STRING,
@@ -4929,8 +4929,22 @@ impl Compiler {
             "ArrayList" if args.len() == 1 => {
                 self.compile_member(sc, &args[0], "toMutableList", &[], false, line)
             }
-            // Collection builders → heap objects.
-            "listOf" | "mutableListOf" | "arrayListOf" | "emptyList" | "ArrayList" => {
+            // Collection builders → heap objects. `listOf`/`emptyList` take the
+            // READ-ONLY op: Kotlin's read-only literal is not a `java.util
+            // .ArrayList` — it is `EmptyList`, a `SingletonList` or an
+            // array-backed `Arrays$ArrayList` depending on its length — and
+            // that class decides the wording of an out-of-range index. The
+            // mutable builders are `ArrayList`s and take the plain op. See
+            // `host::ListImpl`.
+            "listOf" | "emptyList" => {
+                for a in args {
+                    self.compile_expr(sc, a)?;
+                }
+                self.b
+                    .emit(Op::Extended(KT_LIST_RO, args.len() as u8), line);
+                Ok(Type::Obj)
+            }
+            "mutableListOf" | "arrayListOf" | "ArrayList" => {
                 for a in args {
                     self.compile_expr(sc, a)?;
                 }
