@@ -3682,3 +3682,72 @@ fn by_on_a_local_accepts_only_lazy_and_only_on_a_val() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn an_endless_generator_is_bounded_by_take_not_by_materializing_it() {
+    // `generateSequence(1) { it * 2 }` never ends, so every one of these
+    // terminates only because the pipeline stayed lazy up to the bound.
+    assert_eq!(
+        stdout("println(generateSequence(1) { it * 2 }.take(5).toList())"),
+        "[1, 2, 4, 8, 16]\n"
+    );
+    assert_eq!(
+        stdout("println(generateSequence(1) { it + 1 }.map { it * it }.take(4).toList())"),
+        "[1, 4, 9, 16]\n"
+    );
+    assert_eq!(
+        stdout("println(generateSequence(1) { it + 1 }.filter { it % 2 == 0 }.take(3).toList())"),
+        "[2, 4, 6]\n"
+    );
+    // `takeWhile` bounds it too, and `first { }` short-circuits.
+    assert_eq!(
+        stdout("println(generateSequence(1) { it + 1 }.takeWhile { it < 5 }.toList())"),
+        "[1, 2, 3, 4]\n"
+    );
+    assert_eq!(
+        stdout("println(generateSequence(1) { it + 1 }.first { it > 10 })"),
+        "11\n"
+    );
+}
+
+#[test]
+fn a_generator_ends_when_its_step_answers_null() {
+    // The other way a `generateSequence` terminates: no `take` at all.
+    assert_eq!(
+        stdout("println(generateSequence(1) { if (it < 20) it * 2 else null }.toList())"),
+        "[1, 2, 4, 8, 16, 32]\n"
+    );
+    // A null SEED is an empty sequence, exactly as a null step ends one.
+    assert_eq!(
+        stdout("println(generateSequence<Int>(null) { it + 1 }.toList())"),
+        "[]\n"
+    );
+}
+
+#[test]
+fn a_sequence_is_re_runnable_and_its_stages_do_not_leak_between_pipelines() {
+    // Pulling a pipeline must not consume the base: the stage list is copied
+    // into each derived sequence, so `dropWhile`'s progress and `take`'s
+    // countdown are per-pull state and not shared.
+    let src = r#"
+fun main() {
+    val seq = generateSequence(1) { it + 1 }
+    println(seq.take(3).toList())
+    println(seq.take(3).toList())
+    println(seq.dropWhile { it < 3 }.take(2).toList())
+    println(seq.take(3).toList())
+}"#;
+    assert_eq!(stdout(src), "[1, 2, 3]\n[1, 2, 3]\n[3, 4]\n[1, 2, 3]\n");
+}
+
+#[test]
+fn split_to_sequence_matches_split() {
+    assert_eq!(
+        stdout(r#"println("a,b,c".splitToSequence(",").toList())"#),
+        "[a, b, c]\n"
+    );
+    assert_eq!(
+        stdout(r#"println("a,b,c".splitToSequence(",").map { it.uppercase() }.toList())"#),
+        "[A, B, C]\n"
+    );
+}

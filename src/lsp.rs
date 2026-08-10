@@ -1694,6 +1694,20 @@ const CORPUS: &[Entry] = &[
         "println(listOf(1, 2, 3).dropLast(1))   // [1, 2]\nprintln(\"abcde\".dropLast(2))            // abc",
     ),
     (
+        "generateSequence",
+        "Sequence Members",
+        "generateSequence(seed: T?, next: (T) -> T?): Sequence<T>",
+        "A LAZY sequence: `next` runs on demand and ends the sequence by answering `null`. It is the one sequence here that is not materialized up front, because it is the one that can be endless — `generateSequence(1) { it * 2 }` is bounded only by a `take`, a `takeWhile`, or a short-circuiting search. `map`/`filter`/`filterNot`/`takeWhile`/`dropWhile`/`take`/`drop` stay lazy on it; anything else pulls the pipeline into a `List` first, which on an unbounded one raises rather than hanging.",
+        "println(generateSequence(1) { it * 2 }.take(5).toList())                     // [1, 2, 4, 8, 16]\nprintln(generateSequence(1) { if (it < 20) it * 2 else null }.toList())      // [1, 2, 4, 8, 16, 32]",
+    ),
+    (
+        "splitToSequence",
+        "Sequence Members",
+        "String.splitToSequence(vararg delimiters: String): Sequence<String>",
+        "`split` answering a sequence. The receiver bounds the result either way, so it is materialized like every other finite sequence here.",
+        "println(\"a,b,c\".splitToSequence(\",\").toList())   // [a, b, c]",
+    ),
+    (
         "unzip",
         "Sequence Members",
         "unzip(): Pair<List<A>, List<B>>",

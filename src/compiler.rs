@@ -25,12 +25,13 @@ use crate::host::{
     KT_AS, KT_BUILDER, KT_CHR_STRING, KT_CLASSOF, KT_CLOSURE_CALL, KT_COLL_HOF, KT_COMPARATOR,
     KT_DBG_LINE, KT_DDIV, KT_DISPLAY, KT_ENUM_REG, KT_EQUALS_REG, KT_EXC_ABORT, KT_EXC_CUT,
     KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE,
-    KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND, KT_FFI_CALL, KT_FFI_COMPILE, KT_GETFIELD, KT_HASH_REG,
-    KT_IDENTITY, KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL,
-    KT_ITER_GET, KT_ITER_SIZE, KT_JOIN, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_MAKE_CLOSURE,
-    KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OPER_VM, KT_PAIR,
-    KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_RESULT_HOF, KT_RUN_CATCHING,
-    KT_SCOPE_FN, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG,
+    KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND, KT_FFI_CALL, KT_FFI_COMPILE, KT_GENSEQ, KT_GETFIELD,
+    KT_HASH_REG, KT_IDENTITY, KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS,
+    KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_JOIN, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST,
+    KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OPER_VM,
+    KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_RESULT_HOF,
+    KT_RUN_CATCHING, KT_SCOPE_FN, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG, KT_TO_STRING,
+    KT_TYPE_REG,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
@@ -4696,6 +4697,17 @@ impl Compiler {
                 self.compile_expr(sc, &args[0])?;
                 self.b.emit(Op::CallBuiltin(KT_CLOSURE_CALL, 0), line);
                 Ok(Type::Unknown)
+            }
+            // `generateSequence(seed) { next }` — the one sequence that is
+            // genuinely lazy here, because it is the one that can be endless.
+            // The step answers Kotlin `null` to end it.
+            "generateSequence" if args.len() == 2 && is_lambda(&args[1]) => {
+                self.compile_expr(sc, &args[0])?;
+                self.lambda_hint = Some(vec![(Type::Unknown, Type::Unknown)]);
+                self.compile_expr(sc, &args[1])?;
+                self.lambda_hint = None;
+                self.b.emit(Op::CallBuiltin(KT_GENSEQ, 0), line);
+                Ok(Type::Obj)
             }
             // `compareBy { … }` / `compareByDescending { … }` — a `Comparator`
             // over one or more key selectors, for `sortedWith`. The selectors

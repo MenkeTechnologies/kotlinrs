@@ -732,6 +732,17 @@ and a wider `Iterable` surface — `sorted`/`sortedDescending`/`take`/`drop` plu
 the `associate`/`associateBy`/`minByOrNull`/`none`/`filterNot`/`flatMap`/
 `mapIndexed`/`sortedByDescending` higher-order members.
 
+Also landed: **lazy sequences** — `generateSequence(seed) { next }`, ended by a
+step that answers `null`, and the one sequence here that is not materialized up
+front because it is the one that can be endless. `map`/`filter`/`filterNot`/
+`takeWhile`/`dropWhile`/`take`/`drop` append a pipeline stage instead of
+running; `first { }`/`find { }`/`any { }` pull one element at a time and stop at
+the first match; every other member materializes first, which on an unbounded
+pipeline raises rather than hanging (the reference toolchain hangs). The stage
+list is copied into each derived sequence, so a base bound to a name is
+re-runnable and `dropWhile`'s progress never leaks between pipelines.
+`splitToSequence` is `split` — finite either way, so it materializes.
+
 Also landed: `Comparator`s — `compareBy` / `compareByDescending` over one or
 more key selectors, extended by `thenBy` / `thenByDescending`, and consumed by
 `sortedWith` alongside the plain two-argument lambda it already took. The keys

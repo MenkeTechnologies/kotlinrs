@@ -291,6 +291,10 @@ pub const KT_PRECOND: u16 = 132;
 /// A builtin rather than an `Op::Extended` because the comparator's selectors
 /// are closures that `sortedWith` later invokes re-entrantly.
 pub const KT_COMPARATOR: u16 = 133;
+/// Build a lazy sequence. Stack: `[seed, step]`; pops both and pushes the
+/// `HeapObj::Gen` handle. `step` is a one-parameter closure answering the next
+/// element or Kotlin `null` to end the sequence.
+pub const KT_GENSEQ: u16 = 134;
 
 /// Kotlin `==` over heap objects. Stack: `[a, b]`; pushes a `Bool`.
 ///
@@ -773,6 +777,22 @@ enum HeapObj {
         units: Vec<u16>,
         cap: usize,
     },
+    /// A LAZY sequence — `generateSequence(seed) { next }` plus the pipeline
+    /// stages applied to it.
+    ///
+    /// Every other sequence here is a materialized `List`, which is right
+    /// because every other one is finite. `generateSequence` is not: its step
+    /// runs until it answers `null`, and `generateSequence(1) { it * 2 }` never
+    /// does. So this one carries the recipe instead of the elements, and only a
+    /// terminal operation pulls — which is what makes `.take(5).toList()` a
+    /// five-element list rather than a hang.
+    Gen {
+        /// The next element to yield, or `None` once the step answered `null`.
+        seed: Option<Value>,
+        /// `(T) -> T?` — the step. Answering Kotlin `null` ends the sequence.
+        step: Value,
+        stages: Vec<Stage>,
+    },
     /// A `Comparator` built by `compareBy` and extended by `thenBy`: an ORDERED
     /// chain of `(selector closure, descending)` keys, compared left to right
     /// with the first non-equal key deciding.
@@ -784,6 +804,33 @@ enum HeapObj {
     /// `a` and descending by `b`, which a single sign cannot express.
     Comparator(Vec<(Value, bool)>),
 }
+
+/// One stage of a lazy [`HeapObj::Gen`] pipeline, in application order.
+///
+/// Only the stages that can be applied ONE ELEMENT AT A TIME are here. A stage
+/// that has to see the whole sequence (`sorted`, `distinct`, `groupBy`) cannot
+/// be lazy at all, so it materializes instead — and on an endless generator
+/// that is a fault, not an answer, which is also what the reference toolchain
+/// gives you (it hangs).
+#[derive(Clone)]
+enum Stage {
+    Map(Value),
+    /// `filter` when `true`, `filterNot` when `false`.
+    Filter(Value, bool),
+    /// `takeWhile` — ends the sequence at the first element that fails.
+    TakeWhile(Value),
+    /// `dropWhile`, with the flag recording that it has already stopped
+    /// dropping. It is per-PULL state, which is why a pipeline is cloned into
+    /// each new `Gen` rather than shared.
+    DropWhile(Value, bool),
+    Take(i64),
+    Drop(i64),
+}
+
+/// The most elements a terminal operation will pull from a generator before
+/// giving up. A pipeline with no bound is an infinite loop — the reference
+/// toolchain hangs on one — and a diagnosis beats a hang.
+const GEN_PULL_CAP: usize = 1_000_000;
 
 /// Which syntactic form produced a range. This is not cosmetic: `a..b` and
 /// `a until b` build an `IntRange`, whose `toString` is `first..last`, while
@@ -2200,6 +2247,7 @@ fn register_builtins(vm: &mut VM) {
     vm.register_builtin(KT_OPER_VM, b_operator);
     vm.register_builtin(KT_PRECOND, b_precond);
     vm.register_builtin(KT_COMPARATOR, b_comparator);
+    vm.register_builtin(KT_GENSEQ, b_genseq);
     vm.register_builtin(KT_EXC_NEW, b_exc_new);
     vm.register_builtin(KT_EXC_THROW, b_exc_throw);
     vm.register_builtin(KT_EXC_PENDING, b_exc_pending);
@@ -3363,6 +3411,114 @@ fn result_parts(v: &Value) -> Option<(Value, Option<Value>)> {
     .flatten()
 }
 
+/// The `(seed, step, stages)` of a lazy sequence, or `None` for anything else.
+fn gen_parts(v: &Value) -> Option<(Option<Value>, Value, Vec<Stage>)> {
+    with_obj(v, |o| match o {
+        HeapObj::Gen { seed, step, stages } => Some((seed.clone(), step.clone(), stages.clone())),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// A new lazy sequence: `gen` with `stage` appended.
+///
+/// The stages are COPIED rather than shared, which matters because `DropWhile`
+/// carries per-pull state — two pipelines built from one base must not see each
+/// other's progress.
+fn gen_with(vm: &mut VM, gen: &Value, stage: Stage) -> Result<Value, String> {
+    let (seed, step, mut stages) =
+        gen_parts(gen).ok_or_else(|| format!("unresolved reference on {}", obj_label(gen)))?;
+    let _ = vm;
+    stages.push(stage);
+    Ok(alloc(HeapObj::Gen { seed, step, stages }))
+}
+
+/// Pull from a lazy sequence until `want` elements have come out, the generator
+/// ends, a stage stops it, or [`GEN_PULL_CAP`] is reached.
+///
+/// `want == None` means "everything", which only terminates because the step
+/// eventually answers `null` or a `take`/`takeWhile` stage is in the pipeline.
+/// That is exactly the contract Kotlin gives: an unbounded pipeline with a
+/// non-short-circuiting terminal does not finish.
+fn gen_pull(vm: &mut VM, gen: &Value, want: Option<usize>) -> Result<Vec<Value>, String> {
+    let (mut seed, step, mut stages) =
+        gen_parts(gen).ok_or_else(|| format!("unresolved reference on {}", obj_label(gen)))?;
+    let mut out: Vec<Value> = Vec::new();
+    let mut pulled = 0usize;
+    'source: while let Some(cur) = seed.clone() {
+        if want.is_some_and(|n| out.len() >= n) {
+            break;
+        }
+        pulled += 1;
+        if pulled > GEN_PULL_CAP {
+            return Err(format!(
+                "java.lang.IllegalStateException: sequence produced more than {GEN_PULL_CAP} \
+                 elements without a `take`, `takeWhile` or a step returning null"
+            ));
+        }
+        // Advance the source BEFORE the stages run: a stage may end the
+        // sequence, and the next seed is a property of the source alone.
+        let next = invoke_closure(vm, &step, std::slice::from_ref(&cur))?;
+        seed = if matches!(next, Value::Undef) {
+            None
+        } else {
+            Some(next)
+        };
+
+        let mut v = cur;
+        for i in 0..stages.len() {
+            match stages[i].clone() {
+                Stage::Map(f) => v = invoke_closure(vm, &f, std::slice::from_ref(&v))?,
+                Stage::Filter(f, keep) => {
+                    if truthy(&invoke_closure(vm, &f, std::slice::from_ref(&v))?) != keep {
+                        continue 'source;
+                    }
+                }
+                Stage::TakeWhile(f) => {
+                    if !truthy(&invoke_closure(vm, &f, std::slice::from_ref(&v))?) {
+                        break 'source;
+                    }
+                }
+                Stage::DropWhile(f, done) => {
+                    if !done {
+                        if truthy(&invoke_closure(vm, &f, std::slice::from_ref(&v))?) {
+                            continue 'source;
+                        }
+                        stages[i] = Stage::DropWhile(f, true);
+                    }
+                }
+                Stage::Take(n) => {
+                    if n <= 0 {
+                        break 'source;
+                    }
+                    stages[i] = Stage::Take(n - 1);
+                }
+                Stage::Drop(n) => {
+                    if n > 0 {
+                        stages[i] = Stage::Drop(n - 1);
+                        continue 'source;
+                    }
+                }
+            }
+        }
+        out.push(v);
+    }
+    Ok(out)
+}
+
+/// `KT_GENSEQ` — see [`KT_GENSEQ`].
+fn b_genseq(vm: &mut VM, _argc: u8) -> Value {
+    let step = vm.pop();
+    let seed = vm.pop();
+    // A `null` seed is an empty sequence, exactly as it ends one.
+    let seed = (!matches!(seed, Value::Undef)).then_some(seed);
+    alloc(HeapObj::Gen {
+        seed,
+        step,
+        stages: Vec::new(),
+    })
+}
+
 /// `KT_COMPARATOR` — see [`KT_COMPARATOR`].
 fn b_comparator(vm: &mut VM, argc: u8) -> Value {
     let name = vm.pop().to_str();
@@ -3761,6 +3917,53 @@ fn coll_hof(
     extras: &[Value],
     clo: &Value,
 ) -> Result<Value, String> {
+    // A lazy sequence receiver. The four stages that can be applied one element
+    // at a time stay lazy — that is what keeps `generateSequence(1) { it * 2 }
+    // .map { … }.take(5)` finite. The short-circuiting searches pull only as far
+    // as they must, and every other member materializes first, which on an
+    // unbounded pipeline is a fault (see [`GEN_PULL_CAP`]) rather than a hang.
+    if gen_parts(recv).is_some() {
+        match name {
+            "map" => return gen_with(vm, recv, Stage::Map(clo.clone())),
+            "filter" => return gen_with(vm, recv, Stage::Filter(clo.clone(), true)),
+            "filterNot" => return gen_with(vm, recv, Stage::Filter(clo.clone(), false)),
+            "takeWhile" => return gen_with(vm, recv, Stage::TakeWhile(clo.clone())),
+            "dropWhile" => return gen_with(vm, recv, Stage::DropWhile(clo.clone(), false)),
+            // `first { }` / `find { }` / `any { }` stop at the first match, so
+            // they are pulled one element at a time and terminate on an endless
+            // sequence — as they do on Kotlin's.
+            "first" | "firstOrNull" | "find" | "any" | "indexOfFirst" => {
+                let mut at = 0i64;
+                loop {
+                    let batch = gen_pull(vm, recv, Some(at as usize + 1))?;
+                    let Some(v) = batch.get(at as usize) else {
+                        return Ok(match name {
+                            "any" => Value::Bool(false),
+                            "indexOfFirst" => Value::Int(-1),
+                            "first" => {
+                                return Err("java.util.NoSuchElementException: \
+                                            Sequence contains no element matching the predicate."
+                                    .to_string())
+                            }
+                            _ => Value::Undef,
+                        });
+                    };
+                    if truthy(&invoke_closure(vm, clo, std::slice::from_ref(v))?) {
+                        return Ok(match name {
+                            "any" => Value::Bool(true),
+                            "indexOfFirst" => Value::Int(at),
+                            _ => v.clone(),
+                        });
+                    }
+                    at += 1;
+                }
+            }
+            _ => {
+                let items = alloc(HeapObj::List(gen_pull(vm, recv, None)?));
+                return coll_hof(vm, name, &items, extras, clo);
+            }
+        }
+    }
     // A `String` receiver: `kotlin.text` mirrors most of the collection API on
     // `CharSequence`, iterating the characters. The shared implementation below
     // works on the materialized `Char`s; only the RESULT type differs, and
@@ -5062,7 +5265,11 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         // With several delimiters, the earliest match in the string wins at
         // each position — Kotlin scans left to right, not delimiter by
         // delimiter, so `"a1b2c".split("1", "2")` is `[a, b, c]`.
-        (Value::Str(s), "split") => {
+        // `splitToSequence` is `split` returning a lazy `Sequence` rather than
+        // a `List`. The result is FINITE either way — the receiver bounds it —
+        // so it materializes like every other finite sequence here; only
+        // `generateSequence` needs the lazy representation.
+        (Value::Str(s), "split" | "splitToSequence") => {
             let delims: Vec<String> = args.iter().map(kotlin_string).collect();
             let mut parts: Vec<Value> = Vec::new();
             if delims.len() <= 1 {
@@ -5507,6 +5714,34 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     // mean something different or nothing at all.
     if let Some(units) = builder_units(recv) {
         return builder_method(vm, recv, units, name, args);
+    }
+    // A lazy sequence. `take`/`drop` stay lazy — `take` is the ONLY thing that
+    // bounds an endless generator, so materializing it first would defeat the
+    // whole point — and everything else pulls the pipeline into a `List` and
+    // then resolves against that.
+    if gen_parts(recv).is_some() {
+        match name {
+            "take" | "drop" => {
+                let n = args.first().map(|v| v.to_int()).unwrap_or(0);
+                if n < 0 {
+                    return Err(format!(
+                        "java.lang.IllegalArgumentException: Requested element count {n} is less than zero."
+                    ));
+                }
+                let stage = if name == "take" {
+                    Stage::Take(n)
+                } else {
+                    Stage::Drop(n)
+                };
+                return gen_with(vm, recv, stage);
+            }
+            // `asSequence` on a sequence is the identity.
+            "asSequence" => return Ok(recv.clone()),
+            _ => {
+                let items = alloc(HeapObj::List(gen_pull(vm, recv, None)?));
+                return obj_method(vm, &items, name, args);
+            }
+        }
     }
     // `componentN` (destructuring) is uniform across the ordered kinds.
     if let Some(idx) = name
@@ -6335,6 +6570,7 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
         HeapObj::Map(_)
         | HeapObj::Closure { .. }
         | HeapObj::Comparator(_)
+        | HeapObj::Gen { .. }
         | HeapObj::Grouping { .. }
         | HeapObj::Range(_)
         | HeapObj::Builder { .. }
@@ -6786,6 +7022,7 @@ fn obj_hash(recv: &Value) -> Option<i32> {
         | HeapObj::Builder { .. }
         | HeapObj::Closure { .. }
         | HeapObj::Comparator(_)
+        | HeapObj::Gen { .. }
         | HeapObj::Grouping { .. }
         | HeapObj::Exc { .. } => None,
     })
@@ -6812,6 +7049,7 @@ fn obj_label(recv: &Value) -> String {
         HeapObj::Entry(_, _) => "Map.Entry".to_string(),
         HeapObj::Closure { .. } => "Function".to_string(),
         HeapObj::Comparator(_) => "Comparator".to_string(),
+        HeapObj::Gen { .. } => "Sequence".to_string(),
         HeapObj::Grouping { .. } => "Grouping".to_string(),
         HeapObj::Range(r) => match (r.is_char, r.progression) {
             (true, true) => "CharProgression",
@@ -6916,6 +7154,10 @@ fn display_obj(id: u32) -> String {
             // A `Comparator` is an anonymous JVM object with no printed form
             // worth reproducing; like a lambda it exists to be invoked.
             HeapObj::Comparator(keys) => format!("(comparator keys={})", keys.len()),
+            // A lazy sequence has no printed form worth reproducing either —
+            // the JVM renders it as `kotlin.sequences.GeneratorSequence@…`,
+            // an identity hash. It exists to be consumed, not displayed.
+            HeapObj::Gen { stages, .. } => format!("(sequence stages={})", stages.len()),
             // A `Grouping` is an anonymous object on the JVM, so it has no
             // meaningful printed form; it exists to be consumed by a terminal
             // operation, not displayed.
