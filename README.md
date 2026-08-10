@@ -1159,6 +1159,13 @@ is `if (element != null) listOf(element) else emptyList()` and collapses like a
 literal. The provenance table had claimed `listOfNotNull` for the read-only row,
 which is neither of those, and nothing implemented even that.
 
+The `step` infix had the same shape as the escape table, one level up. Kotlin
+declares a single `IntProgression.step`, and only the infix spelling reached the
+parser's node for it — so `(1..5).step(2)` answered `unresolved reference` and
+the "Step must be positive" diagnostic behind it was unreachable through half
+its call sites. The method form rewrites to the same node rather than growing a
+second lowering.
+
 Four assertions that could not fail went with them. `stderr.contains(
 "IndexOutOfBoundsException")` cannot tell the plain subclass from the array one
 — it is a substring of both — cannot see the detail message, and passes whether
