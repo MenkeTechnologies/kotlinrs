@@ -114,6 +114,43 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// The escape body after a `\`, which the backslash's reader has consumed.
+    ///
+    /// ONE table for both literal kinds. Kotlin's escape set does not vary by
+    /// quote — `"\'"` and `'\"'` are both legal, and `\u`/`\b` are legal in
+    /// both — but this used to be written out twice, and only the `Char` copy
+    /// carried `\u` and `\b`. `"A"` therefore lexed as the five characters
+    /// `u0041` while `'A'` lexed as `A`: the same escape, two answers, from
+    /// the same file. A second table cannot drift from the first if there is no
+    /// second table.
+    fn escape(&mut self) -> Result<char, String> {
+        let e = self.bump();
+        Ok(match e {
+            b'n' => '\n',
+            b't' => '\t',
+            b'r' => '\r',
+            b'\\' => '\\',
+            b'\'' => '\'',
+            b'"' => '"',
+            b'$' => '$',
+            b'0' => '\0',
+            b'b' => '\u{8}',
+            b'u' => {
+                // `\uXXXX` — exactly four hex digits.
+                let mut code: u32 = 0;
+                for _ in 0..4 {
+                    let h = self.bump();
+                    let d = (h as char)
+                        .to_digit(16)
+                        .ok_or("invalid `\\u` escape in literal")?;
+                    code = code * 16 + d;
+                }
+                char::from_u32(code).ok_or("invalid unicode scalar in literal")?
+            }
+            other => other as char,
+        })
+    }
+
     /// A `Char` literal `'A'` — a single UTF-16 unit (or escape). Kotlin `Char`
     /// is integral; the code unit is carried in [`Tok::Char`] and lowers to a
     /// plain integer at runtime, statically typed `Char` so display and `Char`
@@ -125,31 +162,7 @@ impl<'a> Lexer<'a> {
         }
         let ch = if self.peek() == b'\\' {
             self.bump();
-            let e = self.bump();
-            match e {
-                b'n' => '\n',
-                b't' => '\t',
-                b'r' => '\r',
-                b'\\' => '\\',
-                b'\'' => '\'',
-                b'"' => '"',
-                b'$' => '$',
-                b'0' => '\0',
-                b'b' => '\u{8}',
-                b'u' => {
-                    // `\uXXXX` — exactly four hex digits.
-                    let mut code: u32 = 0;
-                    for _ in 0..4 {
-                        let h = self.bump();
-                        let d = (h as char)
-                            .to_digit(16)
-                            .ok_or("invalid `\\u` escape in char literal")?;
-                        code = code * 16 + d;
-                    }
-                    char::from_u32(code).ok_or("invalid unicode scalar in char literal")?
-                }
-                other => other as char,
-            }
+            self.escape()?
         } else {
             // A UTF-8 encoded scalar. Decode from the raw bytes so multi-byte
             // characters (`'é'`) lex to a single Char.
@@ -305,17 +318,7 @@ impl<'a> Lexer<'a> {
                 }
                 b'\\' => {
                     self.bump();
-                    let e = self.bump();
-                    cur.push(match e {
-                        b'n' => '\n',
-                        b't' => '\t',
-                        b'r' => '\r',
-                        b'\\' => '\\',
-                        b'"' => '"',
-                        b'$' => '$',
-                        b'0' => '\0',
-                        other => other as char,
-                    });
+                    cur.push(self.escape()?);
                 }
                 b'$' => {
                     // Flush the pending literal run before the interpolation.
