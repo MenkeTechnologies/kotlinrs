@@ -5,9 +5,59 @@
 use crate::{compiler, host, parser};
 use fusevm::{VMResult, VM};
 
-/// Parse, compile, and run `src`. Returns the process exit code (`0` on normal
-/// completion) or an error string for a compile error or uncaught exception.
+/// The interpreter thread's stack, in bytes.
+///
+/// A closure body, an `equals`/`hashCode`/`toString` override and a
+/// lambda-taking collection member all run through a re-entrant `vm.run()`
+/// (`host::run_sub`), so one level of Kotlin recursion through any of them
+/// costs one Rust frame of the whole interpreter dispatch loop. Those frames
+/// are large — measured at roughly 100 KB each in a `cargo build` (dev, no
+/// optimization) binary, where every local of the dispatch `match` gets its own
+/// slot — so the platform default main-thread stack (8 MiB on macOS) runs out
+/// at a recursion depth under 100.
+///
+/// That is both a capability floor and a correctness problem: a Rust stack
+/// overflow is `SIGABRT`, which no `catch` can see, where Kotlin raises a
+/// perfectly catchable `StackOverflowError`. Running the program on a thread
+/// whose stack is reserved up front moves the floor somewhere useful, and
+/// [`host::NESTED_RUN_LIMIT`] then raises the JVM's throwable *before* this
+/// stack can be exhausted. Both halves are needed: the big stack alone only
+/// moves the abort, and the limit alone would reject shallow, legal programs.
+///
+/// This is a virtual reservation. Only the pages a run actually touches are
+/// committed, so a `println("hi")` costs nothing for it.
+const INTERPRETER_STACK: usize = 1 << 29; // 512 MiB
+
+/// Parse, compile, and run `src` on the interpreter thread.
+///
+/// Every piece of run state `host` keeps is `thread_local!` (the pending
+/// exception, the `finally` stash, the catchability flag, the parked fault), so
+/// the whole pipeline — compile, install, run, and *collect the error* — has to
+/// happen on the one thread. It does: this spawns [`run_source_on_this_thread`]
+/// and hands back exactly what it returned.
 pub fn run_source(src: &str) -> Result<i32, String> {
+    let owned = src.to_string();
+    let worker = std::thread::Builder::new()
+        .name("kotlin".to_string())
+        .stack_size(INTERPRETER_STACK)
+        .spawn(move || run_source_on_this_thread(&owned));
+    match worker {
+        Ok(h) => match h.join() {
+            Ok(r) => r,
+            // The interpreter thread panicked. That is a kotlinrs bug, not a
+            // Kotlin exception, so it is reported as one rather than dressed up
+            // as a throwable a program could have caught.
+            Err(_) => Err("internal error: the interpreter thread panicked".to_string()),
+        },
+        // No thread available (a hard resource limit). Running inline is worse
+        // than not running at all only in stack depth, so fall back rather than
+        // refuse the program.
+        Err(_) => run_source_on_this_thread(src),
+    }
+}
+
+/// [`run_source`] without the thread hop — the whole pipeline, inline.
+pub fn run_source_on_this_thread(src: &str) -> Result<i32, String> {
     let src = crate::rust_ffi::desugar(src);
     let program = parser::parse_program(&src)?;
     let chunk = compiler::compile(&program)?;

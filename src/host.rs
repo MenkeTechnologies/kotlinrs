@@ -526,6 +526,83 @@ fn tag_list_impl(list: &Value, which: ListImpl) {
     }
 }
 
+thread_local! {
+    /// Handles that are a `Sequence` VIEW of the list they are carried as.
+    ///
+    /// `asSequence()` (and a `generateSequence` pipeline that materialized)
+    /// keeps a `HeapObj::List` here, because kotlinrs evaluates a bounded
+    /// sequence eagerly. That representation is not observable — but the
+    /// DIAGNOSTICS are, and Kotlin declares its own `first`/`last`/`single`/
+    /// `reduce`/`elementAt` on `Sequence` with their own wording:
+    /// `listOf<Int>().asSequence().first()` says `Sequence is empty.` where the
+    /// list says `List is empty.` (measured on kotlinc 2.4.10 / JDK 21.0.12).
+    ///
+    /// Deliberately NOT a [`ListImpl`] row. That table names which JVM `List`
+    /// CLASS a handle is, and a `Sequence` is not a `List` of any class; adding
+    /// a row there would make it answer a question it exists to answer
+    /// precisely.
+    static SEQ_VIEW: RefCell<std::collections::HashSet<u32>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+/// Mark `v` as a `Sequence` view — see [`SEQ_VIEW`] — and hand it back.
+fn tag_sequence(v: Value) -> Value {
+    if let Value::Obj(id) = v {
+        SEQ_VIEW.with(|t| {
+            t.borrow_mut().insert(id);
+        });
+    }
+    v
+}
+
+/// Whether `kotlin.sequences` declares `name` to answer another `Sequence`.
+///
+/// The complement is what matters: `toList`/`toSet`/`toMutableList`/
+/// `toTypedArray`/`asIterable`/`joinToString`/`groupBy`/`associate…` all answer
+/// a COLLECTION, and an element accessor answers an element — none of those
+/// carry the tag forward. Stated once here rather than at each derivation site,
+/// which is what let the tag stop after one step.
+fn sequence_preserving(name: &str) -> bool {
+    matches!(
+        name,
+        "map"
+            | "mapIndexed"
+            | "mapNotNull"
+            | "filter"
+            | "filterNot"
+            | "filterNotNull"
+            | "filterIndexed"
+            | "take"
+            | "takeWhile"
+            | "drop"
+            | "dropWhile"
+            | "distinct"
+            | "distinctBy"
+            | "sorted"
+            | "sortedBy"
+            | "sortedDescending"
+            | "sortedByDescending"
+            | "sortedWith"
+            | "flatMap"
+            | "minus"
+            | "plus"
+            | "onEach"
+            | "withIndex"
+            | "asSequence"
+            | "reversed"
+            | "zip"
+            | "zipWithNext"
+    )
+}
+
+/// Whether `v` is a `Sequence` view.
+fn is_sequence_view(v: &Value) -> bool {
+    match v {
+        Value::Obj(id) => SEQ_VIEW.with(|t| t.borrow().contains(id)),
+        _ => false,
+    }
+}
+
 /// Allocate a `List` that a read-only member produced, tagged so its
 /// out-of-range diagnostic names the class Kotlin would have handed back.
 fn alloc_ro_list(items: Vec<Value>) -> Value {
@@ -1117,6 +1194,7 @@ fn reset_heap() {
     HEAP.with(|h| h.borrow_mut().clear());
     COLL_ORDER.with(|c| c.borrow_mut().clear());
     LIST_IMPL.with(|t| t.borrow_mut().clear());
+    SEQ_VIEW.with(|t| t.borrow_mut().clear());
     TYPES.with(|t| t.borrow_mut().clear());
     TOSTRING_SUBS.with(|t| t.borrow_mut().clear());
     EQUALS_SUBS.with(|t| t.borrow_mut().clear());
@@ -1269,6 +1347,43 @@ pub const BUILTIN_THROWABLES: &[(&str, &str)] = &[
     // `TODO()`'s throwable. It is Kotlin's own, not the JVM's, so it keeps the
     // `kotlin.` package its `toString` prints.
     ("NotImplementedError", "kotlin.NotImplementedError"),
+    // `java.util.Formatter`'s faults. Their MESSAGES were already produced
+    // before these rows existed, which is precisely the defect: a fault raised
+    // under a class the hierarchy has never heard of falls straight through to
+    // `Throwable`, so `catch (e: IllegalArgumentException)` — which the JVM
+    // answers YES to for every one of them — saw nothing. Measured on JDK
+    // 21.0.12: `try { "%q".format(1) } catch (e: IllegalArgumentException)`
+    // catches.
+    ("IllegalFormatException", "java.util.IllegalFormatException"),
+    (
+        "UnknownFormatConversionException",
+        "java.util.UnknownFormatConversionException",
+    ),
+    (
+        "IllegalFormatConversionException",
+        "java.util.IllegalFormatConversionException",
+    ),
+    (
+        "MissingFormatArgumentException",
+        "java.util.MissingFormatArgumentException",
+    ),
+    (
+        "IllegalFormatWidthException",
+        "java.util.IllegalFormatWidthException",
+    ),
+    (
+        "IllegalFormatPrecisionException",
+        "java.util.IllegalFormatPrecisionException",
+    ),
+    (
+        "FormatFlagsConversionMismatchException",
+        "java.util.FormatFlagsConversionMismatchException",
+    ),
+    // Runaway recursion. An `Error` under `VirtualMachineError`, so
+    // `catch (e: Exception)` does NOT claim it and `catch (e: Throwable)` does
+    // — see [`NESTED_RUN_LIMIT`].
+    ("VirtualMachineError", "java.lang.VirtualMachineError"),
+    ("StackOverflowError", "java.lang.StackOverflowError"),
 ];
 
 /// The JVM throwable hierarchy kotlinrs models, as `(class, superclass)` simple
@@ -1300,6 +1415,22 @@ const THROWABLE_PARENTS: &[(&str, &str)] = &[
     // An `Error`, NOT an `Exception` — which is why `catch (e: Exception)` does
     // not catch what `TODO()` throws and `catch (e: Throwable)` does.
     ("NotImplementedError", "Error"),
+    // `java.util.IllegalFormatException` extends `IllegalArgumentException`,
+    // and every Formatter fault extends it. That one row is what makes a
+    // format fault catchable at the three levels the JVM catches it at
+    // (`IllegalArgumentException`, `RuntimeException`, `Exception`).
+    ("IllegalFormatException", "IllegalArgumentException"),
+    ("UnknownFormatConversionException", "IllegalFormatException"),
+    ("IllegalFormatConversionException", "IllegalFormatException"),
+    ("MissingFormatArgumentException", "IllegalFormatException"),
+    ("IllegalFormatWidthException", "IllegalFormatException"),
+    ("IllegalFormatPrecisionException", "IllegalFormatException"),
+    (
+        "FormatFlagsConversionMismatchException",
+        "IllegalFormatException",
+    ),
+    ("VirtualMachineError", "Error"),
+    ("StackOverflowError", "VirtualMachineError"),
 ];
 
 /// The fully-qualified name of a throwable's simple name, or `None` when the
@@ -2397,7 +2528,15 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
         }
         KT_TO_STRING => {
             let v = vm.pop();
-            vm.push(Value::str(kotlin_string(&v)));
+            // Checked, not bare: this is the coercion string interpolation and
+            // `+` go through, so a cyclic structure reaches the render walk
+            // here as readily as through `println`.
+            RENDER_OVERFLOW.with(|f| f.set(false));
+            let s = kotlin_string(&v);
+            if RENDER_OVERFLOW.with(|f| f.replace(false)) {
+                fault(vm, "java.lang.StackOverflowError");
+            }
+            vm.push(Value::str(s));
         }
         KT_IS => {
             // Stack: [value, typeName]; typeName on top.
@@ -3010,6 +3149,48 @@ fn invoke_closure(vm: &mut VM, clo: &Value, args: &[Value]) -> Result<Value, Str
 /// re-entrant pattern the mature fusevm frontends (groovyrs/scalars) use to give
 /// closures their own frame without any VM change.
 fn run_sub(vm: &mut VM, entry: usize, stack_base: usize) -> Result<Value, String> {
+    // GUARD FIRST, before the frame is pushed. Every re-entrant `vm.run()` in
+    // this file funnels through here, so this one check covers recursion
+    // through a lambda, through a `toString`/`equals`/`hashCode` override, and
+    // through a property delegate alike.
+    let depth = NESTED_DEPTH.with(|d| d.get());
+    if depth >= NESTED_RUN_LIMIT {
+        // Kotlin's answer, and a catchable one. Reaching the Rust stack's own
+        // end instead is `SIGABRT` — `fatal runtime error: stack overflow` —
+        // which unwinds nothing and which no `catch` can ever see.
+        fault(vm, "java.lang.StackOverflowError");
+        return Ok(Value::Undef);
+    }
+    NESTED_DEPTH.with(|d| d.set(depth + 1));
+    let out = run_sub_inner(vm, entry, stack_base);
+    NESTED_DEPTH.with(|d| d.set(depth));
+    out
+}
+
+/// How deep the re-entrant `vm.run()` nesting may go before
+/// `java.lang.StackOverflowError` is raised.
+///
+/// This is a stack budget, not a taste. One level costs one Rust frame of the
+/// whole interpreter dispatch loop, measured at roughly 100 KB in a `cargo
+/// build` (dev, unoptimized) binary. Against
+/// `runtime::INTERPRETER_STACK`'s 512 MiB that leaves room for some
+/// thousands of levels; 2000 keeps a wide margin for the deepest frame the
+/// dispatch loop can take and for anything the host itself recurses through
+/// below this point (nested container rendering, `value_eq`).
+///
+/// Kotlin's own limit is a JVM stack, not a count, so no fixed number here can
+/// match it exactly — a program that recurses 1900 deep succeeds on both, and
+/// one that recurses forever raises `StackOverflowError` on both. What must NOT
+/// differ is the KIND of failure, and before this guard existed it did.
+pub const NESTED_RUN_LIMIT: usize = 2000;
+
+thread_local! {
+    /// Current re-entrant `vm.run()` nesting depth — see [`NESTED_RUN_LIMIT`].
+    static NESTED_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`run_sub`] without the depth accounting.
+fn run_sub_inner(vm: &mut VM, entry: usize, stack_base: usize) -> Result<Value, String> {
     let return_ip = vm.chunk.ops.len();
     vm.frames.push(Frame {
         return_ip,
@@ -3276,6 +3457,89 @@ fn instance_tag(v: &Value) -> Option<String> {
     .flatten()
 }
 
+/// How deep a display walk may nest before `java.lang.StackOverflowError`.
+///
+/// Rendering a container recurses in Rust, once per level, in BOTH the
+/// VM-aware [`display_vm`] and the VM-less [`display_obj`]. A cyclic structure
+/// the direct-self check below does not cover — `a` holds `b` and `b` holds `a`
+/// — recurses forever, and hitting the Rust stack's end is `SIGABRT`, which no
+/// `catch` can see. The JVM raises `StackOverflowError` there (measured on JDK
+/// 21.0.12), and so does this.
+///
+/// Far below [`NESTED_RUN_LIMIT`] because a render frame is small and a
+/// legitimately 512-deep printed structure does not occur.
+const RENDER_DEPTH_LIMIT: usize = 512;
+
+thread_local! {
+    /// The heap ids of the containers currently being rendered, outermost
+    /// first. The last entry is the IMMEDIATE parent, which is the only one
+    /// `AbstractCollection.toString` compares against — see
+    /// [`self_reference`].
+    static RENDERING: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    /// Set when a display walk hit [`RENDER_DEPTH_LIMIT`]. Read and cleared by
+    /// [`display_checked`], which is where a `vm` is in hand to raise with.
+    static RENDER_OVERFLOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `AbstractCollection`/`AbstractMap`'s self-reference placeholder for `v` when
+/// it is the container currently being rendered, else `None`.
+///
+/// The JVM's check is `if (e == this)` — reference identity against the
+/// IMMEDIATE receiver, one level, no cycle detection of any kind. So
+/// `xs.add(xs)` renders `[(this Collection)]` while `a.add(b); b.add(a)` still
+/// overflows the stack. Both were measured on JDK 21.0.12; reproducing only the
+/// first half is what makes the two cases differ here the way they differ
+/// there. A `Map` words it `(this Map)`.
+fn self_reference(v: &Value, in_map: bool) -> Option<&'static str> {
+    let Value::Obj(id) = v else { return None };
+    let parent = RENDERING.with(|r| r.borrow().last().copied());
+    (parent == Some(*id)).then_some(if in_map {
+        "(this Map)"
+    } else {
+        "(this Collection)"
+    })
+}
+
+/// Run `body` with `v`'s heap id pushed as the container being rendered.
+/// Answers `None` when [`RENDER_DEPTH_LIMIT`] is already reached, having
+/// recorded the overflow for [`display_checked`].
+fn rendering<T>(v: &Value, body: impl FnOnce() -> T) -> Option<T> {
+    let Value::Obj(id) = v else {
+        return Some(body());
+    };
+    let too_deep = RENDERING.with(|r| {
+        let mut r = r.borrow_mut();
+        if r.len() >= RENDER_DEPTH_LIMIT {
+            return true;
+        }
+        r.push(*id);
+        false
+    });
+    if too_deep {
+        RENDER_OVERFLOW.with(|f| f.set(true));
+        return None;
+    }
+    let out = body();
+    RENDERING.with(|r| {
+        r.borrow_mut().pop();
+    });
+    Some(out)
+}
+
+/// [`display_vm`], then raise `StackOverflowError` if the walk ran away.
+///
+/// The render functions answer a `String` and have nowhere to put a throwable,
+/// so they park the fact in `RENDER_OVERFLOW` and this — the one render entry
+/// point holding a `vm` — turns it into the exception.
+fn display_checked(vm: &mut VM, v: &Value) -> String {
+    RENDER_OVERFLOW.with(|f| f.set(false));
+    let s = display_vm(vm, v);
+    if RENDER_OVERFLOW.with(|f| f.replace(false)) {
+        fault(vm, "java.lang.StackOverflowError");
+    }
+    s
+}
+
 /// The Kotlin display form of `v`, honouring a user `toString()` override.
 ///
 /// An instance whose class registered an override runs that body through a
@@ -3314,28 +3578,51 @@ fn display_vm(vm: &mut VM, v: &Value) -> String {
         _ => Shape::Plain,
     })
     .unwrap_or(Shape::Plain);
-    match shape {
+    if matches!(shape, Shape::Plain) {
+        return kotlin_string(v);
+    }
+    // Every recursive arm runs inside `rendering`, so the element walk can see
+    // its own container (the `(this Collection)` check) and so a runaway cycle
+    // stops at `RENDER_DEPTH_LIMIT` instead of at the Rust stack's end.
+    rendering(v, || match shape {
         Shape::List(items) => {
-            let body: Vec<String> = items.iter().map(|x| display_vm(vm, x)).collect();
+            let body: Vec<String> = items
+                .iter()
+                .map(|x| match self_reference(x, false) {
+                    Some(s) => s.to_string(),
+                    None => display_vm(vm, x),
+                })
+                .collect();
             format!("[{}]", body.join(", "))
         }
         Shape::Map(entries) => {
             let body: Vec<String> = entries
                 .iter()
-                .map(|(k, val)| format!("{}={}", display_vm(vm, k), display_vm(vm, val)))
+                .map(|(k, val)| {
+                    let ks = match self_reference(k, true) {
+                        Some(s) => s.to_string(),
+                        None => display_vm(vm, k),
+                    };
+                    let vs = match self_reference(val, true) {
+                        Some(s) => s.to_string(),
+                        None => display_vm(vm, val),
+                    };
+                    format!("{ks}={vs}")
+                })
                 .collect();
             format!("{{{}}}", body.join(", "))
         }
         Shape::Pair(a, b) => format!("({}, {})", display_vm(vm, &a), display_vm(vm, &b)),
         Shape::Entry(k, val) => format!("{}={}", display_vm(vm, &k), display_vm(vm, &val)),
         Shape::Plain => kotlin_string(v),
-    }
+    })
+    .unwrap_or_default()
 }
 
 /// `KT_DISPLAY` — see [`KT_DISPLAY`].
 fn b_display(vm: &mut VM, _argc: u8) -> Value {
     let v = vm.pop();
-    Value::str(display_vm(vm, &v))
+    Value::str(display_checked(vm, &v))
 }
 
 /// `KT_MAP_VM` — see [`KT_MAP_VM`]. Stack: `[pair0 .. pairN]`, each a `Pair`.
@@ -3832,8 +4119,20 @@ fn b_coll_hof(vm: &mut VM, argc: u8) -> Value {
     }
     extras.reverse();
     let recv = vm.pop();
+    let from_sequence = is_sequence_view(&recv);
     match coll_hof(vm, &name, &recv, &extras, &clo, seq_kind_of(&recv)) {
-        Ok(v) => v,
+        Ok(v) => {
+            // The lambda-taking members dispatch here rather than through
+            // `kt_method`, so the sequence tag has to be carried forward on
+            // this path too — otherwise
+            // `xs.asSequence().map { }.filter { }.first()` falls back to the
+            // `List` wording after the first stage. Same rule, stated by the
+            // same predicate.
+            if from_sequence && sequence_preserving(&name) {
+                tag_sequence(v.clone());
+            }
+            v
+        }
         Err(e) => {
             fault(vm, e);
             Value::Undef
@@ -4464,7 +4763,9 @@ fn coll_hof(
                 }
             }
             _ => {
-                let items = alloc(HeapObj::List(gen_pull(vm, recv, None)?));
+                // Tagged: materializing a lazy sequence must not switch its diagnostics
+                // onto the `List` wording — see [`SEQ_VIEW`].
+                let items = tag_sequence(alloc(HeapObj::List(gen_pull(vm, recv, None)?)));
                 return coll_hof(vm, name, &items, extras, clo, kind);
             }
         }
@@ -5279,6 +5580,65 @@ fn unknown_conversion(c: char) -> String {
     format!("java.util.UnknownFormatConversionException: Conversion = '{c}'")
 }
 
+/// The `Formatter` fault for a width or precision that does not fit an `int`.
+///
+/// Java parses both into an `int` and then rejects a negative one, so EVERY
+/// overflowing spelling lands on the same number: measured on JDK 21.0.12,
+/// `%2147483648d`, `%10000000000d`, `%4294967296d` and
+/// `%99999999999999999999d` all answer `IllegalFormatWidthException:
+/// -2147483648`, and `%.2147483648f` answers `IllegalFormatPrecisionException:
+/// -2147483648`. kotlinrs parsed the digits into a `usize` and fell back to
+/// `unwrap_or(0)`, so an overflowing width was silently *no* width — and the
+/// widths that DO fit a `usize` but not an `int` (`%4294967296d`) tried to pad
+/// to four billion characters and hung.
+fn illegal_span(kind: &str) -> String {
+    format!("java.util.IllegalFormat{kind}Exception: {}", i32::MIN)
+}
+
+/// The JVM binary name of the class `v` would be BOXED to, for
+/// `IllegalFormatConversionException`.
+///
+/// `Long`/`Int` and `Float`/`Double` each share one runtime representation
+/// here, so a `5L` rejected by `%f` is named `java.lang.Integer` where the JVM
+/// names `java.lang.Long`. The CLASS of the throwable, its place in the
+/// hierarchy and the conversion character are all exact; only that one operand
+/// name is approximate, and only for the two widths kotlinrs does not carry at
+/// run time.
+fn format_arg_class(v: &Value) -> String {
+    if char_code(v).is_some() {
+        return "java.lang.Character".to_string();
+    }
+    match v {
+        Value::Int(_) => "java.lang.Integer".to_string(),
+        Value::Float(_) => "java.lang.Double".to_string(),
+        Value::Bool(_) => "java.lang.Boolean".to_string(),
+        Value::Str(_) => "java.lang.String".to_string(),
+        _ => runtime_jvm_class(v)
+            .map(|(n, _)| n)
+            .or_else(|| jvm_class(&obj_label(v)).map(|(n, _)| n.to_string()))
+            .unwrap_or_else(|| obj_label(v)),
+    }
+}
+
+/// Whether `conv` accepts `arg`, per `java.util.Formatter`'s conversion
+/// categories. Measured on JDK 21.0.12: `%f` REJECTS an `Int`
+/// (`f != java.lang.Integer`), `%d` rejects a `Double`, `%c` takes a `Char` or
+/// an `Int` but not a `String`, and `%s`/`%b` take anything. A null argument is
+/// accepted everywhere — the JVM prints `null` rather than faulting.
+fn conversion_accepts(conv: char, arg: &Value) -> bool {
+    if matches!(arg, Value::Undef) {
+        return true;
+    }
+    let is_char = char_code(arg).is_some();
+    match conv {
+        // Integral only. A `Char` is a `Character`, not an integral box.
+        'd' | 'x' | 'X' | 'o' => matches!(arg, Value::Int(_)) && !is_char,
+        'f' | 'e' | 'E' => matches!(arg, Value::Float(_)),
+        'c' => is_char || matches!(arg, Value::Int(_)),
+        _ => true,
+    }
+}
+
 fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
     let mut out = String::new();
     let mut argi = 0usize;
@@ -5288,6 +5648,12 @@ fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
             out.push(c);
             continue;
         }
+        // The whole specifier as WRITTEN, accumulated as it is consumed:
+        // `MissingFormatArgumentException` quotes it in full, flags, width and
+        // precision included (`'%-5.2f'`, `'%,d'` — measured on JDK 21.0.12),
+        // so the text has to be kept rather than reconstructed from the parsed
+        // pieces.
+        let mut spec = String::from("%");
         // The character right after the `%`, kept for the truncated-spec fault
         // below — see [`unknown_conversion`].
         let after = it.peek().copied();
@@ -5302,21 +5668,37 @@ fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
                 ',' => group = true,
                 _ => break,
             }
+            spec.push(*f);
             it.next();
         }
-        let mut width = String::new();
+        let mut width_txt = String::new();
         while it.peek().is_some_and(|d| d.is_ascii_digit()) {
-            width.push(it.next().expect("peeked"));
+            let d = it.next().expect("peeked");
+            spec.push(d);
+            width_txt.push(d);
         }
-        let width: usize = width.parse().unwrap_or(0);
+        // Parsed as the `i32` Java parses it as, so a spelling that overflows
+        // faults instead of silently becoming no width at all.
+        let width: usize = match width_txt.parse::<i32>() {
+            Ok(w) => w as usize,
+            Err(_) if width_txt.is_empty() => 0,
+            Err(_) => return Err(illegal_span("Width")),
+        };
         let mut prec: Option<usize> = None;
         if it.peek() == Some(&'.') {
             it.next();
+            spec.push('.');
             let mut p = String::new();
             while it.peek().is_some_and(|d| d.is_ascii_digit()) {
-                p.push(it.next().expect("peeked"));
+                let d = it.next().expect("peeked");
+                spec.push(d);
+                p.push(d);
             }
-            prec = Some(p.parse().unwrap_or(0));
+            prec = Some(match p.parse::<i32>() {
+                Ok(v) => v as usize,
+                Err(_) if p.is_empty() => 0,
+                Err(_) => return Err(illegal_span("Precision")),
+            });
         }
         // A spec that runs off the end of the format string. The JVM names the
         // character right after the `%` — not the last one it read — and names
@@ -5324,16 +5706,40 @@ fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
         let conv = it
             .next()
             .ok_or_else(|| unknown_conversion(after.unwrap_or('%')))?;
+        spec.push(conv);
         // `%%` and `%n` take no argument, but they DO take the width and the
         // `-` flag: `%5%` is four spaces then `%`. Falling through to the
         // padding below is what applies them.
         let arg = if matches!(conv, '%' | 'n') {
             Value::Undef
         } else {
-            let a = args.get(argi).cloned().unwrap_or(Value::Undef);
+            // AN EXHAUSTED ARGUMENT LIST IS A FAULT, not a hole. It used to
+            // become `Undef`, which `to_int()` reads as `0`, so
+            // `"%d %d".format(1)` answered `1 0` — a wrong answer with no
+            // diagnostic anywhere. The JVM raises here.
+            let Some(a) = args.get(argi).cloned() else {
+                return Err(format!(
+                    "java.util.MissingFormatArgumentException: Format specifier '{spec}'"
+                ));
+            };
             argi += 1;
             a
         };
+        // A CONVERSION IS TYPED. `%d` with a `String` used to coerce through
+        // `to_int()` and answer `0`; the JVM refuses the pair outright.
+        if !conversion_accepts(conv, &arg) {
+            return Err(format!(
+                "java.util.IllegalFormatConversionException: {conv} != {}",
+                format_arg_class(&arg)
+            ));
+        }
+        // A null argument renders as the four characters `null` under every
+        // conversion but `%b`, which answers `false` for it. The width and the
+        // `-` flag still apply, so `%5d` of a null is ` null`.
+        if matches!(arg, Value::Undef) && !matches!(conv, '%' | 'n' | 'b') {
+            out.push_str(&pad("null".to_string(), width, left, false, conv));
+            continue;
+        }
         let mut body = match conv {
             '%' => "%".to_string(),
             // `%n` is the platform line separator, which is `\n` everywhere
@@ -5364,7 +5770,16 @@ fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
                 }
             }
             'c' => char_string(num_of(&arg)),
-            'b' => format!("{}", truthy(&arg)),
+            // `%b` is a NULL TEST, not a truth test: `false` for null and for a
+            // `Boolean false`, `true` for every other value including `0`, `""`
+            // and an empty list. `truthy` answered Kotlin's notion of truth
+            // instead, so `"%b".format("x")` and `"%b".format(1)` both read
+            // `false` where the JVM reads `true` (measured on JDK 21.0.12).
+            'b' => match &arg {
+                Value::Undef => "false".to_string(),
+                Value::Bool(b) => b.to_string(),
+                _ => "true".to_string(),
+            },
             's' | 'S' => {
                 let s = kotlin_string(&arg);
                 let s = match prec {
@@ -5405,21 +5820,29 @@ fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
                 body.insert(0, ' ');
             }
         }
-        let pad = width.saturating_sub(body.chars().count());
-        if pad > 0 {
-            if left {
-                body.push_str(&" ".repeat(pad));
-            } else if zero && matches!(conv, 'd' | 'f' | 'e' | 'E' | 'x' | 'X' | 'o') {
-                // Zero padding goes after any sign, not before it.
-                let at = usize::from(body.starts_with(['-', '+', ' ']));
-                body.insert_str(at, &"0".repeat(pad));
-            } else {
-                body.insert_str(0, &" ".repeat(pad));
-            }
-        }
-        out.push_str(&body);
+        out.push_str(&pad(body, width, left, zero, conv));
     }
     Ok(out)
+}
+
+/// Widen `body` to `width`, the way `java.util.Formatter` does: spaces on the
+/// right under `-`, zeros after any sign under `0` on the numeric conversions,
+/// spaces on the left otherwise. Shared with the null-argument path, which pads
+/// its literal `null` by the same rules.
+fn pad(mut body: String, width: usize, left: bool, zero: bool, conv: char) -> String {
+    let n = width.saturating_sub(body.chars().count());
+    if n > 0 {
+        if left {
+            body.push_str(&" ".repeat(n));
+        } else if zero && matches!(conv, 'd' | 'f' | 'e' | 'E' | 'x' | 'X' | 'o') {
+            // Zero padding goes after any sign, not before it.
+            let at = usize::from(body.starts_with(['-', '+', ' ']));
+            body.insert_str(at, &"0".repeat(n));
+        } else {
+            body.insert_str(0, &" ".repeat(n));
+        }
+    }
+    body
 }
 
 /// UTF-16 offset of `needle` in `hay`, or -1 — matching `String.indexOf` and
@@ -5762,7 +6185,20 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
     }
     // Heap objects (List/Map/Pair/data-class members) dispatch through the heap.
     if let Value::Obj(_) = recv {
+        let from_sequence = is_sequence_view(recv);
         let out = obj_method(vm, recv, name, args);
+        // A DERIVED sequence is still a sequence. `Sequence.map`/`filter`/
+        // `take`/`drop`/… are declared to answer a `Sequence`, so
+        // `xs.asSequence().drop(1).first()` must still say `Sequence is empty.`
+        // A materialized one is carried as a `List`, and without this the tag
+        // stopped at the first derivation. The members that answer a
+        // COLLECTION instead (`toList`, `toSet`, `toMutableList`, …) are
+        // exactly the ones named here, so the rule is stated once.
+        if from_sequence && sequence_preserving(name) {
+            if let Ok(v) = &out {
+                tag_sequence(v.clone());
+            }
+        }
         // A mutating member (`add`, `put`, `remove`, …) may have appended to a
         // collection that does not iterate in insertion order. Restoring the
         // discipline here rather than at each mutation keeps the ~10 mutating
@@ -6445,7 +6881,9 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             // `asSequence` on a sequence is the identity.
             "asSequence" => return Ok(recv.clone()),
             _ => {
-                let items = alloc(HeapObj::List(gen_pull(vm, recv, None)?));
+                // Tagged: materializing a lazy sequence must not switch its diagnostics
+                // onto the `List` wording — see [`SEQ_VIEW`].
+                let items = tag_sequence(alloc(HeapObj::List(gen_pull(vm, recv, None)?)));
                 return obj_method(vm, &items, name, args);
             }
         }
@@ -6808,15 +7246,23 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     // kinds can't drift apart member by member. A range is flagged because its
     // `first`/`last` are *properties* of the progression (defined even when it is
     // empty), where a list's are element accessors.
-    let kind = with_obj(recv, |o| match o {
-        HeapObj::List(_) => Some(SeqKind::List),
-        HeapObj::Set(_) => Some(SeqKind::Set),
-        HeapObj::Array { .. } => Some(SeqKind::Array),
-        HeapObj::Range(_) => Some(SeqKind::Range),
-        _ => None,
+    //
+    // WHICH kind comes from [`seq_kind_of`], not from a second match written
+    // out here. This site used to answer the question itself, and the two
+    // answers had already drifted: a materialized `Sequence` is a
+    // `HeapObj::List`, so the local match called it a `List` and
+    // `listOf<Int>().asSequence().first()` said `List is empty.` where Kotlin
+    // says `Sequence is empty.` The `with_obj` below decides only WHETHER the
+    // receiver is an ordered sequence at all.
+    let ordered = with_obj(recv, |o| {
+        matches!(
+            o,
+            HeapObj::List(_) | HeapObj::Set(_) | HeapObj::Array { .. } | HeapObj::Range(_)
+        )
     })
-    .flatten();
-    if let Some(kind) = kind {
+    .unwrap_or(false);
+    if ordered {
+        let kind = seq_kind_of(recv);
         let range = with_obj(recv, |o| match o {
             HeapObj::Range(r) => Some(*r),
             _ => None,
@@ -7056,6 +7502,11 @@ fn seq_kind_of(v: &Value) -> SeqKind {
     if matches!(v, Value::Str(_)) {
         return SeqKind::CharSeq;
     }
+    // A materialized `Sequence` is carried as a `List` and would otherwise
+    // answer the `List` wording — see [`SEQ_VIEW`].
+    if is_sequence_view(v) {
+        return SeqKind::Seq;
+    }
     with_obj(v, |o| match o {
         HeapObj::Set(_) => SeqKind::Set,
         HeapObj::Map(_) => SeqKind::Set,
@@ -7117,8 +7568,14 @@ fn index_fault(kind: SeqKind, recv: Option<&Value>, i: i64, len: usize) -> Strin
                 _ => plain,
             }
         }
-        SeqKind::Set | SeqKind::Range | SeqKind::Seq => format!(
+        // `Iterable.elementAt` and `Sequence.elementAt` are two declarations
+        // with two messages — `Collection doesn't contain…` and `Sequence
+        // doesn't contain…`. Measured on kotlinc 2.4.10 / JDK 21.0.12.
+        SeqKind::Set | SeqKind::Range => format!(
             "java.lang.IndexOutOfBoundsException: Collection doesn't contain element at index {i}."
+        ),
+        SeqKind::Seq => format!(
+            "java.lang.IndexOutOfBoundsException: Sequence doesn't contain element at index {i}."
         ),
         SeqKind::CharSeq => sioobe_index(i, len),
     }
@@ -7353,9 +7810,12 @@ fn sequence_member(
         // by definition and the `as…` views wrap the receiver. Same elements,
         // different class, and the difference shows in an out-of-range message.
         "toList" => return Some(Ok(alloc_ro_list(items.to_vec()))),
-        "toMutableList" | "toTypedArray" | "asList" | "asIterable" | "asSequence" => {
+        "toMutableList" | "toTypedArray" | "asList" | "asIterable" => {
             return Some(Ok(alloc(HeapObj::List(items.to_vec()))))
         }
+        // Same eager representation, but tagged: its empty/exhausted
+        // diagnostics are the `Sequence` ones, not the `List` ones.
+        "asSequence" => return Some(Ok(tag_sequence(alloc(HeapObj::List(items.to_vec()))))),
         // `withIndex()` pairs each element with its position. Kotlin's element
         // type is the data class `IndexedValue`, whose `index`/`value` are read
         // as ordinary properties and which prints as
@@ -8107,13 +8567,21 @@ fn display_obj(id: u32) -> String {
             } => {
                 if *is_data {
                     // Only the primary-constructor properties, which is what
-                    // Kotlin's generated `toString` renders.
-                    let body = data_slice(fields, *data_from, *data_len)
-                        .iter()
-                        .map(|(n, v)| format!("{n}={}", kotlin_string(v)))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!("{class}({body})")
+                    // Kotlin's generated `toString` renders. Guarded like a
+                    // container: `data class D(var next: Any?)` holding itself
+                    // recurses here, and the JVM's generated `toString` has no
+                    // self-check — it raises `StackOverflowError`, which is what
+                    // `RENDER_DEPTH_LIMIT` delivers.
+                    let me = Value::Obj(id);
+                    rendering(&me, || {
+                        let body = data_slice(fields, *data_from, *data_len)
+                            .iter()
+                            .map(|(n, v)| format!("{n}={}", kotlin_string(v)))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("{class}({body})")
+                    })
+                    .unwrap_or_default()
                 } else if is_enum_class(class) {
                     // `Enum.toString()` is the constant's name.
                     match fields.iter().find(|(n, _)| n == "name") {
@@ -8134,20 +8602,41 @@ fn display_obj(id: u32) -> String {
             // A `Set` prints exactly like a `List` in Kotlin — square brackets,
             // elements in iteration (insertion) order.
             HeapObj::List(items) | HeapObj::Set(items) => {
-                let body = items
-                    .iter()
-                    .map(kotlin_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("[{body}]")
+                let me = Value::Obj(id);
+                rendering(&me, || {
+                    let body = items
+                        .iter()
+                        .map(|x| match self_reference(x, false) {
+                            Some(s) => s.to_string(),
+                            None => kotlin_string(x),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("[{body}]")
+                })
+                .unwrap_or_default()
             }
             HeapObj::Map(entries) => {
-                let body = entries
-                    .iter()
-                    .map(|(k, v)| format!("{}={}", kotlin_string(k), kotlin_string(v)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{{{body}}}")
+                let me = Value::Obj(id);
+                rendering(&me, || {
+                    let body = entries
+                        .iter()
+                        .map(|(k, v)| {
+                            let ks = match self_reference(k, true) {
+                                Some(s) => s.to_string(),
+                                None => kotlin_string(k),
+                            };
+                            let vs = match self_reference(v, true) {
+                                Some(s) => s.to_string(),
+                                None => kotlin_string(v),
+                            };
+                            format!("{ks}={vs}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{{{body}}}")
+                })
+                .unwrap_or_default()
             }
             HeapObj::Pair(a, b) => format!("({}, {})", kotlin_string(a), kotlin_string(b)),
             // Kotlin's `Lazy.toString()` reports whether the value has been
