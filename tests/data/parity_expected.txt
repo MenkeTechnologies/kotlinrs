@@ -602,3 +602,34 @@ import kotlin.math.*\n\nfun main() {\n    println(Math.round(0.49999999999999994
 import kotlin.math.*\n\nfun main() {\n    try { println(Double.NaN.roundToInt()) } catch (e: Throwable) { println(e) }\n    try { println(Double.NaN.roundToLong()) } catch (e: Throwable) { println(e) }\n    try { println(5.coerceIn(3, 1)) } catch (e: Throwable) { println(e) }\n    println(Double.NaN.coerceIn(1.0, 3.0))\n    println((-0.0).coerceIn(0.0, 1.0))\n}	java.lang.IllegalArgumentException: Cannot round NaN value.\njava.lang.IllegalArgumentException: Cannot round NaN value.\njava.lang.IllegalArgumentException: Cannot coerce value to an empty range: maximum 1 is less than minimum 3.\nNaN\n-0.0\n
 fun main() {\n    val i = 9\n    for (n in 0..2) {\n        val b = buildList { for (k in 1..n) add(k) }\n        try { b[i] } catch (e: Throwable) { println(e) }\n    }\n    try { listOfNotNull(1)[i] } catch (e: Throwable) { println(e) }\n    try { listOfNotNull<Int>(null)[i] } catch (e: Throwable) { println(e) }\n    try { listOfNotNull(1, null)[i] } catch (e: Throwable) { println(e) }\n    try { listOfNotNull<Int>(null, null)[i] } catch (e: Throwable) { println(e) }\n}	java.lang.IndexOutOfBoundsException: index: 9, size: 0\njava.lang.IndexOutOfBoundsException: index: 9, size: 1\njava.lang.IndexOutOfBoundsException: index: 9, size: 2\njava.lang.IndexOutOfBoundsException: Index: 9, Size: 1\njava.lang.IndexOutOfBoundsException: Empty list doesn't contain element at index 9.\njava.lang.IndexOutOfBoundsException: Index 9 out of bounds for length 1\njava.lang.IndexOutOfBoundsException: Index 9 out of bounds for length 0\n
 fun main() {\n    println(1..5 step 2)\n    println((1..5).step(2))\n    println((5 downTo 1).step(2))\n    println(('a'..'g').step(3))\n    println((1..5).step(2).toList())\n    val n = 0\n    try { (1..5).step(n) } catch (e: Throwable) { println(e) }\n}	1..5 step 2\n1..5 step 2\n5 downTo 1 step 2\na..g step 3\n[1, 3, 5]\njava.lang.IllegalArgumentException: Step must be positive, was: 0.\n
+fun main() { val xs = mutableListOf<Any>(); xs.add(xs); println(xs) }	[(this Collection)]\n
+fun main() { val xs = mutableListOf<Any>(); xs.add(1); xs.add(xs); xs.add(2); println(xs) }	[1, (this Collection), 2]\n
+fun main() { val s = mutableSetOf<Any>(); s.add(s); println(s) }	[(this Collection)]\n
+fun main() { val m = mutableMapOf<String, Any>(); m["k"] = m; println(m) }	{k=(this Map)}\n
+fun main() { val m = mutableMapOf<Any, Int>(); m[m] = 1; println(m) }	{(this Map)=1}\n
+fun f(n: Int): Int = if (n == 0) 0 else listOf(n).map { f(it - 1) }[0]\nfun main() { try { println(f(200000)) } catch (e: Throwable) { println(e) } }	java.lang.StackOverflowError\n
+fun f(n: Int): Int = if (n == 0) 0 else listOf(n).map { f(it - 1) }[0]\nfun main() { try { println(f(200000)) } catch (e: Exception) { println("Exception") } catch (e: Throwable) { println("not an Exception") } }	not an Exception\n
+fun f(n: Int): Int = if (n == 0) 0 else listOf(n).map { f(it - 1) }[0]\nfun main() { try { println(f(200000)) } catch (e: Error) { println("Error") } catch (e: Throwable) { println("not an Error") } }	Error\n
+data class D(var next: Any?)\nfun main() { val d = D(null); d.next = d; try { println(d) } catch (e: Throwable) { println(e) } }	java.lang.StackOverflowError\n
+fun main() { val a = mutableListOf<Any>(); val b = mutableListOf<Any>(); a.add(b); b.add(a); try { println(a) } catch (e: Throwable) { println(e) } }	java.lang.StackOverflowError\n
+fun main() { try { println("%d %d".format(1)) } catch (e: Throwable) { println(e) } }	java.util.MissingFormatArgumentException: Format specifier '%d'\n
+fun main() { try { println("%-5.2f".format()) } catch (e: Throwable) { println(e) } }	java.util.MissingFormatArgumentException: Format specifier '%-5.2f'\n
+fun main() { try { println("%,d".format()) } catch (e: Throwable) { println(e) } }	java.util.MissingFormatArgumentException: Format specifier '%,d'\n
+fun main() { try { println("%d".format("x")) } catch (e: Throwable) { println(e) } }	java.util.IllegalFormatConversionException: d != java.lang.String\n
+fun main() { try { println("%f".format(1)) } catch (e: Throwable) { println(e) } }	java.util.IllegalFormatConversionException: f != java.lang.Integer\n
+fun main() { try { println("%c".format("x")) } catch (e: Throwable) { println(e) } }	java.util.IllegalFormatConversionException: c != java.lang.String\n
+fun main() { try { println("%e".format(1)) } catch (e: Throwable) { println(e) } }	java.util.IllegalFormatConversionException: e != java.lang.Integer\n
+fun main() { try { println("%2147483648d".format(1)) } catch (e: Throwable) { println(e) } }	java.util.IllegalFormatWidthException: -2147483648\n
+fun main() { try { println("%.2147483648f".format(1.0)) } catch (e: Throwable) { println(e) } }	java.util.IllegalFormatPrecisionException: -2147483648\n
+fun main() { try { println("%q".format(1)) } catch (e: IllegalArgumentException) { println("caught " + e) } }	caught java.util.UnknownFormatConversionException: Conversion = 'q'\n
+fun main() { try { println("%d".format("x")) } catch (e: RuntimeException) { println("caught " + e) } }	caught java.util.IllegalFormatConversionException: d != java.lang.String\n
+fun main() { val n: Any? = null; println("%b".format(n)); println("%b".format(false)); println("%b".format("x")); println("%b".format(1)); println("%b".format(0)) }	false\nfalse\ntrue\ntrue\ntrue\n
+fun main() { val n: Any? = null; println("[" + "%d".format(n) + "]"); println("[" + "%f".format(n) + "]"); println("[" + "%5d".format(n) + "]"); println("[" + "%-6s".format(n) + "]") }	[null]\n[null]\n[ null]\n[null  ]\n
+fun main() { println("%d".format(1, 2, 3)); println("a%%b%nc".format().length) }	1\n5\n
+fun main() { try { println(listOf<Int>().asSequence().first()) } catch (e: Throwable) { println(e) } }	java.util.NoSuchElementException: Sequence is empty.\n
+fun main() { try { println(listOf<Int>().asSequence().reduce { a, b -> a + b }) } catch (e: Throwable) { println(e) } }	java.lang.UnsupportedOperationException: Empty sequence can't be reduced.\n
+fun main() { try { println(listOf(1).asSequence().elementAt(9)) } catch (e: Throwable) { println(e) } }	java.lang.IndexOutOfBoundsException: Sequence doesn't contain element at index 9.\n
+fun main() { try { println(listOf(1, 2).asSequence().map { it }.filter { it > 9 }.first()) } catch (e: Throwable) { println(e) } }	java.util.NoSuchElementException: Sequence is empty.\n
+fun main() { try { println(listOf<Int>().asSequence().toList().first()) } catch (e: Throwable) { println(e) } }	java.util.NoSuchElementException: List is empty.\n
+fun main() { try { println(generateSequence<Int>(null) { it }.first()) } catch (e: Throwable) { println(e) } }	java.util.NoSuchElementException: Sequence is empty.\n
+fun f(n: Int): Int = if (n == 0) 0 else listOf(n).map { f(it - 1) }[0]\nfun main() { println(f(1500)) }	0\n

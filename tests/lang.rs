@@ -4759,3 +4759,433 @@ fun main() {
         "java.lang.IllegalArgumentException: Step must be positive, was: 0.\n"
     );
 }
+
+// ─── Round 7: a fault the program cannot catch is not a fault Kotlin has ──
+//
+// Every expected string below was measured on kotlinc 2.4.10 running on JRE
+// 21.0.12, with the program COMPILED by that same JVM and RUN under
+// `java -cp out:kotlin-stdlib.jar` (not the `kotlin` launcher, whose
+// URLClassLoader changes how a `ClassCastException` words itself). Both axes
+// matter and both were pinned.
+
+/// Runaway recursion through a lambda, a `toString`, or an `equals` used to
+/// exhaust the RUST stack — `fatal runtime error: stack overflow, aborting`,
+/// SIGABRT, exit 134. That is not a Kotlin behaviour at any depth: the JVM
+/// raises `StackOverflowError`, which a program can catch and recover from.
+/// Reproduced at depth 100 before the fix; every shape below aborted.
+#[test]
+fn runaway_recursion_raises_a_catchable_stack_overflow_error() {
+    // Through a lambda-taking collection member — a re-entrant `vm.run()` per
+    // level, which is what the Rust stack was paying for.
+    assert_eq!(
+        prog(
+            "fun f(n: Int): Int = if (n == 0) 0 else listOf(n).map { f(it - 1) }[0]\n\
+             fun main() { try { println(f(200000)) } catch (e: Throwable) { println(e) } }"
+        ),
+        "java.lang.StackOverflowError\n"
+    );
+    // Through a user `toString()` that walks a cycle.
+    assert_eq!(
+        prog(
+            "class N { var next: N? = null\n\
+             \x20   override fun toString(): String = \"N(\" + next + \")\" }\n\
+             fun main() { val a = N(); a.next = a\n\
+             \x20   try { println(a) } catch (e: Throwable) { println(e) } }"
+        ),
+        "java.lang.StackOverflowError\n"
+    );
+    // Through a data class's GENERATED toString, which has no self-check.
+    assert_eq!(
+        prog(
+            "data class D(var next: Any?)\n\
+             fun main() { val d = D(null); d.next = d\n\
+             \x20   try { println(d) } catch (e: Throwable) { println(e) } }"
+        ),
+        "java.lang.StackOverflowError\n"
+    );
+    // Through a user `equals`.
+    assert_eq!(
+        prog(
+            "class E { var o: E? = null\n\
+             \x20   override fun equals(other: Any?): Boolean = o == (other as E).o }\n\
+             fun main() { val a = E(); a.o = a\n\
+             \x20   try { println(a == a) } catch (e: Throwable) { println(e) } }"
+        ),
+        "java.lang.StackOverflowError\n"
+    );
+}
+
+/// `StackOverflowError` is an `Error` under `VirtualMachineError`, so
+/// `catch (e: Exception)` must NOT claim it — the property that separates a
+/// throwable placed in the hierarchy from one that merely has the right name.
+/// A class absent from `THROWABLE_PARENTS` descends straight from `Throwable`,
+/// which answers this pair the same way by accident; the uncaught line below is
+/// what distinguishes them, and the `Error` arm is what pins the placement.
+#[test]
+fn stack_overflow_error_sits_under_error_and_not_under_exception() {
+    let recurse = "fun f(n: Int): Int = if (n == 0) 0 else listOf(n).map { f(it - 1) }[0]\n";
+    assert_eq!(
+        prog(&format!(
+            "{recurse}fun main() {{ try {{ println(f(200000)) }} \
+             catch (e: Exception) {{ println(\"Exception\") }} \
+             catch (e: Throwable) {{ println(\"not an Exception\") }} }}"
+        )),
+        "not an Exception\n"
+    );
+    assert_eq!(
+        prog(&format!(
+            "{recurse}fun main() {{ try {{ println(f(200000)) }} \
+             catch (e: Error) {{ println(\"Error\") }} \
+             catch (e: Throwable) {{ println(\"not an Error\") }} }}"
+        )),
+        "Error\n"
+    );
+    // Uncaught, it is the JVM's own report line — messageless, so no colon.
+    assert_eq!(
+        uncaught_line(&format!("{recurse}fun main() {{ println(f(200000)) }}")),
+        "Exception in thread \"main\" java.lang.StackOverflowError"
+    );
+}
+
+/// `AbstractCollection.toString` checks each element against `this` and writes
+/// `(this Collection)`; `AbstractMap` writes `(this Map)`. The check is
+/// reference identity against the IMMEDIATE receiver and nothing more, so a
+/// two-step cycle still overflows — which is why both halves are pinned here.
+/// Every one of these eight aborted with SIGABRT before the fix.
+#[test]
+fn a_container_holding_itself_renders_the_jvm_placeholder() {
+    assert_eq!(
+        prog("fun main() { val xs = mutableListOf<Any>(); xs.add(xs); println(xs) }"),
+        "[(this Collection)]\n"
+    );
+    assert_eq!(
+        prog(
+            "fun main() { val xs = mutableListOf<Any>()\n\
+             \x20   xs.add(1); xs.add(xs); xs.add(2); println(xs) }"
+        ),
+        "[1, (this Collection), 2]\n"
+    );
+    assert_eq!(
+        prog("fun main() { val s = mutableSetOf<Any>(); s.add(s); println(s) }"),
+        "[(this Collection)]\n"
+    );
+    assert_eq!(
+        prog("fun main() { val m = mutableMapOf<String, Any>(); m[\"k\"] = m; println(m) }"),
+        "{k=(this Map)}\n"
+    );
+    assert_eq!(
+        prog("fun main() { val m = mutableMapOf<Any, Int>(); m[m] = 1; println(m) }"),
+        "{(this Map)=1}\n"
+    );
+    // INDIRECT cycles get no placeholder — the JVM has no cycle detection, only
+    // that one identity check — so they raise, and raise catchably.
+    for src in [
+        "fun main() { val a = mutableListOf<Any>(); val b = mutableListOf<Any>()\n\
+         \x20   a.add(b); b.add(a)\n\
+         \x20   try { println(a) } catch (e: Throwable) { println(e) } }",
+        "fun main() { val xs = mutableListOf<Any>(); val ys = mutableListOf<Any>(xs)\n\
+         \x20   xs.add(ys)\n\
+         \x20   try { println(ys) } catch (e: Throwable) { println(e) } }",
+        "fun main() { val xs = mutableListOf<Any>(); xs.add(listOf(xs))\n\
+         \x20   try { println(xs) } catch (e: Throwable) { println(e) } }",
+    ] {
+        assert_eq!(prog(src), "java.lang.StackOverflowError\n", "for {src:?}");
+    }
+}
+
+/// An exhausted argument list used to become `Undef`, which every numeric
+/// conversion read as `0` — so `"%d %d".format(1)` answered `1 0`, a wrong
+/// answer with no diagnostic anywhere. The JVM raises, and it quotes the
+/// specifier AS WRITTEN, flags and width and precision included.
+#[test]
+fn a_specifier_with_no_argument_left_raises_and_quotes_itself() {
+    for (src, want) in [
+        (
+            r#"fun main() { try { println("%d %d".format(1)) } catch (e: Throwable) { println(e) } }"#,
+            "java.util.MissingFormatArgumentException: Format specifier '%d'\n",
+        ),
+        (
+            r#"fun main() { try { println("%s".format()) } catch (e: Throwable) { println(e) } }"#,
+            "java.util.MissingFormatArgumentException: Format specifier '%s'\n",
+        ),
+        (
+            r#"fun main() { try { println("%-5.2f".format()) } catch (e: Throwable) { println(e) } }"#,
+            "java.util.MissingFormatArgumentException: Format specifier '%-5.2f'\n",
+        ),
+        (
+            r#"fun main() { try { println("%,d".format()) } catch (e: Throwable) { println(e) } }"#,
+            "java.util.MissingFormatArgumentException: Format specifier '%,d'\n",
+        ),
+        (
+            r#"fun main() { try { println("a%sb%dc".format("x")) } catch (e: Throwable) { println(e) } }"#,
+            "java.util.MissingFormatArgumentException: Format specifier '%d'\n",
+        ),
+    ] {
+        assert_eq!(prog(src), want, "for {src:?}");
+    }
+    // EXTRA arguments are ignored, not a fault.
+    assert_eq!(
+        prog(r#"fun main() { println("%d".format(1, 2, 3)) }"#),
+        "1\n"
+    );
+    // `%%` and `%n` consume no argument, so an empty list is fine.
+    assert_eq!(
+        prog(r#"fun main() { println("a%%b%nc".format().length) }"#),
+        "5\n"
+    );
+}
+
+/// A conversion is TYPED. `%d` with a `String` used to coerce through `to_int()`
+/// and print `0`; `%f` with an `Int` printed `1.000000` where the JVM refuses
+/// the pair. The refusal names the conversion character and the argument's
+/// boxed class.
+#[test]
+fn a_conversion_refuses_an_argument_of_the_wrong_class() {
+    for (src, want) in [
+        (r#""%d".format("x")"#, "d != java.lang.String"),
+        (r#""%d".format(true)"#, "d != java.lang.Boolean"),
+        (r#""%d".format(1.5)"#, "d != java.lang.Double"),
+        (r#""%d".format('a')"#, "d != java.lang.Character"),
+        (r#""%f".format("x")"#, "f != java.lang.String"),
+        (r#""%f".format(1)"#, "f != java.lang.Integer"),
+        (r#""%x".format("x")"#, "x != java.lang.String"),
+        (r#""%o".format(true)"#, "o != java.lang.Boolean"),
+        (r#""%e".format(1)"#, "e != java.lang.Integer"),
+        (r#""%c".format("x")"#, "c != java.lang.String"),
+        (r#""%c".format(1.0)"#, "c != java.lang.Double"),
+    ] {
+        assert_eq!(
+            prog(&format!(
+                "fun main() {{ try {{ println({src}) }} catch (e: Throwable) {{ println(e) }} }}"
+            )),
+            format!("java.util.IllegalFormatConversionException: {want}\n"),
+            "for {src}"
+        );
+    }
+    // The pairs the JVM ACCEPTS must keep working — the check must not have
+    // become a blanket refusal.
+    for (src, want) in [
+        (r#""%c".format(65)"#, "A"),
+        (r#""%c".format('z')"#, "z"),
+        (r#""%s".format(1)"#, "1"),
+        (r#""%s".format(listOf(1, 2))"#, "[1, 2]"),
+        (r#""%d".format(255)"#, "255"),
+        (r#""%x".format(255)"#, "ff"),
+        (r#""%f".format(5.0)"#, "5.000000"),
+    ] {
+        assert_eq!(
+            prog(&format!("fun main() {{ println({src}) }}")),
+            format!("{want}\n")
+        );
+    }
+}
+
+/// The Theme-C property a message audit cannot see: every `java.util.Formatter`
+/// fault descends from `IllegalFormatException`, which descends from
+/// `IllegalArgumentException`. kotlinrs produced the right MESSAGES for these
+/// before it had the right CLASSES, so a `catch (e: IllegalArgumentException)`
+/// — which the JVM answers YES to — saw nothing at all and the throwable fell
+/// out to `Throwable`.
+#[test]
+fn a_format_fault_is_catchable_where_the_jvm_catches_it() {
+    for fault in [
+        r#""%q".format(1)"#,              // UnknownFormatConversionException
+        r#""%d".format("x")"#,            // IllegalFormatConversionException
+        r#""%d %d".format(1)"#,           // MissingFormatArgumentException
+        r#""%,s".format("a")"#,           // FormatFlagsConversionMismatchException
+        r#""%2147483648d".format(1)"#,    // IllegalFormatWidthException
+        r#""%.2147483648f".format(1.0)"#, // IllegalFormatPrecisionException
+    ] {
+        for level in ["IllegalArgumentException", "RuntimeException", "Exception"] {
+            assert_eq!(
+                prog(&format!(
+                    "fun main() {{ try {{ println({fault}) }} \
+                     catch (e: {level}) {{ println(\"caught\") }} \
+                     catch (e: Throwable) {{ println(\"escaped\") }} }}"
+                )),
+                "caught\n",
+                "{fault} should be caught by {level}"
+            );
+        }
+        // And it is NOT an `Error`.
+        assert_eq!(
+            prog(&format!(
+                "fun main() {{ try {{ println({fault}) }} \
+                 catch (e: Error) {{ println(\"Error\") }} \
+                 catch (e: Throwable) {{ println(\"not an Error\") }} }}"
+            )),
+            "not an Error\n",
+            "{fault} is not an Error"
+        );
+    }
+}
+
+/// A width or precision that does not fit an `int`. kotlinrs parsed the digits
+/// into a `usize` and fell back to `unwrap_or(0)`, so an overflowing width was
+/// silently NO width — and the values that fit a `usize` but not an `int`
+/// (`%4294967296d`) tried to pad to four billion characters and hung. Java
+/// parses into an `int` and rejects the negative, so every overflowing spelling
+/// lands on the same number.
+#[test]
+fn a_width_or_precision_that_overflows_an_int_is_a_fault() {
+    for spec in [
+        "%2147483648d",
+        "%10000000000d",
+        "%4294967296d",
+        "%99999999999999999999d",
+    ] {
+        assert_eq!(
+            prog(&format!(
+                "fun main() {{ try {{ println(\"{spec}\".format(1)) }} \
+                 catch (e: Throwable) {{ println(e) }} }}"
+            )),
+            "java.util.IllegalFormatWidthException: -2147483648\n",
+            "for {spec}"
+        );
+    }
+    for spec in ["%.2147483648f", "%.99999999999999999999f"] {
+        assert_eq!(
+            prog(&format!(
+                "fun main() {{ try {{ println(\"{spec}\".format(1.0)) }} \
+                 catch (e: Throwable) {{ println(e) }} }}"
+            )),
+            "java.util.IllegalFormatPrecisionException: -2147483648\n",
+            "for {spec}"
+        );
+    }
+    // A width that DOES fit still pads.
+    assert_eq!(
+        prog(r#"fun main() { println("[%5d]".format(1)) }"#),
+        "[    1]\n"
+    );
+}
+
+/// `%b` is a NULL TEST, not a truth test: `false` only for `null` and for a
+/// `Boolean false`. kotlinrs answered Kotlin's notion of truth, so
+/// `"%b".format("x")` and `"%b".format(1)` both read `false` where the JVM
+/// reads `true` — a silently wrong answer on the happy path.
+#[test]
+fn percent_b_is_a_null_test_and_not_a_truth_test() {
+    let src = r#"fun main() {
+    val n: Any? = null
+    println("%b".format(n))
+    println("%b".format(false))
+    println("%b".format(true))
+    println("%b".format("x"))
+    println("%b".format(""))
+    println("%b".format(1))
+    println("%b".format(0))
+    println("%b".format(listOf<Int>()))
+}"#;
+    assert_eq!(
+        prog(src),
+        "false\nfalse\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n"
+    );
+}
+
+/// A null argument renders as the four characters `null` under every conversion
+/// but `%b`, and the width and `-` flag still apply. kotlinrs coerced it
+/// through the conversion instead, printing `0` for `%d`, `0.000000` for `%f`
+/// and a NUL character for `%c`.
+#[test]
+fn a_null_argument_renders_as_null_under_every_conversion_but_b() {
+    let src = r#"fun main() {
+    val n: Any? = null
+    println("[" + "%d".format(n) + "]")
+    println("[" + "%x".format(n) + "]")
+    println("[" + "%f".format(n) + "]")
+    println("[" + "%c".format(n) + "]")
+    println("[" + "%s".format(n) + "]")
+    println("[" + "%5d".format(n) + "]")
+    println("[" + "%-6s".format(n) + "]")
+}"#;
+    assert_eq!(
+        prog(src),
+        "[null]\n[null]\n[null]\n[null]\n[null]\n[ null]\n[null  ]\n"
+    );
+}
+
+/// `kotlin.sequences` declares its own `first`/`last`/`single`/`reduce`/
+/// `elementAt`, each wording its empty-or-exhausted fault as a SEQUENCE.
+/// kotlinrs materializes a bounded sequence into a `List` and its diagnostics
+/// followed that representation, so `listOf<Int>().asSequence().first()` said
+/// `List is empty.` The representation is not observable; the message is.
+#[test]
+fn a_sequence_words_its_faults_as_a_sequence_and_not_as_a_list() {
+    for (expr, want) in [
+        ("listOf<Int>().asSequence().first()", "java.util.NoSuchElementException: Sequence is empty."),
+        ("listOf<Int>().asSequence().last()", "java.util.NoSuchElementException: Sequence is empty."),
+        ("listOf<Int>().asSequence().single()", "java.util.NoSuchElementException: Sequence is empty."),
+        (
+            "listOf<Int>().asSequence().reduce { a, b -> a + b }",
+            "java.lang.UnsupportedOperationException: Empty sequence can't be reduced.",
+        ),
+        (
+            "listOf(1).asSequence().elementAt(9)",
+            "java.lang.IndexOutOfBoundsException: Sequence doesn't contain element at index 9.",
+        ),
+        (
+            "listOf(1).asSequence().first { it > 9 }",
+            "java.util.NoSuchElementException: Sequence contains no element matching the predicate.",
+        ),
+        // A DERIVED sequence is still a sequence: `drop` answers a `Sequence`,
+        // so the wording must survive the step. It did not — the tag stopped
+        // after one derivation.
+        (
+            "listOf(1).asSequence().drop(1).first()",
+            "java.util.NoSuchElementException: Sequence is empty.",
+        ),
+        (
+            "listOf(1, 2).asSequence().map { it }.filter { it > 9 }.first()",
+            "java.util.NoSuchElementException: Sequence is empty.",
+        ),
+        // A generated one, which was never a list at any point.
+        (
+            "generateSequence<Int>(null) { it }.first()",
+            "java.util.NoSuchElementException: Sequence is empty.",
+        ),
+    ] {
+        assert_eq!(
+            prog(&format!(
+                "fun main() {{ try {{ println({expr}) }} catch (e: Throwable) {{ println(e) }} }}"
+            )),
+            format!("{want}\n"),
+            "for {expr}"
+        );
+    }
+    // The LIST wording must not have moved: an untagged receiver still says
+    // `List`, which is what makes the two distinguishable at all.
+    assert_eq!(
+        prog("fun main() { try { println(listOf<Int>().first()) } catch (e: Throwable) { println(e) } }"),
+        "java.util.NoSuchElementException: List is empty.\n"
+    );
+    // And `toList()` on a sequence answers a COLLECTION, so it goes back to the
+    // list wording.
+    assert_eq!(
+        prog("fun main() { try { println(listOf<Int>().asSequence().toList().first()) } catch (e: Throwable) { println(e) } }"),
+        "java.util.NoSuchElementException: List is empty.\n"
+    );
+}
+
+/// Recursion depth BELOW the limit must still run. The guard replaced an abort
+/// at a depth under 100 with a raise at 2000, so this is also the pin that the
+/// usable depth went up rather than down.
+#[test]
+fn recursion_below_the_limit_still_completes() {
+    assert_eq!(
+        prog(
+            "fun f(n: Int): Int = if (n == 0) 0 else listOf(n).map { f(it - 1) }[0]\n\
+             fun main() { println(f(1500)) }"
+        ),
+        "0\n"
+    );
+    // Plain recursion does not nest the interpreter at all — its frames live on
+    // the VM's own heap-allocated stack — so it is not subject to the limit.
+    assert_eq!(
+        prog(
+            "fun g(n: Int): Int = if (n == 0) 0 else 1 + g(n - 1)\n\
+             fun main() { println(g(50000)) }"
+        ),
+        "50000\n"
+    );
+}
