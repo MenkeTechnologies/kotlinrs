@@ -733,6 +733,19 @@ fusevm::VM  ──►  three-tier Cranelift JIT (linear · block · tracing)
   records enter that file, and it invokes the reference toolchain **exclusively**
   — a corpus recorded from kotlinrs would be a record of our own behaviour rather
   than of Kotlin's, and would pass forever no matter what broke.
+- **A frozen pin is only as good as the capture that minted it, and the replay
+  never re-checks.** `tests/parity.rs` runs the frontend, not the oracle, so a
+  line written from memory rather than measured passes there for good — and the
+  only way to make it pass is to break the frontend to match it. The JDK and
+  locale gates guard the oracle a capture RAN AGAINST; nothing in them says a
+  given line ever came from one. `scripts/reverify-parity.sh` is that check: it
+  re-mints every record from a live JDK 21+ toolchain and compares byte for
+  byte, naming the JVM it resolved for the compile step and for the run step
+  before it compares anything. It batches the compile (one package per record,
+  so top-level declarations cannot collide) and then re-captures anything that
+  disagreed on its own, in the default package, through `capture-parity.sh` —
+  because a package is observable in a user throwable's `toString`, and that
+  artifact must not be mistaken for a bad pin. A developer step, not a CI one.
 - **The JVM under the oracle is part of the oracle, and the capture pins it.**
   `kotlinc` is a launcher that runs on whatever `$JAVA_HOME` names, and a Kotlin
   program's output is not the compiler's alone: `Double.toString` changed
@@ -1173,10 +1186,86 @@ or not the `Exception in thread "main"` report line was written at all. Those
 now compare the whole line, across the five list shapes that word the same fault
 five different ways.
 
-Next: `sequence { … }`/`yield`, variance and bounds,
+The round after that asked a third question of the same corpus: not "was the
+reference recorded faithfully" and not "is the reference written down here at
+all", but **"can the program CATCH what it is told"**. A fault whose value
+matches is still a divergence when the shape around it does not, and there are
+two ways for that to happen.
+
+The first is a **fault that is not a throwable at all**. A Rust stack overflow
+is `SIGABRT` — nothing unwinds, and no `catch` can see it — where Kotlin raises
+a perfectly ordinary `StackOverflowError`. Eight programs aborted that way.
+Four went through the re-entrant `vm.run()` that a closure body, a `toString`
+override or a lambda-taking member each need: one level of Kotlin recursion
+costs one Rust frame of the whole dispatch loop, about 100 KB of it, so the
+platform's default 8 MiB main-thread stack ran out somewhere between depth 50
+and depth 100. The run now happens on a thread whose 512 MiB stack is reserved
+up front, and the nesting is capped below what that stack can take, so the
+failure is raised rather than hit — usable depth up roughly 30×, and what
+remains is catchable. `StackOverflowError` sits under `VirtualMachineError`
+where it belongs, so `catch (e: Exception)` correctly does NOT claim it.
+
+The other four were the display walk, and the JVM does not answer them all
+alike. `AbstractCollection.toString` compares each element against `this` —
+reference identity, the immediate receiver, one level — so a list that holds
+ITSELF renders `[(this Collection)]` and a map `{k=(this Map)}`, while `a`
+holding `b` holding `a` has no check to save it and raises. Implementing only
+the first half is what makes the two differ here the way they differ there.
+
+The second way is a **right message under a class the hierarchy never heard
+of**, which is exactly the defect a message audit cannot see. Every
+`java.util.Formatter` fault already produced the JVM's wording to the character,
+and every one of them was catchable only as `Throwable`: none was declared
+under `IllegalFormatException`, so `catch (e: IllegalArgumentException)` — which
+the reference answers YES to for all six — saw nothing. Auditing the family for
+its class turned up three faults that were not raised at all but answered
+instead: `"%d %d".format(1)` read `1 0`, because an exhausted argument list
+became a hole that `to_int()` reads as `0`; `"%d".format("x")` read `0`, because
+a conversion was untyped and coerced its operand; and a width too big for an
+`int` became NO width, so `"%99999999999999999999d"` printed `1` and
+`"%4294967296d"` tried to pad to four billion characters and never came back.
+`%b` was a truth test where the JVM has a null test, so `"%b".format("x")` read
+`false`. A null argument was coerced through the conversion instead of printing
+`null`.
+
+The same question over the sequences found a message following the
+REPRESENTATION rather than the type: kotlinrs materializes a bounded sequence
+into a `List`, and `listOf<Int>().asSequence().first()` said `List is empty.`
+where Kotlin says `Sequence is empty.` A sequence view is tagged now — not as a
+`List` implementation row, because that table names which JVM `List` class a
+handle is and a `Sequence` is not a `List` of any class — and the tag survives
+`map`/`filter`/`drop` (which answer a `Sequence`) without surviving `toList`
+(which does not). Finding it also turned up why it was missing: the dispatch
+site for the shared ordered members re-derived the receiver's kind with a match
+of its own rather than asking the one function that knows, and the two answers
+had drifted. There is one derivation now.
+
+Alongside them, the census that a green test suite cannot perform on itself:
+can any test in `tests/` execute ZERO assertions and still report PASS? The 224
+language tests came back clean — the only two whose assertions all sit inside a
+loop iterate over inline array literals, which cannot be empty — but the
+source-scraping guards did not. `compiler_emits_each_id_through_its_own_table`
+matches the literal text `Op::CallBuiltin(KT_` in the compiler; renaming that
+needle left the test **green** while the other five still ran, because both of
+its loops then iterated over nothing. A guard that goes quiet exactly when the
+thing it guards has moved is the worst failure a guard can have, and every other
+parser in that file already asserted its own yield. Both halves are floored now,
+and the same rename fails loudly.
+
+And the provenance question was re-asked of the whole corpus rather than a
+sample: all 635 records re-minted from a live JDK 21.0.12 toolchain and compared
+byte for byte, with **no fabricated pin found**. That audit is
+`scripts/reverify-parity.sh` now instead of an ad-hoc step — it is the only
+check there is, since the replay test never runs the oracle, and it states which
+JVM it resolved for the compile step and for the run step before it compares
+anything.
+
+Next: `sequence { … }`/`yield`, `lateinit`, `Throwable.cause` and the
+`(message, cause)` constructors, variance and bounds,
 `Delegates.observable`/`vetoable`, and a growing standard-library surface —
 alongside the sibling parity tooling (LSP/DAP, reference generator, differential
-harness).
+harness). Open divergences are tracked in [BUGS.md](BUGS.md); the round-by-round
+record continues in [CHANGELOG.md](CHANGELOG.md).
 
 ## [0xFF] LICENSE
 
