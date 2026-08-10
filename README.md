@@ -1148,6 +1148,17 @@ comes back wrapping a bare array, so it raises the ARRAY subclass exactly as a
 list literal does — and a RANGE receiver, being `Iterable` and not `Collection`,
 is the one case where the old row was right.
 
+Two more rows surfaced when the round's three standing items were re-judged
+against the same question. `buildList { … }` hands back a
+`kotlin.collections.builders.ListBuilder`, which collapses at no size and words
+its bounds fault lowercase and comma-separated, `index: 9, size: 2`, where every
+other `List` says `Index 9 out of bounds for length 2`. And `listOfNotNull`
+declares two overloads that hand back different classes, with ARITY deciding —
+the vararg one is `filterNotNull()`, a plain `ArrayList`; the one-argument one
+is `if (element != null) listOf(element) else emptyList()` and collapses like a
+literal. The provenance table had claimed `listOfNotNull` for the read-only row,
+which is neither of those, and nothing implemented even that.
+
 Four assertions that could not fail went with them. `stderr.contains(
 "IndexOutOfBoundsException")` cannot tell the plain subclass from the array one
 — it is a substring of both — cannot see the detail message, and passes whether

@@ -487,10 +487,14 @@ enum ListImpl {
     Literal,
     /// The result of a member that ends in Kotlin's `optimizeReadOnlyList` —
     /// `toList`, `reversed`, `distinct`, `take`, `drop`, `takeLast`,
-    /// `dropLast`, `slice`, `listOfNotNull`. Same collapse at 0 and 1, but at 2
-    /// or more it is the `ArrayList` the member built, NOT an array-backed one
-    /// — which is the whole reason this is a second tag rather than a flag on
-    /// [`Literal`].
+    /// `dropLast`, `slice`. Same collapse at 0 and 1, but at 2 or more it is
+    /// the `ArrayList` the member built, NOT an array-backed one — which is the
+    /// whole reason this is a second tag rather than a flag on [`Literal`].
+    ///
+    /// `listOfNotNull` used to be listed here and does not belong: the VARARG
+    /// overload is `filterNotNull()`, a plain `ArrayList` that collapses at no
+    /// size, and the ONE-argument overload is a [`Literal`]. Neither is this
+    /// row, and nothing ever tagged it as one.
     ReadOnly,
     /// The `sorted…` family over a COLLECTION receiver. This row used to be
     /// listed under [`ReadOnly`], on the reading that a sorting member builds
