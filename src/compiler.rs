@@ -3372,7 +3372,10 @@ impl Compiler {
                 "PI" | "E" => return self.compile_math_const(name, line),
                 "round" => return self.compile_math(sc, "jround", args, line),
                 _ if is_math_fn(name) => return self.compile_math(sc, name, args, line),
-                _ => return Err(format!("unresolved reference: Math.{name}")),
+                _ => match java_math_only_fn(name) {
+                    Some(target) => return self.compile_math(sc, target, args, line),
+                    None => return Err(format!("unresolved reference: Math.{name}")),
+                },
             }
         }
         // `Owner.member` where `Owner` names a class with a `companion object`:
@@ -5069,13 +5072,21 @@ impl Compiler {
                 self.b.emit(Op::Extended(KT_LIST, args.len() as u8), line);
                 Ok(Type::Obj)
             }
-            // Array builders → a heap array. The element values decide the JVM
-            // descriptor at runtime (see `crate::host::array_desc`), so the
-            // typed builders differ from `arrayOf` only in the primitive case.
+            // Array builders → a heap array.
+            //
+            // The PRIMITIVE builders know their descriptor from their own name:
+            // `intArrayOf(1, 2)` is an `int[]`, which renders `[I@…`, and no
+            // JVM ever renders it `[Ljava.lang.Integer;@…`. Inferring it from
+            // the element values instead — which is all this used to do — gave
+            // the boxed name to every one of them. Only `arrayOf` is left to
+            // infer (see `crate::host::array_desc`), because its element type
+            // is a static type argument this call does not carry.
             "arrayOf" | "intArrayOf" | "doubleArrayOf" | "booleanArrayOf" | "charArrayOf" => {
                 for a in args {
                     self.compile_expr(sc, a)?;
                 }
+                let didx = self.b.add_constant(Value::str(array_literal_desc(name)));
+                self.b.emit(Op::LoadConst(didx), line);
                 self.b.emit(Op::Extended(KT_ARRAY, args.len() as u8), line);
                 Ok(Type::Obj)
             }
@@ -6963,8 +6974,21 @@ impl Compiler {
 fn is_math_fn(name: &str) -> bool {
     matches!(
         name,
-        "abs" | "max" | "min" | "sqrt" | "floor" | "ceil" | "round" | "maxOf" | "minOf"
+        "abs" | "max" | "min" | "sqrt" | "floor" | "ceil" | "round" | "maxOf" | "minOf" | "sign"
     )
+}
+
+/// The `java.lang.Math` statics with no `kotlin.math` counterpart, reachable
+/// only through the `Math.` qualifier. `signum` is `kotlin.math.sign` under the
+/// Java name; `floorDiv`/`floorMod` have no `kotlin.math` spelling at all —
+/// Kotlin exposes the remainder as the `Int.mod` member instead.
+fn java_math_only_fn(name: &str) -> Option<&'static str> {
+    match name {
+        "signum" => Some("sign"),
+        "floorDiv" => Some("floorDiv"),
+        "floorMod" => Some("floorMod"),
+        _ => None,
+    }
 }
 
 /// The `kotlin.math` constants.
@@ -7166,6 +7190,20 @@ fn is_scope_fn(name: &str) -> bool {
 /// than as the parameter `it`). `with` is the free-function spelling of `run`.
 fn is_recv_scope_fn(name: &str) -> bool {
     matches!(name, "run" | "apply" | "with")
+}
+
+/// The JVM type descriptor an array-literal builder produces.
+///
+/// A primitive builder's descriptor is fixed by its name; `arrayOf` answers the
+/// empty string, which the host reads as "infer from the elements".
+fn array_literal_desc(name: &str) -> &'static str {
+    match name {
+        "intArrayOf" => "[I",
+        "doubleArrayOf" => "[D",
+        "booleanArrayOf" => "[Z",
+        "charArrayOf" => "[C",
+        _ => "",
+    }
 }
 
 /// The array literal a `vararg` parameter's collected arguments pack into. The

@@ -476,12 +476,26 @@ enum ListImpl {
     /// subclass.
     Literal,
     /// The result of a member that ends in Kotlin's `optimizeReadOnlyList` —
-    /// `toList`, `sorted`, `sortedBy`, `sortedWith`, `sortedDescending`,
-    /// `reversed`, `distinct`, `take`, `drop`, `takeLast`, `dropLast`, `slice`,
-    /// `listOfNotNull`. Same collapse at 0 and 1, but at 2 or more it is the
-    /// `ArrayList` the member built, NOT an array-backed one — which is the
-    /// whole reason this is a second tag rather than a flag on [`Literal`].
+    /// `toList`, `reversed`, `distinct`, `take`, `drop`, `takeLast`,
+    /// `dropLast`, `slice`, `listOfNotNull`. Same collapse at 0 and 1, but at 2
+    /// or more it is the `ArrayList` the member built, NOT an array-backed one
+    /// — which is the whole reason this is a second tag rather than a flag on
+    /// [`Literal`].
     ReadOnly,
+    /// The `sorted…` family over a COLLECTION receiver. This row used to be
+    /// listed under [`ReadOnly`], on the reading that a sorting member builds
+    /// its own `ArrayList`; measured, it does not. `Iterable.sorted` takes the
+    /// `Collection` fast path — `toTypedArray().apply { sort() }.asList()` —
+    /// and `asList` hands back an `Arrays$ArrayList` wrapping that very array,
+    /// so `listOf(2, 1).sorted()[9]` raises the ARRAY subclass exactly as a
+    /// literal does. Verified on kotlinc 2.4.10 / JDK 21.0.12 for `sorted`,
+    /// `sortedDescending`, `sortedBy`, `sortedByDescending` and `sortedWith`
+    /// over `List`, `Set`, `Array` and `CharSequence` receivers.
+    ///
+    /// A RANGE receiver is the exception and stays [`ReadOnly`]: `IntRange` is
+    /// an `Iterable` and not a `Collection`, so it misses that fast path and
+    /// gets the `toMutableList().apply { sort() }` branch — a real `ArrayList`.
+    Sorted,
 }
 
 /// Record `list`'s implementation class. A no-op for a non-handle.
@@ -499,6 +513,21 @@ fn alloc_ro_list(items: Vec<Value>) -> Value {
     v
 }
 
+/// Allocate the `List` a `sorted…` member produced. `collection` is whether the
+/// receiver was one — see [`ListImpl::Sorted`] for why a range differs.
+fn alloc_sorted_list(items: Vec<Value>, collection: bool) -> Value {
+    let v = alloc(HeapObj::List(items));
+    tag_list_impl(
+        &v,
+        if collection {
+            ListImpl::Sorted
+        } else {
+            ListImpl::ReadOnly
+        },
+    );
+    v
+}
+
 /// Pop `n` operands and hand them back in SOURCE order. The stack yields them
 /// last-first, so a collection builder that skipped the reverse would store
 /// `listOf(1, 2)` as `[2, 1]`.
@@ -512,12 +541,11 @@ fn pop_n(vm: &mut VM, n: u8) -> Vec<Value> {
     vals
 }
 
-/// Tag `v` as read-only when it IS a `List`, and leave every other kind alone —
-/// for the members that answer their receiver's own kind rather than always a
-/// list.
-fn ro_if_list(v: Value) -> Value {
+/// Tag `v` when it IS a `List`, and leave every other kind alone — for the
+/// members that answer their receiver's own kind rather than always a list.
+fn tag_if_list(v: Value, which: ListImpl) -> Value {
     if with_obj(&v, |o| matches!(o, HeapObj::List(_))).unwrap_or(false) {
-        tag_list_impl(&v, ListImpl::ReadOnly);
+        tag_list_impl(&v, which);
     }
     v
 }
@@ -1569,6 +1597,235 @@ fn b_print(vm: &mut VM, argc: u8) -> Value {
     Value::Undef
 }
 
+/// `java.lang.Math.round(double)` — a port of the JDK's algorithm, not a
+/// rewrite of its documentation.
+///
+/// The one-line spelling `floor(x + 0.5)` is the doc's *description* and it is
+/// not what the JDK computes; the difference is observable. `0.5` added to
+/// `0.49999999999999994` — the double just below one half — rounds UP to
+/// exactly `1.0` in the addition itself, so the floor answers 1 where the JVM
+/// answers 0. JDK 8's `Math.round` had that very bug (JDK-8010430); the fix
+/// replaced the addition with the bit manipulation ported here, so no JVM in
+/// this frontend's supported range computes the floor form.
+///
+/// The JDK body, transcribed: read the biased exponent, work out how far the
+/// significand must shift to leave the value with one fractional bit, restore
+/// the implicit leading bit, apply the sign, then add one and shift that bit
+/// away — an exact half-up rounding with no rounding error of its own. A shift
+/// outside `0..64` means the value is already integral (or too large to be
+/// anything else), which the plain cast handles, and that same branch is what
+/// makes NaN answer 0 and the infinities saturate.
+fn java_math_round(a: f64) -> i64 {
+    const SIGNIFICAND_WIDTH: i64 = 53;
+    const EXP_BIAS: i64 = 1023;
+    const EXP_BIT_MASK: u64 = 0x7FF0_0000_0000_0000;
+    const SIGNIF_BIT_MASK: u64 = 0x000F_FFFF_FFFF_FFFF;
+
+    let bits = a.to_bits();
+    let biased_exp = ((bits & EXP_BIT_MASK) >> (SIGNIFICAND_WIDTH - 1)) as i64;
+    let shift = (SIGNIFICAND_WIDTH - 2 + EXP_BIAS) - biased_exp;
+    if (shift & -64) == 0 {
+        let mut r = ((bits & SIGNIF_BIT_MASK) | (SIGNIF_BIT_MASK + 1)) as i64;
+        if (bits as i64) < 0 {
+            r = -r;
+        }
+        ((r >> shift) + 1) >> 1
+    } else {
+        // `as i64` in Rust saturates and maps NaN to 0, which is exactly what
+        // the JVM's `d2l` does.
+        a as i64
+    }
+}
+
+/// `java.lang.Double.parseDouble`, which is NOT Rust's `f64::from_str`.
+///
+/// The two grammars differ in both directions, and every difference below was
+/// measured on kotlinc 2.4.10 / JDK 21.0.12:
+///
+///   * **Java accepts a type suffix.** `"1.5d"`, `"1.5D"`, `"1.5f"` and
+///     `"1.5F"` all parse to `1.5`; Rust rejects every one of them. Exactly one
+///     suffix character is allowed, so `"1.5dd"` still fails.
+///   * **Java accepts hexadecimal floating point.** `"0x1p3"` is 8.0 and
+///     `"0X1.8p1"` is 3.0 — the `p` exponent is a power of TWO and is
+///     mandatory. Rust has no such literal.
+///   * **Rust accepts short infinity spellings.** `"inf"` and `"infinity"`
+///     parse in Rust; Java's grammar admits only the exact word `Infinity`
+///     (with an optional sign), so `"inf".toDouble()` must fault.
+///   * **The whitespace they strip differs.** Java trims characters `<= ' '`,
+///     which is ASCII only; Rust's `str::trim` strips Unicode whitespace and
+///     would have accepted a no-break space around the number.
+fn java_parse_double(s: &str) -> Option<f64> {
+    let t = s.trim_matches(|c: char| c <= ' ');
+    // At most one `d`/`D`/`f`/`F` suffix, and never on its own.
+    let core = match t.chars().last() {
+        Some('d' | 'D' | 'f' | 'F') if t.len() > 1 => &t[..t.len() - 1],
+        _ => t,
+    };
+    let (sign, body) = match core.strip_prefix('-') {
+        Some(b) => (-1.0, b),
+        None => (1.0, core.strip_prefix('+').unwrap_or(core)),
+    };
+    if body == "Infinity" {
+        return Some(sign * f64::INFINITY);
+    }
+    if body == "NaN" {
+        return Some(f64::NAN);
+    }
+    if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        return java_parse_hex_double(hex).map(|v| sign * v);
+    }
+    // The decimal grammar, which Rust's parser is a superset of: reject the
+    // spellings Rust adds (`inf`, `infinity`, `nan` in any case) by requiring a
+    // digit, and let `from_str` do the rounding.
+    if !body.bytes().any(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if body
+        .bytes()
+        .any(|b| !matches!(b, b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-'))
+    {
+        return None;
+    }
+    body.parse::<f64>().ok().map(|v| sign * v)
+}
+
+/// The body of a Java hex-float literal, after `0x`/`0X` and the sign.
+/// `hexDigits[.hexDigits]` then a MANDATORY binary exponent `p[+-]digits`.
+fn java_parse_hex_double(hex: &str) -> Option<f64> {
+    let (mantissa, exp) = hex.split_once(['p', 'P'])?;
+    let exp: i32 = exp.parse().ok()?;
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (mantissa, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    let mut value = 0.0f64;
+    for c in int_part.chars() {
+        value = value * 16.0 + f64::from(c.to_digit(16)?);
+    }
+    let mut scale = 1.0f64 / 16.0;
+    for c in frac_part.chars() {
+        value += f64::from(c.to_digit(16)?) * scale;
+        scale /= 16.0;
+    }
+    Some(value * 2f64.powi(exp))
+}
+
+/// UTF-16 code units back to text, substituting an UNPAIRED SURROGATE the way
+/// the JVM's UTF-8 encoder does.
+///
+/// A `String` member that cuts between the halves of a surrogate pair leaves
+/// one behind — `"\u{1f600}b".drop(1)` is `[DC00, 0062]` — and Kotlin's
+/// `String` holds it, because a JVM string is a code-unit sequence and not a
+/// scalar sequence. Rust's `String` cannot, so the unit has to become
+/// something on the way in. `from_utf16_lossy` picks `U+FFFD`, which prints as
+/// three bytes the JVM never writes; the JVM's own encoder picks `?`, so that
+/// is what this picks.
+///
+/// This is the ENCODER's substitution, not surrogate support: `[DC00]` still
+/// loses its identity here, and `.code` on it answers `0x3F` where the JVM
+/// answers `0xDC00`. Holding the unit would take a UTF-16 string
+/// representation throughout.
+fn utf16_to_string(units: &[u16]) -> String {
+    char::decode_utf16(units.iter().copied())
+        .map(|r| r.unwrap_or('?'))
+        .collect()
+}
+
+/// `java.lang.Math.max(double, double)`, which is NOT `f64::max`.
+///
+/// Rust's `max` IGNORES a NaN operand and answers the other one; Java's
+/// propagates it. They also disagree on the signed zeros, where Java is
+/// explicit that `max(-0.0, 0.0)` is `+0.0` and Rust's is unspecified. Both
+/// clauses are transcribed from the JDK body.
+fn java_fmax(a: f64, b: f64) -> f64 {
+    if a.is_nan() {
+        return a;
+    }
+    if a == 0.0 && b == 0.0 && a.is_sign_negative() {
+        return b;
+    }
+    if a >= b {
+        a
+    } else {
+        b
+    }
+}
+
+/// `java.lang.Math.min(double, double)` — see [`java_fmax`].
+fn java_fmin(a: f64, b: f64) -> f64 {
+    if a.is_nan() {
+        return a;
+    }
+    if a == 0.0 && b == 0.0 && b.is_sign_negative() {
+        return b;
+    }
+    if a <= b {
+        a
+    } else {
+        b
+    }
+}
+
+/// Kotlin's `Char.isWhitespace()`, which is NOT Rust's `char::is_whitespace`.
+///
+/// Kotlin defines it as `Character.isWhitespace(c) || Character.isSpaceChar(c)`
+/// — the union of Java's two predicates — and that set differs from Unicode's
+/// `White_Space` property, which is what Rust implements, at both ends:
+///
+///   * `U+001C`–`U+001F` (FS, GS, RS, US) are whitespace to Java and to nobody
+///     else. Rust answers false.
+///   * `U+0085` (NEL) has `White_Space=Yes`, so Rust answers true. Java's
+///     `isWhitespace` excludes it and `isSpaceChar` does not cover it, so
+///     Kotlin answers false.
+///
+/// Both were measured on kotlinc 2.4.10 / JDK 21.0.12. The rest is the three
+/// separator categories (`Zs`/`Zl`/`Zp`, including the no-break spaces that
+/// `isWhitespace` alone would drop) plus the C0 run `U+0009`–`U+000D`. The
+/// separators are enumerated rather than derived because Rust's standard
+/// library exposes no general-category query.
+fn kotlin_is_whitespace(c: char) -> bool {
+    matches!(c,
+        '\u{9}'..='\u{d}'          // TAB, LF, VT, FF, CR
+        | '\u{1c}'..='\u{1f}'      // FS, GS, RS, US
+        | '\u{20}'                 // SPACE                     Zs
+        | '\u{a0}'                 // NO-BREAK SPACE            Zs
+        | '\u{1680}'               // OGHAM SPACE MARK          Zs
+        | '\u{2000}'..='\u{200a}'  // EN QUAD … HAIR SPACE      Zs
+        | '\u{2028}'               // LINE SEPARATOR            Zl
+        | '\u{2029}'               // PARAGRAPH SEPARATOR       Zp
+        | '\u{202f}'               // NARROW NO-BREAK SPACE     Zs
+        | '\u{205f}'               // MEDIUM MATHEMATICAL SPACE Zs
+        | '\u{3000}'               // IDEOGRAPHIC SPACE         Zs
+    )
+}
+
+/// `String.trim()` / `trimStart()` / `trimEnd()` / `isBlank()` all key on
+/// [`kotlin_is_whitespace`], so none of them may use Rust's `str::trim`.
+fn kotlin_trim(s: &str, start: bool, end: bool) -> &str {
+    let mut out = s;
+    if start {
+        out = out.trim_start_matches(kotlin_is_whitespace);
+    }
+    if end {
+        out = out.trim_end_matches(kotlin_is_whitespace);
+    }
+    out
+}
+
+/// The `NegativeArraySizeException` a negative array length raises.
+///
+/// The JVM puts the REQUESTED LENGTH in the detail message — `anewarray`'s
+/// throw has carried it since well before this frontend's floor, and JDK 17,
+/// 21 and 26 were each measured answering `java.lang.NegativeArraySizeException:
+/// -5` for `IntArray(-5)`. The bare form this used to raise is not an older
+/// dialect that a version gate could have caught; NO JVM produces it.
+fn negative_array_size(n: i64) -> String {
+    format!("java.lang.NegativeArraySizeException: {n}")
+}
+
 /// `KT_ARRAY_INIT` — see [`KT_ARRAY_INIT`]. An empty `desc` means the generic
 /// `Array(n) { … }`, whose descriptor comes from the produced elements.
 fn b_array_init(vm: &mut VM, _argc: u8) -> Value {
@@ -1576,7 +1833,7 @@ fn b_array_init(vm: &mut VM, _argc: u8) -> Value {
     let desc = vm.pop().to_str();
     let n = vm.pop().to_int();
     if n < 0 {
-        fault(vm, "java.lang.NegativeArraySizeException");
+        fault(vm, negative_array_size(n));
         return Value::Undef;
     }
     let mut items = Vec::with_capacity(n as usize);
@@ -2242,27 +2499,37 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             vm.push(iter_at(&recv, i));
         }
         KT_ARRAY => {
+            // The builder's own descriptor sits above the elements; an empty
+            // one means `arrayOf`, which has no primitive type to name.
+            let desc = vm.pop().to_str();
             let n = arg as usize;
             let mut items = Vec::with_capacity(n);
             for _ in 0..n {
                 items.push(vm.pop());
             }
             items.reverse();
-            let desc = array_desc(&items);
+            let desc = if desc.is_empty() {
+                array_desc(&items)
+            } else {
+                desc
+            };
             vm.push(alloc(HeapObj::Array { items, desc }));
         }
         KT_ARRAY_NEW => {
             let desc = vm.pop().to_str();
             let n = vm.pop().to_int();
             if n < 0 {
-                fault(vm, "java.lang.NegativeArraySizeException");
+                fault(vm, negative_array_size(n));
                 vm.push(Value::Undef);
             } else {
                 // A primitive array is zero-filled: `0` for `[I`, `0.0` for `[D`,
-                // `false` for `[Z` — matching JVM default initialization.
+                // `false` for `[Z`, `' '` for `[C` — matching JVM default
+                // initialization. `[C`'s slot is a CHAR, not the integer 0, so
+                // `CharArray(2)[0].code` resolves.
                 let zero = match desc.as_str() {
                     "[D" => Value::Float(0.0),
                     "[Z" => Value::Bool(false),
+                    "[C" => char_of(0),
                     _ => Value::Int(0),
                 };
                 vm.push(alloc(HeapObj::Array {
@@ -2594,16 +2861,51 @@ fn math_call(name: &str, args: &[Value]) -> Result<Value, String> {
                 let seed = a.to_float();
                 Ok(Value::Float(args.iter().map(|v| v.to_float()).fold(
                     seed,
-                    |acc, x| if (x > acc) == want_max { x } else { acc },
+                    |acc, x| {
+                        if want_max {
+                            java_fmax(acc, x)
+                        } else {
+                            java_fmin(acc, x)
+                        }
+                    },
                 )))
             }
         }
+        // `Math.floorDiv`/`Math.floorMod` and Kotlin's `Int.mod` — division that
+        // rounds toward NEGATIVE INFINITY, unlike `/` and `%`, which truncate
+        // toward zero. `-7 / 2` is -3 and `-7 % 2` is -1, where `floorDiv(-7, 2)`
+        // is -4 and `floorMod(-7, 2)` is 1. The remainder's SIGN is the visible
+        // difference: `%` follows the dividend, `mod`/`floorMod` the divisor.
+        "floorDiv" | "floorMod" => {
+            let b = args.get(1).cloned().unwrap_or(Value::Int(0));
+            let (x, y) = (a.to_int(), b.to_int());
+            if y == 0 {
+                return Err("java.lang.ArithmeticException: / by zero".to_string());
+            }
+            Ok(Value::Int(if name == "floorDiv" {
+                x.div_euclid(y) - i64::from(x.rem_euclid(y) != 0 && y < 0)
+            } else {
+                x - y * (x.div_euclid(y) - i64::from(x.rem_euclid(y) != 0 && y < 0))
+            }))
+        }
+        // `kotlin.math.sign` — the SIGN as a `Double`, which keeps the sign of a
+        // zero (`sign(-0.0)` is `-0.0`) and answers NaN for NaN. Rust's
+        // `f64::signum` answers ±1.0 for ±0.0 and 1.0 for NaN, so it is not this.
+        "sign" if !is_int(&a) => {
+            let x = a.to_float();
+            Ok(Value::Float(if x.is_nan() || x == 0.0 {
+                x
+            } else {
+                x.signum()
+            }))
+        }
+        // `Int.sign` / `Long.sign` — the same idea as an `Int`.
+        "sign" => Ok(Value::Int(a.to_int().signum())),
         "sqrt" => Ok(Value::Float(a.to_float().sqrt())),
         "floor" => Ok(Value::Float(a.to_float().floor())),
         "ceil" => Ok(Value::Float(a.to_float().ceil())),
         "round" => Ok(Value::Float(a.to_float().round_ties_even())),
-        // `Math.round(Double)` → `Long`, half-up (i.e. `floor(x + 0.5)`).
-        "jround" => Ok(Value::Int((a.to_float() + 0.5).floor() as i64)),
+        "jround" => Ok(Value::Int(java_math_round(a.to_float()))),
         _ => Err(format!("unresolved reference: {name}")),
     }
 }
@@ -3940,17 +4242,36 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
     }
 }
 
+/// `java.lang.Double.compare` — a TOTAL order, which IEEE comparison is not.
+///
+/// `partial_cmp` answers `None` for a NaN operand, and the `unwrap_or(Equal)`
+/// that used to follow it turned every NaN comparison into a tie: `NaN
+/// .compareTo(1.0)` answered 0 where the JVM answers 1, `sorted()` left NaN
+/// wherever it happened to sit, and `max()` over a list containing one answered
+/// the largest non-NaN instead of NaN. It also made `0.0` and `-0.0`
+/// interchangeable, where `Double.compare` separates them.
+///
+/// `Double.compare` falls back to the raw bits, so all NaNs (canonicalised by
+/// `doubleToLongBits`) sort ABOVE every number and `-0.0` sorts BELOW `0.0`.
+/// Rust's `total_cmp` is that same bit order, once NaN is canonicalised — it
+/// otherwise puts a sign-bit-set NaN below everything, which the JVM's
+/// canonicalisation rules out.
+fn double_compare(x: f64, y: f64) -> std::cmp::Ordering {
+    let canon = |v: f64| if v.is_nan() { f64::NAN } else { v };
+    canon(x).total_cmp(&canon(y))
+}
+
 /// [`value_cmp`] for everything that is not an enum constant.
 fn value_cmp_scalar(a: &Value, b: &Value) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
     match (a, b) {
         // `Char` is `Comparable<Char>` by code unit, so a `List<Char>` sorts and
         // reduces (`max`/`min`) like any other comparable element.
         _ if is_char(a) || is_char(b) => num_of(a).cmp(&num_of(b)),
-        _ => a
-            .to_float()
-            .partial_cmp(&b.to_float())
-            .unwrap_or(Ordering::Equal),
+        // Integral operands compare as integers. Routing them through `f64`
+        // would collapse two `Long`s that differ past the 53-bit mantissa.
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        _ => double_compare(a.to_float(), b.to_float()),
     }
 }
 
@@ -4360,7 +4681,10 @@ fn coll_hof(
                 keyed.push((key, it));
             }
             keyed.sort_by(|a, b| value_cmp(&a.0, &b.0));
-            Ok(alloc_ro_list(keyed.into_iter().map(|(_, it)| it).collect()))
+            Ok(alloc_sorted_list(
+                keyed.into_iter().map(|(_, it)| it).collect(),
+                kind.is_collection(),
+            ))
         }
         "minByOrNull" | "minBy" => {
             let mut best: Option<(Value, Value)> = None;
@@ -4454,7 +4778,10 @@ fn coll_hof(
             // Kotlin keeps them in input order, so the comparison is flipped
             // instead.
             keyed.sort_by(|a, b| value_cmp(&b.0, &a.0));
-            Ok(alloc_ro_list(keyed.into_iter().map(|(_, it)| it).collect()))
+            Ok(alloc_sorted_list(
+                keyed.into_iter().map(|(_, it)| it).collect(),
+                kind.is_collection(),
+            ))
         }
         // `associate` takes the lambda's `Pair` result as the entry; `associateBy`
         // takes its result as the KEY and the element as the value — the mirror
@@ -4737,10 +5064,14 @@ fn coll_hof(
             }
             match err {
                 Some(e) => Err(e),
-                None => Ok(ro_if_list(same_kind_as(
-                    recv,
-                    order.into_iter().map(|i| items[i].clone()).collect(),
-                ))),
+                None => Ok(tag_if_list(
+                    same_kind_as(recv, order.into_iter().map(|i| items[i].clone()).collect()),
+                    if kind.is_collection() {
+                        ListImpl::Sorted
+                    } else {
+                        ListImpl::ReadOnly
+                    },
+                )),
             }
         }
         // The transform-taking forms of the grouping/rendering members. Each has
@@ -4906,6 +5237,18 @@ fn group_thousands(body: &str) -> String {
 ///
 /// An unknown conversion is an error rather than a silent pass-through, so a
 /// format this does not model surfaces instead of quietly diverging.
+/// `java.util.Formatter`'s fault for a conversion it does not know.
+///
+/// The character named is the one the JVM's format-specifier regex stopped on,
+/// and BOTH ways of reaching this fault name a character — there is no bare
+/// form. Measured on JDK 21.0.12: `%q` and `%5q` both answer `Conversion =
+/// 'q'`; a spec that runs off the end answers with the character right after
+/// the `%` (`%5` → `'5'`, `%-` → `'-'`, `%.2` → `'.'`) and with `%` itself
+/// when the string ends there (`"%"` and `"abc%"` → `'%'`).
+fn unknown_conversion(c: char) -> String {
+    format!("java.util.UnknownFormatConversionException: Conversion = '{c}'")
+}
+
 fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
     let mut out = String::new();
     let mut argi = 0usize;
@@ -4915,6 +5258,9 @@ fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
             out.push(c);
             continue;
         }
+        // The character right after the `%`, kept for the truncated-spec fault
+        // below — see [`unknown_conversion`].
+        let after = it.peek().copied();
         let (mut left, mut zero, mut plus, mut space) = (false, false, false, false);
         let mut group = false;
         while let Some(f) = it.peek() {
@@ -4942,16 +5288,27 @@ fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
             }
             prec = Some(p.parse().unwrap_or(0));
         }
+        // A spec that runs off the end of the format string. The JVM names the
+        // character right after the `%` — not the last one it read — and names
+        // `%` itself when nothing follows at all.
         let conv = it
             .next()
-            .ok_or_else(|| "java.util.UnknownFormatConversionException".to_string())?;
-        if conv == '%' {
-            out.push('%');
-            continue;
-        }
-        let arg = args.get(argi).cloned().unwrap_or(Value::Undef);
-        argi += 1;
+            .ok_or_else(|| unknown_conversion(after.unwrap_or('%')))?;
+        // `%%` and `%n` take no argument, but they DO take the width and the
+        // `-` flag: `%5%` is four spaces then `%`. Falling through to the
+        // padding below is what applies them.
+        let arg = if matches!(conv, '%' | 'n') {
+            Value::Undef
+        } else {
+            let a = args.get(argi).cloned().unwrap_or(Value::Undef);
+            argi += 1;
+            a
+        };
         let mut body = match conv {
+            '%' => "%".to_string(),
+            // `%n` is the platform line separator, which is `\n` everywhere
+            // kotlinrs builds.
+            'n' => "\n".to_string(),
             'd' => format!("{}", arg.to_int()),
             'x' => format!("{:x}", arg.to_int()),
             'X' => format!("{:X}", arg.to_int()),
@@ -4990,11 +5347,7 @@ fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
                     s
                 }
             }
-            other => {
-                return Err(format!(
-                    "java.util.UnknownFormatConversionException: Conversion = '{other}'"
-                ))
-            }
+            other => return Err(unknown_conversion(other)),
         };
         // `,` groups the INTEGER part in threes, and the JVM accepts it on the
         // two decimal conversions only: `%,e`, `%,x`, `%,o`, `%,s` and `%,b`
@@ -5049,7 +5402,7 @@ fn utf16_slice_from(s: &str, at: i64) -> Option<String> {
     if at < 0 || at > units.len() as i64 {
         return None;
     }
-    Some(String::from_utf16_lossy(&units[at as usize..]))
+    Some(utf16_to_string(&units[at as usize..]))
 }
 
 /// Whether the optional flag argument at `i` was supplied and true — the
@@ -5208,7 +5561,7 @@ fn builder_method(
         Ok(recv.clone())
     };
     match name {
-        "toString" => Ok(Value::str(String::from_utf16_lossy(&units))),
+        "toString" => Ok(Value::str(utf16_to_string(&units))),
         // `StringBuilder` does not override `equals`/`hashCode`, so both are
         // `Object`'s — identity, NOT the content two equal-looking builders
         // share. Delegating them to the `String` snapshot would quietly make
@@ -5366,13 +5719,8 @@ fn builder_method(
             });
             Ok(Value::Undef)
         }
-        _ => kt_method(
-            vm,
-            &Value::str(String::from_utf16_lossy(&units)),
-            name,
-            args,
-        )
-        .map_err(|e| e.replace("on String", "on StringBuilder")),
+        _ => kt_method(vm, &Value::str(utf16_to_string(&units)), name, args)
+            .map_err(|e| e.replace("on String", "on StringBuilder")),
     }
 }
 
@@ -5398,11 +5746,11 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         (Value::Str(s), "length") => Ok(Value::Int(s.encode_utf16().count() as i64)),
         (Value::Str(s), "uppercase" | "toUpperCase") => Ok(Value::str(s.to_uppercase())),
         (Value::Str(s), "lowercase" | "toLowerCase") => Ok(Value::str(s.to_lowercase())),
-        (Value::Str(s), "trim") => Ok(Value::str(s.trim().to_string())),
+        (Value::Str(s), "trim") => Ok(Value::str(kotlin_trim(s, true, true).to_string())),
         (Value::Str(s), "isEmpty") => Ok(Value::Bool(s.is_empty())),
         (Value::Str(s), "isNotEmpty") => Ok(Value::Bool(!s.is_empty())),
-        (Value::Str(s), "isBlank") => Ok(Value::Bool(s.trim().is_empty())),
-        (Value::Str(s), "isNotBlank") => Ok(Value::Bool(!s.trim().is_empty())),
+        (Value::Str(s), "isBlank") => Ok(Value::Bool(kotlin_trim(s, true, true).is_empty())),
+        (Value::Str(s), "isNotBlank") => Ok(Value::Bool(!kotlin_trim(s, true, true).is_empty())),
 
         // Arg-taking `String` members. The argument is rendered through
         // `kotlin_string` so a `Char` (carried as an integer code unit) or a
@@ -5467,7 +5815,7 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
             if start < 0 || end > units.len() as i64 || start > end {
                 Err(sioobe_range(start, end, units.len()))
             } else {
-                Ok(Value::str(String::from_utf16_lossy(
+                Ok(Value::str(utf16_to_string(
                     &units[start as usize..end as usize],
                 )))
             }
@@ -5494,8 +5842,8 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
             }
             Ok(Value::Int(-1))
         }
-        (Value::Str(s), "trimStart") => Ok(Value::str(s.trim_start().to_string())),
-        (Value::Str(s), "trimEnd") => Ok(Value::str(s.trim_end().to_string())),
+        (Value::Str(s), "trimStart") => Ok(Value::str(kotlin_trim(s, true, false).to_string())),
+        (Value::Str(s), "trimEnd") => Ok(Value::str(kotlin_trim(s, false, true).to_string())),
         (Value::Str(s), "removePrefix") => {
             let p = arg_str(args, 0);
             Ok(Value::str(s.strip_prefix(&p).unwrap_or(s).to_string()))
@@ -5612,7 +5960,7 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
             } else {
                 &units[n..]
             };
-            Ok(Value::str(String::from_utf16_lossy(cut)))
+            Ok(Value::str(utf16_to_string(cut)))
         }
         // The `kotlin.text` from-the-end pair. It answers a `String`, not the
         // `List<Char>` the shared sequence path would build, so it resolves here
@@ -5631,7 +5979,7 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
             } else {
                 &units[..at]
             };
-            Ok(Value::str(String::from_utf16_lossy(cut)))
+            Ok(Value::str(utf16_to_string(cut)))
         }
         // `padStart`/`padEnd` pad to a UTF-16 length with a `Char` (default
         // space); a receiver already that long is returned unchanged.
@@ -5709,14 +6057,20 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
                 Err(ParseFail::Radix(m)) => Err(m),
             }
         }
-        (Value::Str(s), "toDouble" | "toFloat") => s
-            .trim()
-            .parse::<f64>()
-            .map(Value::Float)
-            .map_err(|_| format!("java.lang.NumberFormatException: For input string: \"{s}\"")),
-        (Value::Str(s), "toDoubleOrNull" | "toFloatOrNull") => Ok(s
-            .trim()
-            .parse::<f64>()
+        // `FloatingDecimal.readJavaFormatString` trims first and reports a
+        // nothing-left input with its OWN message, not the `For input string`
+        // one every other numeric parse uses. `Integer.parseInt` does not do
+        // this: `"".toInt()` still says `For input string: ""`.
+        (Value::Str(s), "toDouble" | "toFloat") => {
+            java_parse_double(s).map(Value::Float).ok_or_else(|| {
+                if s.trim_matches(|c: char| c <= ' ').is_empty() {
+                    "java.lang.NumberFormatException: empty String".to_string()
+                } else {
+                    format!("java.lang.NumberFormatException: For input string: \"{s}\"")
+                }
+            })
+        }
+        (Value::Str(s), "toDoubleOrNull" | "toFloatOrNull") => Ok(java_parse_double(s)
             .map(Value::Float)
             .unwrap_or(Value::Undef)),
 
@@ -5776,6 +6130,23 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
                 "coerceAtMost" => args.first(),
                 _ => None,
             };
+            // A crossed pair is REFUSED, not silently reordered. `f64::max`
+            // followed by `f64::min` clamped `5.coerceIn(3, 1)` to 1 instead.
+            if let (Some(lo), Some(hi)) = (lo, hi) {
+                let empty = if ints {
+                    lo.to_int() > hi.to_int()
+                } else {
+                    lo.to_float() > hi.to_float()
+                };
+                if empty {
+                    return Err(format!(
+                        "java.lang.IllegalArgumentException: Cannot coerce value to an \
+                         empty range: maximum {} is less than minimum {}.",
+                        kotlin_string(hi),
+                        kotlin_string(lo)
+                    ));
+                }
+            }
             if ints {
                 let mut v = recv.to_int();
                 if let Some(lo) = lo {
@@ -5786,12 +6157,22 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
                 }
                 Ok(Value::Int(v))
             } else {
-                let mut v = recv.to_float();
+                // Kotlin clamps with `<` and `>`, and returns the RECEIVER when
+                // neither fires. That is not `f64::max`/`min`: those ignore a
+                // NaN receiver and answer a bound, where Kotlin's comparisons
+                // are both false for NaN and hand the NaN straight back. The
+                // same shape keeps `-0.0` out of `coerceIn(0.0, 1.0)`'s clamp,
+                // since `-0.0 < 0.0` is false.
+                let v = recv.to_float();
                 if let Some(lo) = lo {
-                    v = v.max(lo.to_float());
+                    if v < lo.to_float() {
+                        return Ok(Value::Float(lo.to_float()));
+                    }
                 }
                 if let Some(hi) = hi {
-                    v = v.min(hi.to_float());
+                    if v > hi.to_float() {
+                        return Ok(Value::Float(hi.to_float()));
+                    }
                 }
                 Ok(Value::Float(v))
             }
@@ -5802,6 +6183,15 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
             recv.to_float()
                 .powf(args.first().map(|v| v.to_float()).unwrap_or(0.0)),
         )),
+        // `Int.sign` / `Double.sign` — the `kotlin.math` property spelling of
+        // the same function; see [`math_call`] for why neither is `f64::signum`.
+        (Value::Int(_) | Value::Float(_), "sign") => math_call("sign", std::slice::from_ref(recv)),
+        // `Int.mod(Int)` — the FLOOR remainder, whose sign follows the DIVISOR.
+        // `(-7).mod(2)` is 1 where `-7 % 2` is -1.
+        (Value::Int(_), "mod") => math_call(
+            "floorMod",
+            &[recv.clone(), args.first().cloned().unwrap_or(Value::Int(0))],
+        ),
         (Value::Int(_) | Value::Float(_), "absoluteValue") => {
             if is_int(recv) {
                 Ok(Value::Int(recv.to_int().wrapping_abs()))
@@ -5809,9 +6199,26 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
                 Ok(Value::Float(recv.to_float().abs()))
             }
         }
-        // `roundToInt` is half-up, like `Math.round`.
+        // `roundToInt`/`roundToLong` are `Math.round` (see [`java_math_round`])
+        // behind two guards the JVM method does not have. `Math.round(NaN)` is
+        // 0; Kotlin REFUSES it instead, and `roundToInt` additionally clamps to
+        // the `Int` range rather than letting the `Long` result wrap.
         (Value::Int(_) | Value::Float(_), "roundToInt" | "roundToLong") => {
-            Ok(Value::Int((recv.to_float() + 0.5).floor() as i64))
+            let x = recv.to_float();
+            if x.is_nan() {
+                return Err(
+                    "java.lang.IllegalArgumentException: Cannot round NaN value.".to_string(),
+                );
+            }
+            if name == "roundToInt" {
+                if x > i32::MAX as f64 {
+                    return Ok(Value::Int(i32::MAX as i64));
+                }
+                if x < i32::MIN as f64 {
+                    return Ok(Value::Int(i32::MIN as i64));
+                }
+            }
+            Ok(Value::Int(java_math_round(x)))
         }
 
         // ── the arithmetic operators in their method spelling ──
@@ -5955,7 +6362,7 @@ fn char_method(code: i64, name: &str, args: &[Value]) -> Result<Value, String> {
         "isDigit" => Value::Bool(c.is_numeric()),
         "isLetter" => Value::Bool(c.is_alphabetic()),
         "isLetterOrDigit" => Value::Bool(c.is_alphanumeric()),
-        "isWhitespace" => Value::Bool(c.is_whitespace()),
+        "isWhitespace" => Value::Bool(kotlin_is_whitespace(c)),
         "isUpperCase" => Value::Bool(c.is_uppercase()),
         "isLowerCase" => Value::Bool(c.is_lowercase()),
         "uppercaseChar" => char_of(single(c, c.to_uppercase()) as i64),
@@ -6514,6 +6921,16 @@ impl SeqKind {
         self == SeqKind::Set
     }
 
+    /// Whether the receiver is a `java.util.Collection`, which decides which
+    /// branch of `Iterable.sorted` runs — see [`ListImpl::Sorted`]. A range and
+    /// a lazy sequence are `Iterable` only.
+    fn is_collection(self) -> bool {
+        matches!(
+            self,
+            SeqKind::List | SeqKind::Set | SeqKind::Array | SeqKind::CharSeq
+        )
+    }
+
     /// The `NoSuchElementException` detail for an empty receiver.
     fn empty(self) -> &'static str {
         match self {
@@ -6655,8 +7072,10 @@ fn index_fault(kind: SeqKind, recv: Option<&Value>, i: i64, len: usize) -> Strin
                 (Some(_), 1) => {
                     format!("java.lang.IndexOutOfBoundsException: Index: {i}, Size: 1")
                 }
-                // Only a literal of two or more is array-backed.
-                (Some(ListImpl::Literal), _) => format!(
+                // A literal of two or more is array-backed, and so is the
+                // result of a `sorted…` over a collection — both wrap a bare
+                // array, and both raise the ARRAY subclass.
+                (Some(ListImpl::Literal | ListImpl::Sorted), _) => format!(
                     "java.lang.ArrayIndexOutOfBoundsException: \
                      Index {i} out of bounds for length {len}"
                 ),
@@ -6826,6 +7245,16 @@ fn sequence_member(
         "max" | "min" | "maxOrNull" | "minOrNull" => {
             let want_max = name.starts_with("max");
             let best = items.iter().cloned().reduce(|a, b| {
+                // A floating-point receiver takes the `Math.min`/`Math.max`
+                // overload, which PROPAGATES NaN rather than ordering it. The
+                // comparator route agrees for `max` — the total order already
+                // puts NaN on top — but disagrees for `min`, which would answer
+                // the smallest number and leave the NaN behind.
+                if matches!((&a, &b), (Value::Float(_), _) | (_, Value::Float(_)))
+                    && (a.to_float().is_nan() || b.to_float().is_nan())
+                {
+                    return Value::Float(f64::NAN);
+                }
                 let take_b = (value_cmp(&b, &a) == std::cmp::Ordering::Greater) == want_max;
                 if take_b {
                     b
@@ -6974,7 +7403,7 @@ fn sequence_member(
             if name == "sortedDescending" {
                 out.reverse();
             }
-            return Some(Ok(alloc_ro_list(out)));
+            return Some(Ok(alloc_sorted_list(out, kind.is_collection())));
         }
         // `take`/`drop` clamp rather than fault: Kotlin returns the whole
         // sequence for an oversized `take` and an empty one for an oversized
@@ -7289,7 +7718,19 @@ pub fn value_eq(a: &Value, b: &Value) -> bool {
         }),
         (Value::Obj(_), _) | (_, Value::Obj(_)) => false,
         (Value::Int(x), Value::Int(y)) => x == y,
-        (Value::Float(x), Value::Float(y)) => x == y,
+        // `Double.equals`, NOT `==`. Kotlin has both, and they disagree on two
+        // values: the boxed form compares `doubleToLongBits`, so `NaN` equals
+        // itself and `0.0` does NOT equal `-0.0` — the exact reverse of the IEEE
+        // comparison. Which one runs is decided statically: two `Double`-typed
+        // operands under `==` reach `Op::NumEq` (IEEE) and never come here,
+        // while `equals`, an `Any`-typed `==`, and every collection membership
+        // test (`contains`, `indexOf`, `distinct`, `Set`/`Map` keys, `minus`,
+        // `intersect`) route through this function. Answering IEEE here made
+        // `listOf(NaN).contains(NaN)` false and `setOf(0.0, -0.0).size` 2 where
+        // the JVM answers true and 1.
+        (Value::Float(x), Value::Float(y)) => {
+            (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits()
+        }
         (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_)) => {
             a.to_float() == b.to_float()
         }
@@ -7737,7 +8178,7 @@ fn display_obj(id: u32) -> String {
             HeapObj::Array { desc, .. } => format!("{desc}@{id:x}"),
             // `StringBuilder.toString()` is its content, which is why an
             // interpolated or printed builder reads as plain text.
-            HeapObj::Builder { units, .. } => String::from_utf16_lossy(units),
+            HeapObj::Builder { units, .. } => utf16_to_string(units),
             // `Throwable.toString()`: the qualified class name, plus `": " +
             // message` when the constructor was given one.
             HeapObj::Exc { class, msg } => match msg {
@@ -7773,6 +8214,69 @@ fn jvm_class(ty: &str) -> Option<(&'static str, bool)> {
         "StringBuilder" => ("java.lang.StringBuilder", true),
         _ => return None,
     })
+}
+
+/// The JVM binary name of the class a runtime VALUE is, and whether it lives in
+/// `java.base`.
+///
+/// [`jvm_class`] answers for a type NAME, which cannot resolve a container:
+/// `List` is three different JVM classes depending on how the handle was built.
+/// A VALUE can be resolved, because the provenance those classes turn on is
+/// already recorded — [`ListImpl`] for lists, the descriptor for arrays — and
+/// the rest are one class each. Naming them is not invention: every row below
+/// was read off `kotlinc` 2.4.10 / JDK 21.0.12, and the short Kotlin labels
+/// this replaces (`class List cannot be cast to class String`) are a spelling
+/// no JVM produces.
+///
+/// `Set` and `Map` are deliberately absent. Their class turns on the same
+/// literal-versus-mutable provenance a list's does — `setOf()` is a
+/// `kotlin.collections.EmptySet` where `mutableSetOf()` is a
+/// `java.util.LinkedHashSet` — and kotlinrs records no such tag for them, so
+/// there is nothing here to read. They keep the approximate label rather than
+/// take a guess that would be wrong for half the receivers.
+fn runtime_jvm_class(v: &Value) -> Option<(String, bool)> {
+    let len = with_obj(v, |o| match o {
+        HeapObj::List(items) => Some(items.len()),
+        _ => None,
+    })
+    .flatten();
+    let impl_tag = match v {
+        Value::Obj(id) => LIST_IMPL.with(|t| t.borrow().get(id).copied()),
+        _ => None,
+    };
+    with_obj(v, |o| match o {
+        // An array's descriptor IS its binary name, and every array class is in
+        // `java.base`.
+        HeapObj::Array { desc, .. } => Some((desc.clone(), true)),
+        HeapObj::List(_) => {
+            let n = len.unwrap_or(0);
+            Some(match (impl_tag, n) {
+                // `optimizeReadOnlyList` collapses every read-only builder at
+                // the two small sizes, exactly as the index diagnostics do.
+                (Some(_), 0) => ("kotlin.collections.EmptyList".to_string(), false),
+                (Some(_), 1) => ("java.util.Collections$SingletonList".to_string(), true),
+                (Some(ListImpl::Literal | ListImpl::Sorted), _) => {
+                    ("java.util.Arrays$ArrayList".to_string(), true)
+                }
+                // A read-only member's own list, and every untagged handle.
+                _ => ("java.util.ArrayList".to_string(), true),
+            })
+        }
+        HeapObj::Pair(_, _) => Some(("kotlin.Pair".to_string(), false)),
+        HeapObj::Triple(_, _, _) => Some(("kotlin.Triple".to_string(), false)),
+        HeapObj::Range(r) => Some((
+            match (r.is_char, r.progression) {
+                (true, true) => "kotlin.ranges.CharProgression",
+                (true, false) => "kotlin.ranges.CharRange",
+                (false, true) => "kotlin.ranges.IntProgression",
+                (false, false) => "kotlin.ranges.IntRange",
+            }
+            .to_string(),
+            false,
+        )),
+        _ => None,
+    })
+    .flatten()
 }
 
 /// Where a class lives, as the JVM's `ClassCastException` spells it.
@@ -7813,6 +8317,7 @@ fn cast_failure(v: &Value, ty: &str) -> String {
     let recv = jvm_class(&from_label)
         .or(boxed)
         .map(|(n, b)| (n.to_string(), b))
+        .or_else(|| runtime_jvm_class(v))
         .or_else(|| is_instance.then(|| (from_label.clone(), false)));
     let target = jvm_class(ty)
         .map(|(n, b)| (n.to_string(), b))
