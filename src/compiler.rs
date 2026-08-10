@@ -3329,6 +3329,28 @@ impl Compiler {
         if safe {
             return self.compile_safe_member(sc, recv, name, args, line);
         }
+        // `(1..5).step(2)` — the METHOD spelling of the `step` infix. Kotlin
+        // declares one `IntProgression.step` and the two spellings are the same
+        // call, but only the infix form reaches the parser's [`Expr::Step`], so
+        // the method form used to answer `unresolved reference: step on
+        // IntRange` while `1..5 step 2` worked. Rewriting to the same node
+        // keeps ONE lowering, which is what keeps the non-positive-step fault
+        // identical between them.
+        if name == "step"
+            && args.len() == 1
+            && self.infer_class(sc, recv).is_some_and(|c| {
+                matches!(
+                    c.as_str(),
+                    "IntRange" | "CharRange" | "IntProgression" | "CharProgression"
+                )
+            })
+        {
+            let stepped = Expr::Step {
+                recv: Box::new(recv.clone()),
+                by: Box::new(args[0].clone()),
+            };
+            return self.compile_expr(sc, &stepped);
+        }
         // `super.m(args)` — the *statically* resolved supertype implementation,
         // never the virtual one, which is the whole point of the keyword.
         if let Expr::Super { qualifier } = recv {

@@ -4725,3 +4725,37 @@ fn build_list_and_the_one_argument_list_of_not_null_have_their_own_classes() {
         "[1, 2]\n[1]\n"
     );
 }
+
+#[test]
+fn the_step_method_spelling_is_the_same_call_as_the_step_infix() {
+    // Kotlin declares ONE `IntProgression.step`; `1..5 step 2` and
+    // `(1..5).step(2)` are the same call. Only the infix form reached the
+    // parser's `Expr::Step`, so the method form answered `unresolved
+    // reference: step on IntRange`. It rewrites to the same node now, which is
+    // what keeps the non-positive-step fault identical between them.
+    let src = r#"
+class Ladder { fun step(n: Int) = "user step " + n }
+fun main() {
+    println(1..5 step 2)
+    println((1..5).step(2))
+    println((5 downTo 1).step(2))
+    println(('a'..'g').step(3))
+    val r = 1..9
+    println(r.step(4))
+    println(Ladder().step(7))
+    println((1..5).step(2).toList())
+}"#;
+    assert_eq!(
+        prog(src),
+        "1..5 step 2\n1..5 step 2\n5 downTo 1 step 2\na..g step 3\n1..9 step 4\n\
+         user step 7\n[1, 3, 5]\n"
+    );
+    // A user class declaring its OWN `step` is not hijacked by the rewrite —
+    // the line above proves that — and a non-positive step still faults.
+    assert_eq!(
+        prog(
+            "fun main() { val n = 0; try { (1..5).step(n) } catch (e: Throwable) { println(e) } }"
+        ),
+        "java.lang.IllegalArgumentException: Step must be positive, was: 0.\n"
+    );
+}
