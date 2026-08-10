@@ -3507,7 +3507,16 @@ impl Compiler {
         // An untyped receiver (a lambda parameter, a `List` element, a `when`
         // subject) that names a user method: decide by runtime class tag, with
         // the host stdlib dispatch as the fallback arm.
-        if static_cls.is_none() {
+        //
+        // A receiver whose coarse type is a PRIMITIVE is excluded: no user class
+        // instance is an `Int`/`Long`/`Double`/`Boolean`/`Char`/`String`, so the
+        // runtime tag can only ever take the fallback arm — and taking it that
+        // way LOSES the receiver's static width, which the members below push
+        // along as an argument. `(-7L).hashCode()` is `6` in Kotlin (the `Long`
+        // fold) and `-7` under the 32-bit one; it answered `-7` in any program
+        // where some user class happened to declare `hashCode`, because that
+        // made the candidate list non-empty and swallowed the call here.
+        if static_cls.is_none() && !is_primitive_recv(self.infer(sc, recv)) {
             let cands = self.candidates(None, name, args.len());
             if !cands.is_empty() {
                 self.emit_virtual_call(sc, recv, name, args, Targets::dynamic(&cands), line)?;
@@ -6873,6 +6882,25 @@ fn promote(lt: Type, rt: Type) -> Type {
     } else {
         Type::Int
     }
+}
+
+/// True when a receiver of type `t` cannot be an instance of a user class, so a
+/// member call on it needs no runtime class-tag dispatch.
+///
+/// [`Type::Obj`], [`Type::Unit`] and [`Type::Unknown`] are excluded, and that is
+/// the whole point: those are exactly the types a user instance wears, so a
+/// receiver carrying one still has to be decided at run time.
+fn is_primitive_recv(t: Type) -> bool {
+    matches!(
+        t,
+        Type::Int
+            | Type::Long
+            | Type::Double
+            | Type::Boolean
+            | Type::Char
+            | Type::String
+            | Type::NullableString
+    )
 }
 
 /// True when `t` is a statically known operand of `Int` width. `Char` counts —

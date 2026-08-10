@@ -3340,3 +3340,50 @@ fun main() {
 }"#;
     assert_eq!(stdout(src), "-294967296\n4000000000\n");
 }
+
+#[test]
+fn a_primitive_receiver_keeps_its_width_through_a_member_call() {
+    // A member call on an untyped receiver is decided by runtime class tag so a
+    // user override can win. A receiver whose coarse type is a PRIMITIVE is not
+    // one of those: no user instance is a `Long`, so the tag dispatch can only
+    // take its fallback arm — and that arm drops the static width the width-
+    // sensitive members push along. `(-7L).hashCode()` is the `Long` fold, `6`;
+    // it answered the 32-bit `-7` in any program where some user class happened
+    // to declare `hashCode`, because that alone made the candidate list
+    // non-empty. The `String` line is the same rule for a member that is not
+    // width-sensitive: a user `uppercase()` must not capture `"ab".uppercase()`.
+    let src = r#"class H(val a: Int) {
+    override fun hashCode(): Int = a * 31
+    fun uppercase(): String = "OVERRIDE"
+}
+fun main() {
+    println((-7L).hashCode())
+    println((-7).hashCode())
+    println((-1L).hashCode())
+    println("ab".uppercase())
+    println(1L shl 32)
+    println(1 shl 32)
+}"#;
+    assert_eq!(stdout(src), "6\n-7\n0\nAB\n4294967296\n1\n");
+}
+
+#[test]
+fn an_override_still_dispatches_through_an_untyped_receiver() {
+    // The other direction, and the reason the rule above is written on the
+    // receiver's TYPE rather than on the member's name: a `for` variable, a
+    // lambda parameter and a list element carry no static class, so the runtime
+    // tag is the only thing that can reach the user's `hashCode`/`toString`.
+    let src = r#"class H(val a: Int) {
+    override fun hashCode(): Int = a * 31
+    override fun toString(): String = "E" + a
+}
+fun main() {
+    val xs = listOf(H(3), H(4))
+    for (x in xs) println(x.hashCode())
+    println(xs.map { it.hashCode() })
+    println(xs.map { it.toString() })
+    println(xs[0].hashCode())
+    println(H(5).hashCode())
+}"#;
+    assert_eq!(stdout(src), "93\n124\n[93, 124]\n[E3, E4]\n93\n155\n");
+}
