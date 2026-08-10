@@ -74,6 +74,17 @@ if [[ -z $jver ]] || (( jver < 21 )); then
 fi
 print -u2 "capture-parity: oracle $($kotlinc -version 2>&1 | tail -1)"
 
+# THE LOCALE IS PART OF THE ORACLE TOO. `String.format`'s `%f`/`%e`/`%,d` take
+# their decimal separator and grouping from `Locale.getDefault()`, so the same
+# program prints `3.14` on an `en_US` machine and `3,14` on a `de_DE` one — five
+# records in the corpus go through `%f`/`%e` and would have frozen whichever the
+# capturing machine happened to have. kotlinrs has no locale and always formats
+# the `en_US` way, so that is what the oracle is pinned to; the charset is
+# pinned with it so a non-ASCII record cannot depend on the terminal either.
+# (`Double.toString`, `uppercase()`/`lowercase()` and `sorted()` are NOT
+# locale-sensitive — Kotlin's no-argument case members use `Locale.ROOT`.)
+jvmflags=(-J-Duser.language=en -J-Duser.country=US -J-Dfile.encoding=UTF-8)
+
 work=$(mktemp -d) || exit 2
 trap 'rm -rf -- $work' EXIT
 
@@ -87,7 +98,7 @@ while IFS= read -r line; do
         (( bad++ ))
         continue
     fi
-    out=$( (cd $work && $kotlin -classpath out TKt) 2>/dev/null )
+    out=$( (cd $work && $kotlin $jvmflags -classpath out TKt) 2>/dev/null )
     rc=$?
     if (( rc != 0 )); then
         print -u2 "capture-parity: program exited $rc: $line"
