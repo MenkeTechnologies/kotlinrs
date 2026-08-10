@@ -3761,6 +3761,17 @@ fn coll_hof(
             }
             Ok(acc)
         }
+        // `foldRight` walks from the END, and its lambda takes the arguments the
+        // other way round — `(element, acc)`, not `(acc, element)`. Both halves
+        // are observable at once: `listOf(1, 2, 3).foldRight("") { a, b ->
+        // "$a$b" }` is `123`, where `fold` on the same lambda gives `321`.
+        "foldRight" => {
+            let mut acc = extras.first().cloned().unwrap_or(Value::Undef);
+            for it in items.into_iter().rev() {
+                acc = invoke_closure(vm, clo, &[it, acc])?;
+            }
+            Ok(acc)
+        }
         // `runningFold` (and its alias `scan`) is `fold` that keeps every
         // intermediate accumulator, INCLUDING the initial one — so the result
         // is one longer than the input.
@@ -3832,6 +3843,20 @@ fn coll_hof(
             })?;
             for it in iter {
                 acc = invoke_closure(vm, clo, &[acc, it])?;
+            }
+            Ok(acc)
+        }
+        // `reduceRight` is to `reduce` what `foldRight` is to `fold`: the seed
+        // is the LAST element, the walk runs backwards, and the lambda's
+        // arguments are `(element, acc)`.
+        "reduceRight" => {
+            let mut iter = items.into_iter().rev();
+            let mut acc = iter.next().ok_or_else(|| {
+                "java.lang.UnsupportedOperationException: Empty collection can't be reduced."
+                    .to_string()
+            })?;
+            for it in iter {
+                acc = invoke_closure(vm, clo, &[it, acc])?;
             }
             Ok(acc)
         }
@@ -4153,6 +4178,43 @@ fn coll_hof(
                 }
             }
         }
+        // `Map.filterKeys { }` / `filterValues { }` keep the entries whose KEY
+        // (or VALUE) satisfies the predicate. Unlike `mapKeys`/`mapValues`
+        // below, the lambda sees that half alone, not the whole entry — which
+        // is why `filterKeys { it > 1 }` compares an `Int` key and not an
+        // `Entry`.
+        "filterKeys" | "filterValues" => {
+            let on_keys = name == "filterKeys";
+            let mut entries: Vec<(Value, Value)> = Vec::new();
+            for it in items {
+                let Some((k, v)) = with_obj(&it, |o| match o {
+                    HeapObj::Entry(k, v) | HeapObj::Pair(k, v) => Some((k.clone(), v.clone())),
+                    _ => None,
+                })
+                .flatten() else {
+                    return Err(format!(
+                        "unresolved reference: {name} on {}",
+                        obj_label(recv)
+                    ));
+                };
+                let probe = if on_keys { &k } else { &v };
+                if truthy(&invoke_closure(vm, clo, std::slice::from_ref(probe))?) {
+                    entries.push((k, v));
+                }
+            }
+            Ok(alloc(HeapObj::Map(entries)))
+        }
+        // `zipWithNext { a, b -> … }` transforms each element/successor pair.
+        // The no-lambda spelling answers the pairs themselves and resolves in
+        // `sequence_member`, which is why the name is an OPTIONAL higher-order
+        // function rather than a plain one.
+        "zipWithNext" => {
+            let mut out = Vec::with_capacity(items.len().saturating_sub(1));
+            for w in items.windows(2) {
+                out.push(invoke_closure(vm, clo, &[w[0].clone(), w[1].clone()])?);
+            }
+            Ok(alloc(HeapObj::List(out)))
+        }
         // `Map.mapValues { }` — the lambda sees each ENTRY and its result
         // replaces that entry's value; the keys and their order are kept.
         "mapValues" | "mapKeys" => {
@@ -4185,8 +4247,29 @@ fn coll_hof(
         }
         // `getOrElse(index) { default }` — the lambda supplies the fallback and
         // receives the out-of-range index.
+        // `getOrElse` is two different members sharing a name. On a `Map` the
+        // first argument is a KEY and the fallback lambda takes it; on a
+        // sequence it is an INDEX. Routing a map receiver through the index form
+        // read `items` as the entry list, so `mapOf("a" to 1).getOrElse("z") {
+        // 9 }` answered the entry at index 0 — `a=1` — instead of `9`.
         "getOrElse" => {
-            let i = extras.first().map(|v| v.to_int()).unwrap_or(0);
+            let key = extras.first().cloned().unwrap_or(Value::Undef);
+            if matches!(with_obj(recv, |o| matches!(o, HeapObj::Map(_))), Some(true)) {
+                let found = items.iter().find_map(|it| {
+                    with_obj(it, |o| match o {
+                        HeapObj::Entry(k, v) | HeapObj::Pair(k, v) if value_eq(k, &key) => {
+                            Some(v.clone())
+                        }
+                        _ => None,
+                    })
+                    .flatten()
+                });
+                return match found {
+                    Some(v) => Ok(v),
+                    None => invoke_closure(vm, clo, std::slice::from_ref(&key)),
+                };
+            }
+            let i = key.to_int();
             match usize::try_from(i).ok().and_then(|i| items.get(i)) {
                 Some(v) => Ok(v.clone()),
                 None => invoke_closure(vm, clo, &[Value::Int(i)]),
@@ -4984,6 +5067,25 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
             };
             Ok(Value::str(String::from_utf16_lossy(cut)))
         }
+        // The `kotlin.text` from-the-end pair. It answers a `String`, not the
+        // `List<Char>` the shared sequence path would build, so it resolves here
+        // rather than through the character snapshot.
+        (Value::Str(s), "takeLast" | "dropLast") => {
+            let units: Vec<u16> = s.encode_utf16().collect();
+            let n = args.first().map(|v| v.to_int()).unwrap_or(0);
+            if n < 0 {
+                return Err(format!(
+                    "java.lang.IllegalArgumentException: Requested character count {n} is less than zero."
+                ));
+            }
+            let at = units.len() - (n as usize).min(units.len());
+            let cut = if name == "takeLast" {
+                &units[at..]
+            } else {
+                &units[..at]
+            };
+            Ok(Value::str(String::from_utf16_lossy(cut)))
+        }
         // `padStart`/`padEnd` pad to a UTF-16 length with a `Char` (default
         // space); a receiver already that long is returned unchanged.
         (Value::Str(s), "padStart" | "padEnd") => {
@@ -5579,6 +5681,43 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 )),
             };
         }
+        // `Map.toList()` flattens to a `List<Pair<K, V>>` in iteration order —
+        // the map's own order, so a `LinkedHashMap` keeps insertion order and a
+        // `HashMap` keeps its bucket order. The generic sequence `toList` below
+        // cannot serve this: it would hand back the `Entry` objects, which print
+        // `1=a` where a `Pair` prints `(1, a)`.
+        "toList" => {
+            if let Some(entries) = with_obj(recv, |o| match o {
+                HeapObj::Map(entries) => Some(entries.clone()),
+                _ => None,
+            })
+            .flatten()
+            {
+                let out = entries
+                    .into_iter()
+                    .map(|(k, v)| alloc(HeapObj::Pair(k, v)))
+                    .collect();
+                return Ok(alloc(HeapObj::List(out)));
+            }
+        }
+        // `toSortedMap()` is a `java.util.TreeMap`: the entries re-ordered by
+        // NATURAL key order, which is what makes it observably different from
+        // the receiver even though the entries are the same.
+        "toSortedMap" => {
+            if let Some(entries) = with_obj(recv, |o| match o {
+                HeapObj::Map(entries) => Some(entries.clone()),
+                _ => None,
+            })
+            .flatten()
+            {
+                let sorted = alloc(HeapObj::Map(entries));
+                // Recording the discipline rather than sorting once: a `TreeMap`
+                // stays in key order across later `put`s, which is exactly what
+                // [`reorder`] maintains for the other sorted collections.
+                set_order(vm, &sorted, CollOrder::Sorted);
+                return Ok(sorted);
+            }
+        }
         "put" => {
             // Map.put(k, v) → previous value or null.
             let k = args.first().cloned().unwrap_or(Value::Undef);
@@ -6003,6 +6142,58 @@ fn sequence_member(
             } else {
                 items[n..].to_vec()
             };
+            return Some(Ok(alloc(HeapObj::List(out))));
+        }
+        // The from-the-end pair. Same clamping and the same message on a
+        // negative count as `take`/`drop`, counted from the other end: for a
+        // count of `n`, `takeLast` keeps the tail and `dropLast` keeps
+        // everything before it, so the two partition the receiver.
+        "takeLast" | "dropLast" => {
+            let n = args.first().map(|v| v.to_int()).unwrap_or(0);
+            if n < 0 {
+                return Some(Err(format!(
+                    "java.lang.IllegalArgumentException: Requested element count {n} is less than zero."
+                )));
+            }
+            let cut = items.len() - (n as usize).min(items.len());
+            let out = if name == "takeLast" {
+                items[cut..].to_vec()
+            } else {
+                items[..cut].to_vec()
+            };
+            return Some(Ok(alloc(HeapObj::List(out))));
+        }
+        // `unzip` is `zip` run backwards: a list of pairs becomes a PAIR of
+        // lists, `[(1, a), (2, b)]` → `([1, 2], [a, b])`.
+        "unzip" => {
+            let (mut lhs, mut rhs) = (Vec::with_capacity(items.len()), Vec::new());
+            for it in items {
+                match with_obj(it, |o| match o {
+                    HeapObj::Pair(a, b) | HeapObj::Entry(a, b) => Some((a.clone(), b.clone())),
+                    _ => None,
+                })
+                .flatten()
+                {
+                    Some((a, b)) => {
+                        lhs.push(a);
+                        rhs.push(b);
+                    }
+                    None => return Some(Err(format!("unresolved reference: {name} on List"))),
+                }
+            }
+            return Some(Ok(alloc(HeapObj::Pair(
+                alloc(HeapObj::List(lhs)),
+                alloc(HeapObj::List(rhs)),
+            ))));
+        }
+        // `zipWithNext()` pairs each element with its SUCCESSOR, so the result
+        // is one shorter than the receiver and empty for a receiver of one. The
+        // lambda overload transforms each pair instead and lives in `coll_hof`.
+        "zipWithNext" => {
+            let out: Vec<Value> = items
+                .windows(2)
+                .map(|w| alloc(HeapObj::Pair(w[0].clone(), w[1].clone())))
+                .collect();
             return Some(Ok(alloc(HeapObj::List(out))));
         }
         // `joinToString(separator, prefix, postfix, limit, truncated)`. Only

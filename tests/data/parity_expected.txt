@@ -528,3 +528,15 @@ fun main() {\n    println('a' === 'a')\n    println('a' !== 'b')\n}	true\ntrue\n
 fun main() {\n    val m = mapOf(1 to "a")\n    println(m === m)\n    println(m === mapOf(1 to "a"))\n}	true\nfalse\n
 fun main() {\n    val s = setOf(1, 2)\n    println(s !== setOf(1, 2))\n    println(s == setOf(1, 2))\n}	true\ntrue\n
 fun main() {\n    println(true === true)\n    println(true !== false)\n}	true\ntrue\n
+fun main() {\n    println(listOf(1, 2, 3, 4).takeLast(2))\n    println(listOf(1, 2, 3, 4).dropLast(2))\n    println(listOf(1, 2).takeLast(9))\n    println(listOf(1, 2).dropLast(9))\n    println(listOf(1, 2).takeLast(0))\n    println(listOf(1, 2).dropLast(0))\n}	[3, 4]\n[1, 2]\n[1, 2]\n[]\n[]\n[1, 2]\n
+fun main() {\n    println(listOf(1, 2, 3).foldRight("") { a, b -> "$a$b" })\n    println(listOf(1, 2, 3).fold("") { a, b -> "$a$b" })\n    println(listOf(1, 2, 3).foldRight(0) { a, b -> a - b })\n    println(listOf(1, 2, 3).reduceRight { a, b -> a - b })\n    println(listOf(1, 2, 3).reduce { a, b -> a - b })\n}	123\n123\n2\n2\n-4\n
+fun main() {\n    println(listOf(1 to "a", 2 to "b").unzip())\n    println(listOf<Pair<Int, String>>().unzip())\n}	([1, 2], [a, b])\n([], [])\n
+fun main() {\n    println(listOf(1, 2, 3).zipWithNext())\n    println(listOf(1).zipWithNext())\n    println(listOf<Int>().zipWithNext())\n    println(listOf(1, 2, 3).zipWithNext { a, b -> a + b })\n}	[(1, 2), (2, 3)]\n[]\n[]\n[3, 5]\n
+fun main() {\n    println(mapOf(1 to "a", 2 to "b").toList())\n    println(mapOf<Int, String>().toList())\n}	[(1, a), (2, b)]\n[]\n
+fun main() {\n    println(mapOf(1 to "a", 2 to "b").filterKeys { it > 1 })\n    println(mapOf(1 to "a", 2 to "b").filterValues { it == "a" })\n    println(mapOf(1 to "a", 2 to "b").filterKeys { false })\n}	{2=b}\n{1=a}\n{}\n
+fun main() {\n    println(mapOf(2 to "b", 1 to "a", 3 to "c").toSortedMap())\n    println(mapOf("b" to 1, "a" to 2).toSortedMap())\n}	{1=a, 2=b, 3=c}\n{a=2, b=1}\n
+fun f(xs: List<String>) = xs.filter { it == "a" }\nfun main() {\n    println(f(listOf("a", "b", "a")))\n}	[a, a]\n
+fun main() {\n    println(mapOf(1 to "a", 2 to "b").mapValues { it.value == "a" })\n}	{1=true, 2=false}\n
+fun main() {\n    val xs = listOf("x", "y")\n    println(xs.takeLast(1))\n    println(xs.dropLast(1))\n    println(xs.zipWithNext())\n}	[y]\n[x]\n[(x, y)]\n
+fun main() {\n    println("ab".takeLast(9))\n    println("ab".dropLast(9))\n    println("abcde".takeLast(2))\n    println("abcde".dropLast(2))\n}	ab\n\nde\nabc\n
+fun main() {\n    println(mapOf("a" to 1).getOrElse("z") { 9 })\n    println(mapOf("a" to 1).getOrElse("a") { 9 })\n    println(listOf(1, 2).getOrElse(5) { it * 10 })\n    println(listOf(1, 2).getOrElse(1) { 99 })\n}	9\n1\n50\n2\n

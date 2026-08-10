@@ -4291,30 +4291,51 @@ impl Compiler {
         let lt = self.infer(sc, l);
         let rt = self.infer(sc, r);
 
-        // `==`/`!=` on a heap object is structural equality (data-class,
-        // List/Map/Pair), not the numeric/pointer compare of the native ops.
-        if matches!(op, BinOp::Eq | BinOp::Ne) && (lt == Type::Obj || rt == Type::Obj) {
-            self.compile_expr(sc, l)?;
-            self.compile_expr(sc, r)?;
-            // A builtin rather than the `KT_OBJEQ` extension op: a user `equals`
-            // override runs re-entrantly, which an extension handler cannot host
-            // (see `KT_OBJEQ_VM`).
-            self.b.emit(Op::CallBuiltin(KT_OBJEQ_VM, 2), 0);
-            if op == BinOp::Ne {
-                self.b.emit(Op::LogNot, 0);
-            }
-            return Ok(Type::Boolean);
-        }
-
         // `x == null` / `x != null` is a null test, not a value comparison: the
         // native numeric/string ops would compare an absent value's coerced form
-        // (`0` / `""`) and answer `true` for a non-null `0`/`""` receiver.
+        // (`0` / `""`) and answer `true` for a non-null `0`/`""` receiver. A
+        // literal `null` operand is decided from the SYNTAX, so this precedes
+        // the type-driven rule below and keeps the cheap one-operand op.
         if matches!(op, BinOp::Eq | BinOp::Ne)
             && (matches!(l, Expr::Null) || matches!(r, Expr::Null))
         {
             let value = if matches!(l, Expr::Null) { r } else { l };
             self.compile_expr(sc, value)?;
             self.b.emit(Op::Extended(KT_ISNULL, 0), 0);
+            if op == BinOp::Ne {
+                self.b.emit(Op::LogNot, 0);
+            }
+            return Ok(Type::Boolean);
+        }
+
+        // `==`/`!=` reaches the native ops only when the STATIC types say which
+        // native op is right: both numeric/`Char`/`Boolean` (`Op::NumEq`) or
+        // both `String` (`Op::StrEq`). Anything else — a heap object, or an
+        // operand the frontend could not type — goes to the runtime-tagged
+        // structural comparison, which reads each value's own kind.
+        //
+        // The `Unknown` half of that is not caution, it is a miscompile fixed:
+        // `Op::NumEq` COERCES its operands, and two different strings both
+        // coerce to `0`, so `xs.filter { it == "a" }` over a `List<String>`
+        // reached through a declared parameter kept every element. `Unknown`
+        // arises wherever inference stops — a declared `List<String>` parameter,
+        // a `Map` entry half, a member call's result — and each of those can
+        // hold a string just as easily as a number.
+        let native_eq = (lt.is_str() && rt.is_str())
+            || (matches!(
+                lt,
+                Type::Int | Type::Long | Type::Double | Type::Char | Type::Boolean
+            ) && matches!(
+                rt,
+                Type::Int | Type::Long | Type::Double | Type::Char | Type::Boolean
+            ));
+        if matches!(op, BinOp::Eq | BinOp::Ne) && !native_eq {
+            self.compile_expr(sc, l)?;
+            self.compile_expr(sc, r)?;
+            // A builtin rather than the `KT_OBJEQ` extension op: a user `equals`
+            // override runs re-entrantly, which an extension handler cannot host
+            // (see `KT_OBJEQ_VM`).
+            self.b.emit(Op::CallBuiltin(KT_OBJEQ_VM, 2), 0);
             if op == BinOp::Ne {
                 self.b.emit(Op::LogNot, 0);
             }
@@ -7006,7 +7027,9 @@ fn is_coll_hof(name: &str) -> bool {
             | "runningReduce"
             | "scanReduce"
             | "fold"
+            | "foldRight"
             | "reduce"
+            | "reduceRight"
             | "any"
             | "all"
             | "none"
@@ -7040,6 +7063,8 @@ fn is_coll_hof(name: &str) -> bool {
             | "minOfOrNull"
             | "mapValues"
             | "mapKeys"
+            | "filterKeys"
+            | "filterValues"
             | "sortedWith"
     )
 }
@@ -7062,6 +7087,7 @@ fn is_optional_hof(name: &str) -> bool {
             | "trim"
             | "trimStart"
             | "trimEnd"
+            | "zipWithNext"
     )
 }
 
@@ -7079,7 +7105,7 @@ fn hof_ret_type(name: &str) -> Type {
         | "dropWhile" | "sortedBy" | "sortedByDescending" | "associate" | "associateBy"
         | "associateWith" | "groupBy" | "groupingBy" => Type::Obj,
         "filterIndexed" | "mapValues" | "mapKeys" | "sortedWith" | "chunked" | "windowed"
-        | "zip" => Type::Obj,
+        | "zip" | "filterKeys" | "filterValues" | "zipWithNext" => Type::Obj,
         "forEach" | "forEachIndexed" => Type::Unit,
         "any" | "all" | "none" => Type::Boolean,
         "count" | "indexOfFirst" | "indexOfLast" => Type::Int,

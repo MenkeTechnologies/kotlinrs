@@ -731,6 +731,15 @@ and a wider `Iterable` surface — `sorted`/`sortedDescending`/`take`/`drop` plu
 the `associate`/`associateBy`/`minByOrNull`/`none`/`filterNot`/`flatMap`/
 `mapIndexed`/`sortedByDescending` higher-order members.
 
+Also landed: the from-the-end and pairing members — `takeLast`/`dropLast` on a
+sequence and on a `String`, `unzip`, `zipWithNext` in both its pair-yielding and
+its lambda form, and `foldRight`/`reduceRight`, whose lambdas take `(element,
+acc)` where `fold`/`reduce` take `(acc, element)`. On a `Map`: `toList` (which
+yields `Pair`s, printing `(1, a)` rather than an entry's `1=a`),
+`filterKeys`/`filterValues` — each handed that half alone, not the entry — and
+`toSortedMap`, recorded as a `TreeMap` so it stays in key order across later
+writes.
+
 Also landed: a **real runtime `Char`** — its own value representation rather than
 an `Int` code unit, so it prints as a character inside a `List`/`Set`/`Map`,
 answers `is Char`, and keeps Kotlin's `Char` arithmetic and ordering inside a

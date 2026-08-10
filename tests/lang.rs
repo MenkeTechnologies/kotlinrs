@@ -3446,3 +3446,144 @@ fn the_three_character_operators_out_lex_the_two_character_ones() {
         "7\n"
     );
 }
+
+#[test]
+fn the_from_the_end_selectors_partition_the_receiver() {
+    // `takeLast(n)` and `dropLast(n)` split at the same point from the other
+    // end, clamp an oversized count, and fault on a negative one with the same
+    // message `take`/`drop` use.
+    assert_eq!(stdout("println(listOf(1,2,3,4).takeLast(2))"), "[3, 4]\n");
+    assert_eq!(stdout("println(listOf(1,2,3,4).dropLast(2))"), "[1, 2]\n");
+    assert_eq!(stdout("println(listOf(1,2).takeLast(9))"), "[1, 2]\n");
+    assert_eq!(stdout("println(listOf(1,2).dropLast(9))"), "[]\n");
+    assert_eq!(stdout(r#"println("abcde".takeLast(2))"#), "de\n");
+    assert_eq!(stdout(r#"println("abcde".dropLast(2))"#), "abc\n");
+
+    let out = eval("println(listOf(1,2).takeLast(-1))");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("Requested element count -1 is less than zero."),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn folding_from_the_right_reverses_both_the_walk_and_the_lambda_arguments() {
+    // `foldRight`'s lambda is `(element, acc)` where `fold`'s is `(acc,
+    // element)`, so the same lambda gives a different answer for each — that
+    // pair is the whole contract.
+    assert_eq!(
+        stdout(r#"println(listOf(1,2,3).foldRight("") { a, b -> "$a$b" })"#),
+        "123\n"
+    );
+    assert_eq!(
+        stdout(r#"println(listOf(1,2,3).fold("") { a, b -> "$a$b" })"#),
+        "123\n"
+    );
+    assert_eq!(
+        stdout("println(listOf(1,2,3).foldRight(0) { a, b -> a - b })"),
+        "2\n"
+    );
+    assert_eq!(
+        stdout("println(listOf(1,2,3).reduceRight { a, b -> a - b })"),
+        "2\n"
+    );
+    assert_eq!(
+        stdout("println(listOf(1,2,3).reduce { a, b -> a - b })"),
+        "-4\n"
+    );
+}
+
+#[test]
+fn unzip_and_zip_with_next_are_the_pairing_inverses() {
+    assert_eq!(
+        stdout(r#"println(listOf(1 to "a", 2 to "b").unzip())"#),
+        "([1, 2], [a, b])\n"
+    );
+    // One shorter than the receiver, so a one-element list pairs nothing.
+    assert_eq!(
+        stdout("println(listOf(1,2,3).zipWithNext())"),
+        "[(1, 2), (2, 3)]\n"
+    );
+    assert_eq!(stdout("println(listOf(1).zipWithNext())"), "[]\n");
+    // The lambda overload transforms each pair instead of yielding it.
+    assert_eq!(
+        stdout("println(listOf(1,2,3).zipWithNext { a, b -> a + b })"),
+        "[3, 5]\n"
+    );
+}
+
+#[test]
+fn map_conversions_and_half_filters() {
+    // `Map.toList()` must yield `Pair`s, which print `(1, a)` — the entries
+    // themselves would print `1=a`.
+    assert_eq!(
+        stdout(r#"println(mapOf(1 to "a", 2 to "b").toList())"#),
+        "[(1, a), (2, b)]\n"
+    );
+    // `filterKeys`/`filterValues` hand the lambda that HALF, not the entry.
+    assert_eq!(
+        stdout(r#"println(mapOf(1 to "a", 2 to "b").filterKeys { it > 1 })"#),
+        "{2=b}\n"
+    );
+    assert_eq!(
+        stdout(r#"println(mapOf(1 to "a", 2 to "b").filterValues { it == "a" })"#),
+        "{1=a}\n"
+    );
+    // `toSortedMap` is a TreeMap: key order, whatever the receiver's was.
+    assert_eq!(
+        stdout(r#"println(mapOf(2 to "b", 1 to "a", 3 to "c").toSortedMap())"#),
+        "{1=a, 2=b, 3=c}\n"
+    );
+    assert_eq!(
+        stdout(r#"println(mapOf("b" to 1, "a" to 2).toSortedMap())"#),
+        "{a=2, b=1}\n"
+    );
+}
+
+#[test]
+fn equality_on_an_untyped_operand_compares_values_not_their_numeric_coercions() {
+    // `Op::NumEq` coerces, and two different strings both coerce to `0` — so
+    // every comparison against a string came out `true` wherever inference
+    // stopped. It stops at a declared parameter's element type and at a map
+    // entry's halves, both of which can hold a string.
+    assert_eq!(
+        stdout(
+            r#"fun f(xs: List<String>) = xs.filter { it == "a" }
+fun main() { println(f(listOf("a","b","a"))) }"#
+        ),
+        "[a, a]\n"
+    );
+    assert_eq!(
+        stdout(r#"println(mapOf(1 to "a", 2 to "b").mapValues { it.value == "a" })"#),
+        "{1=true, 2=false}\n"
+    );
+    // The statically typed comparisons keep their native ops and their answers.
+    assert_eq!(stdout("println(1 == 1)"), "true\n");
+    assert_eq!(stdout(r#"println("a" == "b")"#), "false\n");
+    assert_eq!(stdout("println('a' == 'a')"), "true\n");
+    assert_eq!(stdout("val x: Int? = null; println(x == null)"), "true\n");
+}
+
+#[test]
+fn get_or_else_reads_a_key_on_a_map_and_an_index_on_a_sequence() {
+    // One name, two members. The map form was routed through the index form, so
+    // the key was coerced to `0` and the entry at that position came back —
+    // `a=1` where the fallback was due.
+    assert_eq!(
+        stdout(r#"println(mapOf("a" to 1).getOrElse("z") { 9 })"#),
+        "9\n"
+    );
+    assert_eq!(
+        stdout(r#"println(mapOf("a" to 1).getOrElse("a") { 9 })"#),
+        "1\n"
+    );
+    // The sequence form still hands the missing INDEX to the lambda.
+    assert_eq!(
+        stdout("println(listOf(1,2).getOrElse(5) { it * 10 })"),
+        "50\n"
+    );
+    assert_eq!(stdout("println(listOf(1,2).getOrElse(1) { 99 })"), "2\n");
+}
