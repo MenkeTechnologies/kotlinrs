@@ -1105,6 +1105,56 @@ expectation the OLD way, and every record it has reached agrees byte for byte �
 which is the same statement as those records ending in exactly one newline. The
 defect was latent, waiting for the first probe that used `print`.
 
+The round after it turned the same question on the frontend's own source: not
+"did the capture record the reference faithfully" but **"is the reference
+written down here at all"**. A version gate cannot see a string frozen in an
+implementation file, and a sweep of every exception message, type name and
+`toString` form in `src/` found four families that no JVM produces — measured
+against JDK 17, 21 and 26 to rule out "an older dialect" as the explanation.
+`NegativeArraySizeException` was raised bare where every JVM names the length it
+was asked for; `UnknownFormatConversionException` was raised bare where the JVM
+always names a character (and names the one right after the `%` when the spec
+runs off the end); `intArrayOf(1, 2)` rendered `[Ljava.lang.Integer;@…`, the
+BOXED descriptor, where an `int[]` renders `[I@…`; and a failed cast on a
+container answered `class List cannot be cast to class String`, a sentence with
+no JVM behind it — the real class depends on how the handle was built, and that
+provenance was already recorded for the index diagnostics. The escape table was
+the same defect one layer down: written out twice, with only the `Char` copy
+carrying `\u`, so `"A"` lexed as the five characters `u0041` while
+`'A'` lexed as `A`. There is one table now.
+
+Alongside it, a sweep of the mappings that share a NAME with the reference but
+not its behaviour. `partial_cmp(…).unwrap_or(Equal)` is not `Double.compare`: it
+scores every NaN comparison as a tie and cannot separate `-0.0` from `0.0`, so
+`sorted()` left NaN where it lay and `compareTo` answered 0 where the JVM
+answers 1. Rust's `==` on two `f64`s is not `Double.equals` either — the boxed
+form compares `doubleToLongBits`, which is the exact reverse on those same two
+values, and it is what every membership test uses, so `listOf(NaN).contains(NaN)`
+was false and `setOf(0.0, -0.0).size` was 2. `floor(x + 0.5)` is `Math.round`'s
+documentation and not its implementation; the addition itself rounds
+`0.49999999999999994` up, which is the JDK 8 bug the current algorithm was
+written to fix, so the JDK body is ported here now. `f64::max` ignores NaN where
+`Math.max` propagates it. `coerceIn` clamped a crossed pair to a bound instead
+of refusing it. `char::is_whitespace` is Unicode's `White_Space` property, and
+Kotlin's predicate is Java's union, which differs at both ends — it counts
+`U+001C`–`U+001F` and does not count NEL. And `f64::from_str` is not
+`Double.parseDouble`: Java takes a `d`/`f` suffix and hexadecimal floating
+point, Rust takes `inf`, and only one of them has an `empty String` message.
+
+The `sorted…` family turned out to be mis-tabulated in the same way. Its
+provenance row claimed an `ArrayList`, on the reading that a sorting member
+builds its own; measured, `Iterable.sorted` takes the `Collection` fast path and
+comes back wrapping a bare array, so it raises the ARRAY subclass exactly as a
+list literal does — and a RANGE receiver, being `Iterable` and not `Collection`,
+is the one case where the old row was right.
+
+Four assertions that could not fail went with them. `stderr.contains(
+"IndexOutOfBoundsException")` cannot tell the plain subclass from the array one
+— it is a substring of both — cannot see the detail message, and passes whether
+or not the `Exception in thread "main"` report line was written at all. Those
+now compare the whole line, across the five list shapes that word the same fault
+five different ways.
+
 Next: `sequence { … }`/`yield`, variance and bounds,
 `Delegates.observable`/`vetoable`, and a growing standard-library surface —
 alongside the sibling parity tooling (LSP/DAP, reference generator, differential
