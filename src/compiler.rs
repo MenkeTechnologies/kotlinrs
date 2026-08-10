@@ -7346,8 +7346,12 @@ fn bind_named_builtin(name: &str, args: &[Expr]) -> Result<Vec<Expr>, String> {
     let last = slots.iter().rposition(|s| s.is_some());
     let mut out = Vec::new();
     for (i, (pname, dflt)) in params.iter().enumerate() {
-        if last.is_none_or(|l| i > l) {
-            break;
+        // Spelled out rather than `Option::is_none_or`, which is stable only
+        // since 1.82 — this crate declares 1.80.
+        match last {
+            None => break,
+            Some(l) if i > l => break,
+            Some(_) => {}
         }
         out.push(match slots[i] {
             Some(e) => e.clone(),

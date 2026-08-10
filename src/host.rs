@@ -3466,8 +3466,8 @@ fn gen_pull(vm: &mut VM, gen: &Value, want: Option<usize>) -> Result<Vec<Value>,
         };
 
         let mut v = cur;
-        for i in 0..stages.len() {
-            match stages[i].clone() {
+        for stage in stages.iter_mut() {
+            match stage.clone() {
                 Stage::Map(f) => v = invoke_closure(vm, &f, std::slice::from_ref(&v))?,
                 Stage::Filter(f, keep) => {
                     if truthy(&invoke_closure(vm, &f, std::slice::from_ref(&v))?) != keep {
@@ -3484,18 +3484,18 @@ fn gen_pull(vm: &mut VM, gen: &Value, want: Option<usize>) -> Result<Vec<Value>,
                         if truthy(&invoke_closure(vm, &f, std::slice::from_ref(&v))?) {
                             continue 'source;
                         }
-                        stages[i] = Stage::DropWhile(f, true);
+                        *stage = Stage::DropWhile(f, true);
                     }
                 }
                 Stage::Take(n) => {
                     if n <= 0 {
                         break 'source;
                     }
-                    stages[i] = Stage::Take(n - 1);
+                    *stage = Stage::Take(n - 1);
                 }
                 Stage::Drop(n) => {
                     if n > 0 {
-                        stages[i] = Stage::Drop(n - 1);
+                        *stage = Stage::Drop(n - 1);
                         continue 'source;
                     }
                 }
