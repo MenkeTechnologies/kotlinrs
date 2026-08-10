@@ -22,15 +22,15 @@
 use crate::ast::*;
 use crate::host::{
     COLL_COPY, COLL_DEFAULT_CAP, COLL_HASH, COLL_SORTED, KT_ARRAY, KT_ARRAY_INIT, KT_ARRAY_NEW,
-    KT_AS, KT_BUILDER, KT_CHR_STRING, KT_CLASSOF, KT_CLOSURE_CALL, KT_COLL_HOF, KT_DBG_LINE,
-    KT_DDIV, KT_DISPLAY, KT_ENUM_REG, KT_EQUALS_REG, KT_EXC_ABORT, KT_EXC_CUT, KT_EXC_DEPTH,
-    KT_EXC_MATCH, KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW,
-    KT_EXC_UNSTASH, KT_EXTEND, KT_FFI_CALL, KT_FFI_COMPILE, KT_GETFIELD, KT_HASH_REG, KT_IDENTITY,
-    KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET,
-    KT_ITER_SIZE, KT_JOIN, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH,
-    KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT,
-    KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN, KT_SETFIELD,
-    KT_SET_VM, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG,
+    KT_AS, KT_BUILDER, KT_CHR_STRING, KT_CLASSOF, KT_CLOSURE_CALL, KT_COLL_HOF, KT_COMPARATOR,
+    KT_DBG_LINE, KT_DDIV, KT_DISPLAY, KT_ENUM_REG, KT_EQUALS_REG, KT_EXC_ABORT, KT_EXC_CUT,
+    KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE,
+    KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND, KT_FFI_CALL, KT_FFI_COMPILE, KT_GETFIELD, KT_HASH_REG,
+    KT_IDENTITY, KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL,
+    KT_ITER_GET, KT_ITER_SIZE, KT_JOIN, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_MAKE_CLOSURE,
+    KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OPER_VM, KT_PAIR,
+    KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_RESULT_HOF, KT_RUN_CATCHING,
+    KT_SCOPE_FN, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
@@ -3384,6 +3384,21 @@ impl Compiler {
         if is_optional_hof(name) && args.last().is_some_and(is_lambda) {
             return self.compile_coll_hof(sc, recv, name, args, line);
         }
+        // `cmp.thenBy { … }` / `thenByDescending` extend a comparator with a
+        // tiebreak key. The receiver is a `Comparator`, not a collection, so
+        // this must precede nothing in particular — but it must not fall into
+        // the member dispatch, which would look for the name on a heap kind
+        // that has no members at all.
+        if matches!(name, "thenBy" | "thenByDescending") && args.len() == 1 && is_lambda(&args[0]) {
+            self.compile_expr(sc, recv)?;
+            self.lambda_hint = Some(vec![(Type::Unknown, Type::Unknown)]);
+            self.compile_expr(sc, &args[0])?;
+            self.lambda_hint = None;
+            let nidx = self.b.add_constant(Value::str(name.to_string()));
+            self.b.emit(Op::LoadConst(nidx), line);
+            self.b.emit(Op::CallBuiltin(KT_COMPARATOR, 1), line);
+            return Ok(Type::Obj);
+        }
         // Scope functions on any receiver. They split two ways: `let`/`also`/
         // `takeIf`/`takeUnless` hand the receiver to the block as the parameter
         // `it`, while `run`/`apply` bind it as the block's `this` — which is
@@ -4653,6 +4668,24 @@ impl Compiler {
                 self.compile_expr(sc, &args[0])?;
                 self.b.emit(Op::CallBuiltin(KT_CLOSURE_CALL, 0), line);
                 Ok(Type::Unknown)
+            }
+            // `compareBy { … }` / `compareByDescending { … }` — a `Comparator`
+            // over one or more key selectors, for `sortedWith`. The selectors
+            // are ordinary one-parameter lambdas, so each is compiled to a
+            // closure value and the host holds the chain.
+            "compareBy" | "compareByDescending"
+                if !args.is_empty() && args.iter().all(is_lambda) =>
+            {
+                for a in args {
+                    self.lambda_hint = Some(vec![(Type::Unknown, Type::Unknown)]);
+                    self.compile_expr(sc, a)?;
+                    self.lambda_hint = None;
+                }
+                let nidx = self.b.add_constant(Value::str(name.to_string()));
+                self.b.emit(Op::LoadConst(nidx), line);
+                self.b
+                    .emit(Op::CallBuiltin(KT_COMPARATOR, args.len() as u8), line);
+                Ok(Type::Obj)
             }
             // `Pair(a, b)` / `Triple(a, b, c)` — the constructor spellings of
             // what `a to b` already builds.

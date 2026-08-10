@@ -731,6 +731,13 @@ and a wider `Iterable` surface — `sorted`/`sortedDescending`/`take`/`drop` plu
 the `associate`/`associateBy`/`minByOrNull`/`none`/`filterNot`/`flatMap`/
 `mapIndexed`/`sortedByDescending` higher-order members.
 
+Also landed: `Comparator`s — `compareBy` / `compareByDescending` over one or
+more key selectors, extended by `thenBy` / `thenByDescending`, and consumed by
+`sortedWith` alongside the plain two-argument lambda it already took. The keys
+are kept as a chain rather than folded into one closure, because `thenBy`
+answers a NEW comparator (Kotlin's are immutable) and each key carries its own
+direction, which a single sign cannot express.
+
 Also landed: the from-the-end and pairing members — `takeLast`/`dropLast` on a
 sequence and on a `String`, `unzip`, `zipWithNext` in both its pair-yielding and
 its lambda form, and `foldRight`/`reduceRight`, whose lambdas take `(element,

@@ -3587,3 +3587,52 @@ fn get_or_else_reads_a_key_on_a_map_and_an_index_on_a_sequence() {
     );
     assert_eq!(stdout("println(listOf(1,2).getOrElse(1) { 99 })"), "2\n");
 }
+
+#[test]
+fn comparators_chain_by_key_and_each_key_keeps_its_own_direction() {
+    let src = r#"
+data class P(val name: String, val age: Int)
+fun main() {
+    val ps = listOf(P("b", 2), P("a", 2), P("c", 1))
+    println(ps.sortedWith(compareBy<P> { it.age }.thenBy { it.name }))
+    println(ps.sortedWith(compareBy<P> { it.age }.thenByDescending { it.name }))
+    println(ps.sortedWith(compareBy({ it.age }, { it.name })))
+}"#;
+    // The tiebreak fires only on an equal first key, and `thenByDescending`
+    // reverses THAT key alone — the age order stays ascending in both.
+    assert_eq!(
+        stdout(src),
+        "[P(name=c, age=1), P(name=a, age=2), P(name=b, age=2)]\n\
+         [P(name=c, age=1), P(name=b, age=2), P(name=a, age=2)]\n\
+         [P(name=c, age=1), P(name=a, age=2), P(name=b, age=2)]\n"
+    );
+}
+
+#[test]
+fn then_by_answers_a_new_comparator_and_leaves_the_base_alone() {
+    // Kotlin's comparators are immutable, so a base bound to a name must still
+    // sort by its own keys after a `thenBy` has been built from it.
+    let src = r#"
+fun main() {
+    val byLen = compareBy<String> { it.length }
+    val words = listOf("cc", "a", "bb")
+    println(words.sortedWith(byLen))
+    println(words.sortedWith(byLen.thenBy { it }))
+    println(words.sortedWith(byLen))
+}"#;
+    assert_eq!(stdout(src), "[a, cc, bb]\n[a, bb, cc]\n[a, cc, bb]\n");
+}
+
+#[test]
+fn sorted_with_still_takes_a_plain_two_argument_lambda() {
+    // `sortedWith` now accepts two different things; the lambda form is the one
+    // that already worked and must not have been displaced by the comparator.
+    assert_eq!(
+        stdout("println(listOf(3,1,2).sortedWith { a, b -> a - b })"),
+        "[1, 2, 3]\n"
+    );
+    assert_eq!(
+        stdout("println(listOf(3,1,2).sortedWith { a, b -> b - a })"),
+        "[3, 2, 1]\n"
+    );
+}

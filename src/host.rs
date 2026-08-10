@@ -283,6 +283,14 @@ pub const KT_OPER_VM: u16 = 131;
 /// must not evaluate `expensive()` when the condition holds — and invoking one
 /// needs the re-entrant builtin table.
 pub const KT_PRECOND: u16 = 132;
+/// Build or extend a `Comparator`. Stack: `[base?, sel0 .. sel{n-1}, nameStr]`
+/// with `arg` = the selector count `n`; `nameStr` is one of `compareBy`,
+/// `compareByDescending`, `thenBy`, `thenByDescending`, and the two `then…`
+/// forms pop a base comparator beneath the selectors. Pushes the comparator.
+///
+/// A builtin rather than an `Op::Extended` because the comparator's selectors
+/// are closures that `sortedWith` later invokes re-entrantly.
+pub const KT_COMPARATOR: u16 = 133;
 
 /// Kotlin `==` over heap objects. Stack: `[a, b]`; pushes a `Bool`.
 ///
@@ -765,6 +773,16 @@ enum HeapObj {
         units: Vec<u16>,
         cap: usize,
     },
+    /// A `Comparator` built by `compareBy` and extended by `thenBy`: an ORDERED
+    /// chain of `(selector closure, descending)` keys, compared left to right
+    /// with the first non-equal key deciding.
+    ///
+    /// The chain is kept rather than folded into one closure because `thenBy`
+    /// answers a NEW comparator over the same keys plus one — Kotlin's
+    /// comparators are immutable — and because each key carries its own
+    /// direction: `compareBy { a }.thenByDescending { b }` sorts ascending by
+    /// `a` and descending by `b`, which a single sign cannot express.
+    Comparator(Vec<(Value, bool)>),
 }
 
 /// Which syntactic form produced a range. This is not cosmetic: `a..b` and
@@ -2181,6 +2199,7 @@ fn register_builtins(vm: &mut VM) {
     vm.register_builtin(KT_MAP_VM, b_map_new);
     vm.register_builtin(KT_OPER_VM, b_operator);
     vm.register_builtin(KT_PRECOND, b_precond);
+    vm.register_builtin(KT_COMPARATOR, b_comparator);
     vm.register_builtin(KT_EXC_NEW, b_exc_new);
     vm.register_builtin(KT_EXC_THROW, b_exc_throw);
     vm.register_builtin(KT_EXC_PENDING, b_exc_pending);
@@ -3344,6 +3363,64 @@ fn result_parts(v: &Value) -> Option<(Value, Option<Value>)> {
     .flatten()
 }
 
+/// `KT_COMPARATOR` — see [`KT_COMPARATOR`].
+fn b_comparator(vm: &mut VM, argc: u8) -> Value {
+    let name = vm.pop().to_str();
+    let mut keys = Vec::with_capacity(argc as usize);
+    for _ in 0..argc {
+        keys.push(vm.pop());
+    }
+    keys.reverse();
+    let descending = name.ends_with("Descending");
+    let mut chain = if name.starts_with("then") {
+        // `thenBy` answers a NEW comparator: the base's keys are copied, not
+        // extended in place, so `val byA = compareBy { … }` keeps its own order
+        // after `byA.thenBy { … }` is built from it.
+        let base = vm.pop();
+        comparator_keys(&base).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    chain.extend(keys.into_iter().map(|k| (k, descending)));
+    alloc(HeapObj::Comparator(chain))
+}
+
+/// The `(selector, descending)` chain of a comparator value, or `None` when `v`
+/// is something else — a plain two-argument lambda, most often.
+fn comparator_keys(v: &Value) -> Option<Vec<(Value, bool)>> {
+    with_obj(v, |o| match o {
+        HeapObj::Comparator(keys) => Some(keys.clone()),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// Order two elements by `cmp`, which is either a `Comparator` built by
+/// `compareBy` or a plain `(a, b) -> Int` lambda. Answers the sign convention
+/// `Comparator.compare` uses: negative when `a` sorts first.
+///
+/// A comparator's keys are compared left to right and the FIRST non-equal key
+/// decides, so a later key is consulted only on a tie — which is what makes
+/// `compareBy { it.a }.thenBy { it.b }` a tiebreak rather than a second sort.
+fn compare_with(vm: &mut VM, cmp: &Value, a: &Value, b: &Value) -> Result<i64, String> {
+    let Some(keys) = comparator_keys(cmp) else {
+        return Ok(invoke_closure(vm, cmp, &[a.clone(), b.clone()])?.to_int());
+    };
+    for (sel, descending) in keys {
+        let ka = invoke_closure(vm, &sel, std::slice::from_ref(a))?;
+        let kb = invoke_closure(vm, &sel, std::slice::from_ref(b))?;
+        let ord = match value_cmp(&ka, &kb) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        };
+        if ord != 0 {
+            return Ok(if descending { -ord } else { ord });
+        }
+    }
+    Ok(0)
+}
+
 /// `KT_PRECOND` — see [`KT_PRECOND`]. Stack: `[subject?, message?, nameStr]`.
 fn b_precond(vm: &mut VM, argc: u8) -> Value {
     let name = vm.pop().to_str();
@@ -4287,13 +4364,16 @@ fn coll_hof(
             for i in 1..order.len() {
                 let mut j = i;
                 while j > 0 {
-                    let r = invoke_closure(
+                    // Either a two-argument lambda or a `compareBy` comparator;
+                    // `compare_with` knows both.
+                    let r = compare_with(
                         vm,
                         clo,
-                        &[items[order[j - 1]].clone(), items[order[j]].clone()],
+                        &items[order[j - 1]].clone(),
+                        &items[order[j]].clone(),
                     );
                     match r {
-                        Ok(v) if v.to_int() > 0 => order.swap(j - 1, j),
+                        Ok(v) if v > 0 => order.swap(j - 1, j),
                         Ok(_) => break,
                         Err(e) => {
                             err = Some(e);
@@ -6254,6 +6334,7 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
         },
         HeapObj::Map(_)
         | HeapObj::Closure { .. }
+        | HeapObj::Comparator(_)
         | HeapObj::Grouping { .. }
         | HeapObj::Range(_)
         | HeapObj::Builder { .. }
@@ -6704,6 +6785,7 @@ fn obj_hash(recv: &Value) -> Option<i32> {
         HeapObj::Array { .. }
         | HeapObj::Builder { .. }
         | HeapObj::Closure { .. }
+        | HeapObj::Comparator(_)
         | HeapObj::Grouping { .. }
         | HeapObj::Exc { .. } => None,
     })
@@ -6729,6 +6811,7 @@ fn obj_label(recv: &Value) -> String {
         HeapObj::Res { .. } => "Result".to_string(),
         HeapObj::Entry(_, _) => "Map.Entry".to_string(),
         HeapObj::Closure { .. } => "Function".to_string(),
+        HeapObj::Comparator(_) => "Comparator".to_string(),
         HeapObj::Grouping { .. } => "Grouping".to_string(),
         HeapObj::Range(r) => match (r.is_char, r.progression) {
             (true, true) => "CharProgression",
@@ -6830,6 +6913,9 @@ fn display_obj(id: u32) -> String {
             // reproduce — a stable placeholder is enough (lambdas are rarely
             // printed, only invoked).
             HeapObj::Closure { params, .. } => format!("(lambda arity={params})"),
+            // A `Comparator` is an anonymous JVM object with no printed form
+            // worth reproducing; like a lambda it exists to be invoked.
+            HeapObj::Comparator(keys) => format!("(comparator keys={})", keys.len()),
             // A `Grouping` is an anonymous object on the JVM, so it has no
             // meaningful printed form; it exists to be consumed by a terminal
             // operation, not displayed.
