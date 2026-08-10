@@ -1079,17 +1079,31 @@ its own parameter list and calling that class's primary constructor, so an
 `init` block, a body property and a `: Super(…)` header all re-run on the copy
 exactly as Kotlin's generated `copy` makes them.
 
-Two harness gaps closed with them, both of the kind a green run hides. The
+Four harness gaps closed with them, every one of the kind a green run hides. The
 differential fuzzer ran its oracle under whatever JVM and locale the shell
 exported — so on a JDK 17 machine it compared this frontend against a JDK 17
 Kotlin, and on a `de_DE` one it read `3,14` as a frontend bug; it now measures
 BOTH launchers' JREs (the compiler's answer is folded into the class file, the
 runtime's is not, and the same file across 17/21 gives four distinct answers)
-and refuses below 21. And `file.encoding=UTF-8` stopped pinning the console in
+and refuses below 21. `file.encoding=UTF-8` stopped pinning the console in
 JDK 19, which moved onto `stdout.encoding` — under `LANG=C` the capture script
 would have frozen `caf?` for `café`, so both console streams are pinned now
 too. The replay test's `n > 0` floor became a real one, and it now checks the
 frontend's exit code and stderr rather than one success bit.
+
+And the capture script itself was minting expectations no JVM ever produced. It
+read the oracle's output through a command substitution, which strips every
+trailing newline, then put exactly one back on the assumption that a probe ends
+in a single `println` — so `print("x")` would have frozen as `x\n` and
+`println("a"); println(); println()` as `a\n`, silently dropping two blank
+lines. A frozen line like that is indistinguishable from a real one on the
+replay side, and the only way to make it pass is to break the frontend to match
+it. The bytes are read off disk now, and the three shapes that expose it are in
+the corpus. Nothing already frozen was affected: the audit that found it replays
+frozen records through a live JDK 21 toolchain while reconstructing the
+expectation the OLD way, and every record it has reached agrees byte for byte —
+which is the same statement as those records ending in exactly one newline. The
+defect was latent, waiting for the first probe that used `print`.
 
 Next: `sequence { … }`/`yield`, variance and bounds,
 `Delegates.observable`/`vetoable`, and a growing standard-library surface —
