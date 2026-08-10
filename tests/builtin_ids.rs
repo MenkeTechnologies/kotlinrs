@@ -219,8 +219,37 @@ fn compiler_emits_each_id_through_its_own_table() {
     let registered = registered_names();
     let arms = coercion_arms();
 
+    // FLOORS FIRST. Every loop below is driven by `emitted`, and `emitted` reads
+    // `src/compiler.rs` as TEXT: it matches the literal `Op::CallBuiltin(KT_`.
+    // Change the emit spelling — wrap it in a helper, rename the `KT_` prefix,
+    // reformat the call across two lines — and it matches nothing, both loops
+    // iterate zero times, and this test reports PASS having compared nothing at
+    // all. Measured, by renaming the needle to `Op::CallBuiltin(RENAMED_KT_`:
+    // this test stayed green while the other five in this file still ran.
+    //
+    // That is the worst failure a guard can have, because it goes silent
+    // exactly when the thing it guards has moved. Every other parser in this
+    // file already asserts its own yield (`declared_ids` > 50, `coercion_arms`
+    // non-empty, `coll_hof_arms` > 30, the `name_keyed_tables` row floors);
+    // this one did not. Raise these with the frontend; never lower them to
+    // accommodate a parser that stopped matching.
+    let call_sites = emitted("Op::CallBuiltin");
+    let ext_sites = emitted("Op::Extended");
+    assert!(
+        call_sites.len() >= 40,
+        "parsed only {} `Op::CallBuiltin(KT_…)` emit site(s) out of src/compiler.rs — \
+         this test's parser has drifted, and a zero yield here is a silent PASS",
+        call_sites.len()
+    );
+    assert!(
+        ext_sites.len() >= 40,
+        "parsed only {} `Op::Extended(KT_…)` emit site(s) out of src/compiler.rs — \
+         this test's parser has drifted, and a zero yield here is a silent PASS",
+        ext_sites.len()
+    );
+
     let mut problems = Vec::new();
-    for name in emitted("Op::CallBuiltin") {
+    for name in call_sites {
         if !registered.contains(&name) {
             problems.push(format!(
                 "  Op::CallBuiltin({name}) is emitted, but {name} is not in `register_builtins` \
@@ -228,7 +257,7 @@ fn compiler_emits_each_id_through_its_own_table() {
             ));
         }
     }
-    for name in emitted("Op::Extended") {
+    for name in ext_sites {
         if !arms.contains(&name) {
             problems.push(format!(
                 "  Op::Extended({name}) is emitted, but `handle_coercion` has no arm for {name} \
@@ -468,6 +497,26 @@ fn throwable_hierarchy_is_closed() {
         .iter()
         .map(|r| (r.strings[0].clone(), r.strings[1].clone()))
         .collect();
+
+    // Both loops below are driven by these two vectors, so if the row scanner
+    // ever yields nothing for BOTH tables — a reformat away from the
+    // `&[(a, b)]` tuple shape does it — this test passes having checked no
+    // class at all. `table_rows` panics only when the DECLARATION is gone; a
+    // declaration that is still there but whose rows no longer parse is
+    // silent, and one empty side alone is caught only because the other side
+    // then flags every row. Floors close both modes directly.
+    assert!(
+        declared.len() >= 15,
+        "parsed only {} row(s) out of BUILTIN_THROWABLES — this test's parser has drifted, \
+         and two empty tables here are a silent PASS",
+        declared.len()
+    );
+    assert!(
+        parents.len() >= 15,
+        "parsed only {} row(s) out of THROWABLE_PARENTS — this test's parser has drifted, \
+         and two empty tables here are a silent PASS",
+        parents.len()
+    );
 
     let mut problems = Vec::new();
     for name in &declared {
