@@ -2929,6 +2929,26 @@ impl Parser {
     /// expression. Kotlin has no assignment *expression*, so an identifier
     /// followed by `=` inside an argument list can only be the named form.
     fn call_arg(&mut self) -> Result<Expr, String> {
+        // `step`, `until` and `downTo` are Kotlin SOFT keywords: they are infix
+        // functions, not reserved words, so each is also a legal parameter name
+        // — and `windowed(size = 2, step = 2)` spells one. The lexer gives them
+        // their own tokens for the range forms, so the name is recovered here.
+        let soft = match self.peek() {
+            Tok::Step => Some("step"),
+            Tok::Until => Some("until"),
+            Tok::DownTo => Some("downTo"),
+            _ => None,
+        };
+        if let Some(soft) = soft {
+            if matches!(self.peek_at(1), Tok::Assign) {
+                self.bump(); // the soft keyword
+                self.bump(); // `=`
+                return Ok(Expr::Named {
+                    name: soft.to_string(),
+                    value: Box::new(self.expr()?),
+                });
+            }
+        }
         if matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Assign) {
             let name = self.ident()?;
             self.bump(); // `=`

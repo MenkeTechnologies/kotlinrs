@@ -3264,6 +3264,29 @@ impl Compiler {
         safe: bool,
         line: u32,
     ) -> Result<Type, String> {
+        // A named argument on a STDLIB member. A user function binds its names
+        // in `bind_args` from the declaration; a builtin has no declaration
+        // here, so the parameter list comes from [`builtin_params`] and the
+        // arguments are rewritten into positional order before any routing
+        // below sees them.
+        //
+        // Only when no USER declaration claims the call: a `data class`'s
+        // generated `copy(a = 8)` and a declared method both bind their names
+        // from the declaration in `bind_args`, and rewriting those here against
+        // a stdlib parameter list would reject them outright.
+        let bound;
+        let args = if args.iter().any(|a| matches!(a, Expr::Named { .. }))
+            && builtin_params(name).is_some()
+            && !self
+                .infer_class(sc, recv)
+                .and_then(|c| self.classes.get(&c).cloned())
+                .is_some_and(|m| m.methods.contains_key(name) || name == "copy")
+        {
+            bound = bind_named_builtin(name, args)?;
+            &bound[..]
+        } else {
+            args
+        };
         // A safe call `recv?.member` short-circuits to null when the receiver is
         // null: evaluate the receiver into a slot, branch on null, and only
         // dispatch the member on the non-null path.
@@ -3279,6 +3302,35 @@ impl Compiler {
         // so `Math.abs(-3)` compiles with no import — unlike the `kotlin.math`
         // top-level spellings. `Math.round` is NOT `kotlin.math.round`: it is
         // half-up and returns a `Long`, so it dispatches under its own name.
+        // A fully-qualified reference, written out instead of imported. Kotlin
+        // resolves `kotlin.math.floor(x)` with no `import` line at all, and the
+        // two `java.lang` statics below are auto-imported on the JVM the same
+        // way `Math` is.
+        if let Some(path) = self.qualifier(sc, recv) {
+            match path.as_str() {
+                "kotlin.math" => {
+                    return match name {
+                        "PI" | "E" => self.compile_math_const(name, line),
+                        _ if is_math_fn(name) => self.compile_math(sc, name, args, line),
+                        _ => Err(format!("unresolved reference: kotlin.math.{name}")),
+                    }
+                }
+                // `String.format(fmt, args…)` — the static spelling of the
+                // `fmt.format(args…)` member, with the receiver moved into the
+                // first argument position.
+                "String" if name == "format" && !args.is_empty() => {
+                    return self.compile_member(sc, &args[0], "format", &args[1..], false, line)
+                }
+                // `Integer.parseInt` / `Integer.valueOf` are `String.toInt()`
+                // under another name — same parse, same NumberFormatException.
+                "Integer" | "java.lang.Integer"
+                    if matches!(name, "parseInt" | "valueOf") && args.len() == 1 =>
+                {
+                    return self.compile_member(sc, &args[0], "toInt", &[], false, line)
+                }
+                _ => {}
+            }
+        }
         if self.is_java_math(sc, recv) {
             match name {
                 "PI" | "E" => return self.compile_math_const(name, line),
@@ -5250,9 +5302,37 @@ impl Compiler {
     /// value. A local binding or a user class named `Math` shadows it, so the
     /// name is only treated as the JVM class when nothing else claims it.
     fn is_java_math(&self, sc: &Scope, recv: &Expr) -> bool {
-        matches!(recv, Expr::Var(n) if n == "Math")
-            && sc.slot("Math").is_none()
-            && !self.classes.contains_key("Math")
+        matches!(
+            self.qualifier(sc, recv).as_deref(),
+            Some("Math") | Some("java.lang.Math")
+        )
+    }
+
+    /// The dotted PATH a receiver expression spells, when it is nothing but a
+    /// chain of plain names none of which is bound to anything —
+    /// `kotlin.math`, `java.lang.Math`, `String`. `None` for any receiver that
+    /// is a value.
+    ///
+    /// A fully-qualified reference reaches the compiler as ordinary member
+    /// access (`kotlin.math.floor(x)` is `Member(Member(Var("kotlin"),
+    /// "math"), "floor")` applied to an argument), so recognizing one means
+    /// flattening the chain back to the name it spelled. The shadowing check is
+    /// what keeps `val kotlin = 1; kotlin.math` from being a package: a local
+    /// binding or a user class of that name wins, as it does for `Math`.
+    fn qualifier(&self, sc: &Scope, recv: &Expr) -> Option<String> {
+        match recv {
+            Expr::Var(n) => (sc.slot(n).is_none()
+                && !self.classes.contains_key(n)
+                && self.companion_of(n).is_none())
+            .then(|| n.clone()),
+            Expr::Member {
+                recv,
+                name,
+                safe: false,
+                ..
+            } => Some(format!("{}.{name}", self.qualifier(sc, recv)?)),
+            _ => None,
+        }
     }
 
     /// Whether `name` names a built-in type (rather than a value) in this
@@ -7162,6 +7242,127 @@ fn is_optional_hof(name: &str) -> bool {
             | "trimEnd"
             | "zipWithNext"
     )
+}
+
+/// What a stdlib member's parameter falls back to when the call omits it.
+enum Dflt {
+    /// No default — omitting it is an error, as it is on Kotlin.
+    Required,
+    /// Compile a literal `null`. Every host member whose parameter takes this
+    /// reads an absent value as its own default (`padStart`'s `padChar` is a
+    /// space, `indexOf`'s `startIndex` is 0).
+    Absent,
+    Str(&'static str),
+    Int(i64),
+    Bool(bool),
+}
+
+/// The parameter list of a stdlib member that is worth naming arguments on —
+/// the ones with several optional parameters, where positional order is the
+/// part a reader cannot see.
+///
+/// Every optional parameter carries its DEFAULT rather than a hole, so a call
+/// that names a later parameter and skips an earlier one still compiles to the
+/// value Kotlin would have passed. Filling a skipped parameter with `null` and
+/// hoping the host reads it as absent is right for some members and silently
+/// wrong for others (`windowed`'s `step` would become 0, not 1).
+fn builtin_params(name: &str) -> Option<&'static [(&'static str, Dflt)]> {
+    Some(match name {
+        "joinToString" => &[
+            ("separator", Dflt::Str(", ")),
+            ("prefix", Dflt::Str("")),
+            ("postfix", Dflt::Str("")),
+            ("limit", Dflt::Int(-1)),
+            ("truncated", Dflt::Str("...")),
+        ],
+        "windowed" => &[
+            ("size", Dflt::Required),
+            ("step", Dflt::Int(1)),
+            ("partialWindows", Dflt::Bool(false)),
+        ],
+        "padStart" | "padEnd" => &[("length", Dflt::Required), ("padChar", Dflt::Absent)],
+        "indexOf" | "lastIndexOf" => &[("string", Dflt::Required), ("startIndex", Dflt::Absent)],
+        "startsWith" => &[("prefix", Dflt::Required), ("startIndex", Dflt::Int(0))],
+        "substring" => &[("startIndex", Dflt::Required), ("endIndex", Dflt::Absent)],
+        "replace" | "replaceFirst" => &[("oldValue", Dflt::Required), ("newValue", Dflt::Required)],
+        "chunked" => &[("size", Dflt::Required)],
+        "take" | "drop" | "takeLast" | "dropLast" => &[("n", Dflt::Required)],
+        "repeat" => &[("n", Dflt::Required)],
+        "coerceIn" => &[
+            ("minimumValue", Dflt::Required),
+            ("maximumValue", Dflt::Required),
+        ],
+        _ => return None,
+    })
+}
+
+/// Rewrite a stdlib member's arguments into positional order, filling every
+/// parameter the call did not supply with its default.
+///
+/// Kotlin's own rules are enforced: positional arguments come first, each name
+/// binds a parameter that exists, and no parameter is bound twice.
+fn bind_named_builtin(name: &str, args: &[Expr]) -> Result<Vec<Expr>, String> {
+    let Some(params) = builtin_params(name) else {
+        let named = args
+            .iter()
+            .find_map(|a| match a {
+                Expr::Named { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        return Err(format!(
+            "named argument `{named}` is not supported for this callee"
+        ));
+    };
+
+    let mut slots: Vec<Option<&Expr>> = vec![None; params.len()];
+    let mut seen_named = false;
+    for (i, a) in args.iter().enumerate() {
+        let Expr::Named { name: arg, value } = a else {
+            if seen_named {
+                return Err(format!(
+                    "{name}: a positional argument cannot follow a named one"
+                ));
+            }
+            if i >= slots.len() {
+                return Err(format!("{name}: too many arguments"));
+            }
+            slots[i] = Some(a);
+            continue;
+        };
+        seen_named = true;
+        let Some(at) = params.iter().position(|(p, _)| p == arg) else {
+            return Err(format!("{name} has no parameter `{arg}`"));
+        };
+        if slots[at].is_some() {
+            return Err(format!("{name}: parameter `{arg}` is bound twice"));
+        }
+        slots[at] = Some(value);
+    }
+
+    // Trailing defaults are dropped rather than passed: several host members
+    // distinguish "absent" from "the default value" (`substring`'s `endIndex`
+    // is the receiver's length, which no literal here knows).
+    let last = slots.iter().rposition(|s| s.is_some());
+    let mut out = Vec::new();
+    for (i, (pname, dflt)) in params.iter().enumerate() {
+        if last.is_none_or(|l| i > l) {
+            break;
+        }
+        out.push(match slots[i] {
+            Some(e) => e.clone(),
+            None => match dflt {
+                Dflt::Required => {
+                    return Err(format!("{name}: no value passed for parameter `{pname}`"))
+                }
+                Dflt::Absent => Expr::Null,
+                Dflt::Str(s) => Expr::Str(vec![StrExpr::Text(s.to_string())]),
+                Dflt::Int(n) => Expr::Int(*n),
+                Dflt::Bool(b) => Expr::Bool(*b),
+            },
+        });
+    }
+    Ok(out)
 }
 
 /// Whether `e` is a lambda literal — what decides an [`is_optional_hof`] call.

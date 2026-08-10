@@ -3751,3 +3751,85 @@ fn split_to_sequence_matches_split() {
         "[A, B, C]\n"
     );
 }
+
+#[test]
+fn named_arguments_reach_the_stdlib_members_that_have_optional_parameters() {
+    // Naming a later parameter must not shift an earlier one: each skipped
+    // parameter is filled with its OWN default, not with a hole.
+    assert_eq!(
+        stdout(r#"println(listOf(1,2,3).joinToString(postfix = "!"))"#),
+        "1, 2, 3!\n"
+    );
+    assert_eq!(
+        stdout(
+            r#"println(listOf(1,2,3).joinToString(separator = "-", prefix = "<", postfix = ">"))"#
+        ),
+        "<1-2-3>\n"
+    );
+    assert_eq!(
+        stdout("println(listOf(1,2,3,4,5).joinToString(limit = 3))"),
+        "1, 2, 3, ...\n"
+    );
+    // `windowed`'s skipped `step` must default to 1, not to the 0 a null would
+    // coerce to — the case a hole-filling rewrite gets wrong.
+    assert_eq!(
+        stdout("println(listOf(1,2,3,4).windowed(size = 2))"),
+        "[[1, 2], [2, 3], [3, 4]]\n"
+    );
+    // `step` is a soft keyword with its own token, and still a parameter name.
+    assert_eq!(
+        stdout("println(listOf(1,2,3,4).windowed(size = 2, step = 2))"),
+        "[[1, 2], [3, 4]]\n"
+    );
+    assert_eq!(
+        stdout(r#"println("ab".padStart(5, padChar = '.'))"#),
+        "...ab\n"
+    );
+}
+
+#[test]
+fn a_named_argument_on_a_user_declaration_still_binds_from_the_declaration() {
+    // The stdlib parameter table must not intercept a call a user declaration
+    // owns — `copy` and a declared method both bind their own names.
+    let src = r#"
+data class Cfg(val a: Int, val b: String)
+class Box(val n: Int) { fun scaled(by: Int) = n * by }
+fun main() {
+    println(Cfg(1, "q").copy(b = "r"))
+    println(Box(3).scaled(by = 4))
+}"#;
+    assert_eq!(stdout(src), "Cfg(a=1, b=r)\n12\n");
+}
+
+#[test]
+fn a_fully_qualified_name_resolves_without_an_import() {
+    assert_eq!(stdout("println(kotlin.math.floor(2.7))"), "2.0\n");
+    assert_eq!(stdout("println(kotlin.math.abs(-3))"), "3\n");
+    assert_eq!(
+        stdout(r#"println(String.format("%.2f", 3.14159))"#),
+        "3.14\n"
+    );
+    assert_eq!(stdout(r#"println(Integer.parseInt("-7"))"#), "-7\n");
+    // A binding of that name shadows the package, as it does for `Math`.
+    assert_eq!(stdout(r#"val String = "s"; println(String.length)"#), "1\n");
+}
+
+#[test]
+fn the_builder_range_members_slice_their_argument_not_the_receiver() {
+    let src = r#"
+fun main() {
+    val sb = StringBuilder("xy")
+    sb.appendRange("hello", 1, 3)
+    println(sb)
+    sb.insertRange(1, "ABCDE", 0, 2)
+    println(sb)
+}"#;
+    assert_eq!(stdout(src), "xyel\nxAByel\n");
+    let out = eval(r#"StringBuilder().appendRange("ab", 0, 9)"#);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("begin 0, end 9, length 2"),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

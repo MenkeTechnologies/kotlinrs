@@ -732,6 +732,21 @@ and a wider `Iterable` surface — `sorted`/`sortedDescending`/`take`/`drop` plu
 the `associate`/`associateBy`/`minByOrNull`/`none`/`filterNot`/`flatMap`/
 `mapIndexed`/`sortedByDescending` higher-order members.
 
+Also landed: **fully-qualified names** written out instead of imported —
+`kotlin.math.floor(x)` / `kotlin.math.PI` with no `import` line, plus the two
+`java.lang` statics the JVM auto-imports alongside `Math`: `String.format(fmt,
+…)` (the static spelling of the `fmt.format(…)` member) and
+`Integer.parseInt` / `Integer.valueOf`. A local binding or a user class of the
+same name shadows the package, exactly as it does for `Math`. **Named arguments
+now reach the stdlib members** with several optional parameters
+(`joinToString`, `windowed`, `padStart`/`padEnd`, `indexOf`, `substring`,
+`replace`, …): each parameter the call skips is filled with its OWN default
+rather than a hole, so `windowed(size = 2)` gets `step = 1` and not the `0` a
+null would coerce to. `step`/`until`/`downTo` are soft keywords with their own
+tokens and are still accepted as parameter names. And `StringBuilder` gained
+`appendRange` / `insertRange`, which slice the ARGUMENT rather than the
+receiver.
+
 Also landed: **lazy sequences** — `generateSequence(seed) { next }`, ended by a
 step that answers `null`, and the one sequence here that is not materialized up
 front because it is the one that can be endless. `map`/`filter`/`filterNot`/

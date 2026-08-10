@@ -5006,6 +5006,33 @@ fn builder_method(
                 u.splice(at as usize..at as usize, ins.clone());
             })
         }
+        // `appendRange(csq, start, end)` / `insertRange(index, csq, start, end)`
+        // take a HALF-OPEN slice of the argument rather than all of it. The
+        // bounds are the argument's, not the receiver's, so they are checked
+        // against its length — a distinction the shared `oob` above cannot make
+        // for us.
+        "appendRange" | "insertRange" => {
+            let inserting = name == "insertRange";
+            let at = if inserting { int_arg(0) } else { len as i64 };
+            if at < 0 || at as usize > len {
+                return Err(oob("offset", at, len));
+            }
+            let src = arg_units(args, usize::from(inserting));
+            let (from, to) = (
+                int_arg(1 + usize::from(inserting)),
+                int_arg(2 + usize::from(inserting)),
+            );
+            if from < 0 || to > src.len() as i64 || from > to {
+                return Err(format!(
+                    "java.lang.IndexOutOfBoundsException: begin {from}, end {to}, length {}",
+                    src.len()
+                ));
+            }
+            let slice = src[from as usize..to as usize].to_vec();
+            chained(&mut |u| {
+                u.splice(at as usize..at as usize, slice.clone());
+            })
+        }
         "deleteCharAt" => {
             let at = int_arg(0);
             if at < 0 || at as usize >= len {
