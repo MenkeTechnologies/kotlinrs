@@ -3177,8 +3177,17 @@ fun main() {
 
 #[test]
 fn a_string_builder_reports_the_jvm_index_diagnostics() {
-    // `insert` says "offset" where the rest say "index", and `delete` CLAMPS
-    // its end instead of throwing.
+    // A SINGLE index and a RANGE are two different messages — `insert` names
+    // both bounds where `deleteCharAt` names one — and `delete` CLAMPS its end
+    // instead of throwing.
+    //
+    // These were pinned to JDK 17's per-call-site wording (`index 9, length 3`
+    // / `offset 9, length 3`), which was what the capturing shell's `JAVA_HOME`
+    // selected. `String` and `AbstractStringBuilder` route their bounds checks
+    // through `Preconditions` from JDK 21 on, so no JDK from 21 answers that,
+    // and kotlinrs's own `Double.toString` already followed JDK 19's algorithm
+    // — the pair described no real JVM. Re-verified against `kotlinc` 2.4.10 on
+    // Homebrew OpenJDK 21.0.12 and 26.0.2, which agree with each other.
     let src = r#"
 fun main() {
     try { StringBuilder("abc").deleteCharAt(9) } catch (e: Exception) { println(e) }
@@ -3188,10 +3197,284 @@ fun main() {
 }"#;
     assert_eq!(
         stdout(src),
-        "java.lang.StringIndexOutOfBoundsException: index 9, length 3\n\
-         java.lang.StringIndexOutOfBoundsException: offset 9, length 3\n\
-         java.lang.StringIndexOutOfBoundsException: index 9, length 3\n\
+        "java.lang.StringIndexOutOfBoundsException: Index 9 out of bounds for length 3\n\
+         java.lang.StringIndexOutOfBoundsException: Range [9, 3) out of bounds for length 3\n\
+         java.lang.StringIndexOutOfBoundsException: Index 9 out of bounds for length 3\n\
          a\n"
+    );
+}
+
+#[test]
+fn a_deleted_range_reports_the_bound_it_clamped_to() {
+    // The three shapes the builder's range check has, all verified against
+    // `kotlinc` 2.4.10 on OpenJDK 21.0.12. `delete`/`replace` clamp `end` to the
+    // length BEFORE checking, so a start past the end reports the CLAMPED
+    // bound: `delete(9, 10)` on five units says `Range [9, 5)`, never
+    // `Range [9, 10)`. `setLength` is the one check the JDK left as its own
+    // hand-written message, identical on 17 and 26.
+    let src = r#"
+fun main() {
+    try { StringBuilder("abcde").delete(9, 10) } catch (e: Exception) { println(e) }
+    try { StringBuilder("abcde").delete(3, 1) } catch (e: Exception) { println(e) }
+    try { StringBuilder("abcde").replace(9, 10, "z") } catch (e: Exception) { println(e) }
+    try { StringBuilder("abcde").appendRange("xyz", 0, 9) } catch (e: Exception) { println(e) }
+    try { StringBuilder("abcde").setLength(-1) } catch (e: Exception) { println(e) }
+    println(StringBuilder("abcde").deleteRange(1, 9))
+    println(StringBuilder("abcde").deleteAt(1))
+}"#;
+    assert_eq!(
+        stdout(src),
+        "java.lang.StringIndexOutOfBoundsException: Range [9, 5) out of bounds for length 5\n\
+         java.lang.StringIndexOutOfBoundsException: Range [3, 1) out of bounds for length 5\n\
+         java.lang.StringIndexOutOfBoundsException: Range [9, 5) out of bounds for length 5\n\
+         java.lang.IndexOutOfBoundsException: Range [0, 9) out of bounds for length 3\n\
+         java.lang.StringIndexOutOfBoundsException: String index out of range: -1\n\
+         a\n\
+         acde\n"
+    );
+}
+
+#[test]
+fn an_empty_receiver_names_its_own_kind() {
+    // Kotlin declares `first`/`single`/`reduce` separately for `List`, `Array`,
+    // `Iterable` and `CharSequence`, and each spells its own message. One
+    // shared implementation with only a `Set`-or-not flag answered the `List`
+    // wording for every kind. Verified against `kotlinc` 2.4.10 on OpenJDK
+    // 21.0.12.
+    let src = r#"
+fun t(f: () -> Any?) {
+    try { println(f()) } catch (e: Throwable) { println(e) }
+}
+fun main() {
+    t { listOf<Int>().first() }
+    t { arrayOf<Int>().first() }
+    t { emptySet<Int>().first() }
+    t { "".single() }
+    t { arrayOf(1, 2).single() }
+    t { emptySet<Int>().reduce { a, _ -> a } }
+    t { arrayOf<Int>().reduce { a, _ -> a } }
+    t { "".reduce { a, _ -> a } }
+    t { listOf<Int>().reduceRight { a, _ -> a } }
+    t { arrayOf(1).first { it > 9 } }
+    t { "a".first { it > 'z' } }
+    t { listOf(1).last { it > 9 } }
+    t { emptySet<Int>().last { it > 9 } }
+}"#;
+    assert_eq!(
+        stdout(src),
+        "java.util.NoSuchElementException: List is empty.\n\
+         java.util.NoSuchElementException: Array is empty.\n\
+         java.util.NoSuchElementException: Collection is empty.\n\
+         java.util.NoSuchElementException: Char sequence is empty.\n\
+         java.lang.IllegalArgumentException: Array has more than one element.\n\
+         java.lang.UnsupportedOperationException: Empty collection can't be reduced.\n\
+         java.lang.UnsupportedOperationException: Empty array can't be reduced.\n\
+         java.lang.UnsupportedOperationException: Empty char sequence can't be reduced.\n\
+         java.lang.UnsupportedOperationException: Empty list can't be reduced.\n\
+         java.util.NoSuchElementException: Array contains no element matching the predicate.\n\
+         java.util.NoSuchElementException: Char sequence contains no character matching the predicate.\n\
+         java.util.NoSuchElementException: List contains no element matching the predicate.\n\
+         java.util.NoSuchElementException: Collection contains no element matching the predicate.\n"
+    );
+}
+
+#[test]
+fn an_extremum_over_an_empty_receiver_throws_bare() {
+    // `max`/`min`/`maxBy`/`maxOf` raise `NoSuchElementException()` with NO
+    // argument, unlike `first`/`last`/`single`, which name the receiver kind.
+    // `maxBy`/`minBy` are the throwing twins Kotlin deprecated in 1.4 and
+    // restored in 1.7; without them a current-Kotlin program was rejected
+    // outright. Verified against `kotlinc` 2.4.10 on OpenJDK 21.0.12.
+    let src = r#"
+fun t(f: () -> Any?) {
+    try { println(f()) } catch (e: Throwable) { println(e) }
+}
+fun main() {
+    t { listOf<Int>().max() }
+    t { listOf<Int>().maxBy { it } }
+    t { listOf<Int>().minBy { it } }
+    t { listOf<Int>().maxOf { it } }
+    t { listOf<Int>().maxByOrNull { it } }
+    t { listOf(1, 5, 3).maxBy { -it } }
+    t { listOf(1, 5, 3).minBy { -it } }
+}"#;
+    assert_eq!(
+        stdout(src),
+        "java.util.NoSuchElementException\n\
+         java.util.NoSuchElementException\n\
+         java.util.NoSuchElementException\n\
+         java.util.NoSuchElementException\n\
+         null\n\
+         1\n\
+         5\n"
+    );
+}
+
+#[test]
+fn a_positional_add_inserts_rather_than_appending() {
+    // `add(index, element)` is a different overload from `add(element)`, and
+    // reading only the first argument ran the appending one with the INDEX as
+    // the element — a longer list either way, so nothing failed loudly.
+    // `ArrayList.rangeCheckForAdd` also has its own message shape, `Index: 9,
+    // Size: 3`, which no other position check uses. Verified against `kotlinc`
+    // 2.4.10 on OpenJDK 21.0.12.
+    let src = r#"
+fun main() {
+    val m = mutableListOf(1, 2, 3)
+    m.add(1, 9)
+    println(m)
+    m.add(4)
+    println(m)
+    try { m.add(99, 0) } catch (e: Exception) { println(e) }
+    try { m.removeAt(9) } catch (e: Exception) { println(e) }
+    try { m[9] = 0 } catch (e: Exception) { println(e) }
+    val a = arrayOf(1, 2, 3)
+    try { a[9] = 0 } catch (e: Exception) { println(e) }
+    try { println(listOf(1, 2).elementAt(9)) } catch (e: Exception) { println(e) }
+    try { println(emptySet<Int>().elementAt(9)) } catch (e: Exception) { println(e) }
+    try { println(listOf(1, 2, 3).subList(0, 9)) } catch (e: Exception) { println(e) }
+    try { println(listOf(1, 2, 3).subList(-1, 2)) } catch (e: Exception) { println(e) }
+    try { println(listOf(1, 2, 3).subList(2, 1)) } catch (e: Exception) { println(e) }
+}"#;
+    assert_eq!(
+        stdout(src),
+        "[1, 9, 2, 3]\n\
+         [1, 9, 2, 3, 4]\n\
+         java.lang.IndexOutOfBoundsException: Index: 99, Size: 5\n\
+         java.lang.IndexOutOfBoundsException: Index 9 out of bounds for length 5\n\
+         java.lang.IndexOutOfBoundsException: Index 9 out of bounds for length 5\n\
+         java.lang.ArrayIndexOutOfBoundsException: Index 9 out of bounds for length 3\n\
+         java.lang.ArrayIndexOutOfBoundsException: Index 9 out of bounds for length 2\n\
+         java.lang.IndexOutOfBoundsException: Collection doesn't contain element at index 9.\n\
+         java.lang.IndexOutOfBoundsException: toIndex = 9\n\
+         java.lang.IndexOutOfBoundsException: fromIndex = -1\n\
+         java.lang.IllegalArgumentException: fromIndex(2) > toIndex(1)\n"
+    );
+}
+
+#[test]
+fn a_string_parse_is_bounded_by_the_width_it_parses_into() {
+    // The destination width is part of the parse, not a cast after it, and each
+    // failure mode has its own message: a malformed string names the string, an
+    // out-of-`Int` value for a narrow target names the string too (because
+    // `Byte.parseByte` goes through `Integer.parseInt` first), and only a value
+    // inside `Int` but outside the target reports the range. A bad radix is not
+    // a `NumberFormatException` at all, which is why even `toIntOrNull` raises
+    // it. Verified against `kotlinc` 2.4.10 on OpenJDK 21.0.12.
+    let src = r#"
+fun t(f: () -> Any?) {
+    try { println(f()) } catch (e: Throwable) { println(e) }
+}
+fun main() {
+    t { "99999999999".toInt() }
+    t { "-2147483649".toInt() }
+    t { "2147483647".toInt() }
+    t { "99999999999".toIntOrNull() }
+    t { " 5".toInt() }
+    t { " 5.0".toDouble() }
+    t { "300".toByte() }
+    t { "12".toByte() }
+    t { "40000".toShort() }
+    t { "99999999999".toByte() }
+    t { "300".toByteOrNull() }
+    t { "8000".toShort(16) }
+    t { "ffffffffff".toInt(16) }
+    t { "5".toIntOrNull(1) }
+}"#;
+    assert_eq!(
+        stdout(src),
+        "java.lang.NumberFormatException: For input string: \"99999999999\"\n\
+         java.lang.NumberFormatException: For input string: \"-2147483649\"\n\
+         2147483647\n\
+         null\n\
+         java.lang.NumberFormatException: For input string: \" 5\"\n\
+         5.0\n\
+         java.lang.NumberFormatException: Value out of range. Value:\"300\" Radix:10\n\
+         12\n\
+         java.lang.NumberFormatException: Value out of range. Value:\"40000\" Radix:10\n\
+         java.lang.NumberFormatException: For input string: \"99999999999\"\n\
+         null\n\
+         java.lang.NumberFormatException: Value out of range. Value:\"8000\" Radix:16\n\
+         java.lang.NumberFormatException: For input string: \"ffffffffff\" under radix 16\n\
+         java.lang.IllegalArgumentException: radix 1 was not in valid range 2..36\n"
+    );
+}
+
+#[test]
+fn a_window_check_drops_the_step_when_it_equals_the_size() {
+    // `chunked(size)` IS `windowed(size, size)`, so naming both would print the
+    // same number twice — the stdlib drops the step there and keeps it (behind
+    // `Both`) otherwise. Three call sites each spelled a third message that was
+    // neither. Verified against `kotlinc` 2.4.10 on OpenJDK 21.0.12.
+    let src = r#"
+fun t(f: () -> Any?) {
+    try { println(f()) } catch (e: Throwable) { println(e) }
+}
+fun main() {
+    t { listOf(1, 2).chunked(0) }
+    t { listOf(1, 2).windowed(0, 2) }
+    t { listOf(1, 2).windowed(2, 0) }
+    t { listOf(1, 2).windowed(0, 0) }
+    t { "ab".chunked(0) }
+    t { "ab".windowed(3, 0) }
+    t { listOf(1, 2).chunked(0) { it } }
+}"#;
+    assert_eq!(
+        stdout(src),
+        "java.lang.IllegalArgumentException: size 0 must be greater than zero.\n\
+         java.lang.IllegalArgumentException: Both size 0 and step 2 must be greater than zero.\n\
+         java.lang.IllegalArgumentException: Both size 2 and step 0 must be greater than zero.\n\
+         java.lang.IllegalArgumentException: size 0 must be greater than zero.\n\
+         java.lang.IllegalArgumentException: size 0 must be greater than zero.\n\
+         java.lang.IllegalArgumentException: Both size 3 and step 0 must be greater than zero.\n\
+         java.lang.IllegalArgumentException: size 0 must be greater than zero.\n"
+    );
+}
+
+#[test]
+fn a_failed_cast_names_both_classes_in_full_and_where_they_live() {
+    // The JVM's `ClassCastException` names binary class names and appends where
+    // each one lives, merging the two locations when they agree — three message
+    // shapes. The short Kotlin labels named neither, and a primitive receiver
+    // had no label at all: `1 as Foo` said `class value cannot be cast`.
+    // Verified against `kotlinc` 2.4.10 on OpenJDK 21.0.12.
+    let src = r#"
+class Foo
+class Bar
+fun t(f: () -> Any?) {
+    try { println(f()) } catch (e: Throwable) { println(e) }
+}
+fun main() {
+    t { val a: Any = "s"; a as Int }
+    t { val a: Any = 1; a as Foo }
+    t { val a: Any = Foo(); a as Bar }
+    t { val a: Any = 1.5; a as Int }
+    t { val a: Any = true; a as Int }
+    t { val a: Any = 'c'; a as Int }
+    t { val a: Any = Foo(); a as Int }
+}"#;
+    assert_eq!(
+        stdout(src),
+        "java.lang.ClassCastException: class java.lang.String cannot be cast to class \
+         java.lang.Integer (java.lang.String and java.lang.Integer are in module java.base \
+         of loader 'bootstrap')\n\
+         java.lang.ClassCastException: class java.lang.Integer cannot be cast to class Foo \
+         (java.lang.Integer is in module java.base of loader 'bootstrap'; Foo is in unnamed \
+         module of loader 'app')\n\
+         java.lang.ClassCastException: class Foo cannot be cast to class Bar (Foo and Bar are \
+         in unnamed module of loader 'app')\n\
+         java.lang.ClassCastException: class java.lang.Double cannot be cast to class \
+         java.lang.Integer (java.lang.Double and java.lang.Integer are in module java.base \
+         of loader 'bootstrap')\n\
+         java.lang.ClassCastException: class java.lang.Boolean cannot be cast to class \
+         java.lang.Integer (java.lang.Boolean and java.lang.Integer are in module java.base \
+         of loader 'bootstrap')\n\
+         java.lang.ClassCastException: class java.lang.Character cannot be cast to class \
+         java.lang.Integer (java.lang.Character and java.lang.Integer are in module java.base \
+         of loader 'bootstrap')\n\
+         java.lang.ClassCastException: class Foo cannot be cast to class java.lang.Integer \
+         (Foo is in unnamed module of loader 'app'; java.lang.Integer is in module java.base \
+         of loader 'bootstrap')\n"
     );
 }
 
@@ -3960,10 +4243,17 @@ fun main() {
     println(sb)
 }"#;
     assert_eq!(stdout(src), "xyel\nxAByel\n");
+    // The ARGUMENT's bounds, so the length reported is the argument's (2) and
+    // not the receiver's (0).
+    //
+    // This asserted `begin 0, end 9, length 2`, which no JVM produces: JDK 17
+    // says `start 0, end 9, length 2` and JDK 21 and 26 both say the below.
+    // The old text was written rather than captured. Re-verified against
+    // `kotlinc` 2.4.10 on OpenJDK 21.0.12 and 26.0.2.
     let out = eval(r#"StringBuilder().appendRange("ab", 0, 9)"#);
     assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("begin 0, end 9, length 2"),
+        String::from_utf8_lossy(&out.stderr).contains("Range [0, 9) out of bounds for length 2"),
         "stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );

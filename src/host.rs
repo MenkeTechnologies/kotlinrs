@@ -1244,15 +1244,67 @@ fn enum_ordinal(v: &Value) -> Option<i64> {
 
 /// `String.toInt`/`toLong` and their `…OrNull` forms, honouring the optional
 /// radix argument. `None` is the parse failure the two pairs report differently.
-fn parse_radix(s: &str, args: &[Value]) -> Option<Value> {
+fn parse_radix(s: &str, args: &[Value], bits: u32) -> Result<Value, ParseFail> {
     let radix = match args.first() {
-        Some(v) => num_of(v) as u32,
+        Some(v) => num_of(v),
         None => 10,
     };
+    // The radix is checked BEFORE the string, and the fault is not a
+    // `NumberFormatException` at all — which is why the `…OrNull` forms raise
+    // it instead of answering null.
     if !(2..=36).contains(&radix) {
-        return None;
+        return Err(ParseFail::Radix(format!(
+            "java.lang.IllegalArgumentException: radix {radix} was not in valid range 2..36"
+        )));
     }
-    i64::from_str_radix(s.trim(), radix).ok().map(Value::Int)
+    // No trimming: `Integer.parseInt` rejects surrounding whitespace, unlike
+    // `Double.parseDouble`, so `" 5".toInt()` throws where `" 5.0".toDouble()`
+    // is `5.0`.
+    let malformed = || {
+        ParseFail::Number(format!(
+            "java.lang.NumberFormatException: For input string: \"{s}\"{}",
+            if radix == 10 {
+                String::new()
+            } else {
+                format!(" under radix {radix}")
+            }
+        ))
+    };
+    // `Byte`/`Short` parse through `Integer.parseInt` and range-check after, so
+    // a value past `Int` reports the MALFORMED message and only one inside it
+    // reports the out-of-range one.
+    let wide = i64::from_str_radix(s, radix as u32).map_err(|_| malformed())?;
+    let fits = |b: u32| b >= 64 || (wide >= -(1i64 << (b - 1)) && wide < (1i64 << (b - 1)));
+    if fits(bits) {
+        return Ok(Value::Int(wide));
+    }
+    if !fits(32) {
+        return Err(malformed());
+    }
+    Err(ParseFail::Number(format!(
+        "java.lang.NumberFormatException: Value out of range. Value:\"{s}\" Radix:{radix}"
+    )))
+}
+
+/// The bit width the `String.toXxx` member named `name` parses into.
+fn int_width_of(name: &str) -> u32 {
+    match name {
+        "toByte" => 8,
+        "toShort" => 16,
+        "toLong" => 64,
+        _ => 32,
+    }
+}
+
+/// Why an integer parse failed, which decides whether an `…OrNull` form
+/// swallows it.
+enum ParseFail {
+    /// The radix was outside `2..36`. Kotlin's `checkRadix` runs before the
+    /// string is looked at, so even `toIntOrNull` raises this one.
+    Radix(String),
+    /// The string is not a number of the requested width. The `…OrNull` forms
+    /// answer null here.
+    Number(String),
 }
 
 /// An integer in `radix`, with the sign written out in front — the form
@@ -1992,13 +2044,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             } else if arg == 1 {
                 vm.push(Value::Undef);
             } else {
-                let from = obj_label(&v);
-                fault(
-                    vm,
-                    format!(
-                        "java.lang.ClassCastException: class {from} cannot be cast to class {ty}"
-                    ),
-                );
+                fault(vm, cast_failure(&v, &ty));
                 vm.push(Value::Undef);
             }
         }
@@ -3364,7 +3410,7 @@ fn b_coll_hof(vm: &mut VM, argc: u8) -> Value {
     }
     extras.reverse();
     let recv = vm.pop();
-    match coll_hof(vm, &name, &recv, &extras, &clo) {
+    match coll_hof(vm, &name, &recv, &extras, &clo, seq_kind_of(&recv)) {
         Ok(v) => v,
         Err(e) => {
             fault(vm, e);
@@ -3854,6 +3900,28 @@ fn same_kind_as(recv: &Value, out: Vec<Value>) -> Value {
 /// The `chunked`/`windowed` groups of a `CharSequence` receiver, each rebuilt
 /// as a `String` — which is what the `kotlin.text` overload hands its lambda
 /// and what its no-lambda form returns (`"abc".chunked(2)` is `[ab, c]`).
+/// Kotlin's `checkWindowSizeStep` — the ONE bounds check behind every
+/// `chunked`/`windowed` overload, on either a collection or a `CharSequence`.
+///
+/// It has TWO messages, not one: `chunked(size)` is `windowed(size, size)`, and
+/// where size and step agree naming both would say the same number twice, so
+/// the stdlib drops the step from the text. Three call sites here each spelled
+/// their own single message, which was the `Both …` case's wording without the
+/// `Both` and the `size … must be` case's numbers duplicated — wrong for both.
+fn check_window_size_step(size: i64, step: i64) -> Result<(), String> {
+    if size > 0 && step > 0 {
+        return Ok(());
+    }
+    Err(format!(
+        "java.lang.IllegalArgumentException: {}",
+        if size == step {
+            format!("size {size} must be greater than zero.")
+        } else {
+            format!("Both size {size} and step {step} must be greater than zero.")
+        }
+    ))
+}
+
 fn coll_hof_str_groups(name: &str, chars: &Value, extras: &[Value]) -> Result<Vec<Value>, String> {
     let items = list_snapshot(chars).unwrap_or_default();
     let size = extras.first().map(|v| v.to_int()).unwrap_or(0);
@@ -3863,12 +3931,7 @@ fn coll_hof_str_groups(name: &str, chars: &Value, extras: &[Value]) -> Result<Ve
     } else {
         extras.get(1).map(|v| v.to_int()).unwrap_or(1)
     };
-    if size <= 0 || step <= 0 {
-        return Err(format!(
-            "java.lang.IllegalArgumentException: \
-             size {size} and step {step} must be greater than zero."
-        ));
-    }
+    check_window_size_step(size, step)?;
     let partial = chunking || extras.get(2).is_some_and(truthy);
     Ok(windows_of(&items, size as usize, step as usize, partial)
         .iter()
@@ -3916,6 +3979,11 @@ fn coll_hof(
     recv: &Value,
     extras: &[Value],
     clo: &Value,
+    // The receiver kind the CALL was written against, carried through the two
+    // recursions below because both change the representation: a `String`
+    // re-enters as its `Char`s and a lazy pipeline as the list it pulled, and
+    // neither is the type whose diagnostics Kotlin spells.
+    kind: SeqKind,
 ) -> Result<Value, String> {
     // A lazy sequence receiver. The four stages that can be applied one element
     // at a time stay lazy — that is what keeps `generateSequence(1) { it * 2 }
@@ -3940,11 +4008,7 @@ fn coll_hof(
                         return Ok(match name {
                             "any" => Value::Bool(false),
                             "indexOfFirst" => Value::Int(-1),
-                            "first" => {
-                                return Err("java.util.NoSuchElementException: \
-                                            Sequence contains no element matching the predicate."
-                                    .to_string())
-                            }
+                            "first" => return Err(kind.no_match(name)),
                             _ => Value::Undef,
                         });
                     };
@@ -3960,7 +4024,7 @@ fn coll_hof(
             }
             _ => {
                 let items = alloc(HeapObj::List(gen_pull(vm, recv, None)?));
-                return coll_hof(vm, name, &items, extras, clo);
+                return coll_hof(vm, name, &items, extras, clo, kind);
             }
         }
     }
@@ -3980,7 +4044,7 @@ fn coll_hof(
             }
             return Ok(alloc(HeapObj::List(out)));
         }
-        let out = coll_hof(vm, name, &chars, extras, clo)?;
+        let out = coll_hof(vm, name, &chars, extras, clo, kind)?;
         if charseq_returns_string(name) {
             return Ok(chars_to_string(&out));
         }
@@ -4118,8 +4182,10 @@ fn coll_hof(
         "reduce" => {
             let mut iter = items.into_iter();
             let mut acc = iter.next().ok_or_else(|| {
-                "java.lang.UnsupportedOperationException: Empty collection can't be reduced."
-                    .to_string()
+                format!(
+                    "java.lang.UnsupportedOperationException: Empty {} can't be reduced.",
+                    kind.reduce_noun(name)
+                )
             })?;
             for it in iter {
                 acc = invoke_closure(vm, clo, &[acc, it])?;
@@ -4132,8 +4198,10 @@ fn coll_hof(
         "reduceRight" => {
             let mut iter = items.into_iter().rev();
             let mut acc = iter.next().ok_or_else(|| {
-                "java.lang.UnsupportedOperationException: Empty collection can't be reduced."
-                    .to_string()
+                format!(
+                    "java.lang.UnsupportedOperationException: Empty {} can't be reduced.",
+                    kind.reduce_noun(name)
+                )
             })?;
             for it in iter {
                 acc = invoke_closure(vm, clo, &[it, acc])?;
@@ -4172,7 +4240,13 @@ fn coll_hof(
             }
             Ok(sum_values(&mapped))
         }
-        "maxByOrNull" => {
+        // `maxBy`/`minBy` and their `…OrNull` twins differ only on an EMPTY
+        // receiver, where the plain pair throws — bare, with no detail, the way
+        // `max`/`min` do. Kotlin deprecated the throwing spelling in 1.4 and
+        // brought it back in 1.7 with these semantics, so a frontend that has
+        // only the `…OrNull` form answers `unresolved reference` for code the
+        // current compiler accepts.
+        "maxByOrNull" | "maxBy" => {
             let mut best: Option<(Value, Value)> = None; // (element, selector)
             for it in items {
                 let sel = invoke_closure(vm, clo, std::slice::from_ref(&it))?;
@@ -4184,7 +4258,7 @@ fn coll_hof(
                     best = Some((it, sel));
                 }
             }
-            Ok(best.map(|(el, _)| el).unwrap_or(Value::Undef))
+            extremum_or(best.map(|(el, _)| el), name)
         }
         "sortedBy" => {
             // Decorate with the selector, stable-sort, undecorate (schwartzian) —
@@ -4200,7 +4274,7 @@ fn coll_hof(
                 keyed.into_iter().map(|(_, it)| it).collect(),
             )))
         }
-        "minByOrNull" => {
+        "minByOrNull" | "minBy" => {
             let mut best: Option<(Value, Value)> = None;
             for it in items {
                 let sel = invoke_closure(vm, clo, std::slice::from_ref(&it))?;
@@ -4212,7 +4286,7 @@ fn coll_hof(
                     best = Some((it, sel));
                 }
             }
-            Ok(best.map(|(el, _)| el).unwrap_or(Value::Undef))
+            extremum_or(best.map(|(el, _)| el), name)
         }
         "none" => {
             for it in items {
@@ -4379,11 +4453,7 @@ fn coll_hof(
             }
             match (hit, name) {
                 (Some(v), _) => Ok(v),
-                (None, "first" | "last") => Err(
-                    "java.util.NoSuchElementException: Collection contains no element \
-                     matching the predicate."
-                        .to_string(),
-                ),
+                (None, "first" | "last") => Err(kind.no_match(name)),
                 (None, _) => Ok(Value::Undef),
             }
         }
@@ -4397,12 +4467,8 @@ fn coll_hof(
             match (hits.len(), name) {
                 (1, _) => Ok(hits.remove(0)),
                 (_, "singleOrNull") => Ok(Value::Undef),
-                (0, _) => Err("java.util.NoSuchElementException: \
-                     Collection contains no element matching the predicate."
-                    .to_string()),
-                _ => Err("java.lang.IllegalArgumentException: \
-                     Collection contains more than one matching element."
-                    .to_string()),
+                (0, _) => Err(kind.no_match(name)),
+                _ => Err(kind.many_match(name)),
             }
         }
         "indexOfFirst" | "indexOfLast" => {
@@ -4450,13 +4516,7 @@ fn coll_hof(
                     best = Some(sel);
                 }
             }
-            match (best, name.ends_with("OrNull")) {
-                (Some(v), _) => Ok(v),
-                (None, true) => Ok(Value::Undef),
-                (None, false) => {
-                    Err("java.util.NoSuchElementException: Collection is empty.".to_string())
-                }
-            }
+            extremum_or(best, name)
         }
         // `Map.filterKeys { }` / `filterValues { }` keep the entries whose KEY
         // (or VALUE) satisfies the predicate. Unlike `mapKeys`/`mapValues`
@@ -4608,12 +4668,7 @@ fn coll_hof(
             } else {
                 extras.get(1).map(|v| v.to_int()).unwrap_or(1)
             };
-            if size <= 0 || step <= 0 {
-                return Err(format!(
-                    "java.lang.IllegalArgumentException: \
-                     size {size} and step {step} must be greater than zero."
-                ));
-            }
+            check_window_size_step(size, step)?;
             let partial = chunking || extras.get(2).is_some_and(truthy);
             let groups = windows_of(&items, size as usize, step as usize, partial);
             let mut out = Vec::with_capacity(groups.len());
@@ -4949,6 +5004,34 @@ fn edit_builder<T>(v: &Value, f: impl FnOnce(&mut Vec<u16>) -> T) -> Option<T> {
 /// written twice — `length`, `indexOf`, `substring`, `startsWith`, `first`,
 /// `toList`, `count`, and the rest all resolve through [`kt_method`] on a
 /// snapshot of the content.
+/// `StringIndexOutOfBoundsException` for a SINGLE index — `s[i]`, `s.get(i)`,
+/// `sb.deleteCharAt(i)`, `sb.setCharAt(i, c)`.
+///
+/// The wording is a property of the JDK the program runs on, not of Kotlin:
+/// `String` and `AbstractStringBuilder` route their bounds checks through
+/// `Preconditions.outOfBounds` from JDK 21 on, and printed a per-call-site
+/// message before that. JDK 17 answers `index 9, length 3` here where JDK 21
+/// and JDK 26 both answer `Index 9 out of bounds for length 3`, verified on
+/// this machine's Corretto 17.0.4.1, Homebrew 21.0.12 and Homebrew 26.0.2.
+///
+/// kotlinrs targets the CURRENT wording, which is also the only choice that is
+/// self-consistent: `Double.toString` here is the shortest-representation
+/// algorithm JDK 19 introduced, so a kotlinrs that also spoke JDK 17's index
+/// messages would be imitating a JVM that never existed.
+fn sioobe_index(i: i64, len: usize) -> String {
+    format!("java.lang.StringIndexOutOfBoundsException: Index {i} out of bounds for length {len}")
+}
+
+/// `StringIndexOutOfBoundsException` for a half-open RANGE — `substring`,
+/// `subSequence`, `sb.insert`, `sb.delete`, `sb.replace`. See [`sioobe_index`]
+/// for which JDK's wording this is and why.
+fn sioobe_range(from: i64, to: i64, len: usize) -> String {
+    format!(
+        "java.lang.StringIndexOutOfBoundsException: \
+         Range [{from}, {to}) out of bounds for length {len}"
+    )
+}
+
 fn builder_method(
     vm: &mut VM,
     recv: &Value,
@@ -4957,10 +5040,16 @@ fn builder_method(
     args: &[Value],
 ) -> Result<Value, String> {
     let len = units.len();
-    /// The JVM's index diagnostic. `insert` says "offset" where the rest say
-    /// "index"; the two messages are otherwise identical.
-    fn oob(what: &str, i: i64, len: usize) -> String {
-        format!("java.lang.StringIndexOutOfBoundsException: {what} {i}, length {len}")
+    /// The JVM's SINGLE-INDEX diagnostic — `charAt`, `deleteCharAt`,
+    /// `setCharAt`. See [`sioobe_index`] for why the wording is the one it is.
+    fn oob(i: i64, len: usize) -> String {
+        sioobe_index(i, len)
+    }
+    /// The JVM's RANGE diagnostic — `insert`, `delete`, `replace`, `substring`.
+    /// The two forms are separate messages, not one message with a different
+    /// noun: a range names both bounds, a single index names one.
+    fn oob_range(from: i64, to: i64, len: usize) -> String {
+        sioobe_range(from, to, len)
     }
     /// A member argument as the code units `String.valueOf` would append.
     ///
@@ -4999,7 +5088,7 @@ fn builder_method(
         "insert" => {
             let at = int_arg(0);
             if at < 0 || at as usize > len {
-                return Err(oob("offset", at, len));
+                return Err(oob_range(at, len as i64, len));
             }
             let ins = arg_units(args, 1);
             chained(&mut |u| {
@@ -5015,16 +5104,20 @@ fn builder_method(
             let inserting = name == "insertRange";
             let at = if inserting { int_arg(0) } else { len as i64 };
             if at < 0 || at as usize > len {
-                return Err(oob("offset", at, len));
+                return Err(oob_range(at, len as i64, len));
             }
             let src = arg_units(args, usize::from(inserting));
             let (from, to) = (
                 int_arg(1 + usize::from(inserting)),
                 int_arg(2 + usize::from(inserting)),
             );
+            // The ARGUMENT's bounds fault as a plain `IndexOutOfBoundsException`
+            // — `Preconditions.checkFromToIndex` on the source `CharSequence`,
+            // not the `StringIndex…` subclass the receiver's own bounds raise.
             if from < 0 || to > src.len() as i64 || from > to {
                 return Err(format!(
-                    "java.lang.IndexOutOfBoundsException: begin {from}, end {to}, length {}",
+                    "java.lang.IndexOutOfBoundsException: \
+                     Range [{from}, {to}) out of bounds for length {}",
                     src.len()
                 ));
             }
@@ -5033,10 +5126,13 @@ fn builder_method(
                 u.splice(at as usize..at as usize, slice.clone());
             })
         }
-        "deleteCharAt" => {
+        // `deleteAt` is `kotlin.text`'s spelling of `deleteCharAt`, and
+        // `deleteRange` of `delete` — both are `StringBuilder` extensions that
+        // forward to the JVM member, so they fault identically.
+        "deleteCharAt" | "deleteAt" => {
             let at = int_arg(0);
             if at < 0 || at as usize >= len {
-                return Err(oob("index", at, len));
+                return Err(oob(at, len));
             }
             chained(&mut |u| {
                 u.remove(at as usize);
@@ -5045,12 +5141,15 @@ fn builder_method(
         // `delete`/`replace` CLAMP their end to the length rather than
         // throwing — `StringBuilder("abc").delete(1, 99)` is `a` — but still
         // reject a start outside the sequence.
-        "delete" | "replace" => {
-            let (start, end) = (int_arg(0), int_arg(1));
-            if start < 0 || start as usize > len || start > end {
-                return Err(oob("start", start, len));
+        "delete" | "deleteRange" | "replace" => {
+            // The JVM clamps `end` to the length BEFORE checking, so the bound
+            // the diagnostic reports is the clamped one: `delete(9, 10)` on a
+            // 5-unit builder says `Range [9, 5)`, not `Range [9, 10)`.
+            let (start, end) = (int_arg(0), int_arg(1).min(len as i64));
+            if start < 0 || start > end {
+                return Err(oob_range(start, end, len));
             }
-            let (start, end) = (start as usize, (end as usize).min(len));
+            let (start, end) = (start as usize, end as usize);
             let with = if name == "replace" {
                 arg_units(args, 2)
             } else {
@@ -5083,8 +5182,13 @@ fn builder_method(
         "clear" => chained(&mut |u| u.clear()),
         "setLength" => {
             let n = int_arg(0);
+            // The one bounds check `AbstractStringBuilder` did NOT move onto
+            // `Preconditions` in JDK 21: `setLength` still raises its own
+            // hand-written message, identical on JDK 17 and JDK 26.
             if n < 0 {
-                return Err(oob("length", n, len));
+                return Err(format!(
+                    "java.lang.StringIndexOutOfBoundsException: String index out of range: {n}"
+                ));
             }
             edit_builder(recv, |u| u.resize(n as usize, 0));
             Ok(Value::Undef)
@@ -5092,7 +5196,7 @@ fn builder_method(
         "setCharAt" => {
             let at = int_arg(0);
             if at < 0 || at as usize >= len {
-                return Err(oob("index", at, len));
+                return Err(oob(at, len));
             }
             let c = args
                 .get(1)
@@ -5224,11 +5328,7 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
                 .map(|v| v.to_int())
                 .unwrap_or(units.len() as i64);
             if start < 0 || end > units.len() as i64 || start > end {
-                Err(format!(
-                    "java.lang.StringIndexOutOfBoundsException: \
-                     Range [{start}, {end}) out of bounds for length {}",
-                    units.len()
-                ))
+                Err(sioobe_range(start, end, units.len()))
             } else {
                 Ok(Value::str(String::from_utf16_lossy(
                     &units[start as usize..end as usize],
@@ -5356,11 +5456,7 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
             let i = args.first().map(|v| v.to_int()).unwrap_or(0);
             match usize::try_from(i).ok().and_then(|i| units.get(i)) {
                 Some(u) => Ok(char_of(*u as i64)),
-                None => Err(format!(
-                    "java.lang.StringIndexOutOfBoundsException: \
-                     index {i}, length {}",
-                    units.len()
-                )),
+                None => Err(sioobe_index(i, units.len())),
             }
         }
         // `take`/`drop` clamp an oversized count and fault on a negative one,
@@ -5461,10 +5557,20 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         // Both take an optional RADIX (`"ff".toInt(16)`). Dropping it would not
         // fail loudly — it would answer the base-10 reading, or throw on a
         // string that is perfectly valid in the base that was asked for.
-        (Value::Str(s), "toInt" | "toLong") => parse_radix(s, args)
-            .ok_or_else(|| format!("java.lang.NumberFormatException: For input string: \"{s}\"")),
-        (Value::Str(s), "toIntOrNull" | "toLongOrNull") => {
-            Ok(parse_radix(s, args).unwrap_or(Value::Undef))
+        // The destination WIDTH is part of the parse, not a cast after it:
+        // `"300".toByte()` is a fault, not `44`. Each width also reports its
+        // own diagnostic — see [`parse_radix`].
+        (Value::Str(s), "toInt" | "toLong" | "toByte" | "toShort") => {
+            parse_radix(s, args, int_width_of(name)).map_err(|e| match e {
+                ParseFail::Radix(m) | ParseFail::Number(m) => m,
+            })
+        }
+        (Value::Str(s), "toIntOrNull" | "toLongOrNull" | "toByteOrNull" | "toShortOrNull") => {
+            match parse_radix(s, args, int_width_of(name.trim_end_matches("OrNull"))) {
+                Ok(v) => Ok(v),
+                Err(ParseFail::Number(_)) => Ok(Value::Undef),
+                Err(ParseFail::Radix(m)) => Err(m),
+            }
         }
         (Value::Str(s), "toDouble" | "toFloat") => s
             .trim()
@@ -5679,7 +5785,7 @@ fn charseq_member(
         let list = alloc(HeapObj::List(chars));
         return Some(coll_hof_str_groups(name, &list, args).map(|g| alloc(HeapObj::List(g))));
     }
-    sequence_member(vm, &chars, false, None, name, args)
+    sequence_member(vm, &chars, SeqKind::CharSeq, None, name, args)
 }
 
 /// The `kotlin.Char` members, on the code unit `code`.
@@ -5841,6 +5947,38 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // `MutableList.add` always appends and answers `true`; `MutableSet.add`
         // answers whether the element was NEW, which is Kotlin's contract and
         // the reason the two share one arm but not one result.
+        // `add(index, element)` is a SEPARATE overload that inserts and answers
+        // `Unit`, not the appending one. Reading only the first argument ran the
+        // append and pushed the INDEX as the element, which is silent: it
+        // answers a longer list either way and only the contents disagree.
+        // A `MutableSet` has no positional overload, so this arm is list-only.
+        "add" if args.len() == 2 => {
+            let at = args[0].to_int();
+            let v = args[1].clone();
+            let out = with_obj_mut(recv, |o| match o {
+                HeapObj::List(items) => Some(
+                    match usize::try_from(at).ok().filter(|i| *i <= items.len()) {
+                        Some(i) => {
+                            items.insert(i, v);
+                            Ok(())
+                        }
+                        // `ArrayList.rangeCheckForAdd` has its OWN message —
+                        // `Index: 9, Size: 3`, not the `Index 9 out of bounds
+                        // for length 3` every other position check uses.
+                        None => Err(format!(
+                            "java.lang.IndexOutOfBoundsException: Index: {at}, Size: {}",
+                            items.len()
+                        )),
+                    },
+                ),
+                _ => None,
+            })
+            .flatten();
+            return match out {
+                Some(r) => r.map(|()| Value::Undef),
+                None => Err(format!("unresolved reference: add on {}", obj_label(recv))),
+            };
+        }
         "add" => {
             let v = args.first().cloned().unwrap_or(Value::Undef);
             let seen = key_position(vm, recv, &v).is_some();
@@ -5962,6 +6100,11 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         }
         "removeAt" => {
             let i = args.first().map(|v| v.to_int()).unwrap_or(0);
+            let len = with_obj(recv, |o| match o {
+                HeapObj::List(items) => Some(items.len()),
+                _ => None,
+            })
+            .flatten();
             let out = with_obj_mut(recv, |o| match o {
                 HeapObj::List(items) if i >= 0 && (i as usize) < items.len() => {
                     Some(items.remove(i as usize))
@@ -5969,7 +6112,12 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 _ => None,
             })
             .flatten();
-            return out.ok_or_else(|| "java.lang.IndexOutOfBoundsException".to_string());
+            return out.ok_or_else(|| match len {
+                Some(n) => format!(
+                    "java.lang.IndexOutOfBoundsException: Index {i} out of bounds for length {n}"
+                ),
+                None => format!("unresolved reference: removeAt on {}", obj_label(recv)),
+            });
         }
         // `entries` is the `Map.Entry` SET — a `Set`, not a list, which is what
         // makes `entries.hashCode()` the sum of the entry hashes rather than a
@@ -6087,14 +6235,14 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     // `first`/`last` are *properties* of the progression (defined even when it is
     // empty), where a list's are element accessors.
     let kind = with_obj(recv, |o| match o {
-        HeapObj::List(_) => 1u8,
-        HeapObj::Set(_) => 4,
-        HeapObj::Array { .. } => 2,
-        HeapObj::Range(_) => 3,
-        _ => 0,
+        HeapObj::List(_) => Some(SeqKind::List),
+        HeapObj::Set(_) => Some(SeqKind::Set),
+        HeapObj::Array { .. } => Some(SeqKind::Array),
+        HeapObj::Range(_) => Some(SeqKind::Range),
+        _ => None,
     })
-    .unwrap_or(0);
-    if kind != 0 {
+    .flatten();
+    if let Some(kind) = kind {
         let range = with_obj(recv, |o| match o {
             HeapObj::Range(r) => Some(*r),
             _ => None,
@@ -6104,7 +6252,7 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         if let Some(v) = sequence_member(
             vm,
             &items,
-            kind == 4,
+            kind,
             range.map(|r| (r.wrap(r.first), r.wrap(r.last()))),
             name,
             args,
@@ -6197,6 +6345,168 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     }
 }
 
+/// Which kind of receiver a shared sequence member was reached through.
+///
+/// The members themselves are kind-agnostic — that is the point of sharing one
+/// implementation — but their DIAGNOSTICS are not: Kotlin's stdlib declares
+/// `first`/`single` separately for `List`, `Array`, `Iterable` and
+/// `CharSequence`, and each spells its own empty-receiver message. Passing only
+/// a `hashed` flag (all a `Set`'s equality needed) left every kind answering
+/// the `List` wording, so `arrayOf<Int>().first()` said `List is empty.`
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SeqKind {
+    List,
+    Array,
+    /// An `IntRange`/`IntProgression`. Its shared members reach it as a plain
+    /// `Iterable`, which is the `Collection` wording.
+    Range,
+    Set,
+    /// A `String`/`StringBuilder` read as its characters.
+    CharSeq,
+    /// A lazy `Sequence`. Only a `generateSequence` pipeline is one here —
+    /// `asSequence()` materializes into a `List`, and its diagnostics follow
+    /// that representation rather than the type the source wrote.
+    Seq,
+}
+
+impl SeqKind {
+    /// Whether membership is hash-gated (a `Set`) rather than sequential; see
+    /// [`member_eq`].
+    fn hashed(self) -> bool {
+        self == SeqKind::Set
+    }
+
+    /// The `NoSuchElementException` detail for an empty receiver.
+    fn empty(self) -> &'static str {
+        match self {
+            SeqKind::List => "List is empty.",
+            SeqKind::Array => "Array is empty.",
+            SeqKind::Set | SeqKind::Range => "Collection is empty.",
+            SeqKind::CharSeq => "Char sequence is empty.",
+            SeqKind::Seq => "Sequence is empty.",
+        }
+    }
+
+    /// The `IllegalArgumentException` subject `single()` raises for a receiver
+    /// with more than one element.
+    fn more_than_one(self) -> &'static str {
+        match self {
+            SeqKind::List => "List",
+            SeqKind::Array => "Array",
+            SeqKind::Set | SeqKind::Range => "Collection",
+            SeqKind::CharSeq => "Char sequence",
+            SeqKind::Seq => "Sequence",
+        }
+    }
+
+    /// The subject of a PREDICATE member's diagnostics, which is the receiver
+    /// type the stdlib declared that member on — not always this receiver's own
+    /// type. `first`/`single`/`find` are declared on `Iterable`, so a list
+    /// receiver is a "Collection" to them; `last` needs to walk backwards and
+    /// is declared on `List`, so the same receiver names itself there.
+    fn predicate_subject(self, name: &str) -> &'static str {
+        match self {
+            SeqKind::List if name.starts_with("last") => "List",
+            SeqKind::List | SeqKind::Set | SeqKind::Range => "Collection",
+            _ => self.more_than_one(),
+        }
+    }
+
+    /// `NoSuchElementException` for a predicate nothing matched. A
+    /// `CharSequence` searches for a CHARACTER, so the noun changes with the
+    /// subject.
+    fn no_match(self, name: &str) -> String {
+        format!(
+            "java.util.NoSuchElementException: {} contains no {} matching the predicate.",
+            self.predicate_subject(name),
+            if self == SeqKind::CharSeq {
+                "character"
+            } else {
+                "element"
+            }
+        )
+    }
+
+    /// `IllegalArgumentException` for a `single { … }` more than one element
+    /// matched. Unlike [`SeqKind::no_match`] the noun here is always "element",
+    /// even for a `CharSequence`.
+    fn many_match(self, name: &str) -> String {
+        format!(
+            "java.lang.IllegalArgumentException: {} contains more than one matching element.",
+            self.predicate_subject(name)
+        )
+    }
+
+    /// The noun in `Empty X can't be reduced.` `reduceRight` walks backwards,
+    /// which only an indexed receiver can do, so it is declared on `List` where
+    /// `reduce` is declared on `Iterable` — and each names its own declaration.
+    fn reduce_noun(self, name: &str) -> &'static str {
+        match self {
+            SeqKind::Array => "array",
+            SeqKind::CharSeq => "char sequence",
+            SeqKind::Seq => "sequence",
+            SeqKind::List if name.starts_with("reduceRight") => "list",
+            _ => "collection",
+        }
+    }
+}
+
+/// The result of a selector-driven extremum — `maxBy`/`minBy`/`maxOf`/`minOf`
+/// and their `…OrNull` twins.
+///
+/// An empty receiver is null for the `…OrNull` spelling and a `NoSuchElement`
+/// for the plain one. The exception is raised BARE: the whole extremum family
+/// spells `throw NoSuchElementException()` with no argument, unlike
+/// `first`/`last`/`single`, which name the receiver kind.
+fn extremum_or(best: Option<Value>, name: &str) -> Result<Value, String> {
+    match (best, name.ends_with("OrNull")) {
+        (Some(v), _) => Ok(v),
+        (None, true) => Ok(Value::Undef),
+        (None, false) => Err("java.util.NoSuchElementException".to_string()),
+    }
+}
+
+/// Which [`SeqKind`] a receiver presents to the shared higher-order members.
+fn seq_kind_of(v: &Value) -> SeqKind {
+    if matches!(v, Value::Str(_)) {
+        return SeqKind::CharSeq;
+    }
+    with_obj(v, |o| match o {
+        HeapObj::Set(_) => SeqKind::Set,
+        HeapObj::Map(_) => SeqKind::Set,
+        HeapObj::Array { .. } => SeqKind::Array,
+        HeapObj::Range(_) => SeqKind::Range,
+        HeapObj::Gen { .. } => SeqKind::Seq,
+        HeapObj::Builder { .. } => SeqKind::CharSeq,
+        _ => SeqKind::List,
+    })
+    .unwrap_or(SeqKind::List)
+}
+
+/// The out-of-range diagnostic for `get`/`elementAt` on a `kind` receiver.
+///
+/// Three different exceptions, because three different stdlib declarations
+/// answer the call. A `List`'s `get` is the JVM's, and `listOf` builds an
+/// ARRAY-backed list, so its fault is an `ArrayIndexOutOfBoundsException` — the
+/// same one an array itself raises. A `Set` or a progression has no positional
+/// access at all: `Iterable.elementAt` walks and reports having run out. A
+/// `CharSequence` raises the `String` subclass.
+///
+/// `mutableListOf(…)[9]` is the case this cannot get right: `ArrayList.get`
+/// raises the PLAIN `IndexOutOfBoundsException`, and one `HeapObj::List`
+/// carries both list kinds, so the array-backed answer is the one both get.
+fn index_fault(kind: SeqKind, i: i64, len: usize) -> String {
+    match kind {
+        SeqKind::List | SeqKind::Array => format!(
+            "java.lang.ArrayIndexOutOfBoundsException: Index {i} out of bounds for length {len}"
+        ),
+        SeqKind::Set | SeqKind::Range | SeqKind::Seq => format!(
+            "java.lang.IndexOutOfBoundsException: Collection doesn't contain element at index {i}."
+        ),
+        SeqKind::CharSeq => sioobe_index(i, len),
+    }
+}
+
 /// The read-only members every ordered sequence shares — `List`, arrays, and
 /// ranges. `range` carries `(first, last)` when the receiver is a range, whose
 /// `first`/`last` are progression *properties* (defined even for an empty range)
@@ -6208,18 +6518,17 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
 fn sequence_member(
     vm: &mut VM,
     items: &[Value],
-    // Whether the receiver is hash-gated (a `Set`) rather than a `List`; see
-    // `member_eq`.
-    hashed: bool,
+    kind: SeqKind,
     range: Option<(Value, Value)>,
     name: &str,
     args: &[Value],
 ) -> Option<Result<Value, String>> {
-    /// Kotlin throws on `first()`/`last()`/`max()`/`min()` over an empty
-    /// sequence rather than returning null.
-    fn need(v: Option<Value>) -> Result<Value, String> {
-        v.ok_or_else(|| "java.util.NoSuchElementException: List is empty.".to_string())
-    }
+    let hashed = kind.hashed();
+    // Kotlin throws on `first()`/`last()`/`single()` over an empty sequence
+    // rather than returning null, and the message NAMES the receiver kind.
+    let need = |v: Option<Value>| -> Result<Value, String> {
+        v.ok_or_else(|| format!("java.util.NoSuchElementException: {}", kind.empty()))
+    };
     let v = match name {
         "size" | "count" => Value::Int(items.len() as i64),
         "isEmpty" => Value::Bool(items.is_empty()),
@@ -6235,11 +6544,21 @@ fn sequence_member(
         // `get`/`elementAt` throw out of range; `getOrNull`/`elementAtOrNull`
         // answer null there. `first`/`last` above draw the same distinction
         // against their `…OrNull` forms.
+        // Kotlin's `elementAt` on a `List` or an array IS `get`, so it faults
+        // the way an INDEX does — naming the index and the length. Only the
+        // kinds with no positional access fall back to the `Iterable` walk,
+        // which reports having run out rather than a bound.
+        //
+        // Answering `List is empty.` here named neither the index nor the real
+        // length, and said "empty" about a receiver that was not.
         "get" | "elementAt" => {
             let i = args.first().map(|v| v.to_int()).unwrap_or(0);
-            return Some(need(
-                usize::try_from(i).ok().and_then(|i| items.get(i).cloned()),
-            ));
+            return Some(
+                match usize::try_from(i).ok().and_then(|i| items.get(i).cloned()) {
+                    Some(v) => Ok(v),
+                    None => Err(index_fault(kind, i, items.len())),
+                },
+            );
         }
         "getOrNull" | "elementAtOrNull" => {
             let i = args.first().map(|v| v.to_int()).unwrap_or(0);
@@ -6280,11 +6599,22 @@ fn sequence_member(
                 .get(1)
                 .map(|v| v.to_int())
                 .unwrap_or(items.len() as i64);
-            if from < 0 || to > items.len() as i64 || from > to {
+            // `AbstractList.subListRangeCheck` reports ONE bound per fault, in
+            // this order, and a crossed pair is not out of bounds at all — it
+            // is an `IllegalArgumentException` naming both.
+            if from < 0 {
                 return Some(Err(format!(
-                    "java.lang.IndexOutOfBoundsException: \
-                     fromIndex: {from}, toIndex: {to}, length {}",
-                    items.len()
+                    "java.lang.IndexOutOfBoundsException: fromIndex = {from}"
+                )));
+            }
+            if to > items.len() as i64 {
+                return Some(Err(format!(
+                    "java.lang.IndexOutOfBoundsException: toIndex = {to}"
+                )));
+            }
+            if from > to {
+                return Some(Err(format!(
+                    "java.lang.IllegalArgumentException: fromIndex({from}) > toIndex({to})"
                 )));
             }
             return Some(Ok(alloc(HeapObj::List(
@@ -6320,8 +6650,13 @@ fn sequence_member(
         "average" => {
             Value::Float(items.iter().map(|v| v.to_float()).sum::<f64>() / items.len() as f64)
         }
-        // `max`/`min` throw on an empty sequence (via `need`); the `…OrNull`
-        // pair answers null instead. That is the only difference between them.
+        // `max`/`min` throw on an empty sequence; the `…OrNull` pair answers
+        // null instead. That is the only difference between them.
+        //
+        // Their `NoSuchElementException` carries NO message, unlike
+        // `first`/`last`/`single`: the stdlib raises it bare
+        // (`throw NoSuchElementException()`), so a `need`-shaped message here
+        // would print a detail the JVM never does.
         "max" | "min" | "maxOrNull" | "minOrNull" => {
             let want_max = name.starts_with("max");
             let best = items.iter().cloned().reduce(|a, b| {
@@ -6335,7 +6670,7 @@ fn sequence_member(
             if name.ends_with("OrNull") {
                 return Some(Ok(best.unwrap_or(Value::Undef)));
             }
-            return Some(need(best));
+            return Some(best.ok_or_else(|| "java.util.NoSuchElementException".to_string()));
         }
         // `flatten()` concatenates one nesting level; a non-iterable element has
         // no `Iterable` receiver in Kotlin, so it cannot occur here.
@@ -6371,11 +6706,8 @@ fn sequence_member(
             } else {
                 args.get(1).map(|v| v.to_int()).unwrap_or(1)
             };
-            if n <= 0 || step <= 0 {
-                return Some(Err(format!(
-                    "java.lang.IllegalArgumentException: \
-                     size {n} and step {step} must be greater than zero."
-                )));
+            if let Err(e) = check_window_size_step(n, step) {
+                return Some(Err(e));
             }
             let partial = chunking || args.get(2).is_some_and(truthy);
             return Some(Ok(alloc(HeapObj::List(windows_of(
@@ -6419,10 +6751,14 @@ fn sequence_member(
             return Some(match (items.len(), name) {
                 (1, _) => Ok(items[0].clone()),
                 (_, "singleOrNull") => Ok(Value::Undef),
-                (0, _) => Err("java.util.NoSuchElementException: List is empty.".to_string()),
-                _ => Err("java.lang.IllegalArgumentException: \
-                          List has more than one element."
-                    .to_string()),
+                (0, _) => Err(format!(
+                    "java.util.NoSuchElementException: {}",
+                    kind.empty()
+                )),
+                _ => Err(format!(
+                    "java.lang.IllegalArgumentException: {} has more than one element.",
+                    kind.more_than_one()
+                )),
             })
         }
         // `toSet` yields a `Set`; `distinct` yields a `List` with the same
@@ -6629,9 +6965,7 @@ fn index_get(vm: &mut VM, recv: &Value, index: &Value) -> Result<Value, String> 
             .and_then(|i| s.encode_utf16().nth(i))
         {
             Some(u) => Ok(char_of(u as i64)),
-            None => Err(format!(
-                "java.lang.StringIndexOutOfBoundsException: index {i}, length {len}"
-            )),
+            None => Err(sioobe_index(i, len)),
         };
     }
     // `sb[i]` indexes the builder's code units, with the same diagnostic a
@@ -6640,10 +6974,7 @@ fn index_get(vm: &mut VM, recv: &Value, index: &Value) -> Result<Value, String> 
         let i = index.to_int();
         return match usize::try_from(i).ok().and_then(|i| units.get(i)) {
             Some(u) => Ok(char_of(*u as i64)),
-            None => Err(format!(
-                "java.lang.StringIndexOutOfBoundsException: index {i}, length {}",
-                units.len()
-            )),
+            None => Err(sioobe_index(i, units.len())),
         };
     }
     // A `Map` key search runs first and OUTSIDE the heap borrow below: it is
@@ -6698,6 +7029,26 @@ fn key_position(vm: &mut VM, recv: &Value, v: &Value) -> Option<usize> {
     keys.iter().position(|x| member_eq(vm, x, v, hashed))
 }
 
+/// Store `value` at `i`, or the JVM's out-of-bounds diagnostic.
+///
+/// `kind` is the exception-class prefix: `"Array"` for an array store, which
+/// the JVM checks with `aastore` and reports as
+/// `ArrayIndexOutOfBoundsException`, and `""` for a `MutableList` store, which
+/// goes through `ArrayList.set` and reports the plain
+/// `IndexOutOfBoundsException`. Both carry the same message text.
+fn store_at(items: &mut [Value], i: i64, value: Value, kind: &str) -> Result<(), String> {
+    match usize::try_from(i).ok().and_then(|i| items.get_mut(i)) {
+        Some(slot) => {
+            *slot = value;
+            Ok(())
+        }
+        None => Err(format!(
+            "java.lang.{kind}IndexOutOfBoundsException: Index {i} out of bounds for length {}",
+            items.len()
+        )),
+    }
+}
+
 /// `recv[index] = value` — list set (bounds-checked) or map put.
 fn index_set(vm: &mut VM, recv: &Value, index: &Value, value: Value) -> Result<(), String> {
     // Only a `Map` looks its slot up by equality; a list/array indexes by
@@ -6709,15 +7060,13 @@ fn index_set(vm: &mut VM, recv: &Value, index: &Value, value: Value) -> Result<(
         None
     };
     let out = with_obj_mut(recv, |o| match o {
-        HeapObj::List(items) | HeapObj::Array { items, .. } => {
-            let i = index.to_int();
-            if i < 0 || i as usize >= items.len() {
-                Err("java.lang.IndexOutOfBoundsException".to_string())
-            } else {
-                items[i as usize] = value;
-                Ok(())
-            }
-        }
+        // A store past the end names its bound, and the two receivers do not
+        // raise the same class: an array's store is a JVM `aastore`, so it
+        // faults as `ArrayIndexOutOfBoundsException`, where a `MutableList`'s
+        // goes through `ArrayList.set` and faults as the plain
+        // `IndexOutOfBoundsException`. The message text is shared.
+        HeapObj::List(items) => store_at(items, index.to_int(), value, ""),
+        HeapObj::Array { items, .. } => store_at(items, index.to_int(), value, "Array"),
         HeapObj::Map(entries) => {
             match at.and_then(|i| entries.get_mut(i)) {
                 Some(slot) => slot.1 = value,
@@ -6733,10 +7082,7 @@ fn index_set(vm: &mut VM, recv: &Value, index: &Value, value: Value) -> Result<(
                     units[i] = char_code(&value).unwrap_or_else(|| value.to_int()) as u16;
                     Ok(())
                 }
-                None => Err(format!(
-                    "java.lang.StringIndexOutOfBoundsException: index {i}, length {}",
-                    units.len()
-                )),
+                None => Err(sioobe_index(i, units.len())),
             }
         }
         _ => Err(format!(
@@ -7229,6 +7575,123 @@ fn display_obj(id: u32) -> String {
 
 /// Whether `v`'s runtime kind matches the Kotlin type name `ty` — backs
 /// `when`'s `is Type` check.
+/// The JVM binary name of the class `ty` names, and whether it lives in
+/// `java.base`.
+///
+/// `None` for a name kotlinrs cannot resolve to ONE JVM class. A Kotlin `List`
+/// is the case that matters: `listOf(1)` is a
+/// `java.util.Collections$SingletonList`, `listOf(1, 2)` an
+/// `java.util.Arrays$ArrayList` and `mutableListOf()` a `java.util.ArrayList`,
+/// and one `HeapObj::List` carries all three — so any single name would be
+/// right for a third of the receivers and confidently wrong for the rest.
+fn jvm_class(ty: &str) -> Option<(&'static str, bool)> {
+    Some(match ty {
+        "Int" => ("java.lang.Integer", true),
+        "Long" => ("java.lang.Long", true),
+        "Short" => ("java.lang.Short", true),
+        "Byte" => ("java.lang.Byte", true),
+        "Double" => ("java.lang.Double", true),
+        "Float" => ("java.lang.Float", true),
+        "Boolean" => ("java.lang.Boolean", true),
+        "Char" => ("java.lang.Character", true),
+        "String" => ("java.lang.String", true),
+        "StringBuilder" => ("java.lang.StringBuilder", true),
+        _ => return None,
+    })
+}
+
+/// Where a class lives, as the JVM's `ClassCastException` spells it.
+fn class_home(java_base: bool) -> &'static str {
+    if java_base {
+        "module java.base of loader 'bootstrap'"
+    } else {
+        "unnamed module of loader 'app'"
+    }
+}
+
+/// The `ClassCastException` a failed `as` raises.
+///
+/// The JVM names both classes in FULL and appends where each one lives, and it
+/// merges the two locations when they agree — three message shapes, not one.
+/// Falls back to the short Kotlin labels when either side is a kind kotlinrs
+/// cannot name exactly (see [`jvm_class`]); inventing a `java.util` name there
+/// would trade a visibly approximate message for an invisibly wrong one.
+fn cast_failure(v: &Value, ty: &str) -> String {
+    let from_label = obj_label(v);
+    // The receiver is nameable when it is a primitive/`String` box or a user
+    // instance; the TARGET when it is one of those names or a name that is not
+    // a builtin container at all, which is what `value_is_type` treats as a
+    // user class.
+    let is_instance = with_obj(v, |o| matches!(o, HeapObj::Instance { .. })).unwrap_or(false);
+    // A primitive's BOX is the class the JVM reports, and `obj_label` has no
+    // name for one — it answers the placeholder `value`. Kotlin's `Int`, `Long`,
+    // `Byte` and `Short` all share `Value::Int` here, so the box named is the
+    // one the majority of them are: an autoboxed literal is an `Integer`.
+    let boxed = match v {
+        Value::Int(_) => jvm_class("Int"),
+        Value::Float(_) => jvm_class("Double"),
+        Value::Bool(_) => jvm_class("Boolean"),
+        _ => None,
+    };
+    // `obj_label` first: it already names `String` and `Char`, and a `Char` is
+    // carried as an `Int` here, so the box table below would claim it.
+    let recv = jvm_class(&from_label)
+        .or(boxed)
+        .map(|(n, b)| (n.to_string(), b))
+        .or_else(|| is_instance.then(|| (from_label.clone(), false)));
+    let target = jvm_class(ty)
+        .map(|(n, b)| (n.to_string(), b))
+        .or_else(|| (!is_builtin_type_name(ty)).then(|| (ty.to_string(), false)));
+    let (Some((a, a_base)), Some((b, b_base))) = (recv, target) else {
+        return format!(
+            "java.lang.ClassCastException: class {from_label} cannot be cast to class {ty}"
+        );
+    };
+    let home = if a_base == b_base {
+        format!("{a} and {b} are in {}", class_home(a_base))
+    } else {
+        format!(
+            "{a} is in {}; {b} is in {}",
+            class_home(a_base),
+            class_home(b_base)
+        )
+    };
+    format!("java.lang.ClassCastException: class {a} cannot be cast to class {b} ({home})")
+}
+
+/// Whether `ty` is a name [`value_is_type`] answers WITHOUT consulting the user
+/// class registry — the builtin containers and the type names that stand for a
+/// whole family. Their JVM class is not fixed, so a failed cast to one of them
+/// keeps the short Kotlin label.
+fn is_builtin_type_name(ty: &str) -> bool {
+    matches!(
+        ty,
+        "Any"
+            | "Unit"
+            | "Nothing"
+            | "Number"
+            | "Comparable"
+            | "CharSequence"
+            | "StringBuffer"
+            | "Appendable"
+            | "List"
+            | "MutableList"
+            | "Iterable"
+            | "Collection"
+            | "Set"
+            | "MutableSet"
+            | "Map"
+            | "MutableMap"
+            | "Pair"
+            | "Triple"
+            | "Array"
+            | "IntArray"
+            | "DoubleArray"
+            | "CharArray"
+            | "BooleanArray"
+    )
+}
+
 fn value_is_type(v: &Value, ty: &str) -> bool {
     match ty {
         // A `Char` has its own runtime representation, so `is Char` and `is Int`

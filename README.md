@@ -156,7 +156,11 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   empty needle), and `.startsWith(prefix, startIndex)` —
   `.compareTo()` (the JVM's code-unit difference, not a clamped sign) and
   `.compareTo(other, ignoreCase)`/`.equals(other, ignoreCase)`, the
-  parses `.toInt()`/`.toLong()`/`.toDouble()` and their `…OrNull` forms, and
+   parses `.toInt()`/`.toLong()`/`.toByte()`/`.toShort()`/`.toDouble()` and
+   their `…OrNull` forms — each bounded by the width it parses into, so
+   `"300".toByte()` is a `NumberFormatException` and not `44`, and each taking
+   an optional radix whose own `2..36` check is an `IllegalArgumentException`
+   that even the `…OrNull` forms raise — and
   `.format(args…)` — the `java.util.Formatter` conversions `%d %s %f %e %x %X
   %o %c %b %%` with the `-`/`0`/`+`/space flags, a width and a precision, where
   `%f` rounds HALF_UP over the value's shortest decimal form exactly as the JVM
@@ -313,7 +317,8 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   real lambda values: `.map`/`.mapIndexed`/`.flatMap`, `.filter`/`.filterNot`,
   `.partition`, `.takeWhile`/`.dropWhile`, `.firstOrNull`/`.lastOrNull`,
   `.forEach`, `.fold`/`.reduce`, `.any`/`.all`/`.none`/`.count`, `.sumOf`,
-  `.maxByOrNull`/`.minByOrNull`, `.sortedBy`/`.sortedByDescending`,
+  `.maxBy`/`.minBy` and `.maxByOrNull`/`.minByOrNull`,
+  `.sortedBy`/`.sortedByDescending`,
   `.associate`/`.associateBy`/`.associateWith`, `.groupBy`,
   `.first`/`.last`/`.find`/`.findLast`/`.single` and their `…OrNull` forms,
   `.indexOfFirst`/`.indexOfLast`, `.filterIndexed`/`.forEachIndexed`,
@@ -696,6 +701,26 @@ fusevm::VM  ──►  three-tier Cranelift JIT (linear · block · tracing)
   records enter that file, and it invokes the reference toolchain **exclusively**
   — a corpus recorded from kotlinrs would be a record of our own behaviour rather
   than of Kotlin's, and would pass forever no matter what broke.
+- **The JVM under the oracle is part of the oracle, and the capture pins it.**
+  `kotlinc` is a launcher that runs on whatever `$JAVA_HOME` names, and a Kotlin
+  program's output is not the compiler's alone: `Double.toString` changed
+  algorithm in JDK 19, and `String`/`StringBuilder` index faults changed wording
+  in JDK 21 — so an unpinned capture records whichever JDK the capturing shell
+  happened to export. Anything the compiler CONSTANT-FOLDS freezes the
+  *compiler's* JVM answer, independently of the one the program runs on.
+  `capture-parity.sh` therefore takes `CAPTURE_JAVA_HOME`, refuses to run below
+  JDK 21, and prints the resolved `kotlinc -version` (which names its JRE) on
+  every capture. kotlinrs targets the current wording throughout; it is the only
+  self-consistent choice, since no single JDK ever paired JDK 17's index
+  messages with JDK 19's `Double.toString`.
+- **A record may not name a class loader.** The oracle's run step is `kotlin
+  -classpath out TKt`, and that launcher loads the program through a
+  `URLClassLoader` of its own — so a `ClassCastException` over a user class
+  reads `unnamed module of loader java.net.URLClassLoader @<identity hash>`
+  where `java -cp` and `java -jar`, the way a compiled Kotlin program actually
+  runs, both read `loader 'app'`. Such a record would freeze the launcher, not
+  the language, and its identity hash is not reproducible; those cases are
+  pinned in `tests/lang.rs` against a `java`-run reference instead.
 - **A run the oracle could not answer is not a pass.** Two failing sides compare
   equal, so a program `kotlinc` rejects — or a `kotlin` that times out — produces
   no output on either side and scores as agreement. `parity-fuzz` therefore
