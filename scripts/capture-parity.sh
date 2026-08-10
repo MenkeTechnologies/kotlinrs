@@ -144,16 +144,30 @@ while IFS= read -r line; do
         (( bad++ ))
         continue
     fi
-    out=$( (cd $work && $kotlin $jvmflags -classpath out TKt) 2>/dev/null )
+    # THE OUTPUT GOES TO A FILE, NOT TO `$(...)`. Command substitution strips
+    # EVERY trailing newline, and the reconstruction that used to follow it put
+    # exactly one back on the assumption that every probe ends in a single
+    # `println`. Nothing enforced that assumption, and both ways of breaking it
+    # minted an expectation the oracle never produced:
+    #
+    #   fun main() { print("x") }                    → real `x`,     recorded `x\n`
+    #   fun main() { println("a"); println(); println() }
+    #                                                → real `a\n\n\n`, recorded `a\n`
+    #
+    # A frozen line like that is unfalsifiable from the replay side — it looks
+    # like every other record — and the only way to make the test pass is to
+    # break the frontend to match it. Reading the bytes back off disk carries
+    # zero, one or many trailing newlines through exactly as they were written.
+    (cd $work && $kotlin $jvmflags -classpath out TKt) > $work/out.txt 2>/dev/null
     rc=$?
     if (( rc != 0 )); then
         print -u2 "capture-parity: program exited $rc: $line"
         (( bad++ ))
         continue
     fi
-    # `$(...)` strips trailing newlines; every probe here ends in `println`, so
-    # put exactly one back and encode it the way the corpus does.
-    printf '%s\t%s\\n\n' "$line" "${out//$'\n'/\\n}"
+    printf '%s\t' "$line"
+    command perl -0pe 's/\n/\\n/g' < $work/out.txt
+    print
     (( n++ ))
 done < $src
 
