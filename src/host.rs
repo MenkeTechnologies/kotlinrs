@@ -2068,13 +2068,193 @@ fn titlecase_char(c: char) -> char {
     }
 }
 
-/// `Character.toUpperCase(char)`: the uppercase mapping when it fits in ONE
-/// character, and the character itself when it expands (`'ß'` stays `'ß'`).
-fn single_uppercase(c: char) -> char {
-    let mut it = c.to_uppercase();
+/// The one character `it` yields, or `None` when it yields any other number.
+fn only(mut it: impl Iterator<Item = char>) -> Option<char> {
     match (it.next(), it.next()) {
-        (Some(m), None) => m,
+        (Some(m), None) => Some(m),
+        _ => None,
+    }
+}
+
+/// `Character.toUpperCase(char)`: the SIMPLE uppercase mapping — one character
+/// in, one character out.
+///
+/// Rust exposes the FULL mapping (`char::to_uppercase`), which is the same
+/// mapping for all but two families:
+///
+///   * Characters with no single-character uppercase at all (`'ß'` expands to
+///     `"SS"`). Those answer THEMSELVES on the JVM, which is what falling
+///     through to `c` gives.
+///   * The Greek letters with a subscript iota, whose full uppercase expands
+///     (`'ᾀ'` is `"ἈΙ"`) while Unicode still gives them a one-character simple
+///     uppercase — their TITLECASE form. `char::to_titlecase` would supply it,
+///     but it is unstable, so the 27 characters are listed.
+///
+/// MEASURED, not recalled: a reference program printed `uppercaseChar().code`
+/// for all 65 536 `Char`s on the oracle. With the list below this agrees on
+/// every one of the 63 488 non-surrogate characters; without it, exactly those
+/// 27 disagree.
+fn single_uppercase(c: char) -> char {
+    if let Some(m) = only(c.to_uppercase()) {
+        return m;
+    }
+    match c as u32 {
+        // Each of the three runs titlecases eight characters up by 8.
+        u @ (0x1F80..=0x1F87 | 0x1F90..=0x1F97 | 0x1FA0..=0x1FA7) => {
+            char::from_u32(u + 8).unwrap_or(c)
+        }
+        0x1FB3 => '\u{1FBC}',
+        0x1FC3 => '\u{1FCC}',
+        0x1FF3 => '\u{1FFC}',
         _ => c,
+    }
+}
+
+/// `Character.toLowerCase(char)`: the SIMPLE lowercase mapping.
+///
+/// `U+0130` (`'İ'`) is the only character in the whole `Char` range whose FULL
+/// lowercase expands (`"i̇"` — an `i` and a combining dot) while Unicode gives
+/// it a one-character simple lowercase. Measured the same way as
+/// [`single_uppercase`]: it is the sole disagreement over all 63 488
+/// non-surrogate characters.
+fn single_lowercase(c: char) -> char {
+    if c == '\u{0130}' {
+        return 'i';
+    }
+    only(c.to_lowercase()).unwrap_or(c)
+}
+
+/// The key two characters share exactly when an `ignoreCase` comparison calls
+/// them equal — `Character.toLowerCase(Character.toUpperCase(c))`.
+///
+/// The JVM's rule is written as three tests (identical, equal uppercase, equal
+/// lowercase-of-uppercase), but the first two imply the third, so one key
+/// decides all three. Which rule it is was MEASURED rather than recalled:
+/// folding through the uppercase and folding the character directly disagree on
+/// exactly two `Char` pairs — `U+03D1`/`U+03F4` and `U+0130`/`U+0131` — and the
+/// oracle answers `true` for both, under `Char.equals`, `String.equals`,
+/// `indexOf`, `contains`, `replace`, `split`, `startsWith`, `endsWith`,
+/// `compareTo` and `regionMatches` alike.
+fn case_fold(c: char) -> char {
+    single_lowercase(single_uppercase(c))
+}
+
+/// The code point at UTF-16 offset `k`, with the number of units it occupies.
+///
+/// A surrogate pair is only read as one when BOTH halves are below `lim`; a
+/// pair straddling the bound reads as the lone high surrogate it starts with,
+/// which is the JVM's `Character.codePointAt(seq, index, limit)` contract.
+fn code_point_at(units: &[u16], k: usize, lim: usize) -> (u32, usize) {
+    let hi = units[k] as u32;
+    if (0xD800..0xDC00).contains(&hi) && k + 1 < lim {
+        let lo = units[k + 1] as u32;
+        if (0xDC00..0xE000).contains(&lo) {
+            return (0x1_0000 + ((hi - 0xD800) << 10) + (lo - 0xDC00), 2);
+        }
+    }
+    (hi, 1)
+}
+
+/// `String.compareTo(other, ignoreCase = true)` — the JVM's
+/// `CASE_INSENSITIVE_ORDER`.
+///
+/// It walks CODE POINTS rather than `Char`s, but only as far as the shorter
+/// receiver's UTF-16 length, so a surrogate pair straddling that bound reads as
+/// a lone surrogate: `"𐐨".compareTo("a", true)` is 55200 (`0xD801 - 'a'`) and
+/// not the difference of the two code points. The answer is the difference of
+/// the first pair of code points whose folding keys differ, or the difference
+/// of the two UTF-16 LENGTHS when no pair does.
+///
+/// MEASURED against the oracle over pairs chosen to separate this from the
+/// three implementations it is easy to mistake it for: a per-`Char` walk
+/// (`"𐐨a"` vs `"𐐀b"` is -1, not 40), a comparison of two lowercased strings
+/// (`"İ"` vs `"i"` is 0, which their full lowercase mappings are not) and a
+/// per-code-point walk without the length bound (`"𐐨"` vs `"a"` is 55200, not
+/// 66503).
+fn compare_ignore_case(a: &str, b: &str) -> i64 {
+    let (au, bu): (Vec<u16>, Vec<u16>) = (a.encode_utf16().collect(), b.encode_utf16().collect());
+    let fold_cp = |cp: u32| char::from_u32(cp).map_or(cp, |c| case_fold(c) as u32);
+    let lim = au.len().min(bu.len());
+    let mut k = 0;
+    while k < lim {
+        let (cp1, width) = code_point_at(&au, k, lim);
+        let (cp2, _) = code_point_at(&bu, k, lim);
+        if cp1 != cp2 {
+            let (f1, f2) = (fold_cp(cp1), fold_cp(cp2));
+            if f1 != f2 {
+                return f1 as i64 - f2 as i64;
+            }
+        }
+        k += width;
+    }
+    au.len() as i64 - bu.len() as i64
+}
+
+/// A receiver prepared for a case-insensitive scan: the case-folding key of
+/// every character, and the UTF-16 offset each character starts at.
+///
+/// The offsets are what let a match report the index Kotlin specifies — every
+/// `String` position in this file is a UTF-16 offset — even though folding is
+/// per CHARACTER and a folded character need not encode to the same width as
+/// the one it came from (`'İ'` folds to `'i'`).
+struct Folded {
+    keys: Vec<char>,
+    /// `at[i]` is character `i`'s UTF-16 offset; `at[keys.len()]` is the
+    /// receiver's whole UTF-16 length, so a match at the end still has one.
+    at: Vec<usize>,
+}
+
+impl Folded {
+    /// `s` folded for comparison; `ignore` false leaves every character as it
+    /// is, so one scan serves both overloads.
+    fn of(s: &str, ignore: bool) -> Folded {
+        let mut keys = Vec::new();
+        let mut at = Vec::new();
+        let mut off = 0usize;
+        for c in s.chars() {
+            at.push(off);
+            keys.push(if ignore { case_fold(c) } else { c });
+            off += c.len_utf16();
+        }
+        at.push(off);
+        Folded { keys, at }
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// The UTF-16 offset character `i` starts at.
+    fn offset(&self, i: usize) -> usize {
+        self.at[i]
+    }
+
+    /// The character index a UTF-16 offset falls on, clamped into range. An
+    /// offset landing INSIDE a surrogate pair rounds down to the character that
+    /// pair belongs to.
+    fn index_at(&self, u16_off: usize) -> usize {
+        match self.at.binary_search(&u16_off) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        }
+    }
+
+    /// The first character index at or after `from` where `needle` matches.
+    fn find(&self, needle: &Folded, from: usize) -> Option<usize> {
+        (from..=self.len().checked_sub(needle.len())?)
+            .find(|&i| self.keys[i..i + needle.len()] == needle.keys[..])
+    }
+
+    /// The last character index at or before `from` where `needle` matches.
+    fn rfind(&self, needle: &Folded, from: usize) -> Option<usize> {
+        let last = self.len().checked_sub(needle.len())?;
+        (0..=from.min(last))
+            .rev()
+            .find(|&i| self.keys[i..i + needle.len()] == needle.keys[..])
     }
 }
 
@@ -4848,6 +5028,8 @@ fn charseq_returns_string(name: &str) -> bool {
             | "filterIndexed"
             | "takeWhile"
             | "dropWhile"
+            | "takeLastWhile"
+            | "dropLastWhile"
             | "trim"
             | "trimStart"
             | "trimEnd"
@@ -5336,6 +5518,24 @@ fn coll_hof(
                 items[..cut].to_vec()
             } else {
                 items[cut..].to_vec()
+            };
+            Ok(alloc(HeapObj::List(out)))
+        }
+        // The from-the-end pair. They cut at the LAST element failing the
+        // predicate, so the cut is one PAST it — `listOf(1, 2, 3)
+        // .dropLastWhile { it > 1 }` keeps `[1]`, not `[1, 2]`.
+        "takeLastWhile" | "dropLastWhile" => {
+            let mut cut = 0usize;
+            for (i, it) in items.iter().enumerate().rev() {
+                if !truthy(&invoke_closure(vm, clo, std::slice::from_ref(it))?) {
+                    cut = i + 1;
+                    break;
+                }
+            }
+            let out = if name == "takeLastWhile" {
+                items[cut..].to_vec()
+            } else {
+                items[..cut].to_vec()
             };
             Ok(alloc(HeapObj::List(out)))
         }
@@ -6133,30 +6333,33 @@ fn pad(mut body: String, width: usize, left: bool, zero: bool, conv: char) -> St
     body
 }
 
-/// UTF-16 offset of `needle` in `hay`, or -1 — matching `String.indexOf` and
-/// the UTF-16 basis `length` already uses.
-/// The tail of `s` starting at UTF-16 offset `at`, or `None` when `at` is past
-/// the end. The `String` search members index in UTF-16 units, matching
-/// `length`.
-fn utf16_slice_from(s: &str, at: i64) -> Option<String> {
-    let units: Vec<u16> = s.encode_utf16().collect();
-    if at < 0 || at > units.len() as i64 {
-        return None;
-    }
-    Some(utf16_to_string(&units[at as usize..]))
-}
-
 /// Whether the optional flag argument at `i` was supplied and true — the
 /// `ignoreCase` parameter the `String` comparisons take.
 fn truthy_arg(args: &[Value], i: usize) -> bool {
     args.get(i).is_some_and(truthy)
 }
 
-fn utf16_index_of(hay: &str, needle: &str) -> i64 {
-    match hay.find(needle) {
-        Some(byte_off) => hay[..byte_off].encode_utf16().count() as i64,
-        None => -1,
-    }
+/// Whether an `ignoreCase` flag was supplied at or after `from` and is true.
+///
+/// The flag is found by TYPE rather than by position, because the members that
+/// take it also take an optional `startIndex` in the same slots — `startsWith`
+/// has both a `(prefix, ignoreCase)` and a `(prefix, startIndex, ignoreCase)`
+/// overload — and a `Boolean` is never one of those. The compiler fills a
+/// skipped `startIndex` with a literal `null` rather than a number, so nothing
+/// but a real argument reaches these scans.
+fn ignore_case(args: &[Value], from: usize) -> bool {
+    args[from.min(args.len())..]
+        .iter()
+        .any(|v| matches!(v, Value::Bool(true)))
+}
+
+/// The `startIndex` supplied at or after `from` — the first `Int` there. A
+/// `Char` is a `Value::Obj`, so a `Char` delimiter can never be read as one.
+fn index_arg(args: &[Value], from: usize) -> Option<i64> {
+    args[from.min(args.len())..].iter().find_map(|v| match v {
+        Value::Int(n) => Some(*n),
+        _ => None,
+    })
 }
 
 /// The receiver width (32 or 64) the compiler appended at index `at` to a
@@ -6520,26 +6723,63 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         // Arg-taking `String` members. The argument is rendered through
         // `kotlin_string` so a `Char` (carried as an integer code unit) or a
         // number reads the way Kotlin would print it.
-        (Value::Str(s), "contains") => Ok(Value::Bool(s.contains(&arg_str(args, 0)))),
+        // Every member from here to `lastIndexOf` has an `ignoreCase` overload.
+        // The flag is not a comparison of two lowercased STRINGS: it folds each
+        // CHARACTER to the key [`case_fold`] describes, which is why `"İ"` and
+        // `"i"` match (their full lowercase mappings do not) — see [`Folded`].
+        (Value::Str(s), "contains") => Ok(Value::Bool({
+            let ignore = ignore_case(args, 1);
+            Folded::of(s, ignore)
+                .find(&Folded::of(&arg_str(args, 0), ignore), 0)
+                .is_some()
+        })),
         // `startsWith(prefix, startIndex)` tests at an OFFSET, not from 0 —
         // `"abc".startsWith("b", 1)` is true. `endsWith` has no such overload.
         (Value::Str(s), "startsWith") => {
-            let at = args.get(1).map(|v| v.to_int()).unwrap_or(0);
-            Ok(Value::Bool(match utf16_slice_from(s, at) {
-                Some(tail) => tail.starts_with(&arg_str(args, 0)),
-                None => false,
-            }))
+            let ignore = ignore_case(args, 1);
+            let hay = Folded::of(s, ignore);
+            let at = hay.index_at(index_arg(args, 1).unwrap_or(0).max(0) as usize);
+            let pre = Folded::of(&arg_str(args, 0), ignore);
+            Ok(Value::Bool(hay.find(&pre, at) == Some(at)))
         }
-        (Value::Str(s), "endsWith") => Ok(Value::Bool(s.ends_with(&arg_str(args, 0)))),
+        (Value::Str(s), "endsWith") => {
+            let ignore = ignore_case(args, 1);
+            let hay = Folded::of(s, ignore);
+            let suf = Folded::of(&arg_str(args, 0), ignore);
+            let start = hay.len().checked_sub(suf.len());
+            Ok(Value::Bool(
+                start.is_some_and(|at| hay.find(&suf, at) == Some(at)),
+            ))
+        }
         (Value::Str(s), "plus") => Ok(Value::str(format!("{s}{}", arg_str(args, 0)))),
-        (Value::Str(s), "replace") => {
-            Ok(Value::str(s.replace(&arg_str(args, 0), &arg_str(args, 1))))
+        // `replace`/`replaceFirst` splice from the ORIGINAL receiver at the
+        // positions the folded scan found, so an `ignoreCase` replacement keeps
+        // every character it did not match exactly as it was.
+        (Value::Str(s), "replace" | "replaceFirst") => {
+            let ignore = ignore_case(args, 2);
+            let (old, new) = (arg_str(args, 0), arg_str(args, 1));
+            let hay = Folded::of(s, ignore);
+            let needle = Folded::of(&old, ignore);
+            let src: Vec<char> = s.chars().collect();
+            let mut out = String::new();
+            let mut at = 0usize;
+            while let Some(hit) = hay.find(&needle, at) {
+                out.extend(&src[at..hit]);
+                out.push_str(&new);
+                // An empty needle matches at every position without consuming
+                // one, so the scan must still advance a character or it would
+                // splice forever.
+                at = hit + needle.len().max(1);
+                if needle.is_empty() && hit < src.len() {
+                    out.push(src[hit]);
+                }
+                if name == "replaceFirst" {
+                    break;
+                }
+            }
+            out.extend(src.get(at.min(src.len())..).into_iter().flatten());
+            Ok(Value::str(out))
         }
-        (Value::Str(s), "replaceFirst") => Ok(Value::str(s.replacen(
-            &arg_str(args, 0),
-            &arg_str(args, 1),
-            1,
-        ))),
         (Value::Str(s), "repeat") => {
             let n = args.first().map(|v| v.to_int()).unwrap_or(0);
             if n < 0 {
@@ -6557,15 +6797,17 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         // rejected, which is observable for an empty needle:
         // `"abc".indexOf("", 9)` is 3, not -1.
         (Value::Str(s), "indexOf") => {
+            let ignore = ignore_case(args, 1);
             let len = s.encode_utf16().count() as i64;
-            let at = args.get(1).map(|v| v.to_int()).unwrap_or(0).clamp(0, len);
-            Ok(Value::Int(match utf16_slice_from(s, at) {
-                Some(tail) => match utf16_index_of(&tail, &arg_str(args, 0)) {
-                    -1 => -1,
-                    found => found + at,
+            let at = index_arg(args, 1).unwrap_or(0).clamp(0, len);
+            let hay = Folded::of(s, ignore);
+            let from = hay.index_at(at as usize);
+            Ok(Value::Int(
+                match hay.find(&Folded::of(&arg_str(args, 0), ignore), from) {
+                    Some(i) => hay.offset(i) as i64,
+                    None => -1,
                 },
-                None => -1,
-            }))
+            ))
         }
         // `subSequence` is the `CharSequence` spelling of the two-argument
         // `substring`. It is typed `CharSequence` rather than `String`, but the
@@ -6591,21 +6833,19 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         // `String.lastIndexOf`'s `length`, which is observable only for an empty
         // needle: `"abc".lastIndexOf("")` is 2 on Kotlin and 3 on Java.
         (Value::Str(s), "lastIndexOf") => {
-            let units: Vec<u16> = s.encode_utf16().collect();
-            let needle: Vec<u16> = arg_str(args, 0).encode_utf16().collect();
-            let last_start = units.len() as i64 - needle.len() as i64;
-            let mut at = args
-                .get(1)
-                .map(|v| v.to_int())
-                .unwrap_or(units.len() as i64 - 1)
-                .min(last_start);
-            while at >= 0 {
-                if units[at as usize..at as usize + needle.len()] == needle[..] {
-                    return Ok(Value::Int(at));
-                }
-                at -= 1;
+            let ignore = ignore_case(args, 1);
+            let hay = Folded::of(s, ignore);
+            let needle = Folded::of(&arg_str(args, 0), ignore);
+            let units = s.encode_utf16().count() as i64;
+            let start = index_arg(args, 1).unwrap_or(units - 1);
+            if start < 0 {
+                return Ok(Value::Int(-1));
             }
-            Ok(Value::Int(-1))
+            let from = hay.index_at((start as usize).min(hay.len()));
+            Ok(Value::Int(match hay.rfind(&needle, from) {
+                Some(i) => hay.offset(i) as i64,
+                None => -1,
+            }))
         }
         (Value::Str(s), "capitalize") => Ok(Value::str(kotlin_capitalize(s, true))),
         (Value::Str(s), "decapitalize") => Ok(Value::str(kotlin_capitalize(s, false))),
@@ -6634,6 +6874,140 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         (Value::Str(s), "removeSuffix") => {
             let p = arg_str(args, 0);
             Ok(Value::str(s.strip_suffix(&p).unwrap_or(s).to_string()))
+        }
+        // `removeSurrounding(delimiter)` is the one-argument spelling of
+        // `removeSurrounding(prefix, suffix)` with the same string for both.
+        // Both ends must match AND the receiver must be long enough to hold
+        // them separately, so `"x".removeSurrounding("x")` keeps its `"x"`
+        // rather than stripping the one character twice.
+        (Value::Str(s), "removeSurrounding") => {
+            let prefix = arg_str(args, 0);
+            let suffix = args.get(1).map(kotlin_string).unwrap_or(prefix.clone());
+            let (pn, sn) = (prefix.chars().count(), suffix.chars().count());
+            let chars: Vec<char> = s.chars().collect();
+            Ok(Value::str(
+                if chars.len() >= pn + sn && s.starts_with(&prefix) && s.ends_with(&suffix) {
+                    chars[pn..chars.len() - sn].iter().collect()
+                } else {
+                    s.to_string()
+                },
+            ))
+        }
+        // `regionMatches(thisOffset, other, otherOffset, length, ignoreCase)`.
+        // Every bound is checked before any character is: a region running past
+        // either receiver answers false rather than faulting.
+        (Value::Str(s), "regionMatches") => {
+            let ignore = ignore_case(args, 4);
+            let this_off = args.first().map(|v| v.to_int()).unwrap_or(0);
+            let other = arg_str(args, 1);
+            let other_off = args.get(2).map(|v| v.to_int()).unwrap_or(0);
+            let len = args.get(3).map(|v| v.to_int()).unwrap_or(0);
+            let (a, b) = (Folded::of(s, ignore), Folded::of(&other, ignore));
+            // The three positions are UTF-16 offsets, so the bounds are checked
+            // in units and only then turned into the character range the folded
+            // keys are indexed by.
+            let (au, bu) = (a.offset(a.len()) as i64, b.offset(b.len()) as i64);
+            let region =
+                |f: &Folded, off: i64| f.index_at(off as usize)..f.index_at((off + len) as usize);
+            Ok(Value::Bool(
+                this_off >= 0
+                    && other_off >= 0
+                    && len >= 0
+                    && this_off + len <= au
+                    && other_off + len <= bu
+                    && a.keys[region(&a, this_off)] == b.keys[region(&b, other_off)],
+            ))
+        }
+        // The longest shared prefix/suffix, taken from THIS receiver — so an
+        // `ignoreCase` match answers the receiver's own casing.
+        (Value::Str(s), "commonPrefixWith" | "commonSuffixWith") => {
+            let ignore = ignore_case(args, 1);
+            let other = arg_str(args, 0);
+            let (a, b) = (Folded::of(s, ignore), Folded::of(&other, ignore));
+            let n = a.len().min(b.len());
+            let chars: Vec<char> = s.chars().collect();
+            let shared = if name == "commonPrefixWith" {
+                (0..n).take_while(|&i| a.keys[i] == b.keys[i]).count()
+            } else {
+                (0..n)
+                    .take_while(|&i| a.keys[a.len() - 1 - i] == b.keys[b.len() - 1 - i])
+                    .count()
+            };
+            Ok(Value::str(if name == "commonPrefixWith" {
+                chars[..shared].iter().collect::<String>()
+            } else {
+                chars[chars.len() - shared..].iter().collect::<String>()
+            }))
+        }
+        // `indexOfAny`/`findAnyOf` and their `…Last` pair scan POSITIONS from
+        // one end and, at each, take the FIRST needle in the collection's own
+        // order — so two needles matching at the same place are decided by the
+        // argument, not by their lengths.
+        (Value::Str(s), "indexOfAny" | "lastIndexOfAny" | "findAnyOf" | "findLastAnyOf") => {
+            let last = name == "lastIndexOfAny" || name == "findLastAnyOf";
+            let ignore = ignore_case(args, 1);
+            let hay = Folded::of(s, ignore);
+            let needles: Vec<(Value, Folded)> = args
+                .first()
+                .map(sequence_items)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| {
+                    let text = kotlin_string(&v);
+                    (v, Folded::of(&text, ignore))
+                })
+                .collect();
+            // The scan walks UTF-16 OFFSETS, which is what `startIndex` and the
+            // answer are both in — not characters. The two part company inside
+            // a surrogate pair, where an EMPTY needle still matches (Kotlin
+            // compares code units there) while no other needle can, since no
+            // `String` here holds a lone surrogate to match against.
+            //
+            // Searching backwards starts at the LAST unit rather than past the
+            // end, so an empty needle answers `lastIndex` and not `length`.
+            let units = hay.offset(hay.len());
+            let start = index_arg(args, 1).unwrap_or(if last { units as i64 - 1 } else { 0 });
+            let positions: Vec<usize> = if last {
+                match start.min(units as i64 - 1) {
+                    top if top < 0 => Vec::new(),
+                    top => (0..=top as usize).rev().collect(),
+                }
+            } else {
+                match start.max(0) {
+                    from if from > units as i64 => Vec::new(),
+                    from => (from as usize..=units).collect(),
+                }
+            };
+            let hit = positions.into_iter().find_map(|off| {
+                let at = hay.index_at(off);
+                needles
+                    .iter()
+                    .find(|(_, n)| {
+                        n.is_empty() || (hay.offset(at) == off && hay.find(n, at) == Some(at))
+                    })
+                    .map(|(v, _)| (off, v.clone()))
+            });
+            Ok(match (hit, name.starts_with("find")) {
+                (Some((off, _)), false) => Value::Int(off as i64),
+                (Some((off, v)), true) => alloc(HeapObj::Pair(Value::Int(off as i64), v)),
+                (None, false) => Value::Int(-1),
+                (None, true) => Value::Undef,
+            })
+        }
+        // `String` is `Comparable`, so it has the clamping members every other
+        // `Comparable` has; they order by the same `compareTo` as `<`.
+        (Value::Str(s), "coerceAtLeast" | "coerceAtMost") => {
+            let other = arg_str(args, 0);
+            // UTF-16 order, not Rust's UTF-8 byte order: the two disagree above
+            // `U+E000`, where a supplementary character sorts BELOW a private-use
+            // one on the JVM and above it in UTF-8.
+            let (a, b): (Vec<u16>, Vec<u16>) =
+                (s.encode_utf16().collect(), other.encode_utf16().collect());
+            Ok(Value::str(if (name == "coerceAtLeast") == (a < b) {
+                other
+            } else {
+                s.to_string()
+            }))
         }
         // `substringBefore`/`substringAfter` and their `…Last` pair. The absent
         // delimiter answers `missingDelimiterValue`, which DEFAULTS to the whole
@@ -6688,10 +7062,17 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
                     "java.lang.IllegalArgumentException: Limit must be non-negative, but was {limit}"
                 ));
             }
-            let delims: Vec<String> = args
+            // `ignoreCase` is told apart the same way, by TYPE — a `Boolean` is
+            // never a delimiter either. The scan runs over CHARACTERS rather
+            // than bytes so that folding, which can change a character's
+            // encoded width, cannot move a cut.
+            let ignore = ignore_case(args, 0);
+            let hay = Folded::of(s, ignore);
+            let src: Vec<char> = s.chars().collect();
+            let delims: Vec<Folded> = args
                 .iter()
                 .filter(|v| !matches!(v, Value::Int(_) | Value::Bool(_)))
-                .map(kotlin_string)
+                .map(|v| Folded::of(&kotlin_string(v), ignore))
                 .collect();
             // ONE scan for every arity, so the limit does not need a second
             // implementation per branch. `start` is where the current part
@@ -6701,34 +7082,32 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
             // match the same position forever.
             let mut parts: Vec<Value> = Vec::new();
             let (mut start, mut search) = (0usize, 0usize);
+            let cut = |from: usize, to: usize| -> Value {
+                Value::str(
+                    src[from.min(src.len())..to.min(src.len())]
+                        .iter()
+                        .collect::<String>(),
+                )
+            };
             while limit == 0 || parts.len() + 1 < limit as usize {
                 let hit = delims
                     .iter()
                     .filter_map(|d| {
                         if d.is_empty() {
-                            (search <= s.len()).then_some((search, 0usize))
+                            (search <= hay.len()).then_some((search, 0usize))
                         } else {
-                            s[search..]
-                                .find(d.as_str())
-                                .map(|at| (search + at, d.len()))
+                            hay.find(d, search).map(|at| (at, d.len()))
                         }
                     })
                     .min();
                 let Some((at, len)) = hit else { break };
-                parts.push(Value::str(s[start..at].to_string()));
+                parts.push(cut(start, at));
                 start = at + len;
-                search = if len == 0 {
-                    match s[at..].chars().next() {
-                        Some(c) => at + c.len_utf8(),
-                        // Past the last character: one step beyond the receiver
-                        // ends the scan on the next round.
-                        None => at + 1,
-                    }
-                } else {
-                    start
-                };
+                // Past the last character, one step beyond the receiver ends
+                // the scan on the next round.
+                search = if len == 0 { at + 1 } else { start };
             }
-            parts.push(Value::str(s[start..].to_string()));
+            parts.push(cut(start, src.len()));
             Ok(alloc(HeapObj::List(parts)))
         }
         (Value::Str(s), "lines") => Ok(alloc(HeapObj::List(
@@ -6832,21 +7211,20 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         (Value::Str(s), "equals") => {
             let other = arg_str(args, 0);
             Ok(Value::Bool(if truthy_arg(args, 1) {
-                s.to_lowercase() == other.to_lowercase()
+                Folded::of(s, true).keys == Folded::of(&other, true).keys
             } else {
                 args.first().is_some_and(|o| value_eq(recv, o))
             }))
         }
+        // `compareTo(other, ignoreCase = true)` is the JVM's
+        // `CASE_INSENSITIVE_ORDER`, which is not the plain comparison of two
+        // lowercased strings — see [`compare_ignore_case`].
+        (Value::Str(s), "compareTo") if truthy_arg(args, 1) => {
+            Ok(Value::Int(compare_ignore_case(s, &arg_str(args, 0))))
+        }
         (Value::Str(s), "compareTo") => {
             let other = arg_str(args, 0);
-            // `compareTo(other, ignoreCase = true)` compares case-folded, which
-            // makes `"a".compareTo("A", true)` 0 rather than 32.
-            let (s, other) = if truthy_arg(args, 1) {
-                (s.to_lowercase(), other.to_lowercase())
-            } else {
-                (s.to_string(), other)
-            };
-            let s = &s;
+            let s = &s.to_string();
             let (a, b): (Vec<u16>, Vec<u16>) =
                 (s.encode_utf16().collect(), other.encode_utf16().collect());
             let d = a
@@ -7183,19 +7561,25 @@ fn charseq_member(
 fn char_method(code: i64, name: &str, args: &[Value]) -> Result<Value, String> {
     let c = char::from_u32(code as u32).unwrap_or(char::REPLACEMENT_CHARACTER);
     let other = || args.first().map(num_of).unwrap_or(0);
-    // `uppercaseChar`/`lowercaseChar` map to a single Char, so a mapping that
-    // expands (`'ß'.uppercase()` is `"SS"`) keeps the original — the JVM's
-    // `Character.toUpperCase(char)` contract.
-    fn single(c: char, mut mapped: impl Iterator<Item = char>) -> char {
-        match (mapped.next(), mapped.next()) {
-            (Some(m), None) => m,
-            _ => c,
-        }
-    }
+    // A SURROGATE HALF is not a character, so `char::from_u32` has nothing to
+    // give and the fallback above is not a stand-in the case members may use:
+    // every one of the 2 048 of them maps to ITSELF on the JVM, where folding
+    // onto the replacement character answered `U+FFFD` from
+    // `uppercaseChar`/`lowercaseChar`/`titlecaseChar` and their `String`
+    // spellings alike. Measured over the whole `Char` range against the oracle.
+    let surrogate = char::from_u32(code as u32).is_none();
     Ok(match name {
         "code" => Value::Int(code),
         "toString" => Value::str(char_string(code)),
         "hashCode" => Value::Int(code),
+        // `equals(other, ignoreCase)` folds both characters to the key they
+        // share exactly when the JVM calls them equal — see [`case_fold`].
+        "equals" if truthy_arg(args, 1) => Value::Bool(
+            match (char::from_u32(code as u32), char::from_u32(other() as u32)) {
+                (Some(a), Some(b)) => case_fold(a) == case_fold(b),
+                _ => code == other(),
+            },
+        ),
         "equals" => Value::Bool(args.first().is_some_and(|o| value_eq(&char_of(code), o))),
         "compareTo" => Value::Int((code - other()).signum()),
         "plus" => char_of(code + other()),
@@ -7207,20 +7591,28 @@ fn char_method(code: i64, name: &str, args: &[Value]) -> Result<Value, String> {
         "isWhitespace" => Value::Bool(kotlin_is_whitespace(c)),
         "isUpperCase" => Value::Bool(c.is_uppercase()),
         "isLowerCase" => Value::Bool(c.is_lowercase()),
-        "uppercaseChar" => char_of(single(c, c.to_uppercase()) as i64),
-        "lowercaseChar" => char_of(single(c, c.to_lowercase()) as i64),
+        "uppercaseChar" | "lowercaseChar" | "titlecaseChar" if surrogate => char_of(code),
+        "uppercase" | "lowercase" | "titlecase" if surrogate => Value::str(char_string(code)),
+        "uppercaseChar" => char_of(single_uppercase(c) as i64),
+        "lowercaseChar" => char_of(single_lowercase(c) as i64),
         // `titlecaseChar` agrees with `uppercaseChar` except where Unicode gives
         // the character a titlecase form of its own — see [`titlecase_char`],
-        // whose exception list was measured against the oracle. `titlecase()`
-        // is the same mapping as a `String`, which is why it can answer a
-        // two-character result where `titlecaseChar` cannot.
+        // whose exception list was measured against the oracle.
         "titlecaseChar" => char_of(titlecase_char(c) as i64),
+        // `titlecase()` is the `String` mapping, so it can answer more than one
+        // character where `titlecaseChar` cannot. When the FULL uppercase
+        // expands, the result is that uppercase with everything after its first
+        // character lowercased again — `'ᾀ'` titlecases to `"Ἀι"`, not to the
+        // `"ἈΙ"` its uppercase is. `U+0149` is the one character that keeps its
+        // whole uppercase. MEASURED: this rule reproduces `titlecase()` on all
+        // 63 488 non-surrogate `Char`s, where taking the full uppercase
+        // unchanged missed 77 of them.
         "titlecase" => {
-            let t = titlecase_char(c);
-            Value::str(if t == single_uppercase(c) {
-                c.to_uppercase().to_string()
-            } else {
-                t.to_string()
+            let up = c.to_uppercase().to_string();
+            Value::str(match up.char_indices().nth(1) {
+                None => titlecase_char(c).to_string(),
+                Some(_) if c == '\u{0149}' => up,
+                Some((rest, _)) => format!("{}{}", &up[..rest], up[rest..].to_lowercase()),
             })
         }
         "uppercase" => Value::str(c.to_uppercase().to_string()),

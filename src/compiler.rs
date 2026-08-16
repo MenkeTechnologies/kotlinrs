@@ -6448,9 +6448,11 @@ impl Compiler {
                 "filter" | "filterNot" | "filterIndexed" | "filterNotNull" | "sorted"
                 | "sortedDescending" | "sortedBy" | "sortedByDescending" | "sortedWith"
                 | "reversed" | "asReversed" | "take" | "takeLast" | "takeWhile" | "drop"
-                | "dropLast" | "dropWhile" | "distinct" | "toList" | "toMutableList" | "toSet"
-                | "toMutableSet" | "shuffled" | "slice" | "subList" | "plus" | "minus"
-                | "union" | "intersect" | "subtract" => self.infer_elem(sc, recv),
+                | "takeLastWhile" | "dropLastWhile" | "dropLast" | "dropWhile" | "distinct"
+                | "toList" | "toMutableList" | "toSet" | "toMutableSet" | "shuffled" | "slice"
+                | "subList" | "plus" | "minus" | "union" | "intersect" | "subtract" => {
+                    self.infer_elem(sc, recv)
+                }
                 _ => Type::Unknown,
             },
             _ => Type::Unknown,
@@ -7563,6 +7565,8 @@ fn is_coll_hof(name: &str) -> bool {
             | "partition"
             | "takeWhile"
             | "dropWhile"
+            | "takeLastWhile"
+            | "dropLastWhile"
             | "firstOrNull"
             | "lastOrNull"
             | "forEach"
@@ -7690,10 +7694,46 @@ fn builtin_params(name: &str) -> Option<&'static [(&'static str, Dflt)]> {
             ("partialWindows", Dflt::Bool(false)),
         ],
         "padStart" | "padEnd" => &[("length", Dflt::Required), ("padChar", Dflt::Absent)],
-        "indexOf" | "lastIndexOf" => &[("string", Dflt::Required), ("startIndex", Dflt::Absent)],
-        "startsWith" => &[("prefix", Dflt::Required), ("startIndex", Dflt::Int(0))],
+        // The `ignoreCase` family. Every one of these has an overload whose
+        // last parameter is the flag, and the host tells the flag apart from a
+        // `startIndex` by TYPE, so naming either one binds the right slot.
+        "indexOf" | "lastIndexOf" => &[
+            ("string", Dflt::Required),
+            ("startIndex", Dflt::Absent),
+            ("ignoreCase", Dflt::Bool(false)),
+        ],
+        "startsWith" => &[
+            ("prefix", Dflt::Required),
+            ("startIndex", Dflt::Int(0)),
+            ("ignoreCase", Dflt::Bool(false)),
+        ],
+        "endsWith" => &[
+            ("suffix", Dflt::Required),
+            ("ignoreCase", Dflt::Bool(false)),
+        ],
+        "contains" => &[("other", Dflt::Required), ("ignoreCase", Dflt::Bool(false))],
+        "equals" | "compareTo" => &[("other", Dflt::Required), ("ignoreCase", Dflt::Bool(false))],
+        "commonPrefixWith" | "commonSuffixWith" => {
+            &[("other", Dflt::Required), ("ignoreCase", Dflt::Bool(false))]
+        }
+        "indexOfAny" | "lastIndexOfAny" | "findAnyOf" | "findLastAnyOf" => &[
+            ("strings", Dflt::Required),
+            ("startIndex", Dflt::Absent),
+            ("ignoreCase", Dflt::Bool(false)),
+        ],
+        "regionMatches" => &[
+            ("thisOffset", Dflt::Required),
+            ("other", Dflt::Required),
+            ("otherOffset", Dflt::Required),
+            ("length", Dflt::Required),
+            ("ignoreCase", Dflt::Bool(false)),
+        ],
         "substring" => &[("startIndex", Dflt::Required), ("endIndex", Dflt::Absent)],
-        "replace" | "replaceFirst" => &[("oldValue", Dflt::Required), ("newValue", Dflt::Required)],
+        "replace" | "replaceFirst" => &[
+            ("oldValue", Dflt::Required),
+            ("newValue", Dflt::Required),
+            ("ignoreCase", Dflt::Bool(false)),
+        ],
         "chunked" => &[("size", Dflt::Required)],
         "take" | "drop" | "takeLast" | "dropLast" => &[("n", Dflt::Required)],
         "repeat" => &[("n", Dflt::Required)],
@@ -7813,8 +7853,8 @@ fn is_lambda(e: &Expr) -> bool {
 fn hof_ret_type(name: &str) -> Type {
     match name {
         "map" | "mapIndexed" | "flatMap" | "filter" | "filterNot" | "partition" | "takeWhile"
-        | "dropWhile" | "sortedBy" | "sortedByDescending" | "associate" | "associateBy"
-        | "associateWith" | "groupBy" | "groupingBy" => Type::Obj,
+        | "dropWhile" | "takeLastWhile" | "dropLastWhile" | "sortedBy" | "sortedByDescending"
+        | "associate" | "associateBy" | "associateWith" | "groupBy" | "groupingBy" => Type::Obj,
         "filterIndexed" | "mapValues" | "mapKeys" | "sortedWith" | "chunked" | "windowed"
         | "zip" | "filterKeys" | "filterValues" | "zipWithNext" => Type::Obj,
         "forEach" | "forEachIndexed" => Type::Unit,

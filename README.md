@@ -152,10 +152,18 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `isDigit`/`isLetter`/`isLetterOrDigit`/`isWhitespace`/`isUpperCase`/
   `isLowerCase`/`uppercaseChar`/`lowercaseChar`/`uppercase`/`lowercase`/
   `titlecaseChar`/`titlecase`/`digitToInt`/`compareTo`/`equals`/`hashCode`/
-  `toString`. `titlecaseChar` is the single-`Char` uppercase mapping except for
-  the two families Unicode gives a titlecase form of their own — the four Latin
-  digraphs (`ǳ` titlecases to `ǲ`, where it uppercases to `Ǳ`) and Georgian
-  Mkhedruli, which has no titlecase mapping at all. `Char.MIN_VALUE`/`MAX_VALUE`
+  `toString`. All six case members are the JVM's SIMPLE mappings, which are not
+  Rust's full ones: `'ᾀ'.uppercaseChar()` is `'ᾈ'` (the full uppercase expands
+  to `"ἈΙ"`), `'İ'.lowercaseChar()` is `'i'` (the full lowercase expands to `i`
+  and a combining dot), and a surrogate half maps to itself. `titlecaseChar` is
+  that uppercase except for the two families Unicode gives a titlecase form of
+  their own — the four Latin digraphs (`ǳ` titlecases to `ǲ`, where it
+  uppercases to `Ǳ`) and Georgian Mkhedruli, which has no titlecase mapping at
+  all. `titlecase()` is the STRING mapping, so where the full uppercase expands
+  it is that uppercase with everything past its first character lowercased again
+  — `'ß'.titlecase()` is `"Ss"`, not `"SS"`. `Char.equals(other, ignoreCase)`
+  folds both to `lowercaseChar(uppercaseChar(c))`, which is why `'ϑ'` and `'ϴ'`
+  are equal under it. `Char.MIN_VALUE`/`MAX_VALUE`
   bound the UTF-16 code unit, so the top is `￿` and not the highest code
   point.
 - **Member access** — chainable postfix `.`: `String.length`,
@@ -171,13 +179,25 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   than from the length, which shows for an empty delimiter),
   `.capitalize()`/`.decapitalize()`/`.replaceFirstChar { }`,
   `.ifEmpty { }`/`.ifBlank { }`,
-  `.removePrefix()`/`.removeSuffix()`, `.toCharArray()`, `.replaceFirst()`,
+  `.removePrefix()`/`.removeSuffix()`/`.removeSurrounding()`, `.toCharArray()`,
+  `.replaceFirst()`, `.regionMatches()`,
+  `.commonPrefixWith()`/`.commonSuffixWith()`,
+  `.indexOfAny()`/`.lastIndexOfAny()`/`.findAnyOf()`/`.findLastAnyOf()`,
+  `.takeLastWhile { }`/`.dropLastWhile { }`,
   the searching members in their overloaded spellings —
   `.indexOf(s, startIndex)`, `.lastIndexOf(s, startIndex)` (whose default
   `startIndex` is Kotlin's `lastIndex`, not Java's `length`, which shows for an
   empty needle), and `.startsWith(prefix, startIndex)` —
   `.compareTo()` (the JVM's code-unit difference, not a clamped sign) and
-  `.compareTo(other, ignoreCase)`/`.equals(other, ignoreCase)`, the
+  the `ignoreCase` overload of every member that has one —
+  `indexOf`/`lastIndexOf`/`startsWith`/`endsWith`/`contains`/`replace`/
+  `replaceFirst`/`split`/`equals`/`compareTo`/`regionMatches`/
+  `commonPrefixWith`/`commonSuffixWith`/`indexOfAny`, positionally or by name.
+  The flag is not a comparison of two lowercased strings: it folds each
+  CHARACTER to `lowercaseChar(uppercaseChar(c))`, so `"İ"` matches `"i"` and
+  `"ϑ"` matches `"ϴ"`, and positions stay UTF-16 offsets throughout.
+  `compareTo(other, ignoreCase)` is the JVM's `CASE_INSENSITIVE_ORDER`, which
+  compares code points bounded by the shorter receiver's UTF-16 length. The
    parses `.toInt()`/`.toLong()`/`.toByte()`/`.toShort()`/`.toDouble()` and
    their `…OrNull` forms — each bounded by the width it parses into, so
    `"300".toByte()` is a `NumberFormatException` and not `44`, and each taking
@@ -1299,7 +1319,44 @@ check there is, since the replay test never runs the oracle, and it states which
 JVM it resolved for the compile step and for the run step before it compares
 anything.
 
-Next: `sequence { … }`/`yield`, `lateinit`, `Throwable.cause` and the
+The round after that found the same shape one argument in rather than one member
+in: **a parameter that was accepted and thrown away.** `ignoreCase` is declared
+on a dozen `String` members; eight of them took it positionally, every one of
+them refused it by name, and none of them read it — so
+`"abcabc".indexOf("B", 1, true)` compiled, ran, and answered `-1`. Twelve
+programs answered a plausible wrong value that way, `split`, `replace`,
+`startsWith`, `endsWith`, `contains` and `Char.equals` among them.
+
+What the flag MEANS was measured rather than recalled, because two characters
+separate the real rule from the one it is easy to write. Folding through the
+uppercase — `lowercaseChar(uppercaseChar(c))` — and folding the character
+directly disagree on exactly two `Char` pairs in the whole range,
+`U+03D1`/`U+03F4` and `U+0130`/`U+0131`, and the reference calls both pairs
+equal under every member that takes the flag. `equals` and `compareTo` had been
+reading the flag and implementing it as a comparison of two `lowercase()`d
+strings, which is that wrong rule; `compareTo(other, ignoreCase)` is in fact the
+JVM's `CASE_INSENSITIVE_ORDER`, a code-point walk bounded by the shorter
+receiver's UTF-16 length, and three measurements are needed to tell it apart
+from the three implementations it resembles.
+
+The case mappings underneath were wrong for 2 076 characters, found by printing
+every one of them for all 65 536 `Char`s and diffing: Rust exposes Unicode's
+FULL mappings and the JVM's `Character` uses the SIMPLE ones. Every surrogate
+half answered `U+FFFD` instead of itself; the 27 Greek letters with a subscript
+iota answered themselves instead of their titlecase form; and `U+0130`
+lowercased to itself instead of to `i`. `Char.titlecase()` was wrong for 77 more
+— when the full uppercase expands, the result is that uppercase with everything
+past its first character lowercased again, so `'ß'` titlecases to `"Ss"` and not
+`"SS"`. All six case members now agree with the oracle over the entire `Char`
+range. `regionMatches`, `removeSurrounding`, `commonPrefixWith`/`SuffixWith`,
+the four `…AnyOf` searches, `coerceAtLeast`/`coerceAtMost` on `String` and
+`takeLastWhile`/`dropLastWhile` were absent and are measured in; a randomized
+differential run over an alphabet of the awkward characters is what caught the
+first draft of the `…AnyOf` family reading its `startIndex` as a character index
+rather than a UTF-16 offset.
+
+Next: `Regex` in every spelling, `sequence { … }`/`yield`, `lateinit`,
+`Throwable.cause` and the
 `(message, cause)` constructors, variance and bounds,
 `Delegates.observable`/`vetoable`, and a growing standard-library surface —
 alongside the sibling parity tooling (LSP/DAP, reference generator, differential

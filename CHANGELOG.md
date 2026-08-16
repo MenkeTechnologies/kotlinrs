@@ -292,3 +292,128 @@ collection sees the wrong thing.
 script that minted the corpus, one `kotlinc` per program in the default package —
 under `kotlinc` 2.4.10 / JRE 21.0.12. The corpus floor moved 635 → 655. 13 new
 `tests/lang.rs` tests, 235 → 248. No test was deleted or weakened.
+
+## Round 9 — a flag that was accepted and thrown away
+
+### What the round looked for
+
+The same diff round 8 used: the member names the frontend implements against
+the identifiers the frozen corpus actually exercises, with everything on
+neither side turned into a one-expression probe. The vein it opened this time
+was not missing NAMES but a missing ARGUMENT. `ignoreCase` is a parameter on a
+dozen `String` members; kotlinrs accepted it on eight of them positionally,
+rejected it by name on all of them, and honoured it on none.
+
+That is the worst shape a gap can take: `"abcabc".indexOf("B", 1, true)`
+compiled, ran, and answered -1 — a plausible number, silently wrong.
+
+### The silent wrong answers
+
+| program | reference | kotlinrs was |
+| --- | --- | --- |
+| `"abcabc".indexOf("B", 1, true)` | `1` | `-1` |
+| `"abcabc".indexOf('B', 1, true)` | `1` | `-1` |
+| `"abcabc".lastIndexOf("B", 5, true)` | `4` | `-1` |
+| `"abcabc".startsWith("ABC", true)` | `true` | `false` |
+| `"abcabc".startsWith("A", 0, true)` | `true` | `false` |
+| `"ABCabc".endsWith("ABC", true)` | `true` | `false` |
+| `"abcabc".contains("B", true)` | `true` | `false` |
+| `"aXbXc".replace("x", "-", true)` | `a-b-c` | `aXbXc` |
+| `"aXbXc".replaceFirst("x", "-", true)` | `a-bXc` | `aXbXc` |
+| `"aXbXc".split("x", ignoreCase = true)` | `[a, b, c]` | `[aXbXc]` |
+| `'a'.equals('A', true)` | `true` | `false` |
+| `"ϑ".compareTo("ϴ", true)` | `0` | `847` |
+
+The last row is a different defect with the same cause: `equals` and `compareTo`
+DID read the flag, but implemented it by lowercasing both whole strings, which
+is not the rule.
+
+Naming the flag was rejected outright on every one of them —
+`startsWith has no parameter `ignoreCase`` — because the parameter tables in
+`builtin_params` stopped one slot short.
+
+### What the rule actually is, measured
+
+Two characters are equal under `ignoreCase` exactly when they share the key
+`lowercaseChar(uppercaseChar(c))`. Folding the character directly instead —
+which is what comparing two `lowercase()`d strings amounts to — disagrees on
+exactly two `Char` pairs in the whole range, `U+03D1`/`U+03F4` and
+`U+0130`/`U+0131`. Both were put to the oracle under every member that takes the
+flag, and it answers `true` for both every time. The two pairs are now pinned.
+
+The fold is per CHARACTER, and the scan therefore runs over characters rather
+than bytes: `'İ'` folds to `'i'`, two UTF-8 bytes to one, so a byte-offset scan
+would have moved the cut. Positions in and out stay UTF-16 offsets, which is
+what Kotlin specifies them in.
+
+`compareTo(other, ignoreCase = true)` is the JVM's `CASE_INSENSITIVE_ORDER`, and
+it is none of the three things it resembles. It walks CODE POINTS, but only as
+far as the shorter receiver's UTF-16 length, so a surrogate pair straddling that
+bound reads as the lone high surrogate it starts with. Three measurements fix
+it: `"𐐨b".compareTo("𐐀a", true)` is 1 (a per-`Char` walk says 40),
+`"İ".compareTo("i", true)` is 0 (a whole-string lowercase says 1), and
+`"𐐨".compareTo("a", true)` is 55200 (an unbounded code-point walk says 66503).
+
+### The case mappings themselves were wrong for 2 076 characters
+
+`uppercaseChar`/`lowercaseChar` are the JVM's SIMPLE case mappings. Rust exposes
+the FULL ones, and the two differ. A reference program printed every mapping for
+all 65 536 `Char`s and the answers were diffed:
+
+| family | count | was | is |
+| --- | --- | --- | --- |
+| surrogate halves | 2 048 | `U+FFFD` | themselves |
+| Greek letters with subscript iota (`U+1F80`…, `U+1FB3`, `U+1FC3`, `U+1FF3`) | 27 | themselves | their titlecase form |
+| `U+0130` under `lowercaseChar` | 1 | itself | `i` |
+
+`Char.titlecase()` was wrong for 77 more: when the full uppercase expands, the
+result is that uppercase with everything past its FIRST character lowercased
+again — `'ᾀ'` titlecases to `"Ἀι"`, not to the `"ἈΙ"` its uppercase is, and
+`'ß'` to `"Ss"`, not `"SS"`. `U+0149` is the one character that keeps its whole
+uppercase. The rule was checked against the oracle's answer for every
+non-surrogate `Char`: 0 mismatches, where taking the uppercase unchanged missed
+77.
+
+`uppercaseChar`, `lowercaseChar`, `titlecaseChar`, `titlecase()`, `uppercase()`
+and `lowercase()` now agree with the oracle byte for byte over the entire `Char`
+range.
+
+### Members that were simply absent
+
+Measured, then added: `regionMatches`, `removeSurrounding`, `commonPrefixWith`,
+`commonSuffixWith`, `indexOfAny`, `lastIndexOfAny`, `findAnyOf`,
+`findLastAnyOf`, `coerceAtLeast`/`coerceAtMost` on `String`, and
+`takeLastWhile`/`dropLastWhile` on both a `List` and a `CharSequence`.
+
+The `…AnyOf` family scans POSITIONS from one end and takes the FIRST needle in
+the collection's own order at each — `"abc".findAnyOf(listOf("ab", "a"))` is
+`(0, ab)` and `"abc".findAnyOf(listOf("a", "ab"))` is `(0, a)`, so length is not
+the tie-break. Its `startIndex` and its answer are both UTF-16 offsets; a
+randomized differential run against the oracle caught the first draft reading
+`startIndex` as a character index, and caught an empty receiver building a range
+from `-1 as usize` and aborting the interpreter.
+
+### Verification
+
+Three randomized differential batches (1 122 probes) over an alphabet chosen for
+the awkward cases — `İ ı ϑ ϴ ß ẞ K k ǅ Ǆ ǆ ſ σ ς Σ 𐐨 𐐀 ᾀ` — diffed live against
+`kotlinc`. Everything the frontend can represent agrees; the two that remain are
+the lone-surrogate limit already recorded in [BUGS.md](BUGS.md).
+
+### Not closed
+
+`Regex`, a `data class` inside a function body, and a label on a lambda literal
+are all still open and still fail loudly. Newly measured and recorded rather
+than fixed: `String.CASE_INSENSITIVE_ORDER`, `"…".toRegex()`,
+`kotlin.random.Random`, and five spellings kotlinrs ACCEPTS that `kotlinc`
+rejects.
+
+### Provenance
+
+20 new records, each minted through `scripts/capture-parity.sh` under
+`kotlinc` 2.4.10 / JRE 21.0.12 — and re-captured under JRE 26.0.2, which
+produced a byte-identical file, so no record here depends on the capturing JVM.
+The corpus floor moved 655 → 675. 5 new `tests/lang.rs` tests, 248 → 253. One
+pre-existing doctest failure in `src/parser.rs` is fixed (an indented Kotlin
+snippet in a doc comment was being compiled as Rust, so `cargo test` was red on
+`main`). No test was deleted or weakened.

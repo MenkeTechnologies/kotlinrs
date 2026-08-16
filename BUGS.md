@@ -139,8 +139,11 @@ the next round starts from a measurement rather than a guess.
 | `Regex("[0-9]+").findAll("a1b22c").map { it.value }.toList()` | `unresolved reference: Regex` | `[1, 22]` |
 | `"hello".replace(Regex("l+"), "L")` | `unresolved reference: Regex` | `heLo` |
 | `"a1b2".split(Regex("[0-9]"))` | `unresolved reference: Regex` | `[a, b, ]` |
+| `"a".toRegex()` | `unresolved reference: toRegex on String` | `a` |
 | `fun main() { data class P(val a: Int) ; println(P(1)) }` | `unexpected token Class (line 1)` | `P(a=1)` |
 | `listOf(1, 2, 3).forEach lit@{ if (it == 2) return@lit }` | `a label must precede a loop (`for`/`while`/`do`), found LBrace` | (runs; the label names the lambda) |
+| `listOf("a", "B").sortedWith(String.CASE_INSENSITIVE_ORDER)` | `unresolved reference: String` | `[a, B]` |
+| `listOf(1, 2, 3).random(kotlin.random.Random(1))` | `unresolved reference: kotlin` | `1` |
 
 `Regex` is the largest of the three by far: the class carries `find`/`findAll`/
 `matches`/`containsMatchIn`/`replace`/`split` plus `MatchResult`'s
@@ -153,3 +156,52 @@ shortest decimal that round-trips a subnormal, and this frontend carries every
 floating value as an `f64`, so it would print `5.0E-324` where Kotlin prints
 `4.9E-324`. Leaving it unresolved keeps that divergence out of running programs
 (see `primitive_const` in `src/compiler.rs`).
+
+## A lone surrogate has no `String` to live in
+
+Kotlin's `Char` is a UTF-16 code unit and a `String` is a sequence of them, so
+both can hold an unpaired surrogate. A Rust `String` is a sequence of Unicode
+SCALARS and cannot, so every place kotlinrs would have to produce one it
+produces `U+FFFD` instead. Measured on `kotlinc` 2.4.10 / JRE 21.0.12 — the
+reference's own output is shown as its console renders it, which is a `?`
+substitution, so none of these can be frozen in the corpus either:
+
+| program | kotlinrs | reference |
+| --- | --- | --- |
+| `println(55296.toChar())` | `\u{FFFD}` | a lone `U+D800` (`?` on the console) |
+| `println("𐐨"[0].titlecase())` | `\u{FFFD}` | a lone `U+D801` |
+| `println("𐐨a".filter { true })` | `\u{FFFD}\u{FFFD}a` | `𐐨a` |
+| `println("𐐨a".takeWhile { true })` | `\u{FFFD}\u{FFFD}a` | `𐐨a` |
+| `println("i𐐀".split("", ignoreCase = true))` | `[, i, 𐐀, ]` | `[, i, ?, ?, ]` |
+
+The `Char` members were the one part of this that was fixable without changing
+the representation, and they are fixed: `uppercaseChar`, `lowercaseChar`,
+`titlecaseChar` and the `code` of a surrogate now answer the code unit itself
+rather than `U+FFFD`'s. What remains is every path that has to put a surrogate
+INSIDE a string — the `CharSequence` collection members, which decompose a
+receiver into `Char`s and rejoin them, and the empty-delimiter `split`, which
+Kotlin cuts between code UNITS and kotlinrs between characters.
+
+Closing it means carrying a `String` as `Vec<u16>` rather than as a Rust
+`String`, which every member in `src/host.rs` would then have to understand.
+The measurements above are the whole specification.
+
+## Accepted where `kotlinc` rejects
+
+Each of these compiles and runs here and is a compile error on the reference, so
+a program that uses one is not portable back. None is a wrong answer — the value
+is what Kotlin's own semantics would give if the spelling were legal — and each
+is the cost of one dispatch rule that is otherwise right.
+
+| program | kotlinrs | `kotlinc` |
+| --- | --- | --- |
+| `(-5).absoluteValue` | `5` | `unresolved reference 'absoluteValue'` (needs `import kotlin.math.absoluteValue`) |
+| `listOf(1, 2, 3).scanReduce { a, b -> a + b }` | `[1, 3, 6]` | `unresolved reference 'scanReduce'` (removed in Kotlin 2.x) |
+| `"ABC".toLowerCase()` | `abc` | `'fun String.toLowerCase(): String' is deprecated. Use lowercase() instead.` |
+| `"abc".toUpperCase()` | `ABC` | same, for `uppercase()` |
+| `"abc".distinct()` / `.sorted()` / `.sortedDescending()` | `[a, b, c]` | `unresolved reference` — the `CharSequence` overload does not exist |
+
+The `String` collection-member rule is the reason for the last row: a
+`CharSequence` receiver is decomposed into its `Char`s and handed to the
+`Iterable` members, which gives the right answer for the two dozen that Kotlin
+does declare and three it does not.

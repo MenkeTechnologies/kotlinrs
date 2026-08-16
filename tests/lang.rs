@@ -5489,3 +5489,220 @@ fn continue_advances_every_loop_shape_rather_than_repeating_it() {
         "112131\n"
     );
 }
+
+/// `ignoreCase` must CHANGE the answer, not merely be accepted.
+///
+/// Every member below took the flag and dropped it: `"abcabc".indexOf("B", 1,
+/// true)` answered -1 where the reference answers 1, and the same for
+/// `lastIndexOf`, `startsWith`, `endsWith`, `replace`, `replaceFirst`, `split`
+/// and `Char.equals`. Each case is pinned twice — flag off and flag on — so a
+/// member that stops reading the flag again cannot pass by keeping the
+/// case-sensitive answer.
+#[test]
+fn ignore_case_changes_the_answer_rather_than_being_accepted_and_dropped() {
+    assert_eq!(stdout(r#"println("abcabc".indexOf("B", 1, true))"#), "1\n");
+    assert_eq!(stdout(r#"println("abcabc".indexOf("B", 1))"#), "-1\n");
+    assert_eq!(stdout(r#"println("abcabc".indexOf('B', 1, true))"#), "1\n");
+    assert_eq!(
+        stdout(r#"println("abcabc".lastIndexOf("B", 5, true))"#),
+        "4\n"
+    );
+    assert_eq!(stdout(r#"println("abcabc".lastIndexOf("B", 5))"#), "-1\n");
+    assert_eq!(
+        stdout(r#"println("abcabc".startsWith("ABC", true))"#),
+        "true\n"
+    );
+    assert_eq!(stdout(r#"println("abcabc".startsWith("ABC"))"#), "false\n");
+    assert_eq!(
+        stdout(r#"println("abcabc".startsWith("A", 0, true))"#),
+        "true\n"
+    );
+    assert_eq!(
+        stdout(r#"println("ABCabc".endsWith("ABC", true))"#),
+        "true\n"
+    );
+    assert_eq!(stdout(r#"println("ABCabc".endsWith("ABC"))"#), "false\n");
+    assert_eq!(stdout(r#"println("abcabc".contains("B", true))"#), "true\n");
+    assert_eq!(stdout(r#"println("abcabc".contains("B"))"#), "false\n");
+    assert_eq!(
+        stdout(r#"println("aXbXc".replace("x", "-", true))"#),
+        "a-b-c\n"
+    );
+    assert_eq!(stdout(r#"println("aXbXc".replace("x", "-"))"#), "aXbXc\n");
+    assert_eq!(
+        stdout(r#"println("aXbXc".replaceFirst("x", "-", true))"#),
+        "a-bXc\n"
+    );
+    assert_eq!(
+        stdout(r#"println("aXbXc".split("x", ignoreCase = true))"#),
+        "[a, b, c]\n"
+    );
+    assert_eq!(stdout(r#"println("aXbXc".split("x"))"#), "[aXbXc]\n");
+    assert_eq!(stdout("println('a'.equals('A', true))"), "true\n");
+    assert_eq!(stdout("println('a'.equals('A'))"), "false\n");
+    // Naming the flag has to reach the same place as passing it positionally,
+    // and it used to be rejected outright ("has no parameter `ignoreCase`").
+    assert_eq!(
+        stdout(r#"println("abcabc".indexOf("B", ignoreCase = true))"#),
+        "1\n"
+    );
+    assert_eq!(
+        stdout(r#"println("HELLO".endsWith("lo", ignoreCase = true))"#),
+        "true\n"
+    );
+    assert_eq!(
+        stdout(r#"println("abc".replace("B", "z", ignoreCase = true))"#),
+        "azc\n"
+    );
+}
+
+/// The `ignoreCase` fold goes THROUGH the uppercase, and is per character.
+///
+/// Two `Char` pairs separate that rule from the two it is easy to mistake it
+/// for. `U+03D1`/`U+03F4` and `U+0130`/`U+0131` fold together only when the
+/// key is `lowercaseChar(uppercaseChar(c))`; folding the character directly, or
+/// comparing two whole `lowercase()`d strings, calls both pairs different. The
+/// reference calls every one of these true, under every member that takes the
+/// flag — which is why they are pinned together rather than one per member.
+#[test]
+fn the_ignore_case_fold_is_through_the_uppercase_and_per_character() {
+    for probe in [
+        "'ϑ'.equals('ϴ', true)",
+        r#""ϑ".equals("ϴ", true)"#,
+        r#""aϑ".contains("ϴ", true)"#,
+        r#""ϑ".startsWith("ϴ", true)"#,
+        r#""ϑ".endsWith("ϴ", true)"#,
+        r#""ϑ".regionMatches(0, "ϴ", 0, 1, true)"#,
+        "'İ'.equals('ı', true)",
+        r#""İ".equals("ı", true)"#,
+        r#""İ".equals("i", true)"#,
+        r#""aİ".contains("ı", true)"#,
+    ] {
+        assert_eq!(stdout(&format!("println({probe})")), "true\n", "{probe}");
+    }
+    assert_eq!(stdout(r#"println("aϑ".indexOf('ϴ', 0, true))"#), "1\n");
+    assert_eq!(stdout(r#"println("aϑb".replace("ϴ", "!", true))"#), "a!b\n");
+    assert_eq!(
+        stdout(r#"println("aϑb".split("ϴ", ignoreCase = true))"#),
+        "[a, b]\n"
+    );
+    assert_eq!(stdout(r#"println("İx".replace("ı", "!", true))"#), "!x\n");
+    // A folded character need not encode to the width of the one it came from
+    // ('İ' is one UTF-16 unit and folds to 'i', which is also one, but two
+    // UTF-8 bytes fold to one), so a scan that worked in BYTES moved the cut.
+    assert_eq!(
+        stdout(r#"println("aİb".split("i", ignoreCase = true))"#),
+        "[a, b]\n"
+    );
+}
+
+/// `uppercaseChar`/`lowercaseChar` are the JVM's SIMPLE case mappings, which
+/// Rust's `char::to_uppercase`/`to_lowercase` (the FULL ones) are not.
+///
+/// Three families disagree, and all three were measured over the whole `Char`
+/// range against the oracle rather than recalled:
+///
+///   * The 27 Greek letters with a subscript iota, whose full uppercase expands
+///     past one character while the simple one is their titlecase form.
+///   * `U+0130`, whose full lowercase expands to `i` and a combining dot.
+///   * Every surrogate half, which is not a character at all and maps to
+///     itself — these answered `U+FFFD` before.
+#[test]
+fn the_char_case_members_are_the_jvms_simple_mappings() {
+    assert_eq!(stdout("println('ᾀ'.uppercaseChar().code)"), "8072\n");
+    assert_eq!(stdout("println('ᾐ'.uppercaseChar().code)"), "8088\n");
+    assert_eq!(stdout("println('ᾠ'.uppercaseChar().code)"), "8104\n");
+    assert_eq!(stdout("println('ᾳ'.uppercaseChar().code)"), "8124\n");
+    assert_eq!(stdout("println('ῃ'.uppercaseChar().code)"), "8140\n");
+    assert_eq!(stdout("println('ῳ'.uppercaseChar().code)"), "8188\n");
+    // 'ß' has no one-character uppercase at all and keeps itself.
+    assert_eq!(stdout("println('ß'.uppercaseChar().code)"), "223\n");
+    assert_eq!(stdout("println('İ'.lowercaseChar().code)"), "105\n");
+    assert_eq!(
+        prog("fun main() { val d = 55296.toChar(); println(d.uppercaseChar().code); println(d.lowercaseChar().code); println(d.titlecaseChar().code) }"),
+        "55296\n55296\n55296\n"
+    );
+    // `titlecase()` is the STRING mapping: when the full uppercase expands, it
+    // is that uppercase with everything past its first character lowercased
+    // again — not the uppercase unchanged.
+    assert_eq!(stdout("println('ᾀ'.titlecase())"), "Ἀι\n");
+    assert_eq!(stdout("println('ß'.titlecase())"), "Ss\n");
+    assert_eq!(stdout("println('և'.titlecase())"), "Եւ\n");
+    // U+0149 is the one character that keeps its whole uppercase.
+    assert_eq!(stdout("println('ŉ'.titlecase())"), "ʼN\n");
+}
+
+/// `compareTo(other, ignoreCase = true)` is the JVM's `CASE_INSENSITIVE_ORDER`,
+/// which is neither a comparison of two lowercased strings nor a walk over
+/// `Char`s.
+///
+/// It compares CODE POINTS, but only as far as the shorter receiver's UTF-16
+/// length, so a surrogate pair straddling that bound reads as a lone surrogate.
+/// Each assertion below fails under a different wrong implementation.
+#[test]
+fn compare_to_ignoring_case_is_the_jvms_case_insensitive_order() {
+    // A whole-string lowercase calls these unequal; the fold does not.
+    assert_eq!(stdout(r#"println("ϑ".compareTo("ϴ", true))"#), "0\n");
+    assert_eq!(stdout(r#"println("İ".compareTo("i", true))"#), "0\n");
+    // The difference is of the folding KEYS, not of the characters.
+    assert_eq!(stdout(r#"println("ß".compareTo("ss", true))"#), "108\n");
+    assert_eq!(stdout(r#"println("ϑ".compareTo("i", true))"#), "847\n");
+    // A common prefix that folds equal falls through to the UTF-16 length.
+    assert_eq!(stdout(r#"println("abc".compareTo("AB", true))"#), "1\n");
+    assert_eq!(stdout(r#"println("abc".compareTo("ABD", true))"#), "-1\n");
+    // A per-`Char` walk answers 40 here, because the low surrogates differ; the
+    // code-point walk folds the pair together and goes on to 'b' vs 'a'.
+    assert_eq!(stdout(r#"println("𐐨b".compareTo("𐐀a", true))"#), "1\n");
+    // …and an UNBOUNDED code-point walk answers 66503 here, because the pair is
+    // longer than the receiver it is being compared against.
+    assert_eq!(stdout(r#"println("𐐨".compareTo("a", true))"#), "55200\n");
+    assert_eq!(stdout(r#"println("abc".compareTo("ABC"))"#), "32\n");
+}
+
+/// `indexOfAny`/`findAnyOf` and their `…Last` pair scan POSITIONS and report
+/// UTF-16 offsets, and `startIndex` is one too.
+///
+/// Reading `startIndex` as a character index instead answered 2 for
+/// `"𐐨cbiϑ".lastIndexOfAny(listOf("c", "s"), 1, true)` where the reference
+/// answers -1, and an empty receiver walked a range built from `-1 as usize`
+/// and aborted the interpreter.
+#[test]
+fn the_any_of_searches_index_in_utf16_units_and_take_the_first_needle() {
+    assert_eq!(
+        stdout(r#"println("𐐨cbiϑ".lastIndexOfAny(listOf("c", "s"), 1, true))"#),
+        "-1\n"
+    );
+    assert_eq!(
+        stdout(r#"println("".findLastAnyOf(listOf("b")))"#),
+        "null\n"
+    );
+    assert_eq!(stdout(r#"println("".indexOfAny(listOf("b")))"#), "-1\n");
+    assert_eq!(
+        stdout(r#"println("abc".indexOfAny(listOf("B", "c"), 0, true))"#),
+        "1\n"
+    );
+    assert_eq!(
+        stdout(r#"println("abc".lastIndexOfAny(listOf("b", "c")))"#),
+        "2\n"
+    );
+    // `findAnyOf` answers the needle from the COLLECTION, not the text it
+    // matched, so an `ignoreCase` hit reports the argument's own casing.
+    assert_eq!(
+        stdout(r#"println("abc".findAnyOf(listOf("B"), 0, true))"#),
+        "(1, B)\n"
+    );
+    assert_eq!(
+        stdout(r#"println("abc".findLastAnyOf(listOf("b", "c")))"#),
+        "(2, c)\n"
+    );
+    // Two needles matching at one position are decided by the collection's
+    // order, not by their lengths.
+    assert_eq!(
+        stdout(r#"println("abc".findAnyOf(listOf("ab", "a")))"#),
+        "(0, ab)\n"
+    );
+    assert_eq!(
+        stdout(r#"println("abc".findAnyOf(listOf("a", "ab")))"#),
+        "(0, a)\n"
+    );
+}
