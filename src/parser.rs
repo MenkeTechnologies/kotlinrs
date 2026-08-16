@@ -394,8 +394,10 @@ fn is_bitwise_infix(w: &str) -> bool {
 /// GLUED to the left operand's line. These three names are plausible ones for a
 /// user function, and the lexer drops newlines — without the line test,
 ///
-///     val x = 1
-///     union(2)
+/// ```text
+/// val x = 1
+/// union(2)
+/// ```
 ///
 /// would parse as `1 union (2)` and the second statement would disappear.
 /// Kotlin's own grammar has that rule (`infixFunctionCall` admits no newline
