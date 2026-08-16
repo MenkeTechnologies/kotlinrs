@@ -185,3 +185,110 @@ so a line written from memory passes there forever — and it names the JVM it
 resolved for the compile step and the run step before it compares anything.
 
 31 new records were captured and the corpus floor moved 604 → 635.
+
+## Round 8 — the members that were missing, and the five that answered wrongly
+
+### How the gaps were found
+
+The corpus is curated, so it cannot report a construct nobody captured. This
+round went looking for those instead of extending what was already covered: the
+member names appearing in `src/host.rs`/`src/compiler.rs` were diffed against
+the identifiers the corpus programs use, and every name on neither side of that
+diff became a probe. Six batches — 284 probe programs, some deliberately
+re-covering earlier ground — were run against the oracle and against the built
+frontend and compared byte for byte on stdout, stderr and exit status. The two
+broad batches diverged on 24 of 51 and on 42 of 124 the first time they ran;
+49 distinct members or behaviours were closed.
+
+Probes are MICRO-probes — one expression each — because an `unresolved
+reference` is a COMPILE error here: a single missing member kills a whole
+program, and a probe that exercises eight members reports only the first.
+
+### Five silent wrong answers
+
+These are the ones that matter most: each ran to completion and printed
+something plausible, so no diagnostic would ever have surfaced them.
+
+| program | was | reference |
+| --- | --- | --- |
+| `"xxhixx".trimStart('x')` | `xxhixx` | `hixx` |
+| `"xyhixy".trim('x', 'y')` | `xyhixy` | `hi` |
+| `"abc".substringAfter("z", "def")` | `abc` | `def` |
+| `"abc".substringAfterLast("")` | `` | `c` |
+| `runCatching { 7 }.getOrDefault(-1)` | `null` | `7` |
+
+The first three are one cause: the vararg `Char` overload of the `trim` family
+and the `missingDelimiterValue` of the `substring…` family were both accepted
+and then ignored. The fourth is subtler — `substringAfterLast` searches with
+Kotlin's `lastIndexOf`, whose default `startIndex` is `lastIndex` and not the
+receiver's length, which shows only for an empty delimiter.
+
+The fifth was a dispatch collision, not a missing member. `Result` and `Map`
+both declare `getOrDefault`, and the host's mutating-member match runs for every
+heap kind: a `Result` receiver fell into the map body, found no key, and
+answered the map form's SECOND argument — which a `Result` call never passes.
+The arm is receiver-guarded now.
+
+### Members and syntax added
+
+`String`: the vararg-`Char` `trim`/`trimStart`/`trimEnd`, `substringBeforeLast`/
+`substringAfterLast` and `missingDelimiterValue` on all four, `capitalize`/
+`decapitalize`, `replaceFirstChar { }`, `ifEmpty`/`ifBlank`, and `split`'s named
+`limit` (which the positional default table could not express — `split`'s first
+parameter is a vararg, so `split("a", "b")` would have bound `"b"` to
+`ignoreCase`; the two optional parameters are lifted out by name and told apart
+from a delimiter by TYPE).
+
+Collections: `distinctBy`, `firstNotNullOf`/`firstNotNullOfOrNull`, `ifEmpty`,
+`asReversed`, `orEmpty`, `contentToString`, the in-place `sort`/`sortDescending`/
+`reverse`/`sortBy`/`sortByDescending`, `Map.getOrPut`/`getOrDefault`, and
+`eachCountTo` — which used to build a fresh map and answer it, so the
+DESTINATION it was handed stayed empty while the printed counts looked right.
+
+Values and types: `sequenceOf`, `longArrayOf`/`floatArrayOf`, `lazy { }` as a
+value (`.value`/`.isInitialized()`), `Result.getOrDefault`/`getOrThrow`,
+`Pair.toList`/`Triple.toList`, `Double.isNaN`/`isInfinite`/`isFinite`,
+`Char.MIN_VALUE`/`MAX_VALUE`, `Char.titlecaseChar`/`titlecase`,
+`Integer.toBinaryString`/`toHexString`/`toOctalString` (unsigned 32-bit, so
+`-1` is `ffffffff` where `(-1).toString(2)` is `-1`), the progression `step`
+property, and the infix spelling of `union`/`intersect`/`subtract`.
+
+The infix set functions parse only when GLUED to their left operand's line. The
+lexer drops newlines, and `union` — unlike `shl` — is a plausible name for a
+local, so without that test
+
+    val x = 1
+    union(2)
+
+would have parsed as `1 union (2)` and the second statement would have
+disappeared. Kotlin's grammar has the rule (`infixFunctionCall` admits no
+newline before the identifier), so the gate is the spec.
+
+### The titlecase table was measured, not recalled
+
+`Char.titlecaseChar()` is the single-`Char` uppercase mapping except where
+Unicode gives a character a titlecase form of its own. Rather than reconstruct
+that list, a reference program compared `titlecaseChar()` against
+`uppercaseChar()` over all 65 536 `Char`s on the oracle and printed the pairs
+that differ. There are exactly 58, in two families: the four Latin digraphs
+(all three case forms titlecase to the middle one) and Georgian Mkhedruli
+(no titlecase mapping at all — it answers itself, where `uppercaseChar` moves
+it into the Mtavruli block). The Greek iota-subscript letters do NOT differ,
+because their single-`Char` uppercase already is the titlecase form.
+
+### Not closed
+
+`Regex` in every spelling, a `data class` declared inside a function body, and a
+label on a lambda literal (`forEach lit@{ … }`). All three fail loudly. They are
+recorded with the reference's answer in [BUGS.md](BUGS.md), along with a
+divergence this round MEASURED rather than introduced: `asReversed()`,
+`Map.keys`/`values` and `subList()` are declared to be live views and are
+snapshots here, so a program that holds one across a write to the backing
+collection sees the wrong thing.
+
+### Provenance
+
+20 new records, each minted through `scripts/capture-parity.sh` — the same
+script that minted the corpus, one `kotlinc` per program in the default package —
+under `kotlinc` 2.4.10 / JRE 21.0.12. The corpus floor moved 635 → 655. 13 new
+`tests/lang.rs` tests, 235 → 248. No test was deleted or weakened.

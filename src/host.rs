@@ -1967,6 +1967,148 @@ fn kotlin_trim(s: &str, start: bool, end: bool) -> &str {
     out
 }
 
+/// `String.trim(vararg chars: Char)` and its one-sided pair.
+///
+/// The vararg overload trims a CHARACTER SET rather than whitespace, so it
+/// shares nothing with [`kotlin_trim`] but its shape: `"xxhixx".trimStart('x')`
+/// is `hixx`, where the no-argument member leaves the receiver untouched. Each
+/// argument is one `Char` — Kotlin has no string-set overload — and the set is
+/// matched by whole `char`, which is what makes a supplementary character
+/// trimmable at all.
+fn kotlin_trim_chars(s: &str, set: &[char], start: bool, end: bool) -> String {
+    let mut out = s;
+    if start {
+        out = out.trim_start_matches(|c| set.contains(&c));
+    }
+    if end {
+        out = out.trim_end_matches(|c| set.contains(&c));
+    }
+    out.to_string()
+}
+
+/// The `Char`s a `trim`-family vararg call names, in argument order.
+///
+/// A `Char` rides as an integer code unit, so an argument is read back through
+/// [`kotlin_string`] and its single character taken; anything that renders to
+/// more than one character cannot have been a `Char` and is skipped rather than
+/// silently matching a prefix.
+fn trim_char_set(args: &[Value]) -> Vec<char> {
+    args.iter()
+        .filter_map(|v| {
+            let s = kotlin_string(v);
+            let mut it = s.chars();
+            match (it.next(), it.next()) {
+                (Some(c), None) => Some(c),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// `substringBefore`/`substringAfter` and their `…Last` pair.
+///
+/// All four take `(delimiter, missingDelimiterValue = this)` — the second
+/// argument is what comes back when the delimiter is ABSENT, and defaulting it
+/// to the receiver is the only reason the one-argument form answers the whole
+/// string. `…Last` differs only in which occurrence it splits on.
+fn substring_around(s: &str, delim: &str, after: bool, last: bool, missing: &str) -> String {
+    let found = if last {
+        // The `…Last` pair searches with `lastIndexOf`, whose default
+        // `startIndex` is Kotlin's `lastIndex` and NOT the receiver's length —
+        // the same divergence from `java.lang.String` the `lastIndexOf` member
+        // carries. It shows only for an EMPTY delimiter, which Kotlin therefore
+        // finds at the start of the LAST character: `"abc".substringAfterLast("")`
+        // is `c`, where a length-based search would answer the empty string.
+        if delim.is_empty() {
+            s.char_indices().next_back().map(|(i, _)| i)
+        } else {
+            s.rfind(delim)
+        }
+    } else {
+        s.find(delim)
+    };
+    match found {
+        Some(at) => {
+            if after {
+                s[at + delim.len()..].to_string()
+            } else {
+                s[..at].to_string()
+            }
+        }
+        None => missing.to_string(),
+    }
+}
+
+/// `Char.titlecaseChar()` — `Character.toTitleCase`, which is the single-`Char`
+/// uppercase mapping EXCEPT where Unicode gives a character a titlecase form of
+/// its own.
+///
+/// The exceptions were MEASURED rather than recalled: a reference program
+/// compared `titlecaseChar()` against `uppercaseChar()` over all 65 536 `Char`s
+/// on the oracle toolchain and printed the pairs that differ. There are exactly
+/// two families.
+///
+///   * The four Latin digraphs, whose three case forms (`Ǆ`/`ǅ`/`ǆ`) all
+///     titlecase to the MIDDLE one.
+///   * Georgian Mkhedruli, which has no titlecase mapping at all — it answers
+///     the character unchanged, where `uppercaseChar` answers Mtavruli.
+///
+/// Nothing else differs; the Greek iota-subscript letters agree because their
+/// single-`Char` uppercase already IS the titlecase form (the full uppercase
+/// mapping expands past one `Char`, so `Character.toUpperCase(char)` gives the
+/// titlecase one).
+fn titlecase_char(c: char) -> char {
+    match c as u32 {
+        0x01C4..=0x01C6 => '\u{01C5}',
+        0x01C7..=0x01C9 => '\u{01C8}',
+        0x01CA..=0x01CC => '\u{01CB}',
+        0x01F1..=0x01F3 => '\u{01F2}',
+        0x10D0..=0x10FA | 0x10FD..=0x10FF => c,
+        _ => single_uppercase(c),
+    }
+}
+
+/// `Character.toUpperCase(char)`: the uppercase mapping when it fits in ONE
+/// character, and the character itself when it expands (`'ß'` stays `'ß'`).
+fn single_uppercase(c: char) -> char {
+    let mut it = c.to_uppercase();
+    match (it.next(), it.next()) {
+        (Some(m), None) => m,
+        _ => c,
+    }
+}
+
+/// `String.capitalize()` / `decapitalize()`.
+///
+/// Both are deprecated in Kotlin and both still compile and run, so parity owes
+/// them their behaviour. `capitalize` prefers the TITLECASE form when the
+/// character has one distinct from its uppercase (`"ǳx"` capitalizes to `"ǲx"`,
+/// not `"Ǳx"`), and falls back to the full uppercase mapping — which may expand
+/// past one character — otherwise. Neither touches a receiver whose first
+/// character is already in the target case.
+fn kotlin_capitalize(s: &str, up: bool) -> String {
+    let Some(first) = s.chars().next() else {
+        return s.to_string();
+    };
+    let rest = &s[first.len_utf8()..];
+    if up {
+        if !first.is_lowercase() {
+            return s.to_string();
+        }
+        let title = titlecase_char(first);
+        if title != single_uppercase(first) {
+            format!("{title}{rest}")
+        } else {
+            format!("{}{rest}", first.to_uppercase())
+        }
+    } else {
+        if first.is_lowercase() {
+            return s.to_string();
+        }
+        format!("{}{rest}", first.to_lowercase())
+    }
+}
+
 /// The `NegativeArraySizeException` a negative array length raises.
 ///
 /// The JVM puts the REQUESTED LENGTH in the detail message — `anewarray`'s
@@ -4775,6 +4917,45 @@ fn coll_hof(
     // works on the materialized `Char`s; only the RESULT type differs, and
     // only for the members whose text overload rebuilds a string.
     if let Value::Str(s) = recv {
+        // Three `kotlin.text` members take a lambda but are NOT element-wise, so
+        // they must answer before the receiver is spread into its characters.
+        // `ifEmpty`/`ifBlank` call the lambda AT MOST ONCE and with no argument;
+        // `replaceFirstChar` calls it on the first character alone and leaves the
+        // rest of the string as it was.
+        match name {
+            "ifEmpty" | "ifBlank" => {
+                let empty = if name == "ifEmpty" {
+                    s.is_empty()
+                } else {
+                    kotlin_trim(s, true, true).is_empty()
+                };
+                return if empty {
+                    invoke_closure(vm, clo, &[])
+                } else {
+                    Ok(recv.clone())
+                };
+            }
+            // The lambda answers a `CharSequence`, not a `Char` —
+            // `it.uppercase()` is a `String` — so its result is rendered and
+            // spliced in whole rather than assumed to be one character wide.
+            // The receiver is split on the UTF-16 boundary `Char` is defined on,
+            // not on the `char` one: the first `Char` of a supplementary
+            // character is its HIGH SURROGATE, and splitting by Rust `char` would
+            // hand the lambda a whole code point Kotlin never passes.
+            "replaceFirstChar" => {
+                let units: Vec<u16> = s.encode_utf16().collect();
+                let Some(&first) = units.first() else {
+                    return Ok(recv.clone());
+                };
+                let head = invoke_closure(vm, clo, &[char_of(first as i64)])?;
+                return Ok(Value::str(format!(
+                    "{}{}",
+                    kotlin_string(&head),
+                    utf16_to_string(&units[1..])
+                )));
+            }
+            _ => {}
+        }
         let chars = alloc(HeapObj::List(chars_of(s)));
         // `chunked`/`windowed` hand each group to the lambda as a `String`, not
         // as a `List<Char>`, so the groups are rebuilt before the callback.
@@ -4884,6 +5065,56 @@ fn coll_hof(
             }
             Ok(alloc(HeapObj::List(out)))
         }
+        // `distinctBy` keeps the FIRST element for each distinct key, so what is
+        // compared is the selector's answer and what is kept is the element. The
+        // key comparison is hash-gated exactly as `distinct`'s is — both build a
+        // `LinkedHashSet` of keys on the JVM.
+        "distinctBy" => {
+            let mut keys: Vec<Value> = Vec::new();
+            let mut out = Vec::new();
+            for it in items {
+                let k = invoke_closure(vm, clo, std::slice::from_ref(&it))?;
+                if !keys.iter().any(|x| hash_eq_vm(vm, x, &k)) {
+                    keys.push(k);
+                    out.push(it);
+                }
+            }
+            Ok(alloc_ro_list(out))
+        }
+        // `firstNotNullOfOrNull` answers the first non-null RESULT, not the
+        // first element that produced one, and stops as soon as it has it.
+        // `firstNotNullOf` is the same walk with a fault at the end.
+        "firstNotNullOf" | "firstNotNullOfOrNull" => {
+            for it in items {
+                let v = invoke_closure(vm, clo, &[it])?;
+                if !matches!(v, Value::Undef) {
+                    return Ok(v);
+                }
+            }
+            if name == "firstNotNullOf" {
+                Err("java.util.NoSuchElementException: No element of the collection was transformed to a non-null value.".to_string())
+            } else {
+                Ok(Value::Undef)
+            }
+        }
+        // `ifEmpty` calls its lambda with NO argument and only when the receiver
+        // has no elements; otherwise the receiver comes back unchanged.
+        "ifEmpty" => {
+            if items.is_empty() {
+                invoke_closure(vm, clo, &[])
+            } else {
+                Ok(recv.clone())
+            }
+        }
+        // `ifBlank` and `replaceFirstChar` are `CharSequence` members and are
+        // answered for a `String` receiver above, before it is spread into its
+        // characters. Reaching here means the receiver was a COLLECTION, which
+        // Kotlin declares neither member on — so the arm exists to say so, and
+        // the routing table stays complete.
+        "ifBlank" | "replaceFirstChar" => Err(format!(
+            "unresolved reference: {name} on {}",
+            obj_label(recv)
+        )),
         // `mapNotNull` drops the results that came back null.
         "mapNotNull" => {
             let mut out = Vec::new();
@@ -5016,6 +5247,33 @@ fn coll_hof(
                 keyed.into_iter().map(|(_, it)| it).collect(),
                 kind.is_collection(),
             ))
+        }
+        // `sortBy`/`sortByDescending` are `sortedBy`'s IN-PLACE twins: they
+        // reorder the receiver and answer `Unit`. Same schwartzian decoration
+        // and the same stability, written back through the handle instead of
+        // into a fresh list.
+        "sortBy" | "sortByDescending" => {
+            let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(items.len());
+            for it in items {
+                let key = invoke_closure(vm, clo, std::slice::from_ref(&it))?;
+                keyed.push((key, it));
+            }
+            // `sortByDescending` is `sortWith(compareByDescending(selector))` —
+            // the COMPARISON is inverted, not the result. Reversing a stable
+            // ascending sort would reverse the ties along with it, which is a
+            // different order.
+            if name == "sortBy" {
+                keyed.sort_by(|a, b| value_cmp(&a.0, &b.0));
+            } else {
+                keyed.sort_by(|a, b| value_cmp(&b.0, &a.0));
+            }
+            let out: Vec<Value> = keyed.into_iter().map(|(_, it)| it).collect();
+            with_obj_mut(recv, |o| {
+                if let HeapObj::List(items) | HeapObj::Array { items, .. } = o {
+                    *items = out;
+                }
+            });
+            Ok(Value::Undef)
         }
         "minByOrNull" | "minBy" => {
             let mut best: Option<(Value, Value)> = None;
@@ -5261,6 +5519,36 @@ fn coll_hof(
                 }
             }
             extremum_or(best, name)
+        }
+        // `MutableMap.getOrPut(key) { … }` keys on a NULL VALUE, not on an absent
+        // key — that is what the stdlib body tests — so a key present with a null
+        // value recomputes and overwrites. The lambda takes no argument and runs
+        // only when it has to.
+        "getOrPut" => {
+            let k = extras.first().cloned().unwrap_or(Value::Undef);
+            let at = key_position(vm, recv, &k);
+            let existing = at
+                .and_then(|i| {
+                    with_obj(recv, |o| match o {
+                        HeapObj::Map(entries) => entries.get(i).map(|(_, v)| v.clone()),
+                        _ => None,
+                    })
+                    .flatten()
+                })
+                .unwrap_or(Value::Undef);
+            if !matches!(existing, Value::Undef) {
+                return Ok(existing);
+            }
+            let fresh = invoke_closure(vm, clo, &[])?;
+            with_obj_mut(recv, |o| {
+                if let HeapObj::Map(entries) = o {
+                    match at.and_then(|i| entries.get_mut(i)) {
+                        Some(slot) => slot.1 = fresh.clone(),
+                        None => entries.push((k.clone(), fresh.clone())),
+                    }
+                }
+            });
+            Ok(fresh)
         }
         // `Map.filterKeys { }` / `filterValues { }` keep the entries whose KEY
         // (or VALUE) satisfies the predicate. Unlike `mapKeys`/`mapValues`
@@ -6212,7 +6500,18 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         (Value::Str(s), "length") => Ok(Value::Int(s.encode_utf16().count() as i64)),
         (Value::Str(s), "uppercase" | "toUpperCase") => Ok(Value::str(s.to_uppercase())),
         (Value::Str(s), "lowercase" | "toLowerCase") => Ok(Value::str(s.to_lowercase())),
-        (Value::Str(s), "trim") => Ok(Value::str(kotlin_trim(s, true, true).to_string())),
+        // `trim()` is whitespace; `trim(vararg chars: Char)` is a character set.
+        // Which one a call means is decided by whether it passed any argument —
+        // the two overloads share a name and nothing else.
+        (Value::Str(s), "trim") if args.is_empty() => {
+            Ok(Value::str(kotlin_trim(s, true, true).to_string()))
+        }
+        (Value::Str(s), "trim") => Ok(Value::str(kotlin_trim_chars(
+            s,
+            &trim_char_set(args),
+            true,
+            true,
+        ))),
         (Value::Str(s), "isEmpty") => Ok(Value::Bool(s.is_empty())),
         (Value::Str(s), "isNotEmpty") => Ok(Value::Bool(!s.is_empty())),
         (Value::Str(s), "isBlank") => Ok(Value::Bool(kotlin_trim(s, true, true).is_empty())),
@@ -6308,8 +6607,26 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
             }
             Ok(Value::Int(-1))
         }
-        (Value::Str(s), "trimStart") => Ok(Value::str(kotlin_trim(s, true, false).to_string())),
-        (Value::Str(s), "trimEnd") => Ok(Value::str(kotlin_trim(s, false, true).to_string())),
+        (Value::Str(s), "capitalize") => Ok(Value::str(kotlin_capitalize(s, true))),
+        (Value::Str(s), "decapitalize") => Ok(Value::str(kotlin_capitalize(s, false))),
+        (Value::Str(s), "trimStart") if args.is_empty() => {
+            Ok(Value::str(kotlin_trim(s, true, false).to_string()))
+        }
+        (Value::Str(s), "trimEnd") if args.is_empty() => {
+            Ok(Value::str(kotlin_trim(s, false, true).to_string()))
+        }
+        (Value::Str(s), "trimStart") => Ok(Value::str(kotlin_trim_chars(
+            s,
+            &trim_char_set(args),
+            true,
+            false,
+        ))),
+        (Value::Str(s), "trimEnd") => Ok(Value::str(kotlin_trim_chars(
+            s,
+            &trim_char_set(args),
+            false,
+            true,
+        ))),
         (Value::Str(s), "removePrefix") => {
             let p = arg_str(args, 0);
             Ok(Value::str(s.strip_prefix(&p).unwrap_or(s).to_string()))
@@ -6318,21 +6635,25 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
             let p = arg_str(args, 0);
             Ok(Value::str(s.strip_suffix(&p).unwrap_or(s).to_string()))
         }
-        // `substringBefore`/`substringAfter` yield the whole receiver when the
-        // delimiter is absent — Kotlin's default `missingDelimiterValue`.
-        (Value::Str(s), "substringBefore") => {
-            let d = arg_str(args, 0);
-            Ok(Value::str(match s.split_once(&d) {
-                Some((head, _)) => head.to_string(),
+        // `substringBefore`/`substringAfter` and their `…Last` pair. The absent
+        // delimiter answers `missingDelimiterValue`, which DEFAULTS to the whole
+        // receiver — so a call that passes the second argument answers that
+        // instead, and the one-argument form is the default showing through.
+        (
+            Value::Str(s),
+            "substringBefore" | "substringAfter" | "substringBeforeLast" | "substringAfterLast",
+        ) => {
+            let missing = match args.get(1) {
+                Some(v) => kotlin_string(v),
                 None => s.to_string(),
-            }))
-        }
-        (Value::Str(s), "substringAfter") => {
-            let d = arg_str(args, 0);
-            Ok(Value::str(match s.split_once(&d) {
-                Some((_, tail)) => tail.to_string(),
-                None => s.to_string(),
-            }))
+            };
+            Ok(Value::str(substring_around(
+                s,
+                &arg_str(args, 0),
+                name.starts_with("substringAfter"),
+                name.ends_with("Last"),
+                &missing,
+            )))
         }
         // `String.reversed()` reverses whole characters, not code units — the
         // JVM's `StringBuilder.reverse` keeps surrogate pairs intact.
@@ -6347,32 +6668,67 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         // a `List`. The result is FINITE either way — the receiver bounds it —
         // so it materializes like every other finite sequence here; only
         // `generateSequence` needs the lazy representation.
+        //
+        // `limit` caps the number of parts, the last one keeping the whole
+        // remainder. It can only be passed by NAME (the delimiters are a
+        // vararg), and it is told apart from a delimiter by TYPE: a delimiter is
+        // a `String` or a `Char`, never an `Int`, so no marker argument is
+        // needed. Zero means no limit; a negative one is rejected the way
+        // Kotlin's `require` rejects it.
         (Value::Str(s), "split" | "splitToSequence") => {
-            let delims: Vec<String> = args.iter().map(kotlin_string).collect();
-            let mut parts: Vec<Value> = Vec::new();
-            if delims.len() <= 1 {
-                let d = delims.first().cloned().unwrap_or_default();
-                parts.extend(s.split(&d as &str).map(|p| Value::str(p.to_string())));
-            } else {
-                let mut rest = s.as_str();
-                'scan: loop {
-                    let hit = delims
-                        .iter()
-                        .filter(|d| !d.is_empty())
-                        .filter_map(|d| rest.find(d.as_str()).map(|at| (at, d.len())))
-                        .min();
-                    match hit {
-                        Some((at, len)) => {
-                            parts.push(Value::str(rest[..at].to_string()));
-                            rest = &rest[at + len..];
-                        }
-                        None => {
-                            parts.push(Value::str(rest.to_string()));
-                            break 'scan;
-                        }
-                    }
-                }
+            let limit = args
+                .iter()
+                .find_map(|v| match v {
+                    Value::Int(n) => Some(*n),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            if limit < 0 {
+                return Err(format!(
+                    "java.lang.IllegalArgumentException: Limit must be non-negative, but was {limit}"
+                ));
             }
+            let delims: Vec<String> = args
+                .iter()
+                .filter(|v| !matches!(v, Value::Int(_) | Value::Bool(_)))
+                .map(kotlin_string)
+                .collect();
+            // ONE scan for every arity, so the limit does not need a second
+            // implementation per branch. `start` is where the current part
+            // began and `search` is where the next delimiter may match — they
+            // differ only after an EMPTY delimiter, which matches at `search`
+            // itself and must then advance one CHARACTER, or the scan would
+            // match the same position forever.
+            let mut parts: Vec<Value> = Vec::new();
+            let (mut start, mut search) = (0usize, 0usize);
+            while limit == 0 || parts.len() + 1 < limit as usize {
+                let hit = delims
+                    .iter()
+                    .filter_map(|d| {
+                        if d.is_empty() {
+                            (search <= s.len()).then_some((search, 0usize))
+                        } else {
+                            s[search..]
+                                .find(d.as_str())
+                                .map(|at| (search + at, d.len()))
+                        }
+                    })
+                    .min();
+                let Some((at, len)) = hit else { break };
+                parts.push(Value::str(s[start..at].to_string()));
+                start = at + len;
+                search = if len == 0 {
+                    match s[at..].chars().next() {
+                        Some(c) => at + c.len_utf8(),
+                        // Past the last character: one step beyond the receiver
+                        // ends the scan on the next round.
+                        None => at + 1,
+                    }
+                } else {
+                    start
+                };
+            }
+            parts.push(Value::str(s[start..].to_string()));
             Ok(alloc(HeapObj::List(parts)))
         }
         (Value::Str(s), "lines") => Ok(alloc(HeapObj::List(
@@ -6665,6 +7021,26 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
                 Ok(Value::Float(recv.to_float().abs()))
             }
         }
+        // `Integer.toBinaryString`/`toHexString`/`toOctalString`, reached as
+        // members of their argument (see the compiler's rewrite). All three read
+        // the value as an UNSIGNED 32-bit pattern — that is the whole difference
+        // from `toString(radix)`, and it is only visible for a negative one:
+        // `Integer.toHexString(-1)` is `ffffffff`.
+        (Value::Int(n), "toBinaryString" | "toHexString" | "toOctalString") => {
+            let bits = *n as i32 as u32;
+            Ok(Value::str(match name {
+                "toBinaryString" => format!("{bits:b}"),
+                "toHexString" => format!("{bits:x}"),
+                _ => format!("{bits:o}"),
+            }))
+        }
+        // The three IEEE classifiers. They are `Double`/`Float` members only —
+        // an integer has no `isNaN` on Kotlin — and `isFinite` is neither of the
+        // other two rather than a range test, so it is the one that stays right
+        // for a subnormal.
+        (Value::Float(x), "isNaN") => Ok(Value::Bool(x.is_nan())),
+        (Value::Float(x), "isInfinite") => Ok(Value::Bool(x.is_infinite())),
+        (Value::Float(x), "isFinite") => Ok(Value::Bool(x.is_finite())),
         // `roundToInt`/`roundToLong` are `Math.round` (see [`java_math_round`])
         // behind two guards the JVM method does not have. `Math.round(NaN)` is
         // 0; Kotlin REFUSES it instead, and `roundToInt` additionally clamps to
@@ -6833,6 +7209,20 @@ fn char_method(code: i64, name: &str, args: &[Value]) -> Result<Value, String> {
         "isLowerCase" => Value::Bool(c.is_lowercase()),
         "uppercaseChar" => char_of(single(c, c.to_uppercase()) as i64),
         "lowercaseChar" => char_of(single(c, c.to_lowercase()) as i64),
+        // `titlecaseChar` agrees with `uppercaseChar` except where Unicode gives
+        // the character a titlecase form of its own — see [`titlecase_char`],
+        // whose exception list was measured against the oracle. `titlecase()`
+        // is the same mapping as a `String`, which is why it can answer a
+        // two-character result where `titlecaseChar` cannot.
+        "titlecaseChar" => char_of(titlecase_char(c) as i64),
+        "titlecase" => {
+            let t = titlecase_char(c);
+            Value::str(if t == single_uppercase(c) {
+                c.to_uppercase().to_string()
+            } else {
+                t.to_string()
+            })
+        }
         "uppercase" => Value::str(c.to_uppercase().to_string()),
         "lowercase" => Value::str(c.to_lowercase().to_string()),
         "digitToInt" => match c.to_digit(10) {
@@ -6934,6 +7324,29 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                     match entries.iter_mut().find(|(ek, _)| value_eq(ek, &k)) {
                         Some(slot) => slot.1 = Value::Int(slot.1.to_int() + 1),
                         None => entries.push((k, Value::Int(1))),
+                    }
+                }
+                // `eachCountTo(destination)` writes into the map it was GIVEN
+                // and answers that same map — the caller's handle is the result,
+                // so a fresh allocation here would leave the destination empty
+                // while still printing the right counts. It also ACCUMULATES:
+                // an existing count for a key is added to, not replaced.
+                if name == "eachCountTo" {
+                    if let Some(dest) = args.first() {
+                        for (k, n) in entries {
+                            let at = key_position(vm, dest, &k);
+                            with_obj_mut(dest, |o| {
+                                if let HeapObj::Map(d) = o {
+                                    match at.and_then(|i| d.get_mut(i)) {
+                                        Some(slot) => {
+                                            slot.1 = Value::Int(slot.1.to_int() + n.to_int())
+                                        }
+                                        None => d.push((k.clone(), n.clone())),
+                                    }
+                                }
+                            });
+                        }
+                        return Ok(dest.clone());
                     }
                 }
                 return Ok(alloc(HeapObj::Map(entries)));
@@ -7077,6 +7490,31 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                     obj_label(recv)
                 )),
             };
+        }
+        // The IN-PLACE reorderings. Each is the mutating twin of a `sorted…`/
+        // `reversed()` member that copies, and the difference is the whole
+        // point: `l.sortDescending()` answers `Unit` and leaves `l` reordered,
+        // where `l.sortedDescending()` answers a new list and leaves `l` alone.
+        // They are declared on `MutableList` and on the primitive arrays.
+        "sort" | "sortDescending" | "reverse" => {
+            let done = with_obj_mut(recv, |o| match o {
+                HeapObj::List(items) | HeapObj::Array { items, .. } => {
+                    if name == "reverse" {
+                        items.reverse();
+                    } else {
+                        items.sort_by(value_cmp);
+                        if name == "sortDescending" {
+                            items.reverse();
+                        }
+                    }
+                    true
+                }
+                _ => false,
+            })
+            .unwrap_or(false);
+            if done {
+                return Ok(Value::Undef);
+            }
         }
         // `remove(element)` on a mutable list or set — `removeAt(index)` is the
         // by-position form and stays separate.
@@ -7238,6 +7676,27 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             .flatten();
             return Ok(prev.unwrap_or(Value::Undef));
         }
+        // `getOrDefault(key, defaultValue)` answers the default for an ABSENT
+        // key only — a key mapped to null answers that null, which is why the
+        // test is the key's position and not the value that came back.
+        //
+        // The receiver must be checked: this match runs for every heap kind, and
+        // `Result` declares a `getOrDefault` of its own that means something
+        // else. Without the guard a `Result` reached the map body, found no key,
+        // and answered the map form's SECOND argument — which a `Result` call
+        // never passes, so every `runCatching { … }.getOrDefault(x)` was null.
+        "getOrDefault" if with_obj(recv, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false) => {
+            let k = args.first().cloned().unwrap_or(Value::Undef);
+            return Ok(match key_position(vm, recv, &k) {
+                Some(i) => with_obj(recv, |o| match o {
+                    HeapObj::Map(entries) => entries.get(i).map(|(_, v)| v.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .unwrap_or(Value::Undef),
+                None => args.get(1).cloned().unwrap_or(Value::Undef),
+            });
+        }
         _ => {}
     }
 
@@ -7268,6 +7727,17 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             _ => None,
         })
         .flatten();
+        // `step` is a PROPERTY of a progression — `(1..10).step` is 1 and
+        // `(1..10 step 3).step` is 3 — and it is the one range member the
+        // element snapshot cannot answer, since the elements no longer say how
+        // far apart they were. A DOWNWARD progression reports a NEGATIVE step:
+        // `10 downTo 1` is `IntProgression.fromClosedRange(10, 1, -1)`, and the
+        // sign is how the progression knows its direction.
+        if name == "step" {
+            if let Some(r) = range {
+                return Ok(Value::Int(r.step));
+            }
+        }
         let items = list_snapshot(recv).unwrap_or_default();
         if let Some(v) = sequence_member(
             vm,
@@ -7302,6 +7772,68 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 })
                 .unwrap_or(Value::Undef),
         });
+    }
+
+    // `Result.getOrThrow()` RE-RAISES the parked failure, which the read-only
+    // block below cannot do — it answers a value and has no way to start an
+    // unwind. `getOrDefault` sits here with it because the two are one pair:
+    // both read a success and differ only in what a failure gives back.
+    if matches!(name, "getOrThrow" | "getOrDefault") {
+        if let Some((value, err)) = result_parts(recv) {
+            return Ok(match (name, err) {
+                ("getOrThrow", Some(e)) => {
+                    raise(vm, e);
+                    Value::Undef
+                }
+                ("getOrDefault", Some(_)) => args.first().cloned().unwrap_or(Value::Undef),
+                _ => value,
+            });
+        }
+    }
+
+    // A `Lazy` cell read through its OWN members rather than through a `by lazy`
+    // binding (which the compiler forces at each read instead). `value` forces
+    // and caches; `isInitialized()` reports whether that has happened, so it
+    // must not force — asking the question would otherwise answer it.
+    if matches!(name, "value" | "isInitialized") {
+        let state = with_obj(recv, |o| match o {
+            HeapObj::Lazy { thunk, value } => Some((thunk.clone(), value.clone())),
+            _ => None,
+        })
+        .flatten();
+        if let Some((thunk, cached)) = state {
+            if name == "isInitialized" {
+                return Ok(Value::Bool(cached.is_some()));
+            }
+            if let Some(v) = cached {
+                return Ok(v);
+            }
+            // The thunk is user code and may allocate, so it runs with no heap
+            // borrow held — the snapshot above is what releases it.
+            let v = invoke_closure(vm, &thunk, &[])?;
+            with_obj_mut(recv, |o| {
+                if let HeapObj::Lazy { value, .. } = o {
+                    *value = Some(v.clone());
+                }
+            });
+            return Ok(v);
+        }
+    }
+
+    // `Pair.toList()` / `Triple.toList()` — the tuple's components in order,
+    // and the only way either becomes a collection. It sits OUTSIDE the
+    // read-only block below because it ALLOCATES, and that block runs under a
+    // shared heap borrow the allocator would have to take mutably.
+    if name == "toList" {
+        let parts = with_obj(recv, |o| match o {
+            HeapObj::Pair(a, b) => Some(vec![a.clone(), b.clone()]),
+            HeapObj::Triple(a, b, c) => Some(vec![a.clone(), b.clone(), c.clone()]),
+            _ => None,
+        })
+        .flatten();
+        if let Some(parts) = parts {
+            return Ok(alloc_ro_list(parts));
+        }
     }
 
     // Read-only members.
@@ -7974,6 +8506,28 @@ fn sequence_member(
         // the separator used to be read, so every affix was silently dropped
         // and `joinToString("-", "<", ">")` printed `1-2-3`.
         "joinToString" => Value::str(join_to_string(items, args, 0, None)),
+        // An `Array`'s own `toString` is its identity hash, so `contentToString`
+        // is the member that renders the ELEMENTS — and it is spelled the same
+        // way a `List`'s `toString` is.
+        "contentToString" => {
+            return Some(Ok(Value::str(format!(
+                "[{}]",
+                items
+                    .iter()
+                    .map(kotlin_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))))
+        }
+        // `asReversed()` is a REVERSED VIEW on the receiver, where `reversed()`
+        // copies. The two agree for every read; they part only when the backing
+        // list is mutated afterwards, which is recorded in BUGS.md — this
+        // answers the copy.
+        "asReversed" => return Some(Ok(alloc_ro_list(items.iter().rev().cloned().collect()))),
+        // `orEmpty()` is declared on the NULLABLE receiver and answers an empty
+        // collection for null. A receiver that reached here is not null, so the
+        // member is the identity — the empty half never applies.
+        "orEmpty" if recv.is_some() => return Some(Ok(recv.unwrap().clone())),
         "reversed" => {
             // `IntRange.reversed()` is an `IntProgression` counting down; a
             // list's is a plain reversed list.

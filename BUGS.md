@@ -105,3 +105,51 @@ overflow) and succeeds for the second. Same category as the `%2147483647d` entry
   `Sequence` is stated once, in one predicate, but it is a list and a member
   added to the stdlib surface without being added there loses the sequence
   wording for everything downstream of it.
+
+## Collection VIEWS are snapshots
+
+`asReversed()`, `Map.keys`/`Map.values` and `subList()` are declared to be LIVE
+VIEWS of their receiver: Kotlin's documentation for each says a change to the
+backing collection shows through. Every one of them is a copy here, taken when
+the member is called, so the view stops tracking at that moment. Measured on
+`kotlinc` 2.4.10 / JRE 21.0.12:
+
+| program | kotlinrs | reference |
+| --- | --- | --- |
+| `val b = mutableListOf(1, 2, 3); val v = b.asReversed(); b.add(4); println(v)` | `[3, 2, 1]` | `[4, 3, 2, 1]` |
+| `val m = mutableMapOf("a" to 1); val k = m.keys; m["b"] = 2; println(k)` | `[a]` | `[a, b]` |
+| `val l = mutableListOf(1, 2); val s = l.subList(0, 2); l[0] = 9; println(s)` | `[1, 2]` | `[9, 2]` |
+
+Every read that does not outlive a mutation of the backing collection agrees, so
+this is invisible until a program holds a view across a write. Closing it needs a
+heap representation for a view — a `HeapObj` that carries a handle and a mapping
+rather than its own elements — which every member that snapshots elements
+(`list_snapshot`, the display path, indexing, `size`) would then have to
+understand. That is the whole change; the measurements above are its
+specification.
+
+## Still missing, with the measurement
+
+Each of these fails LOUDLY — an `unresolved reference` or a parse error — so
+none is a wrong answer. They are recorded with what the reference produces so
+the next round starts from a measurement rather than a guess.
+
+| program | kotlinrs | reference |
+| --- | --- | --- |
+| `Regex("[0-9]+").findAll("a1b22c").map { it.value }.toList()` | `unresolved reference: Regex` | `[1, 22]` |
+| `"hello".replace(Regex("l+"), "L")` | `unresolved reference: Regex` | `heLo` |
+| `"a1b2".split(Regex("[0-9]"))` | `unresolved reference: Regex` | `[a, b, ]` |
+| `fun main() { data class P(val a: Int) ; println(P(1)) }` | `unexpected token Class (line 1)` | `P(a=1)` |
+| `listOf(1, 2, 3).forEach lit@{ if (it == 2) return@lit }` | `a label must precede a loop (`for`/`while`/`do`), found LBrace` | (runs; the label names the lambda) |
+
+`Regex` is the largest of the three by far: the class carries `find`/`findAll`/
+`matches`/`containsMatchIn`/`replace`/`split` plus `MatchResult`'s
+`value`/`groupValues`/`range`, and matching itself needs an engine this crate has
+no dependency for. The other two are parser gaps — a class declaration inside a
+function body, and a label on a lambda literal rather than on a loop.
+
+`Double.MIN_VALUE` is absent deliberately and for a different reason: it is the
+shortest decimal that round-trips a subnormal, and this frontend carries every
+floating value as an `f64`, so it would print `5.0E-324` where Kotlin prints
+`4.9E-324`. Leaving it unresolved keeps that divergence out of running programs
+(see `primitive_const` in `src/compiler.rs`).

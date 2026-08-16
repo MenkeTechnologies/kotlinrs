@@ -151,12 +151,26 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `reversed()`, `in`, iteration, and the `a..e` printed form); and the members
   `isDigit`/`isLetter`/`isLetterOrDigit`/`isWhitespace`/`isUpperCase`/
   `isLowerCase`/`uppercaseChar`/`lowercaseChar`/`uppercase`/`lowercase`/
-  `digitToInt`/`compareTo`/`equals`/`hashCode`/`toString`.
+  `titlecaseChar`/`titlecase`/`digitToInt`/`compareTo`/`equals`/`hashCode`/
+  `toString`. `titlecaseChar` is the single-`Char` uppercase mapping except for
+  the two families Unicode gives a titlecase form of their own — the four Latin
+  digraphs (`ǳ` titlecases to `ǲ`, where it uppercases to `Ǳ`) and Georgian
+  Mkhedruli, which has no titlecase mapping at all. `Char.MIN_VALUE`/`MAX_VALUE`
+  bound the UTF-16 code unit, so the top is `￿` and not the highest code
+  point.
 - **Member access** — chainable postfix `.`: `String.length`,
-  `.uppercase()`/`.lowercase()`, `.trim()`/`.trimStart()`/`.trimEnd()`,
-  `.isEmpty()`/`.isNotEmpty()`, `.split()` (one delimiter or several),
+  `.uppercase()`/`.lowercase()`, `.trim()`/`.trimStart()`/`.trimEnd()` — each in
+  all three overloads, the no-argument whitespace one, the vararg `Char` SET
+  (`"xxhixx".trimStart('x')` is `hixx`) and the predicate —
+  `.isEmpty()`/`.isNotEmpty()`, `.split()` (one delimiter or several, with the
+  named `limit` that caps the parts and leaves the last one unsplit),
   `.lines()`, `.reversed()`, `.take()`/`.drop()`, `.first()`/`.last()`,
-  `.padStart()`/`.padEnd()`, `.substringBefore()`/`.substringAfter()`,
+  `.padStart()`/`.padEnd()`, `.substringBefore()`/`.substringAfter()` and their
+  `…Last` pair (all four taking the `missingDelimiterValue` that defaults to the
+  whole receiver, and the `…Last` two searching from Kotlin's `lastIndex` rather
+  than from the length, which shows for an empty delimiter),
+  `.capitalize()`/`.decapitalize()`/`.replaceFirstChar { }`,
+  `.ifEmpty { }`/`.ifBlank { }`,
   `.removePrefix()`/`.removeSuffix()`, `.toCharArray()`, `.replaceFirst()`,
   the searching members in their overloaded spellings —
   `.indexOf(s, startIndex)`, `.lastIndexOf(s, startIndex)` (whose default
@@ -179,8 +193,12 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `FormatFlagsConversionMismatchException` as on the JVM rather than a silently
   ignored flag. Numerically,
   `.coerceIn()`/`.coerceAtLeast()`/`.coerceAtMost()`, `.pow()`,
-  `.absoluteValue`, `.roundToInt()`; plus `Char.code`, `Int.toChar()`, and
-  `Any.toString()`.
+  `.absoluteValue`, `.roundToInt()`, the IEEE classifiers
+  `.isNaN()`/`.isInfinite()`/`.isFinite()`, and the unsigned 32-bit renderers
+  `Integer.toBinaryString`/`toHexString`/`toOctalString` — which differ from
+  `toString(radix)` only for a negative value (`Integer.toHexString(-1)` is
+  `ffffffff` where `(-1).toString(2)` is `-1`); plus `Char.code`,
+  `Int.toChar()`, and `Any.toString()`.
 - **Classes** — `class C(val x: Int, var y: Int) { fun m() {…} }`: primary-
   constructor properties (`val`/`var`), plain constructor parameters (a
   parameter with no `val`/`var` is forwarded, not stored), instance methods
@@ -291,8 +309,17 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `.take(n)`/`.drop(n)` (both clamp rather than fault), `.flatten()`,
   `.zip(other)`, `.chunked(n)`/`.windowed(n, step, partialWindows)`,
   `.subList(from, to)`, `.slice(indices)`,
-  `.union`/`.intersect`/`.subtract`,
-  `.joinToString(sep, prefix, postfix, limit, truncated)`, `.reversed()`. The
+  `.union`/`.intersect`/`.subtract` — in the infix spelling (`a union b`) as
+  well as the method one, the infix form reading only when it is on the same
+  line as its left operand, exactly as Kotlin's grammar admits it —
+  `.joinToString(sep, prefix, postfix, limit, truncated)`, `.reversed()` and
+  `.asReversed()`, `.contentToString()` on an array, `.orEmpty()`,
+  `.plusElement`/`.minusElement`. Beside the copying members are the IN-PLACE
+  ones a `MutableList` and a primitive array declare — `.sort()`,
+  `.sortDescending()`, `.reverse()`, `.sortBy { }`, `.sortByDescending { }` —
+  which answer `Unit` and reorder the receiver, where `sorted…`/`reversed()`
+  answer a new list and leave it alone. A `Map` adds `.getOrPut(k) { }` (which
+  keys on a null VALUE, not on an absent key) and `.getOrDefault(k, v)`. The
   `…OrNull` members answer `null` where their plain counterparts throw:
   `.maxOrNull()`/`.minOrNull()`, `.firstOrNull()`/`.lastOrNull()`,
   `.getOrNull(i)`/`.elementAtOrNull(i)` beside `.elementAt(i)`.
@@ -317,12 +344,15 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   A `Set` iterates, indexes into the sequence members, and feeds the
   higher-order functions like any other `Iterable`.
 - **Ranges** — first-class values, not just `for` headers: `1..5`,
-  `1 until 5`, `5 downTo 1`, `… step n`, bound to names, printed
+  `1 until 5`, `5 downTo 1`, `… step n`, the `.first`/`.last`/`.step`
+  properties (a downward progression reporting a NEGATIVE step, which is how it
+  knows its direction), bound to names, printed
   (`IntRange` shows `1..5`, `IntProgression` shows `1..9 step 2` — its last
   *reachable* element), aggregated (`(1..3).sum()`), mapped/filtered, and
   iterated. `x in r` / `x !in r` is step-aligned membership; `in` also works over
   a `List`, a `Map`'s keys, and a `String`'s substrings.
-- **Arrays** — `arrayOf`/`intArrayOf`/`doubleArrayOf`/`booleanArrayOf`, the
+- **Arrays** — `arrayOf`/`intArrayOf`/`longArrayOf`/`doubleArrayOf`/
+  `floatArrayOf`/`booleanArrayOf`/`charArrayOf`, the
   zero-filled `IntArray(n)`/`DoubleArray(n)`/`BooleanArray(n)`, and the
   index-lambda initializers `IntArray(n) { it * 2 }` / `DoubleArray(n) { … }` /
   `Array(n) { … }`, with `[i]` read
@@ -352,6 +382,8 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `.first`/`.last`/`.find`/`.findLast`/`.single` and their `…OrNull` forms,
   `.indexOfFirst`/`.indexOfLast`, `.filterIndexed`/`.forEachIndexed`,
   `.maxOf`/`.minOf`, `.mapValues`/`.mapKeys`, `.getOrElse(i) { }`,
+  `.distinctBy`, `.firstNotNullOf`/`.firstNotNullOfOrNull`, `.ifEmpty { }`,
+  `.sortBy`/`.sortByDescending` (in place), `.getOrPut(k) { }`,
   `.sortedWith { a, b -> … }`, and the transform-taking overloads of
   `.joinToString`, `.chunked`, `.windowed`, and `.zip`. `it` is the implicit
   parameter, and `mapIndexed` takes `(index, element)`. A `Map` receiver feeds
@@ -412,14 +444,19 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   function; a local of the same name shadows one. `val z: Int by lazy { … }` —
   on a top-level property, a class property **or a local `val`** — runs its block
   at the **first read** and caches the result, so an initializer with an effect
-  fires at use rather than at startup. `lazy` is the only supported delegate; any
+  fires at use rather than at startup. `lazy { … }` is also a VALUE in its own
+  right (`val c = lazy { … }`), building the same cell the delegate stores and
+  read through `.value` and `.isInitialized()` — the second of which must not
+  force it, since asking the question would otherwise answer it. `lazy` is the
+  only supported delegate; any
   other `by` is a compile error, and on a local it is the only one accepted at
   all (a local has no property object to hand a `getValue` delegate).
 - **`runCatching` / `Result`** — `runCatching { … }` runs a block and packages
   its outcome as `Success(v)` / `Failure(<throwable>)`, catching the runtime
   faults this frontend raises as well as an explicit `throw`. The readers are
   total: `isSuccess`/`isFailure`, `getOrNull()`/`exceptionOrNull()`,
-  `getOrElse { }`, `map { }`, `onSuccess { }`/`onFailure { }`.
+  `getOrElse { }`, `getOrDefault(v)`, `getOrThrow()` (which RE-RAISES the parked
+  failure rather than answering it), `map { }`, `onSuccess { }`/`onFailure { }`.
 - **Control flow** — `if`/`else` (statement **and** expression, incl.
   `else if`); `when` (statement **and** expression) in subject and subjectless
   forms, with literal, comma-grouped, `in`/`!in` range, `is`/`!is` type (incl.
@@ -836,7 +873,9 @@ the first match; every other member materializes first, which on an unbounded
 pipeline raises rather than hanging (the reference toolchain hangs). The stage
 list is copied into each derived sequence, so a base bound to a name is
 re-runnable and `dropWhile`'s progress never leaks between pipelines.
-`splitToSequence` is `split` — finite either way, so it materializes.
+`splitToSequence` is `split` — finite either way, so it materializes, and so
+does `sequenceOf(…)`, which is the read-only list of its elements carrying the
+`Sequence` tag (so `sequenceOf<Int>().first()` still says `Sequence is empty.`).
 
 Also landed: `Comparator`s — `compareBy` / `compareByDescending` over one or
 more key selectors, extended by `thenBy` / `thenByDescending`, and consumed by

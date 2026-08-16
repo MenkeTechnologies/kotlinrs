@@ -3312,7 +3312,7 @@ impl Compiler {
         // a stdlib parameter list would reject them outright.
         let bound;
         let args = if args.iter().any(|a| matches!(a, Expr::Named { .. }))
-            && builtin_params(name).is_some()
+            && (builtin_params(name).is_some() || matches!(name, "split" | "splitToSequence"))
             && !self
                 .infer_class(sc, recv)
                 .and_then(|c| self.classes.get(&c).cloned())
@@ -3386,6 +3386,17 @@ impl Compiler {
                 {
                     return self.compile_member(sc, &args[0], "toInt", &[], false, line)
                 }
+                // `Integer.toBinaryString`/`toHexString`/`toOctalString` are NOT
+                // `Int.toString(radix)`: they render the UNSIGNED 32-bit
+                // pattern, so `-1` is thirty-two `1`s where `(-1).toString(2)`
+                // is `-1`. Moved onto the argument as a member, the same way
+                // `parseInt` above becomes `String.toInt()`.
+                "Integer" | "java.lang.Integer"
+                    if matches!(name, "toBinaryString" | "toHexString" | "toOctalString")
+                        && args.len() == 1 =>
+                {
+                    return self.compile_member(sc, &args[0], name, &[], false, line)
+                }
                 _ => {}
             }
         }
@@ -3434,7 +3445,13 @@ impl Compiler {
                         match v {
                             Value::Int(n) => self.b.emit(Op::LoadInt(n), line),
                             Value::Float(f) => self.b.emit(Op::LoadFloat(f), line),
-                            _ => unreachable!("primitive_const yields only Int/Float"),
+                            // `Char.MIN_VALUE`/`MAX_VALUE`. A `Char` is a tagged
+                            // handle rather than a number, so it rides in the
+                            // constant pool exactly as a `'x'` literal does.
+                            other => {
+                                let idx = self.b.add_constant(other);
+                                self.b.emit(Op::LoadConst(idx), line)
+                            }
                         };
                         return Ok(vty);
                     }
@@ -4929,6 +4946,32 @@ impl Compiler {
                 self.b.emit(Op::CallBuiltin(KT_CLOSURE_CALL, 0), line);
                 Ok(Type::Unknown)
             }
+            // `lazy { … }` written as a VALUE rather than behind `by`. It builds
+            // the very cell the delegate form stores, so the two share one
+            // representation — the difference is only that a `by lazy` binding
+            // is forced on every read, where this one is forced by `.value`.
+            "lazy" if args.len() == 1 && is_lambda(&args[0]) => {
+                self.compile_expr(sc, &args[0])?;
+                self.b.emit(Op::Extended(KT_LAZY_NEW, 0), line);
+                Ok(Type::Obj)
+            }
+            // `sequenceOf(a, b, c)` is a FINITE sequence, so it is the read-only
+            // list its elements make, carrying the `Sequence` tag. The tag is
+            // what its diagnostics name — `sequenceOf<Int>().first()` says
+            // `Sequence is empty.`, not `List is empty.` — and applying it
+            // through the same `asSequence` the member spelling uses keeps the
+            // two builders from drifting.
+            "sequenceOf" => {
+                for a in args {
+                    self.compile_expr(sc, a)?;
+                }
+                self.b
+                    .emit(Op::Extended(KT_LIST_RO, args.len() as u8), line);
+                let nidx = self.b.add_constant(Value::str("asSequence"));
+                self.b.emit(Op::LoadConst(nidx), line);
+                self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 0), line);
+                Ok(Type::Obj)
+            }
             // `generateSequence(seed) { next }` — the one sequence that is
             // genuinely lazy here, because it is the one that can be endless.
             // The step answers Kotlin `null` to end it.
@@ -5123,7 +5166,8 @@ impl Compiler {
             // the boxed name to every one of them. Only `arrayOf` is left to
             // infer (see `crate::host::array_desc`), because its element type
             // is a static type argument this call does not carry.
-            "arrayOf" | "intArrayOf" | "doubleArrayOf" | "booleanArrayOf" | "charArrayOf" => {
+            "arrayOf" | "intArrayOf" | "longArrayOf" | "doubleArrayOf" | "floatArrayOf"
+            | "booleanArrayOf" | "charArrayOf" => {
                 for a in args {
                     self.compile_expr(sc, a)?;
                 }
@@ -6004,8 +6048,9 @@ impl Compiler {
                 | "mapOf" | "mutableMapOf" | "hashMapOf" | "emptyMap" | "setOf"
                 | "mutableSetOf" | "hashSetOf" | "linkedSetOf" | "sortedSetOf" | "emptySet"
                 | "HashSet" | "LinkedHashSet" | "TreeSet" | "HashMap" | "LinkedHashMap"
-                | "arrayOf" | "intArrayOf" | "doubleArrayOf" | "booleanArrayOf" | "charArrayOf"
-                | "IntArray" | "DoubleArray" | "BooleanArray" | "CharArray" | "Array" => Type::Obj,
+                | "arrayOf" | "intArrayOf" | "longArrayOf" | "doubleArrayOf" | "floatArrayOf"
+                | "booleanArrayOf" | "charArrayOf" | "IntArray" | "DoubleArray"
+                | "BooleanArray" | "CharArray" | "Array" => Type::Obj,
                 // `Pair`/`Triple`/`Result` are heap objects, and saying so is
                 // what routes `==` on them to STRUCTURAL equality: the native
                 // compare would coerce two handles to numbers and answer `true`
@@ -7241,7 +7286,9 @@ fn is_recv_scope_fn(name: &str) -> bool {
 fn array_literal_desc(name: &str) -> &'static str {
     match name {
         "intArrayOf" => "[I",
+        "longArrayOf" => "[J",
         "doubleArrayOf" => "[D",
+        "floatArrayOf" => "[F",
         "booleanArrayOf" => "[Z",
         "charArrayOf" => "[C",
         _ => "",
@@ -7335,6 +7382,11 @@ fn primitive_const(ty: &str, name: &str) -> Option<(Value, Type)> {
             (Value::Float(f64::NEG_INFINITY), Type::Double)
         }
         ("Double" | "Float", "NaN") => (Value::Float(f64::NAN), Type::Double),
+        // `Char.MIN_VALUE`/`MAX_VALUE` bound the UTF-16 CODE UNIT, so the top is
+        // `￿` and not the highest code point — both halves of a surrogate
+        // pair are ordinary `Char`s below it.
+        ("Char", "MIN_VALUE") => (crate::host::char_of(0), Type::Char),
+        ("Char", "MAX_VALUE") => (crate::host::char_of(0xFFFF), Type::Char),
         _ => return None,
     };
     Some(v)
@@ -7536,6 +7588,8 @@ fn is_coll_hof(name: &str) -> bool {
             | "minBy"
             | "sortedBy"
             | "sortedByDescending"
+            | "sortBy"
+            | "sortByDescending"
             | "associate"
             | "associateBy"
             | "associateWith"
@@ -7563,6 +7617,17 @@ fn is_coll_hof(name: &str) -> bool {
             | "filterKeys"
             | "filterValues"
             | "sortedWith"
+            | "distinctBy"
+            | "firstNotNullOf"
+            | "firstNotNullOfOrNull"
+            // `ifEmpty`/`ifBlank`/`replaceFirstChar`/`getOrPut` take a lambda in
+            // their ONLY overload, so they belong here rather than among the
+            // optional forms — but none is element-wise, and each answers before
+            // the shared per-element walk (see [`crate::host::coll_hof`]).
+            | "ifEmpty"
+            | "ifBlank"
+            | "replaceFirstChar"
+            | "getOrPut"
     )
 }
 
@@ -7646,6 +7711,30 @@ fn builtin_params(name: &str) -> Option<&'static [(&'static str, Dflt)]> {
 /// Kotlin's own rules are enforced: positional arguments come first, each name
 /// binds a parameter that exists, and no parameter is bound twice.
 fn bind_named_builtin(name: &str, args: &[Expr]) -> Result<Vec<Expr>, String> {
+    // `split(vararg delimiters: String, ignoreCase: Boolean = false,
+    // limit: Int = 0)` cannot be a [`builtin_params`] row: its first parameter
+    // is a VARARG, so a positional slot table would bind the second delimiter
+    // of `split("a", "b")` to `ignoreCase`. The two optional parameters are
+    // therefore lifted out by name and appended after the delimiters, where the
+    // host tells them apart by TYPE — a delimiter is a `String` or a `Char`,
+    // never an `Int` or a `Boolean`.
+    if matches!(name, "split" | "splitToSequence") {
+        let mut out: Vec<Expr> = Vec::with_capacity(args.len());
+        let mut tail: Vec<Expr> = Vec::new();
+        for a in args {
+            match a {
+                Expr::Named { name: arg, value } if arg == "limit" || arg == "ignoreCase" => {
+                    tail.push((**value).clone())
+                }
+                Expr::Named { name: arg, .. } => {
+                    return Err(format!("{name} has no parameter `{arg}`"))
+                }
+                other => out.push(other.clone()),
+            }
+        }
+        out.extend(tail);
+        return Ok(out);
+    }
     let Some(params) = builtin_params(name) else {
         let named = args
             .iter()

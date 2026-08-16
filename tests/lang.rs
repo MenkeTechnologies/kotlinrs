@@ -5189,3 +5189,303 @@ fn recursion_below_the_limit_still_completes() {
         "50000\n"
     );
 }
+
+/// `substringAfterLast`/`substringBeforeLast` search with Kotlin's
+/// `lastIndexOf`, whose default `startIndex` is `lastIndex` and NOT the
+/// receiver's length. The two rules agree for every non-empty delimiter and
+/// part only for an empty one, which is therefore the case that pins it:
+/// `"abc".substringAfterLast("")` is `c` on Kotlin, and the length-based search
+/// a `rfind` gives answers the empty string.
+#[test]
+fn the_last_substring_pair_searches_from_last_index_not_from_length() {
+    assert_eq!(stdout(r#"println("abc".substringAfterLast(""))"#), "c\n");
+    assert_eq!(stdout(r#"println("abc".substringBeforeLast(""))"#), "ab\n");
+    // The non-empty delimiter is the ordinary last occurrence.
+    assert_eq!(stdout(r#"println("a.b.c".substringAfterLast("."))"#), "c\n");
+    assert_eq!(
+        stdout(r#"println("a.b.c".substringBeforeLast("."))"#),
+        "a.b\n"
+    );
+    // An absent delimiter answers `missingDelimiterValue`, which DEFAULTS to
+    // the whole receiver — so the one-argument form is that default showing.
+    assert_eq!(stdout(r#"println("abc".substringAfterLast("z"))"#), "abc\n");
+    assert_eq!(
+        stdout(r#"println("abc".substringAfterLast("z", "d"))"#),
+        "d\n"
+    );
+    assert_eq!(stdout(r#"println("abc".substringBefore("z", "d"))"#), "d\n");
+}
+
+/// `Result.getOrDefault` and `Map.getOrDefault` are different members that
+/// share a name, and the host's member dispatch runs the map body for EVERY
+/// heap kind. Without a receiver test the `Result` call fell into the map body,
+/// found no key, and answered the map form's SECOND argument — which a `Result`
+/// call never passes, so every `runCatching { … }.getOrDefault(x)` was null.
+#[test]
+fn get_or_default_tells_a_result_receiver_from_a_map_one() {
+    assert_eq!(stdout("println(runCatching { 7 }.getOrDefault(-1))"), "7\n");
+    assert_eq!(
+        stdout(r#"println(runCatching { "x".toInt() }.getOrDefault(-1))"#),
+        "-1\n"
+    );
+    assert_eq!(stdout("println(runCatching { 7 }.getOrThrow())"), "7\n");
+    // The map form still reads its own two arguments.
+    assert_eq!(
+        stdout(r#"println(mapOf("a" to 1).getOrDefault("a", 0))"#),
+        "1\n"
+    );
+    assert_eq!(
+        stdout(r#"println(mapOf("a" to 1).getOrDefault("z", 0))"#),
+        "0\n"
+    );
+}
+
+/// `split`'s `limit` caps the number of parts and leaves the LAST one unsplit.
+/// It can only be passed by name — the delimiters are a vararg — and the empty
+/// delimiter is the case that separates a real scan from a post-hoc truncation:
+/// `"abc".split("", limit = 2)` is `[, abc]`, because the empty delimiter
+/// matches at position 0 before it matches anywhere else.
+#[test]
+fn split_limit_caps_the_parts_and_keeps_the_remainder_whole() {
+    assert_eq!(
+        stdout(r#"println("a,b,c".split(",", limit = 2))"#),
+        "[a, b,c]\n"
+    );
+    assert_eq!(
+        stdout(r#"println("a,b,c".split(",", limit = 1))"#),
+        "[a,b,c]\n"
+    );
+    // Zero is "no limit", not "no parts".
+    assert_eq!(
+        stdout(r#"println("a,b,c".split(",", limit = 0))"#),
+        "[a, b, c]\n"
+    );
+    assert_eq!(
+        stdout(r#"println("abc".split("", limit = 2))"#),
+        "[, abc]\n"
+    );
+    assert_eq!(
+        stdout(r#"println("abc".split("", limit = 3))"#),
+        "[, a, bc]\n"
+    );
+    // Several delimiters still race for the earliest match under a limit.
+    assert_eq!(
+        stdout(r#"println("a1b2c".split("1", "2", limit = 2))"#),
+        "[a, b2c]\n"
+    );
+    // The unlimited spellings are unchanged, including the empty delimiter's
+    // parts at both ends.
+    assert_eq!(stdout(r#"println("abc".split(""))"#), "[, a, b, c, ]\n");
+    assert_eq!(stdout(r#"println("a1b2c".split("1", "2"))"#), "[a, b, c]\n");
+}
+
+/// The infix set functions parse only when GLUED to the left operand's line.
+/// The lexer drops newlines, so without that test a following statement that
+/// begins with one of these names would be swallowed as an infix argument and
+/// disappear — `union`, unlike `shl`, is a plausible name for a local.
+#[test]
+fn the_infix_set_functions_do_not_swallow_the_next_statement() {
+    assert_eq!(stdout("println(setOf(1, 2) union setOf(3))"), "[1, 2, 3]\n");
+    assert_eq!(stdout("println(setOf(1, 2) intersect setOf(2))"), "[2]\n");
+    assert_eq!(stdout("println(setOf(1, 2) subtract setOf(1))"), "[2]\n");
+    // `union` on its own line is a local read, not an infix call on the value
+    // above it — both statements must survive.
+    assert_eq!(
+        prog(
+            "fun main() {\n\
+             \x20   val union = 5\n\
+             \x20   println(1)\n\
+             \x20   println(union)\n\
+             }"
+        ),
+        "1\n5\n"
+    );
+}
+
+/// The IN-PLACE reorderings answer `Unit` and mutate the receiver, where the
+/// `sorted…`/`reversed()` members copy and leave it alone.
+/// `sortByDescending` is `sortWith(compareByDescending(selector))`: the
+/// COMPARISON is inverted, so ties keep their input order — reversing a stable
+/// ascending sort would reverse the ties with them.
+#[test]
+fn the_in_place_sorts_mutate_the_receiver_and_keep_ties_in_order() {
+    assert_eq!(
+        prog("fun main() { val m = mutableListOf(3, 1, 2); m.sort(); println(m); m.sortDescending(); println(m); m.reverse(); println(m) }"),
+        "[1, 2, 3]\n[3, 2, 1]\n[1, 2, 3]\n"
+    );
+    // Two elements of equal length stay in the order they were given.
+    assert_eq!(
+        prog(
+            r#"fun main() { val t = mutableListOf("bb", "aa", "c"); t.sortByDescending { it.length }; println(t) }"#
+        ),
+        "[bb, aa, c]\n"
+    );
+    assert_eq!(
+        prog(
+            r#"fun main() { val l = mutableListOf("bb", "a", "ccc"); l.sortBy { it.length }; println(l) }"#
+        ),
+        "[a, bb, ccc]\n"
+    );
+    // A primitive array sorts in place through the same member.
+    assert_eq!(
+        prog("fun main() { val a = intArrayOf(3, 1, 2); a.sort(); println(a.contentToString()) }"),
+        "[1, 2, 3]\n"
+    );
+}
+
+/// `titlecaseChar` is the single-`Char` uppercase mapping EXCEPT for the two
+/// families that have a titlecase form of their own, and `capitalize` prefers
+/// that form when it differs. The exception list was measured against the
+/// reference toolchain over all 65 536 `Char`s.
+#[test]
+fn titlecase_differs_from_uppercase_only_for_the_two_measured_families() {
+    assert_eq!(stdout("println('a'.titlecaseChar())"), "A\n");
+    assert_eq!(stdout("println('1'.titlecaseChar())"), "1\n");
+    // The Latin digraphs titlecase to their MIDDLE form (U+01F2), where the
+    // uppercase mapping goes all the way to U+01F1.
+    assert_eq!(stdout(r"println('ǳ'.titlecaseChar().code)"), "498\n");
+    assert_eq!(stdout(r"println('ǳ'.uppercaseChar().code)"), "497\n");
+    assert_eq!(stdout(r"println('ǆ'.titlecaseChar().code)"), "453\n");
+    // Georgian Mkhedruli has no titlecase mapping and answers itself, where
+    // the uppercase one moves it into the Mtavruli block.
+    assert_eq!(stdout(r"println('ა'.titlecaseChar().code)"), "4304\n");
+    assert_eq!(stdout(r"println('ა'.uppercaseChar().code)"), "7312\n");
+    assert_eq!(stdout(r#"println("abc".capitalize())"#), "Abc\n");
+    assert_eq!(stdout(r#"println("ABC".capitalize())"#), "ABC\n");
+    assert_eq!(stdout(r#"println("ABC".decapitalize())"#), "aBC\n");
+    assert_eq!(stdout(r#"println("".capitalize())"#), "\n");
+}
+
+/// A progression's `step` is a PROPERTY, and it is the one range member the
+/// element list cannot answer — the elements no longer say how far apart they
+/// were. A downward progression reports a NEGATIVE step, which is how it knows
+/// its direction.
+#[test]
+fn a_progression_reports_its_own_step_with_its_sign() {
+    assert_eq!(stdout("println((1..10).step)"), "1\n");
+    assert_eq!(stdout("println((10 downTo 1).step)"), "-1\n");
+    assert_eq!(stdout("println((1..10 step 3).step)"), "3\n");
+    assert_eq!(stdout("println((10 downTo 1 step 3).step)"), "-3\n");
+    assert_eq!(stdout("println((1 until 10).step)"), "1\n");
+}
+
+/// `lazy { }` written as a VALUE builds the same cell `by lazy` stores, so the
+/// thunk runs at most once and only when `.value` asks for it.
+/// `isInitialized()` must NOT force it — asking the question would otherwise
+/// answer it.
+#[test]
+fn a_standalone_lazy_forces_once_and_only_when_asked() {
+    assert_eq!(
+        prog("fun main() { val x = lazy { 42 }; println(x.isInitialized()); println(x.value); println(x.isInitialized()) }"),
+        "false\n42\ntrue\n"
+    );
+    assert_eq!(
+        prog("fun main() { var n = 0; val y = lazy { n++; 7 }; println(y.value); println(y.value); println(n) }"),
+        "7\n7\n1\n"
+    );
+}
+
+/// `Integer.toBinaryString`/`toHexString`/`toOctalString` render the UNSIGNED
+/// 32-bit pattern, which is the whole difference from `toString(radix)` and is
+/// visible only for a negative value.
+#[test]
+fn the_integer_radix_renderers_are_unsigned_where_to_string_is_not() {
+    assert_eq!(stdout("println(Integer.toBinaryString(255))"), "11111111\n");
+    assert_eq!(stdout("println(Integer.toHexString(255))"), "ff\n");
+    assert_eq!(stdout("println(Integer.toOctalString(8))"), "10\n");
+    assert_eq!(stdout("println(Integer.toHexString(-1))"), "ffffffff\n");
+    assert_eq!(
+        stdout("println(Integer.toBinaryString(-1))"),
+        "11111111111111111111111111111111\n"
+    );
+    // The member spelling keeps the sign, so the two are not interchangeable.
+    assert_eq!(stdout("println((-1).toString(2))"), "-1\n");
+}
+
+/// `getOrPut` keys on a NULL VALUE rather than on an absent key — that is what
+/// the stdlib body tests — and its lambda runs only when it has to.
+#[test]
+fn get_or_put_computes_only_for_a_missing_key_and_stores_the_result() {
+    assert_eq!(
+        prog(
+            r#"fun main() { val m = mutableMapOf("a" to 1); println(m.getOrPut("a") { 99 }); println(m.getOrPut("b") { 2 }); println(m) }"#
+        ),
+        "1\n2\n{a=1, b=2}\n"
+    );
+    // The lambda is not called at all for a key that is already there.
+    assert_eq!(
+        prog(
+            r#"fun main() { var calls = 0; val m = mutableMapOf("a" to 1); m.getOrPut("a") { calls++; 9 }; println(calls) }"#
+        ),
+        "0\n"
+    );
+}
+
+/// `eachCountTo` fills the map it was GIVEN and answers that same map, so the
+/// caller's handle is the result. A fresh allocation here would leave the
+/// destination empty while still printing the right counts — the one shape
+/// where the return value alone cannot tell the two apart. It also
+/// ACCUMULATES onto a count that is already there.
+#[test]
+fn each_count_to_writes_into_the_destination_it_was_handed() {
+    assert_eq!(
+        prog(
+            r#"fun main() { val d = mutableMapOf<Char, Int>(); listOf("ax", "ay", "b").groupingBy { it.first() }.eachCountTo(d); println(d) }"#
+        ),
+        "{a=2, b=1}\n"
+    );
+    assert_eq!(
+        prog(
+            r#"fun main() { val d = mutableMapOf('a' to 10); println(listOf("ax", "b").groupingBy { it.first() }.eachCountTo(d)); println(d) }"#
+        ),
+        "{a=11, b=1}\n{a=11, b=1}\n"
+    );
+}
+
+/// The vararg `trim` overloads take a CHARACTER SET and share nothing with the
+/// whitespace ones but a name. Passing a `Char` used to be accepted and
+/// ignored, which answered the receiver unchanged — a silent wrong answer
+/// rather than a diagnostic.
+#[test]
+fn the_trim_family_takes_a_character_set_when_given_arguments() {
+    assert_eq!(stdout(r#"println("xxhixx".trimStart('x'))"#), "hixx\n");
+    assert_eq!(stdout(r#"println("xxhixx".trimEnd('x'))"#), "xxhi\n");
+    assert_eq!(stdout(r#"println("xyhixy".trim('x', 'y'))"#), "hi\n");
+    // A receiver with none of the named characters is left alone, and the
+    // no-argument spelling is still the whitespace trim.
+    assert_eq!(stdout(r#"println("hi".trimEnd('x'))"#), "hi\n");
+    assert_eq!(stdout(r#"println("  hi  ".trim() + "|")"#), "hi|\n");
+    assert_eq!(stdout(r#"println("".trimStart('x') + "|")"#), "|\n");
+}
+
+/// A `for` loop's `continue` targets the loop's INCREMENT, not its top — the
+/// counted form must still advance, or the loop never terminates. Pinned for
+/// every loop shape at once, because a jump patched to the wrong target is a
+/// hang rather than a wrong answer and would take the whole suite down with it.
+#[test]
+fn continue_advances_every_loop_shape_rather_than_repeating_it() {
+    assert_eq!(
+        prog("fun main() { for (i in 1..5) { if (i == 3) continue; print(i) }; println() }"),
+        "1245\n"
+    );
+    assert_eq!(
+        prog("fun main() { for (i in 5 downTo 1 step 2) { if (i == 3) continue; print(i) }; println() }"),
+        "51\n"
+    );
+    assert_eq!(
+        prog("fun main() { for (x in listOf(1, 2, 3)) { if (x == 2) continue; print(x) }; println() }"),
+        "13\n"
+    );
+    assert_eq!(
+        prog("fun main() { var j = 0; while (j < 5) { j++; if (j == 2) continue; print(j) }; println() }"),
+        "1345\n"
+    );
+    assert_eq!(
+        prog("fun main() { var j = 0; do { j++; if (j == 2) continue; print(j) } while (j < 4); println() }"),
+        "134\n"
+    );
+    assert_eq!(
+        prog("fun main() { outer@ for (a in 1..3) { for (b in 1..3) { if (b == 2) continue@outer; print(\"\" + a + b) } }; println() }"),
+        "112131\n"
+    );
+}

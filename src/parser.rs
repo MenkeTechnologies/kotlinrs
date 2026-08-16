@@ -386,6 +386,24 @@ fn is_bitwise_infix(w: &str) -> bool {
     matches!(w, "and" | "or" | "xor" | "shl" | "shr" | "ushr")
 }
 
+/// Whether an identifier spells one of the `kotlin.collections` infix set
+/// functions. They are ordinary `infix fun Iterable<T>.union(other)` extensions,
+/// so `a union b` and `a.union(b)` are one call written two ways.
+///
+/// Unlike [`is_bitwise_infix`], a call site is accepted only when the name is
+/// GLUED to the left operand's line. These three names are plausible ones for a
+/// user function, and the lexer drops newlines — without the line test,
+///
+///     val x = 1
+///     union(2)
+///
+/// would parse as `1 union (2)` and the second statement would disappear.
+/// Kotlin's own grammar has that rule (`infixFunctionCall` admits no newline
+/// before the identifier), so the gate is the spec, not a workaround.
+fn is_set_infix(w: &str) -> bool {
+    matches!(w, "union" | "intersect" | "subtract")
+}
+
 /// Whether an identifier is one of the declaration modifiers (see [`Mods`]).
 fn is_modifier_word(w: &str) -> bool {
     matches!(
@@ -2508,7 +2526,9 @@ impl Parser {
                 // lower here — so they need no operator of their own, and they
                 // sit at this precedence level with the other named infix
                 // functions.
-                Tok::Ident(n) if is_bitwise_infix(n) => {
+                Tok::Ident(n)
+                    if is_bitwise_infix(n) || (is_set_infix(n) && self.glued_to_prev()) =>
+                {
                     let name = self.ident()?;
                     let r = self.range_expr()?;
                     l = Expr::MethodCall {
