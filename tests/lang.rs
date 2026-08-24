@@ -5994,3 +5994,65 @@ fn the_callable_reference_operator_denotes_a_function() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// The map builders and the `toMap` conversions that were `unresolved
+/// reference`.
+///
+/// `linkedMapOf`/`sortedMapOf`/`TreeMap` are the ordered `Map` builders whose
+/// `Set` counterparts (`linkedSetOf`/`sortedSetOf`/`TreeSet`) already resolved;
+/// each one's ITERATION order is the whole reason it exists, so that is what
+/// these pin. Captured from `kotlinc` 2.4.10 on JRE 21.0.12.
+#[test]
+fn the_ordered_map_builders_and_to_map_conversions_resolve() {
+    // Insertion order, like `mapOf`.
+    assert_eq!(
+        stdout(r#"println(linkedMapOf(2 to "b", 1 to "a"))"#),
+        "{2=b, 1=a}\n"
+    );
+    // KEY order — the point of a `TreeMap`.
+    assert_eq!(
+        stdout(r#"println(sortedMapOf(2 to "b", 1 to "a"))"#),
+        "{1=a, 2=b}\n"
+    );
+    assert_eq!(
+        stdout(r#"println(sortedMapOf("b" to 1, "a" to 2).keys)"#),
+        "[a, b]\n"
+    );
+    // The JVM constructor's COPY form, which takes a map rather than pairs.
+    assert_eq!(
+        stdout("println(TreeMap(mapOf(3 to 1, 1 to 2)))"),
+        "{1=2, 3=1}\n"
+    );
+    // Structural `==`, which needs the builder to be typed as a heap object.
+    assert_eq!(
+        stdout("println(linkedMapOf(1 to 1) == linkedMapOf(1 to 1))"),
+        "true\n"
+    );
+
+    // `Iterable<Pair<K, V>>.toMap()`.
+    assert_eq!(stdout("println(listOf(1 to 2).toMap())"), "{1=2}\n");
+    // A later pair overwrites an earlier equal key, and the map keeps the
+    // FIRST insertion's position.
+    assert_eq!(stdout("println(listOf(1 to 2, 1 to 3).toMap())"), "{1=3}\n");
+    assert_eq!(
+        stdout(r#"println(listOf("a" to 1, "b" to 2).toMap().keys)"#),
+        "[a, b]\n"
+    );
+    assert_eq!(stdout("println(setOf(1 to 2).toMap())"), "{1=2}\n");
+    assert_eq!(stdout("println(listOf<Pair<Int,Int>>().toMap())"), "{}\n");
+
+    // `Map.toMap()` / `Map.toMutableMap()` — a COPY, in the receiver's own
+    // iteration order. The copy must be independent of the receiver.
+    assert_eq!(stdout("println(mapOf(1 to 2).toMap())"), "{1=2}\n");
+    assert_eq!(
+        stdout(
+            "val m = mapOf(1 to 2).toMutableMap(); m[3] = 4; println(m); println(mapOf(1 to 2))"
+        ),
+        "{1=2, 3=4}\n{1=2}\n"
+    );
+    // A `HashMap` copy keeps the receiver's BUCKET order, not insertion order.
+    assert_eq!(
+        stdout("println(hashMapOf(3 to 1, 1 to 2).toMap())"),
+        "{1=2, 3=1}\n"
+    );
+}

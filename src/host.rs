@@ -8024,6 +8024,21 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 )),
             };
         }
+        // `Map.toMap()` / `Map.toMutableMap()` — a COPY of the receiver in its
+        // own iteration order, which is what makes `m.toMutableMap()` the
+        // idiomatic way to get a writable map without disturbing `m`. Both were
+        // `unresolved reference` here; the `Iterable<Pair>.toMap()` below is a
+        // different receiver and does not reach a map.
+        "toMap" | "toMutableMap" if args.is_empty() => {
+            if let Some(entries) = with_obj(recv, |o| match o {
+                HeapObj::Map(entries) => Some(entries.clone()),
+                _ => None,
+            })
+            .flatten()
+            {
+                return Ok(alloc(HeapObj::Map(entries)));
+            }
+        }
         "keys" | "values" => {
             // Snapshot the entries under a shared borrow, then allocate the
             // result list separately (allocating inside `with_obj` would re-borrow
@@ -8819,6 +8834,38 @@ fn sequence_member(
                     kind.more_than_one()
                 )),
             })
+        }
+        // `Iterable<Pair<K, V>>.toMap()` — the no-selector sibling of
+        // `associate`, so it shares that member's duplicate-key rule: a later
+        // pair overwrites an earlier one with an equal key, and the map keeps
+        // FIRST-insertion order (`listOf(1 to 2, 1 to 3).toMap()` is `{1=3}`).
+        //
+        // A `Pair` and ONLY a `Pair`. `toMap` has no `Map.Entry` overload —
+        // `m.entries.filter { … }.toMap()` is `none of the following candidates
+        // is applicable` under kotlinc — and no `toMutableMap` sibling on an
+        // `Iterable` either; that one is `Map.toMutableMap()`, which is a
+        // different receiver and resolves elsewhere. Both were measured before
+        // being excluded.
+        "toMap" if args.is_empty() => {
+            let mut entries: Vec<(Value, Value)> = Vec::with_capacity(items.len());
+            for it in items {
+                let Some((k, v)) = with_obj(it, |o| match o {
+                    HeapObj::Pair(a, b) => Some((a.clone(), b.clone())),
+                    _ => None,
+                })
+                .flatten() else {
+                    return Some(Err(format!(
+                        "unresolved reference: toMap on {}",
+                        recv.map(obj_label)
+                            .unwrap_or_else(|| kind.empty().to_string())
+                    )));
+                };
+                match entries.iter_mut().find(|(ek, _)| value_eq(ek, &k)) {
+                    Some(slot) => slot.1 = v,
+                    None => entries.push((k, v)),
+                }
+            }
+            return Some(Ok(alloc(HeapObj::Map(entries))));
         }
         // `toSet` yields a `Set`; `distinct` yields a `List` with the same
         // elements — the pair Kotlin draws the distinction between.

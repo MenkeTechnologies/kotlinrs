@@ -5434,7 +5434,8 @@ impl Compiler {
                     .emit(Op::CallBuiltin(KT_SET_VM, args.len() as u8), line);
                 Ok(Type::Obj)
             }
-            "mapOf" | "mutableMapOf" | "hashMapOf" | "emptyMap" | "HashMap" | "LinkedHashMap" => {
+            "mapOf" | "mutableMapOf" | "hashMapOf" | "emptyMap" | "HashMap" | "LinkedHashMap"
+            | "linkedMapOf" | "sortedMapOf" | "TreeMap" => {
                 // Each argument is a `k to v` Pair — except in the copy form
                 // `HashMap(other)`, whose single argument is a whole map.
                 for a in args {
@@ -6258,9 +6259,10 @@ impl Compiler {
                 | "mapOf" | "mutableMapOf" | "hashMapOf" | "emptyMap" | "setOf"
                 | "mutableSetOf" | "hashSetOf" | "linkedSetOf" | "sortedSetOf" | "emptySet"
                 | "HashSet" | "LinkedHashSet" | "TreeSet" | "HashMap" | "LinkedHashMap"
-                | "arrayOf" | "intArrayOf" | "longArrayOf" | "doubleArrayOf" | "floatArrayOf"
-                | "booleanArrayOf" | "charArrayOf" | "IntArray" | "DoubleArray"
-                | "BooleanArray" | "CharArray" | "Array" => Type::Obj,
+                | "linkedMapOf" | "sortedMapOf" | "TreeMap" | "arrayOf" | "intArrayOf"
+                | "longArrayOf" | "doubleArrayOf" | "floatArrayOf" | "booleanArrayOf"
+                | "charArrayOf" | "IntArray" | "DoubleArray" | "BooleanArray" | "CharArray"
+                | "Array" => Type::Obj,
                 // `Pair`/`Triple`/`Result` are heap objects, and saying so is
                 // what routes `==` on them to STRUCTURAL equality: the native
                 // compare would coerce two handles to numbers and answer `true`
@@ -7079,14 +7081,14 @@ impl Compiler {
     fn emit_coll_spec(&mut self, name: &str, argc: usize) {
         let order = match name {
             "hashSetOf" | "HashSet" | "hashMapOf" | "HashMap" => COLL_HASH,
-            "sortedSetOf" | "TreeSet" => COLL_SORTED,
+            "sortedSetOf" | "TreeSet" | "sortedMapOf" | "TreeMap" => COLL_SORTED,
             _ => 0,
         };
         // The JVM constructors take a collection to copy, or nothing at all.
         // The Kotlin builders take their elements.
         let ctor = matches!(
             name,
-            "HashSet" | "LinkedHashSet" | "TreeSet" | "HashMap" | "LinkedHashMap"
+            "HashSet" | "LinkedHashSet" | "TreeSet" | "HashMap" | "LinkedHashMap" | "TreeMap"
         );
         let shape = match (ctor, argc) {
             (true, 0) => COLL_DEFAULT_CAP,
@@ -7159,7 +7161,9 @@ impl Compiler {
                         return Some("Set".to_string())
                     }
                     "mapOf" | "mutableMapOf" | "hashMapOf" | "emptyMap" | "HashMap"
-                    | "LinkedHashMap" => return Some("Map".to_string()),
+                    | "LinkedHashMap" | "linkedMapOf" | "sortedMapOf" | "TreeMap" => {
+                        return Some("Map".to_string())
+                    }
                     // The primitive array factories, whose name states the
                     // element type. `arrayOf`/`Array` are deliberately absent:
                     // their elements are unconstrained.
