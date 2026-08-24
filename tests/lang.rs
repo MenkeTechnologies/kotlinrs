@@ -5763,7 +5763,9 @@ fn a_top_level_val_resolves_the_operator_conventions_of_its_class() {
     );
     // A member call on an unannotated global resolves statically too.
     assert_eq!(
-        stdout(&format!("{decl}val a = K(9)\nfun main() {{ println(a.v) }}")),
+        stdout(&format!(
+            "{decl}val a = K(9)\nfun main() {{ println(a.v) }}"
+        )),
         "9\n"
     );
 }
@@ -5806,7 +5808,10 @@ fn a_top_level_val_holding_a_lambda_is_callable() {
     // A non-callable global keeps its COMPILE-TIME diagnostic rather than
     // becoming a closure call that only fails at run time.
     let out = eval("val n = 5\nfun main() { println(n(1)) }");
-    assert!(!out.status.success(), "`n(1)` on an Int global must not compile");
+    assert!(
+        !out.status.success(),
+        "`n(1)` on an Int global must not compile"
+    );
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("unresolved reference: n"),
         "stderr was {:?}",
@@ -5896,7 +5901,9 @@ fn the_callable_reference_operator_denotes_a_function() {
         "[2, 3, 4]\n"
     );
     assert_eq!(
-        stdout("fun add(a: Int, b: Int) = a + b\nfun main() { println(listOf(1,2,3).fold(0, ::add)) }"),
+        stdout(
+            "fun add(a: Int, b: Int) = a + b\nfun main() { println(listOf(1,2,3).fold(0, ::add)) }"
+        ),
         "6\n"
     );
     assert_eq!(
