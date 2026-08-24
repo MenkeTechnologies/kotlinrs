@@ -6415,6 +6415,24 @@ fn builder_units(v: &Value) -> Option<Vec<u16>> {
     .flatten()
 }
 
+/// A builder's length in code units, WITHOUT copying its content.
+///
+/// [`builder_units`] clones the whole buffer, and every `StringBuilder` member
+/// used to go through it — including `append`, which then copied the entire
+/// string it was appending to, once per call. That made building a string one
+/// piece at a time quadratic: 25k / 50k / 100k / 200k appends of ten characters
+/// took 0.18 s / 0.56 s / 2.08 s / 8.37 s, four times the work for twice the
+/// input, where the JVM's `AbstractStringBuilder` is amortized constant.
+/// Dispatch reads the length first and materializes a snapshot only in the two
+/// arms that actually need the content.
+fn builder_len(v: &Value) -> Option<usize> {
+    with_obj(v, |o| match o {
+        HeapObj::Builder { units, .. } => Some(units.len()),
+        _ => None,
+    })
+    .flatten()
+}
+
 /// Rewrite a builder's content in place, growing its capacity to fit the
 /// result. Answers `f`'s value, or `None` when `v` is not a builder.
 fn edit_builder<T>(v: &Value, f: impl FnOnce(&mut Vec<u16>) -> T) -> Option<T> {
@@ -6469,11 +6487,21 @@ fn sioobe_range(from: i64, to: i64, len: usize) -> String {
 fn builder_method(
     vm: &mut VM,
     recv: &Value,
-    units: Vec<u16>,
+    len: usize,
     name: &str,
     args: &[Value],
 ) -> Result<Value, String> {
-    let len = units.len();
+    /// The receiver's content, copied.
+    ///
+    /// Only the two arms below need it — `toString`, and the delegation of
+    /// every inherited `CharSequence` member to [`kt_method`] on a snapshot.
+    /// Every mutating member reaches the buffer through `edit_builder`, which
+    /// borrows it, and reads nothing from here but `len`. Taking the copy per
+    /// arm rather than per call is what makes `append` amortized constant; see
+    /// [`builder_len`].
+    fn content(recv: &Value) -> Vec<u16> {
+        builder_units(recv).unwrap_or_default()
+    }
     /// The JVM's SINGLE-INDEX diagnostic — `charAt`, `deleteCharAt`,
     /// `setCharAt`. See [`sioobe_index`] for why the wording is the one it is.
     fn oob(i: i64, len: usize) -> String {
@@ -6505,7 +6533,7 @@ fn builder_method(
         Ok(recv.clone())
     };
     match name {
-        "toString" => Ok(Value::str(utf16_to_string(&units))),
+        "toString" => Ok(Value::str(utf16_to_string(&content(recv)))),
         // `StringBuilder` does not override `equals`/`hashCode`, so both are
         // `Object`'s — identity, NOT the content two equal-looking builders
         // share. Delegating them to the `String` snapshot would quietly make
@@ -6663,7 +6691,7 @@ fn builder_method(
             });
             Ok(Value::Undef)
         }
-        _ => kt_method(vm, &Value::str(utf16_to_string(&units)), name, args)
+        _ => kt_method(vm, &Value::str(utf16_to_string(&content(recv))), name, args)
             .map_err(|e| e.replace("on String", "on StringBuilder")),
     }
 }
@@ -7637,8 +7665,8 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     // `CharSequence`, not a collection, so none of the collection members below
     // apply to it, and the ones whose NAMES collide (`clear`, `remove`, `set`)
     // mean something different or nothing at all.
-    if let Some(units) = builder_units(recv) {
-        return builder_method(vm, recv, units, name, args);
+    if let Some(len) = builder_len(recv) {
+        return builder_method(vm, recv, len, name, args);
     }
     // A lazy sequence. `take`/`drop` stay lazy — `take` is the ONLY thing that
     // bounds an endless generator, so materializing it first would defeat the
@@ -7798,7 +7826,18 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         }
         "add" => {
             let v = args.first().cloned().unwrap_or(Value::Undef);
-            let seen = key_position(vm, recv, &v).is_some();
+            // Only a `Set` needs to know whether the element is already there —
+            // it decides both the answer and whether the collection changes at
+            // all. A `List` always appends and always answers `true`.
+            //
+            // The probe is a full scan that re-enters the VM for a user
+            // `equals`, so running it unconditionally made BUILDING a list
+            // quadratic while its result was discarded: 20k / 40k / 80k
+            // `xs.add(i)` calls took 15 s / 59 s / 234 s — four times the work
+            // for twice the input — where `items.push` below is amortized
+            // constant.
+            let is_set = with_obj(recv, |o| matches!(o, HeapObj::Set(_))).unwrap_or(false);
+            let seen = is_set && key_position(vm, recv, &v).is_some();
             let added = with_obj_mut(recv, |o| match o {
                 HeapObj::List(items) => {
                     items.push(v);
