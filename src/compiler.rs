@@ -1360,6 +1360,31 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
     };
     (c.math_scope, c.math_star) = math_scope(&program.imports);
 
+    // Backfill the CLASS of an unannotated top-level property from its
+    // initializer. `PropMeta.class` above copies the *annotation*, so
+    // `val p: Op = Op(1)` carried `Op` and `val p = Op(1)` carried nothing —
+    // and `infer_class` reads exactly that field for a global. Everything that
+    // keys off a receiver's class therefore stopped at the file scope while
+    // working inside a function, where the local binding table records it:
+    // `Op(1) + Op(2)` and a local `val a = Op(1); a + b` both resolved the
+    // `plus` convention, and the same two objects held in top-level `val`s
+    // failed to compile with `unresolved reference: plus on Op`.
+    //
+    // A single forward pass in declaration order is enough for a chain
+    // (`val a = Op(1)` then `val b = a`) because that is the order the
+    // initializers run in — a property may only name one declared before it.
+    for p in &program.props {
+        if p.class.is_some() || p.lazy || p.delegate {
+            continue;
+        }
+        let sc = Scope::new();
+        if let Some(cls) = c.infer_class(&sc, &p.init) {
+            if let Some(g) = c.globals.get_mut(&p.name) {
+                g.class = Some(cls);
+            }
+        }
+    }
+
     // Preamble: publish each declared type's supertypes to the runtime (which
     // `is` checks, `catch` matching, and the throwable display form all consult),
     // build `object` singletons into globals, then bind main's args (an empty
@@ -5287,6 +5312,36 @@ impl Compiler {
                     let idx = self.b.add_name(sub.as_deref().unwrap_or(name));
                     self.b.emit(Op::Call(idx, sig.arity as u8), line);
                     return Ok(self.call_ret(sc, &sig, args));
+                }
+                // A TOP-LEVEL property holding a first-class function value:
+                // `val f = { x: Int -> x + 1 }` at file scope, then `f(3)`.
+                // The local-slot arm above already covers the same shape for a
+                // `val` inside a function; without this arm a global one was an
+                // `unresolved reference`, because every remaining arm looks for a
+                // *callable declaration* and a property is not one. Placed AFTER
+                // the free-function lookup so a top-level `fun f` still wins —
+                // Kotlin keeps functions and properties in separate namespaces
+                // and resolves a call against the function first.
+                //
+                // Gated on the property's type so `val n = 5; n(1)` keeps its
+                // compile-time diagnostic instead of becoming a closure call that
+                // only fails at run time: a lambda-valued global infers `Obj`
+                // (a closure handle) and an annotated `(Int) -> Int` one infers
+                // `Unknown`, and neither spelling can be a primitive.
+                if let Some(p) = self.globals.get(name).cloned() {
+                    if matches!(p.ty, Type::Obj | Type::Unknown) {
+                        let g = self.b.add_name(name);
+                        self.b.emit(Op::GetVar(g), line);
+                        if p.lazy {
+                            self.b.emit(Op::CallBuiltin(KT_LAZY_GET, 0), line);
+                        }
+                        for a in args {
+                            self.compile_expr(sc, a)?;
+                        }
+                        self.b
+                            .emit(Op::CallBuiltin(KT_CLOSURE_CALL, args.len() as u8), line);
+                        return Ok(Type::Unknown);
+                    }
                 }
                 // An extension on the enclosing receiver, called without a
                 // qualifier from inside a method or another extension.

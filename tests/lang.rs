@@ -5706,3 +5706,110 @@ fn the_any_of_searches_index_in_utf16_units_and_take_the_first_needle() {
         "(0, a)\n"
     );
 }
+
+/// A top-level `val` records its class, so every receiver-keyed rule reaches
+/// file scope and not only function scope.
+///
+/// `PropMeta.class` was copied from the type ANNOTATION alone, so `val p = C()`
+/// carried no class while `val p: C = C()` did — and `infer_class` reads exactly
+/// that field for a global. The operator CONVENTIONS are resolved against the
+/// left operand's class, so the same two objects answered `K3` held in locals
+/// and failed to compile with `unresolved reference: plus on K` held in
+/// top-level `val`s. Measured against `kotlinc` 2.4.10 / JRE 21.0.12: every
+/// line below prints what the reference prints.
+#[test]
+fn a_top_level_val_resolves_the_operator_conventions_of_its_class() {
+    let decl = r#"class K(val v: Int) {
+    operator fun plus(o: K) = K(v + o.v)
+    operator fun times(o: K) = K(v * o.v)
+    operator fun compareTo(other: K) = v - other.v
+    override fun toString() = "K" + v
+}
+"#;
+    // Unannotated — the case that did not compile at all.
+    assert_eq!(
+        stdout(&format!(
+            "{decl}val a = K(1)\nval b = K(2)\nfun main() {{ println(a + b) }}"
+        )),
+        "K3\n"
+    );
+    assert_eq!(
+        stdout(&format!(
+            "{decl}val a = K(3)\nval b = K(4)\nfun main() {{ println(a * b) }}"
+        )),
+        "K12\n"
+    );
+    // `<` is `compareTo`'s SIGN, and it is keyed off the same class field.
+    assert_eq!(
+        stdout(&format!(
+            "{decl}val a = K(1)\nval b = K(2)\nfun main() {{ println(a < b) }}"
+        )),
+        "true\n"
+    );
+    // A global naming an EARLIER global inherits its class through the same
+    // forward pass, in the order the initializers run.
+    assert_eq!(
+        stdout(&format!(
+            "{decl}val a = K(5)\nval b = a\nfun main() {{ println(b + K(1)) }}"
+        )),
+        "K6\n"
+    );
+    // The annotated spelling already worked and must keep working.
+    assert_eq!(
+        stdout(&format!(
+            "{decl}val a: K = K(7)\nfun main() {{ println(a + K(1)) }}"
+        )),
+        "K8\n"
+    );
+    // A member call on an unannotated global resolves statically too.
+    assert_eq!(
+        stdout(&format!("{decl}val a = K(9)\nfun main() {{ println(a.v) }}")),
+        "9\n"
+    );
+}
+
+/// A top-level `val` holding a lambda is callable as `f(x)`.
+///
+/// The local-slot arm of `compile_call` covered the same shape inside a
+/// function; at file scope every remaining arm looks for a callable
+/// DECLARATION, and a property is not one, so `f(3)` was `unresolved
+/// reference: f`. Reference `kotlinc` prints `103` / `4` for the first two.
+#[test]
+fn a_top_level_val_holding_a_lambda_is_callable() {
+    assert_eq!(
+        stdout("val f = { x: Int -> x + 100 }\nfun main() { println(f(3)) }"),
+        "103\n"
+    );
+    // The annotated function-type spelling infers `Unknown`, not `Obj`.
+    assert_eq!(
+        stdout("val f: (Int) -> Int = { x -> x + 1 }\nfun main() { println(f(3)) }"),
+        "4\n"
+    );
+    assert_eq!(
+        stdout("val f = { a: Int, b: Int -> a * b }\nfun main() { println(f(3, 4)) }"),
+        "12\n"
+    );
+    // A top-level `fun` of the same name still wins: Kotlin keeps functions and
+    // properties in separate namespaces and resolves a CALL against the
+    // function. Reference prints `fun`.
+    assert_eq!(
+        stdout(
+            "val f = { _: Int -> \"val\" }\nfun f(x: Int) = \"fun\"\nfun main() { println(f(1)) }"
+        ),
+        "fun\n"
+    );
+    // A local binding still shadows the global, as it did before.
+    assert_eq!(
+        stdout("val f = { x: Int -> x + 1 }\nfun main() { val f = { x: Int -> x + 2 }; println(f(1)) }"),
+        "3\n"
+    );
+    // A non-callable global keeps its COMPILE-TIME diagnostic rather than
+    // becoming a closure call that only fails at run time.
+    let out = eval("val n = 5\nfun main() { println(n(1)) }");
+    assert!(!out.status.success(), "`n(1)` on an Int global must not compile");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unresolved reference: n"),
+        "stderr was {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
