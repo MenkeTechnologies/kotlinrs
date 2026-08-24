@@ -96,7 +96,7 @@ fn fnv1a(s: &str) -> u64 {
 /// fewer records than this is reporting on a TRUNCATED file rather than on the
 /// frontend — and `n > 0` would have called that a pass. Raise it with the
 /// corpus; never lower it to accommodate a deletion.
-const CORPUS_FLOOR: usize = 675;
+const CORPUS_FLOOR: usize = 722;
 
 #[test]
 fn frozen_corpus_matches_reference_kotlin() {

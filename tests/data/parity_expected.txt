@@ -673,3 +673,50 @@ fun main() {\n    println("abc".indexOfAny(listOf("B", "c"), 0, true))\n    prin
 fun main() {\n    println("abc".dropLastWhile { it > 'a' })\n    println("abc".takeLastWhile { it > 'a' })\n    println(listOf(1, 2, 3).dropLastWhile { it > 1 })\n    println(listOf(1, 2, 3).takeLastWhile { it > 1 })\n    println(listOf<Int>().dropLastWhile { it > 1 })\n}	a\nbc\n[1]\n[2, 3]\n[]\n
 fun main() {\n    println("abc".coerceAtLeast("b"))\n    println("abc".coerceAtMost("b"))\n    println("abc".coerceAtLeast("a"))\n}	b\nabc\nabc\n
 fun main() {\n    println("kelvin".indexOf('K', 0, true))\n    println("aϑb".replace("ϴ", "!", true))\n    println("aİb".split("i", ignoreCase = true))\n    println("İx".replace("ı", "!", true))\n}	0\na!b\n[a, b]\n!x\n
+class K(val v: Int) {\n    operator fun plus(o: K) = K(v + o.v)\n    override fun toString() = "K" + v\n}\nval ka = K(1)\nval kb = K(2)\nfun main() {\n    println(ka + kb)\n}	K3\n
+class K(val v: Int) {\n    operator fun times(o: K) = K(v * o.v)\n    override fun toString() = "K" + v\n}\nval ka = K(3)\nval kb = K(4)\nfun main() {\n    println(ka * kb)\n}	K12\n
+class K(val v: Int) {\n    operator fun compareTo(other: K) = v - other.v\n}\nval ka = K(1)\nval kb = K(2)\nfun main() {\n    println(ka < kb)\n}	true\n
+class K(val v: Int) {\n    operator fun plus(o: K) = K(v + o.v)\n    override fun toString() = "K" + v\n}\nval ka = K(5)\nval kb = ka\nfun main() {\n    println(kb + K(1))\n}	K6\n
+class K(val v: Int)\nval ka = K(9)\nfun main() {\n    println(ka.v)\n}	9\n
+val f = { x: Int -> x + 100 }\nfun main() {\n    println(f(3))\n}	103\n
+val f: (Int) -> Int = { x -> x + 1 }\nfun main() {\n    println(f(3))\n}	4\n
+val f = { a: Int, b: Int -> a * b }\nfun main() {\n    println(f(3, 4))\n}	12\n
+val f = { _: Int -> "val" }\nfun f(x: Int) = "fun"\nfun main() {\n    println(f(1))\n}	fun\n
+fun main() {\n    println(mapOf("a" to 1, "b" to 2).map { (k, v) -> "$k=$v" })\n}	[a=1, b=2]\n
+fun main() {\n    println(mapOf("a" to 1, "b" to 2).filter { (k, v) -> v > 1 })\n}	{b=2}\n
+fun main() {\n    println(listOf(1 to 2, 3 to 4).map { (a, b) -> a + b })\n}	[3, 7]\n
+fun main() {\n    println(listOf(1 to 2).map { (a, _) -> a })\n}	[1]\n
+fun main() {\n    println(listOf(1 to 2, 3 to 1).sortedBy { (_, v) -> v })\n}	[(3, 1), (1, 2)]\n
+fun main() {\n    println(listOf(1 to 2).map { (x: Int, y: Int) -> x - y })\n}	[-1]\n
+fun main() {\n    println(listOf(Triple(1, 2, 3)).map { (x, y, z) -> x + y + z })\n}	[6]\n
+data class Rec(val n: String, val q: Int)\nfun main() {\n    println(listOf(Rec("r", 7)).map { (n, q) -> "$n$q" })\n}	[r7]\n
+fun main() {\n    println(mapOf(1 to 2).entries.map { (k, v) -> k * v })\n}	[2]\n
+fun main() {\n    println(listOf(1 to "x").associate { (k, v) -> v to k })\n}	{x=1}\n
+val a = 1\nval b = 2\nfun main() {\n    println(listOf(1, 2, 3).map { (a + b).toString() }.size)\n}	3\n
+fun main() {\n    println(listOf(1).map { (it) })\n}	[1]\n
+fun inc(x: Int) = x + 1\nfun main() {\n    println(listOf(1, 2, 3).map(::inc))\n}	[2, 3, 4]\n
+fun add(a: Int, b: Int) = a + b\nfun main() {\n    println(listOf(1, 2, 3).fold(0, ::add))\n}	6\n
+fun odd(x: Int) = x % 2 == 1\nfun main() {\n    println(listOf(1, 2, 3).filter(::odd))\n}	[1, 3]\n
+fun nul(): Int = 7\nfun main() {\n    val f = ::nul\n    println(f())\n}	7\n
+fun main() {\n    listOf("x", "y").forEach(::println)\n}	x\ny\n
+class C(val v: Int) {\n    override fun toString() = "C" + v\n}\nfun main() {\n    println(listOf(1, 2).map(::C))\n}	[C1, C2]\n
+class C(val v: Int) {\n    fun twice() = v * 2\n}\nfun main() {\n    println(listOf(C(1), C(2)).map(C::twice))\n}	[2, 4]\n
+class C(val v: Int)\nfun main() {\n    println(listOf(C(1), C(2)).map(C::v))\n}	[1, 2]\n
+data class P(val n: String, val q: Int)\nfun main() {\n    println(listOf(P("a", 1), P("b", 2)).sortedByDescending(P::q))\n}	[P(n=b, q=2), P(n=a, q=1)]\n
+fun main() {\n    println(listOf("aa", "b").map(String::length))\n}	[2, 1]\n
+fun main() {\n    println(listOf("aa", "b").map(String::uppercase))\n}	[AA, B]\n
+class C(val v: Int) {\n    fun plusN(n: Int) = v + n\n}\nfun main() {\n    val c = C(5)\n    println(listOf(1, 2).map(c::plusN))\n}	[6, 7]\n
+var n = 0\nfun bump(): String {\n    n += 1\n    return "s"\n}\nfun main() {\n    val f = bump()::length\n    println(listOf(1, 2, 3).map { f() })\n    println(n)\n}	[1, 1, 1]\n1\n
+fun main() {\n    println(linkedMapOf(2 to "b", 1 to "a"))\n}	{2=b, 1=a}\n
+fun main() {\n    println(sortedMapOf(2 to "b", 1 to "a"))\n}	{1=a, 2=b}\n
+fun main() {\n    println(sortedMapOf("b" to 1, "a" to 2).keys)\n}	[a, b]\n
+fun main() {\n    println(linkedMapOf(1 to 1) == linkedMapOf(1 to 1))\n}	true\n
+fun main() {\n    println(listOf(1 to 2, 1 to 3).toMap())\n}	{1=3}\n
+fun main() {\n    println(listOf("a" to 1, "b" to 2).toMap().keys)\n}	[a, b]\n
+fun main() {\n    println(setOf(1 to 2).toMap())\n}	{1=2}\n
+fun main() {\n    println(listOf<Pair<Int, Int>>().toMap())\n}	{}\n
+fun main() {\n    val m = mapOf(1 to 2).toMutableMap()\n    m[3] = 4\n    println(m)\n    println(mapOf(1 to 2))\n}	{1=2, 3=4}\n{1=2}\n
+fun main() {\n    println(hashMapOf(3 to 1, 1 to 2).toMap())\n}	{1=2, 3=1}\n
+fun main() {\n    val sb = StringBuilder()\n    for (i in 1..5) {\n        sb.append("ab")\n    }\n    println(sb.toString())\n    println(sb.length)\n}	ababababab\n10\n
+fun main() {\n    val xs = mutableListOf<Int>()\n    for (i in 1..5) {\n        xs.add(i)\n    }\n    println(xs)\n    println(xs.add(3))\n}	[1, 2, 3, 4, 5]\ntrue\n
+fun main() {\n    val s = mutableSetOf(1, 2)\n    println(s.add(2))\n    println(s.add(3))\n    println(s)\n}	false\ntrue\n[1, 2, 3]\n
