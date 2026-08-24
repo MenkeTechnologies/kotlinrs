@@ -2693,6 +2693,28 @@ impl Parser {
                 e = Expr::NotNull(Box::new(e));
                 continue;
             }
+            // `recv::name` — a member reference. Whether the receiver names a
+            // TYPE (`String::length`, whose function takes the receiver as its
+            // first parameter) or is a VALUE to capture (`s::length`) is a
+            // question about scope, so the compiler decides it; the parser only
+            // records which expression was written.
+            if self.at(&Tok::ColonColon) {
+                let line = self.line();
+                self.bump();
+                let name = match self.peek().clone() {
+                    Tok::Ident(n) => {
+                        self.bump();
+                        n
+                    }
+                    other => return Err(format!("expected a name after `::`, found {other:?}")),
+                };
+                e = Expr::FunRef {
+                    recv: Some(Box::new(e)),
+                    name,
+                    line,
+                };
+                continue;
+            }
             // Invocation of the value the chain has produced so far — `f()()`,
             // `lst[0](7)`, `{ x: Int -> x }(9)`, `m["k"]!!()`. Restricted to
             // chains that already ended in a call/index/lambda so a bare value
@@ -3064,6 +3086,24 @@ impl Parser {
     fn primary(&mut self) -> Result<Expr, String> {
         let line = self.line();
         match self.peek().clone() {
+            // `::name` — a reference to a top-level function or a constructor,
+            // written with no receiver. The receiver-ful spellings
+            // (`Type::name`, `expr::name`) are postfix and are handled in
+            // `postfix`.
+            Tok::ColonColon => {
+                self.bump();
+                match self.peek().clone() {
+                    Tok::Ident(n) => {
+                        self.bump();
+                        Ok(Expr::FunRef {
+                            recv: None,
+                            name: n,
+                            line,
+                        })
+                    }
+                    other => Err(format!("expected a name after `::`, found {other:?}")),
+                }
+            }
             Tok::Int(n) => {
                 self.bump();
                 Ok(Expr::Int(n))

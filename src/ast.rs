@@ -867,6 +867,22 @@ pub enum Expr {
         params: Vec<(String, Type)>,
         body: Vec<Stmt>,
     },
+    /// A callable reference — `::inc`, `String::length`, `obj::method`.
+    ///
+    /// The three spellings differ only in `recv`: absent for a free function or
+    /// a constructor, a TYPE name for an unbound member reference (the resulting
+    /// function takes the receiver as its first parameter), and any other
+    /// expression for a bound one (the receiver is evaluated once, where the
+    /// reference is written, and captured).
+    ///
+    /// It is not lowered here because its ARITY is not known until the compiler
+    /// has the callee's signature; see `Compiler::compile_fun_ref`, which
+    /// synthesizes the equivalent [`Expr::Lambda`] and compiles that.
+    FunRef {
+        recv: Option<Box<Expr>>,
+        name: String,
+        line: u32,
+    },
     /// `if` used as an expression (each branch's last statement is its value).
     If(IfExpr),
     /// `when` used as an expression (the matched arm's value).

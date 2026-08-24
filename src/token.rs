@@ -66,6 +66,10 @@ pub enum Tok {
     RBracket, // ]
     Comma,
     Colon,
+    /// `::` — the callable-reference operator: `::topLevelFn`, `Type::member`,
+    /// `receiver::member`. Distinct from two adjacent [`Tok::Colon`]s because it
+    /// binds an operand rather than introducing a type annotation.
+    ColonColon,
     Semi,
     Dot,
     DotDot,   // ..

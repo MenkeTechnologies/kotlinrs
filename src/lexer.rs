@@ -424,6 +424,10 @@ impl<'a> Lexer<'a> {
             (b'|', b'|') => two(self, Tok::OrOr),
             (b'-', b'>') => two(self, Tok::Arrow),
             (b'.', b'.') => two(self, Tok::DotDot),
+            // `::` — the callable-reference operator. Tested before the
+            // one-character `:` it starts with, or `::inc` lexes as two
+            // type-annotation colons and the parser reports the stray second.
+            (b':', b':') => two(self, Tok::ColonColon),
             (b'+', _) => Tok::Plus,
             (b'-', _) => Tok::Minus,
             (b'*', _) => Tok::Star,

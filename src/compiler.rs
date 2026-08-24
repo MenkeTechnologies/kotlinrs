@@ -2963,6 +2963,9 @@ impl Compiler {
                 prefix,
             } => self.compile_incdec(sc, target, *inc, *prefix),
             Expr::Lambda { params, body } => self.compile_lambda(sc, params, body),
+            Expr::FunRef { recv, name, line } => {
+                self.compile_fun_ref(sc, recv.as_deref(), name, *line)
+            }
             Expr::If(ie) => self.compile_if(sc, ie),
             Expr::When(w) => self.compile_when(sc, w),
             Expr::Try(t) => self.compile_try(sc, t),
@@ -4242,6 +4245,158 @@ impl Compiler {
     /// prologue pops the pushed params + captures top-down into those slots. The
     /// body lowers as a block-value (its last expression is the lambda's result),
     /// then a `ReturnValue` hands that value back to the invoking builtin.
+    /// A callable reference — `::inc`, `String::length`, `obj::method`.
+    ///
+    /// Kotlin's own definition is that the reference denotes a FUNCTION, so it
+    /// lowers to the lambda that calls it: the arity comes from the callee's
+    /// signature and the body is one call with the synthesized parameters
+    /// forwarded. Everything downstream — capture, `Op::CallBuiltin`
+    /// dispatch, passing it to `map`/`filter`/`sortedBy` — is then the closure
+    /// path that already exists, which is why this needs no new runtime.
+    ///
+    /// The parameter names are unspellable in Kotlin source, so a reference
+    /// written inside a lambda cannot collide with `it` or with anything the
+    /// program bound.
+    fn compile_fun_ref(
+        &mut self,
+        sc: &mut Scope,
+        recv: Option<&Expr>,
+        name: &str,
+        line: u32,
+    ) -> Result<Type, String> {
+        let param = |i: usize| format!("<ref{i}>");
+        let args = |n: usize| (0..n).map(|i| Expr::Var(param(i))).collect::<Vec<_>>();
+        let lam = |n: usize, body: Expr| Expr::Lambda {
+            params: (0..n).map(|i| (param(i), Type::Unknown)).collect(),
+            body: vec![Stmt::new(line, StmtKind::Expr(body))],
+        };
+
+        let Some(recv) = recv else {
+            // `::name` — a top-level function or a constructor.
+            if let Some(sig) = self.fun_sig.get(name).or_else(|| self.local_sigs.get(name)) {
+                let n = sig.arity;
+                let body = Expr::Call {
+                    name: name.to_string(),
+                    args: args(n),
+                    line,
+                };
+                return self.compile_expr(sc, &lam(n, body));
+            }
+            if let Some(meta) = self.classes.get(name) {
+                // `::C` is C's PRIMARY constructor, so its arity is that
+                // parameter list's — including any that carry a default, which
+                // is the type Kotlin gives the reference.
+                let n = meta.ctor_params.len();
+                let body = Expr::Call {
+                    name: name.to_string(),
+                    args: args(n),
+                    line,
+                };
+                return self.compile_expr(sc, &lam(n, body));
+            }
+            if matches!(name, "println" | "print") {
+                let body = Expr::Call {
+                    name: name.to_string(),
+                    args: args(1),
+                    line,
+                };
+                return self.compile_expr(sc, &lam(1, body));
+            }
+            return Err(format!("unresolved reference: {name}"));
+        };
+
+        // `Type::member` — an UNBOUND reference, whose function takes the
+        // receiver as its first parameter. Recognized by the receiver naming a
+        // type rather than a binding: a local of the same name shadows the type,
+        // exactly as it does everywhere else.
+        if let Expr::Var(t) = recv {
+            let shadowed = sc.slot(t).is_some() || self.globals.contains_key(t);
+            if !shadowed {
+                if let Some(meta) = self.classes.get(t).cloned() {
+                    if let Some(sig) = meta.methods.get(name) {
+                        let n = sig.arity;
+                        let body = Expr::MethodCall {
+                            recv: Box::new(Expr::Var(param(0))),
+                            name: name.to_string(),
+                            args: (1..=n).map(|i| Expr::Var(param(i))).collect(),
+                            safe: false,
+                            line,
+                        };
+                        return self.compile_expr(sc, &lam(n + 1, body));
+                    }
+                    if meta.prop(name).is_some() {
+                        let body = Expr::Member {
+                            recv: Box::new(Expr::Var(param(0))),
+                            name: name.to_string(),
+                            safe: false,
+                            line,
+                        };
+                        return self.compile_expr(sc, &lam(1, body));
+                    }
+                    return Err(format!("unresolved reference: {name} on {t}"));
+                }
+                // A BUILT-IN receiver type (`String::length`, `Int::toString`).
+                // The frontend keeps no arity table for those members, so the
+                // reference is lowered as a one-parameter member ACCESS — which
+                // covers a property and a zero-argument method alike, since
+                // `compile_member` dispatches both from the name. A member that
+                // needs arguments is not expressible this way and fails there
+                // with its own `unresolved reference` rather than silently
+                // binding the wrong arity.
+                if t.starts_with(char::is_uppercase) && self.companion_of(t).is_none() {
+                    let body = Expr::Member {
+                        recv: Box::new(Expr::Var(param(0))),
+                        name: name.to_string(),
+                        safe: false,
+                        line,
+                    };
+                    return self.compile_expr(sc, &lam(1, body));
+                }
+            }
+        }
+
+        // `expr::member` — a BOUND reference. Kotlin evaluates the receiver
+        // where the reference is written, once, and the resulting function takes
+        // only the member's own parameters. A plain name is captured directly; a
+        // computed receiver is pinned to a temporary first, so `f()::g` calls
+        // `f()` once rather than once per invocation.
+        let bound = match recv {
+            Expr::Var(n) => n.clone(),
+            other => {
+                let t = self.compile_expr(sc, other)?;
+                let cls = self.infer_class(sc, other);
+                let synth = format!("<refrecv{}>", self.lambdas_seen);
+                let slot = sc.declare_obj(&synth, t, false, cls);
+                self.b.emit(Op::SetSlot(slot), line);
+                synth
+            }
+        };
+        let n = self
+            .infer_class(sc, &Expr::Var(bound.clone()))
+            .and_then(|c| self.classes.get(&c))
+            .and_then(|m| m.methods.get(name))
+            .map(|s| s.arity);
+        let body = match n {
+            Some(n) => Expr::MethodCall {
+                recv: Box::new(Expr::Var(bound)),
+                name: name.to_string(),
+                args: args(n),
+                safe: false,
+                line,
+            },
+            // No method of that name on a class the frontend knows — a property,
+            // or a member of a built-in receiver. Same reasoning as the unbound
+            // built-in case above: lower it as a zero-parameter member access.
+            None => Expr::Member {
+                recv: Box::new(Expr::Var(bound)),
+                name: name.to_string(),
+                safe: false,
+                line,
+            },
+        };
+        self.compile_expr(sc, &lam(n.unwrap_or(0), body))
+    }
+
     fn compile_lambda_body(&mut self, pl: PendingLambda) -> Result<(), String> {
         let entry = self.b.current_pos();
         self.b.add_sub_entry(pl.name_idx, entry);
@@ -6168,7 +6323,9 @@ impl Compiler {
             // `++`/`--` keep the target's type, so `d++` on a `Double` stays a
             // `Double` for display and `/` dispatch.
             Expr::IncDec { target, .. } => self.infer(sc, target),
-            Expr::Lambda { .. } => Type::Unknown,
+            // A lambda and a callable reference are both closure handles the
+            // frontend does not type further.
+            Expr::Lambda { .. } | Expr::FunRef { .. } => Type::Unknown,
             Expr::Member {
                 recv, name, safe, ..
             } => {
@@ -8015,6 +8172,9 @@ fn expr_any(e: &Expr, f: &dyn Fn(&Expr) -> bool) -> bool {
         Expr::Is { value, .. } => expr_any(value, f),
         Expr::IncDec { target, .. } => expr_any(target, f),
         Expr::Lambda { body, .. } => body_any(body, f),
+        // A callable reference names a function; nothing inside it is an
+        // expression of the enclosing body except an explicit bound receiver.
+        Expr::FunRef { recv, .. } => recv.as_deref().is_some_and(|r| expr_any(r, f)),
         Expr::If(ie) => if_any(ie, f),
         Expr::When(w) => when_any(w, f),
         Expr::Try(t) => {

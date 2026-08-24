@@ -5880,3 +5880,110 @@ fn a_lambda_parameter_may_be_a_destructuring_group() {
     );
     assert_eq!(stdout("println(listOf(1).map { (it) })"), "[1]\n");
 }
+
+/// The callable-reference operator `::`.
+///
+/// `::` did not lex at all — `listOf(1).map(::inc)` was `unexpected token
+/// Colon`. Kotlin's definition is that a reference denotes a FUNCTION, so it
+/// lowers to the lambda that calls it and rides the closure path that already
+/// existed. Every expectation below was captured from `kotlinc` 2.4.10 on
+/// JRE 21.0.12.
+#[test]
+fn the_callable_reference_operator_denotes_a_function() {
+    // `::name` — a top-level function.
+    assert_eq!(
+        stdout("fun inc(x: Int) = x + 1\nfun main() { println(listOf(1,2,3).map(::inc)) }"),
+        "[2, 3, 4]\n"
+    );
+    assert_eq!(
+        stdout("fun add(a: Int, b: Int) = a + b\nfun main() { println(listOf(1,2,3).fold(0, ::add)) }"),
+        "6\n"
+    );
+    assert_eq!(
+        stdout("fun odd(x: Int) = x % 2 == 1\nfun main() { println(listOf(1,2,3).filter(::odd)) }"),
+        "[1, 3]\n"
+    );
+    // A zero-parameter function's reference is a zero-parameter function.
+    assert_eq!(
+        stdout("fun nul(): Int = 7\nfun main() { val f = ::nul; println(f()) }"),
+        "7\n"
+    );
+    // `::println` is a reference to the built-in.
+    assert_eq!(
+        stdout(r#"fun main() { listOf("x","y").forEach(::println) }"#),
+        "x\ny\n"
+    );
+    // `::C` is C's primary constructor.
+    assert_eq!(
+        stdout(
+            "class C(val v: Int) { override fun toString() = \"C\" + v }\nfun main() { println(listOf(1,2).map(::C)) }"
+        ),
+        "[C1, C2]\n"
+    );
+
+    // `Type::member` — UNBOUND: the receiver becomes the first parameter.
+    let c = "class C(val v: Int) { fun twice() = v * 2\n fun plusN(n: Int) = v + n }\n";
+    assert_eq!(
+        stdout(&format!(
+            "{c}fun main() {{ println(listOf(C(1), C(2)).map(C::twice)) }}"
+        )),
+        "[2, 4]\n"
+    );
+    // A PROPERTY reference is a one-parameter function too.
+    assert_eq!(
+        stdout(&format!(
+            "{c}fun main() {{ println(listOf(C(1), C(2)).map(C::v)) }}"
+        )),
+        "[1, 2]\n"
+    );
+    assert_eq!(
+        stdout(
+            "data class P(val n: String, val q: Int)\nfun main() { println(listOf(P(\"a\",1), P(\"b\",2)).sortedByDescending(P::q)) }"
+        ),
+        "[P(n=b, q=2), P(n=a, q=1)]\n"
+    );
+    // A BUILT-IN receiver type, where the frontend keeps no arity table and the
+    // reference lowers to a one-parameter member access — a property and a
+    // zero-argument method alike.
+    assert_eq!(
+        stdout(r#"println(listOf("aa","b").map(String::length))"#),
+        "[2, 1]\n"
+    );
+    assert_eq!(
+        stdout(r#"println(listOf("aa","b").map(String::uppercase))"#),
+        "[AA, B]\n"
+    );
+
+    // `expr::member` — BOUND: the receiver is captured, and the function takes
+    // only the member's own parameters.
+    assert_eq!(
+        stdout(&format!(
+            "{c}fun main() {{ val c = C(5); println(listOf(1,2).map(c::plusN)) }}"
+        )),
+        "[6, 7]\n"
+    );
+    // A local of the same name SHADOWS the type, so this is a bound reference
+    // on the value and not an unbound one on the class.
+    assert_eq!(
+        stdout(&format!(
+            "{c}fun main() {{ val C = C(4); println(listOf(1).map(C::plusN)) }}"
+        )),
+        "[5]\n"
+    );
+    // A computed receiver is evaluated ONCE, where the reference is written —
+    // not once per invocation of the resulting function.
+    assert_eq!(
+        stdout(
+            "var n = 0\nfun bump(): String { n += 1; return \"s\" }\nfun main() { val f = bump()::length; println(listOf(1,2,3).map { f() }); println(n) }"
+        ),
+        "[1, 1, 1]\n1\n"
+    );
+    // A name that resolves to nothing is still a compile-time error.
+    let out = eval("fun main() { println(listOf(1).map(::nope)) }");
+    assert!(!out.status.success(), "`::nope` must not compile");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unresolved reference: nope"),
+        "stderr was {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
