@@ -379,7 +379,7 @@ println(total(1, 2, 3))   // 6</code></pre>
         <article class="doc-entry" id="doc-keywords-declarations-44">
           <h3><a class="doc-anchor" href="#doc-keywords-declarations-44">#</a> <code>by</code></h3>
           <pre><code class="lang-kotlin">val name: T by lazy { … }</code></pre>
-          <p>Property delegation. Only <code>by lazy</code> is supported: the block runs at the FIRST read and its value is cached, so an initializer with an effect fires at use rather than at startup. <code>lazy</code> requires <code>val</code>; any other delegate is a compile error.</p>
+          <p>Property delegation, on a top-level property, a class property or a local <code>val</code>. Only <code>by lazy</code> is supported: the block runs at the FIRST read and its value is cached, so an initializer with an effect fires at use rather than at startup. <code>lazy</code> requires <code>val</code>; any other delegate is a compile error.</p>
           <pre><code class="lang-kotlin">val z: Int by lazy { println("forcing"); 42 }
 fun main() { println("before"); println(z); println(z) }</code></pre>
         </article>
@@ -496,177 +496,202 @@ println(k)     // 1</code></pre>
         <article class="doc-entry" id="doc-operators-14">
           <h3><a class="doc-anchor" href="#doc-operators-14">#</a> <code>==</code></h3>
           <pre><code class="lang-kotlin">a == b</code></pre>
-          <p>Structural equality. It compares numbers by value across <code>Int</code>/<code>Double</code>, <code>List</code>s element-wise, <code>Set</code>s order-insensitively, <code>Map</code>s entry-wise, and data-class instances over their primary-constructor properties. An <code>Array</code> inherits identity equality, so <code>arrayOf(1) == arrayOf(1)</code> is <code>false</code>. There is no <code>===</code> identity operator.</p>
+          <p>Structural equality. It compares numbers by value across <code>Int</code>/<code>Double</code>, <code>List</code>s element-wise, <code>Set</code>s order-insensitively, <code>Map</code>s entry-wise, and data-class instances over their primary-constructor properties. An <code>Array</code> inherits identity equality, so <code>arrayOf(1) == arrayOf(1)</code> is <code>false</code>. Contrast <code>===</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2) == listOf(1, 2))   // true
 println(setOf(1, 2) == setOf(2, 1))     // true</code></pre>
         </article>
         <article class="doc-entry" id="doc-operators-15">
           <h3><a class="doc-anchor" href="#doc-operators-15">#</a> <code>!=</code></h3>
           <pre><code class="lang-kotlin">a != b</code></pre>
-          <p>The negation of <code>==</code>, with the same structural rules. There is no <code>!==</code>.</p>
+          <p>The negation of <code>==</code>, with the same structural rules.</p>
           <pre><code class="lang-kotlin">println(1 != 2)   // true</code></pre>
         </article>
         <article class="doc-entry" id="doc-operators-16">
-          <h3><a class="doc-anchor" href="#doc-operators-16">#</a> <code>&lt;</code></h3>
+          <h3><a class="doc-anchor" href="#doc-operators-16">#</a> <code>===</code></h3>
+          <pre><code class="lang-kotlin">a === b</code></pre>
+          <p>Referential identity: whether both sides denote the SAME object, which <code>==</code> does not ask. Two independently built collections are <code>==</code> and not <code>===</code>, and a <code>data class</code>'s generated <code>equals</code> changes only the former. Values this runtime does not box — numbers, <code>Char</code>, <code>Boolean</code>, <code>String</code>, <code>null</code> — compare by value, so <code>1 === 1</code> and <code>"x" === "x"</code> are <code>true</code> as they are on the JVM's interned literals. Two boxing artifacts are NOT modelled: an <code>Any</code>-typed integer outside the JVM's <code>Integer</code> cache, and a <code>String</code> assembled at run time, both of which the reference toolchain answers <code>false</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(1) === listOf(1))   // false
+println(listOf(1) == listOf(1))    // true
+val a = mutableListOf(1)
+println(a === a)                   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-17">
+          <h3><a class="doc-anchor" href="#doc-operators-17">#</a> <code>!==</code></h3>
+          <pre><code class="lang-kotlin">a !== b</code></pre>
+          <p>The negation of <code>===</code> — true when the two sides are different objects.</p>
+          <pre><code class="lang-kotlin">println(listOf(1) !== listOf(1))   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-18">
+          <h3><a class="doc-anchor" href="#doc-operators-18">#</a> <code>&lt;</code></h3>
           <pre><code class="lang-kotlin">a &lt; b</code></pre>
           <p>Less-than. Numbers compare numerically and <code>Char</code>s by code unit. <code>String</code>s do not compare with the relational operators here — kotlinrs implements no <code>compareTo</code> on <code>String</code>.</p>
           <pre><code class="lang-kotlin">println(1 &lt; 2)       // true
 println('a' &lt; 'z')   // true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-17">
-          <h3><a class="doc-anchor" href="#doc-operators-17">#</a> <code>&gt;</code></h3>
+        <article class="doc-entry" id="doc-operators-19">
+          <h3><a class="doc-anchor" href="#doc-operators-19">#</a> <code>&gt;</code></h3>
           <pre><code class="lang-kotlin">a &gt; b</code></pre>
           <p>Greater-than, over numbers and <code>Char</code>s.</p>
           <pre><code class="lang-kotlin">println(3 &gt; 2)   // true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-18">
-          <h3><a class="doc-anchor" href="#doc-operators-18">#</a> <code>&lt;=</code></h3>
+        <article class="doc-entry" id="doc-operators-20">
+          <h3><a class="doc-anchor" href="#doc-operators-20">#</a> <code>&lt;=</code></h3>
           <pre><code class="lang-kotlin">a &lt;= b</code></pre>
           <p>Less-than-or-equal, over numbers and <code>Char</code>s.</p>
           <pre><code class="lang-kotlin">println(2 &lt;= 2)   // true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-19">
-          <h3><a class="doc-anchor" href="#doc-operators-19">#</a> <code>&gt;=</code></h3>
+        <article class="doc-entry" id="doc-operators-21">
+          <h3><a class="doc-anchor" href="#doc-operators-21">#</a> <code>&gt;=</code></h3>
           <pre><code class="lang-kotlin">a &gt;= b</code></pre>
           <p>Greater-than-or-equal, over numbers and <code>Char</code>s.</p>
           <pre><code class="lang-kotlin">println(2 &gt;= 3)   // false</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-20">
-          <h3><a class="doc-anchor" href="#doc-operators-20">#</a> <code>&amp;&amp;</code></h3>
+        <article class="doc-entry" id="doc-operators-22">
+          <h3><a class="doc-anchor" href="#doc-operators-22">#</a> <code>&amp;&amp;</code></h3>
           <pre><code class="lang-kotlin">a &amp;&amp; b</code></pre>
           <p>Short-circuiting logical AND: the right operand is not evaluated when the left is false.</p>
           <pre><code class="lang-kotlin">val xs = listOf(1)
 println(xs.isNotEmpty() &amp;&amp; xs[0] == 1)   // true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-21">
-          <h3><a class="doc-anchor" href="#doc-operators-21">#</a> <code>||</code></h3>
+        <article class="doc-entry" id="doc-operators-23">
+          <h3><a class="doc-anchor" href="#doc-operators-23">#</a> <code>||</code></h3>
           <pre><code class="lang-kotlin">a || b</code></pre>
           <p>Short-circuiting logical OR: the right operand is not evaluated when the left is true.</p>
           <pre><code class="lang-kotlin">println(false || 1 &lt; 2)   // true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-22">
-          <h3><a class="doc-anchor" href="#doc-operators-22">#</a> <code>!</code></h3>
+        <article class="doc-entry" id="doc-operators-24">
+          <h3><a class="doc-anchor" href="#doc-operators-24">#</a> <code>!</code></h3>
           <pre><code class="lang-kotlin">!a</code></pre>
           <p>Logical negation. Written twice as a postfix it is instead the not-null assertion <code>!!</code>, and followed by <code>=</code>, <code>in</code> or <code>is</code> it forms <code>!=</code>, <code>!in</code>, <code>!is</code>.</p>
           <pre><code class="lang-kotlin">println(!(1 &gt; 2))   // true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-23">
-          <h3><a class="doc-anchor" href="#doc-operators-23">#</a> <code>..</code></h3>
+        <article class="doc-entry" id="doc-operators-25">
+          <h3><a class="doc-anchor" href="#doc-operators-25">#</a> <code>..</code></h3>
           <pre><code class="lang-kotlin">a..b</code></pre>
           <p>Inclusive ascending range. It is a value, not only a loop header: it can be bound, passed, iterated, and asked for <code>sum</code>, <code>first</code>, <code>last</code>, <code>reversed</code> and the higher-order collection functions. <code>'a'..'z'</code> builds a <code>Char</code> range.</p>
           <pre><code class="lang-kotlin">val r = 1..5
 println(r.sum())   // 15</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-24">
-          <h3><a class="doc-anchor" href="#doc-operators-24">#</a> <code>?.</code></h3>
+        <article class="doc-entry" id="doc-operators-26">
+          <h3><a class="doc-anchor" href="#doc-operators-26">#</a> <code>?.</code></h3>
           <pre><code class="lang-kotlin">recv?.member
 recv?.method(args)</code></pre>
           <p>Safe call. The receiver is evaluated once; when it is null the whole expression is <code>null</code> and the member is never dispatched. Chains short-circuit as a unit.</p>
           <pre><code class="lang-kotlin">val s: String? = null
 println(s?.length)   // null</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-25">
-          <h3><a class="doc-anchor" href="#doc-operators-25">#</a> <code>?:</code></h3>
+        <article class="doc-entry" id="doc-operators-27">
+          <h3><a class="doc-anchor" href="#doc-operators-27">#</a> <code>?:</code></h3>
           <pre><code class="lang-kotlin">a ?: b</code></pre>
           <p>Elvis. Yields the left operand unless it is null, in which case it evaluates and yields the right. Right-associative, binding looser than arithmetic and tighter than the comparisons — and its right side may be a <code>throw</code>.</p>
           <pre><code class="lang-kotlin">val x: Int? = null
 println(x ?: 0)   // 0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-26">
-          <h3><a class="doc-anchor" href="#doc-operators-26">#</a> <code>!!</code></h3>
+        <article class="doc-entry" id="doc-operators-28">
+          <h3><a class="doc-anchor" href="#doc-operators-28">#</a> <code>::</code></h3>
+          <pre><code class="lang-kotlin">::fn
+Type::member
+receiver::member</code></pre>
+          <p>Callable reference: names a function as a VALUE. With no receiver it is a top-level function or a primary constructor; with a TYPE receiver it is unbound, so the resulting function takes the receiver as its first parameter; with any other expression it is bound, and that receiver is evaluated once where the reference is written. <code>Type::class</code> is not supported.</p>
+          <pre><code class="lang-kotlin">fun inc(x: Int) = x + 1
+println(listOf(1, 2).map(::inc))            // [2, 3]
+println(listOf("aa", "b").map(String::length))   // [2, 1]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-29">
+          <h3><a class="doc-anchor" href="#doc-operators-29">#</a> <code>!!</code></h3>
           <pre><code class="lang-kotlin">expr!!</code></pre>
           <p>Not-null assertion: yields the operand, or raises <code>NullPointerException</code> when it is null. Lexed as two consecutive <code>!</code> tokens, so <code>a != b</code> is unaffected.</p>
           <pre><code class="lang-kotlin">val x: Int? = 1
 println(x!! + 1)   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-27">
-          <h3><a class="doc-anchor" href="#doc-operators-27">#</a> <code>?</code></h3>
+        <article class="doc-entry" id="doc-operators-30">
+          <h3><a class="doc-anchor" href="#doc-operators-30">#</a> <code>?</code></h3>
           <pre><code class="lang-kotlin">T?</code></pre>
           <p>Marks a type nullable. kotlinrs parses the mark and then discards it — there is no static null checking, so a nullable and a non-nullable annotation compile identically and a null only surfaces at run time.</p>
           <pre><code class="lang-kotlin">val x: Int? = null
 println(x)   // null</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-28">
-          <h3><a class="doc-anchor" href="#doc-operators-28">#</a> <code>[]</code></h3>
+        <article class="doc-entry" id="doc-operators-31">
+          <h3><a class="doc-anchor" href="#doc-operators-31">#</a> <code>[]</code></h3>
           <pre><code class="lang-kotlin">recv[index]</code></pre>
           <p>Indexed read. On a <code>String</code> the index is a UTF-16 code unit offset and the result is a <code>Char</code>; on a <code>List</code>, <code>Set</code> or <code>Array</code> it is a bounds-checked position; on a <code>Map</code> it is a key lookup that yields <code>null</code> when absent. Chainable: <code>m[k][i]</code>.</p>
           <pre><code class="lang-kotlin">println("abc"[1])                 // b
 println(listOf(10, 20)[1])        // 20
 println(mapOf("a" to 1)["z"])     // null</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-29">
-          <h3><a class="doc-anchor" href="#doc-operators-29">#</a> <code>[]=</code></h3>
+        <article class="doc-entry" id="doc-operators-32">
+          <h3><a class="doc-anchor" href="#doc-operators-32">#</a> <code>[]=</code></h3>
           <pre><code class="lang-kotlin">recv[index] = value</code></pre>
           <p>Indexed write. A <code>List</code> or <code>Array</code> slot is bounds-checked and raises <code>IndexOutOfBoundsException</code> past the end; a <code>Map</code> key is inserted when absent. Compound forms (<code>xs[0] += 1</code>) go through the same path.</p>
           <pre><code class="lang-kotlin">val xs = mutableListOf(1, 2)
 xs[0] = 9
 println(xs)   // [9, 2]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-30">
-          <h3><a class="doc-anchor" href="#doc-operators-30">#</a> <code>-&gt;</code></h3>
+        <article class="doc-entry" id="doc-operators-33">
+          <h3><a class="doc-anchor" href="#doc-operators-33">#</a> <code>-&gt;</code></h3>
           <pre><code class="lang-kotlin">{ params -&gt; body }
 cond -&gt; result</code></pre>
           <p>Two roles: it separates a lambda's parameters from its body, and a <code>when</code> arm's conditions from its result. It also appears in a function type annotation, <code>(Int) -&gt; Int</code>, whose parameter and return types are parsed and discarded.</p>
           <pre><code class="lang-kotlin">val f: (Int) -&gt; Int = { n -&gt; n * 2 }
 println(f(21))   // 42</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-31">
-          <h3><a class="doc-anchor" href="#doc-operators-31">#</a> <code>@</code></h3>
+        <article class="doc-entry" id="doc-operators-34">
+          <h3><a class="doc-anchor" href="#doc-operators-34">#</a> <code>@</code></h3>
           <pre><code class="lang-kotlin">label@ for (…) { … }
 break@label</code></pre>
           <p>Loop labels. A <code>label@</code> prefix names the loop that follows, and <code>break@label</code> / <code>continue@label</code> target it. There is no <code>this@Label</code> and no <code>return@label</code>.</p>
           <pre><code class="lang-kotlin">outer@ for (i in 1..3) { for (j in 1..3) { if (j == 2) continue@outer; print(i) } }   // 123</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-32">
-          <h3><a class="doc-anchor" href="#doc-operators-32">#</a> <code>$</code></h3>
+        <article class="doc-entry" id="doc-operators-35">
+          <h3><a class="doc-anchor" href="#doc-operators-35">#</a> <code>$</code></h3>
           <pre><code class="lang-kotlin">"text $name text ${expr}"</code></pre>
           <p>String template interpolation. A bare <code>$name</code> splices an identifier; <code>${…}</code> splices an arbitrary expression, re-parsed from the source between the braces. Each interpolated value is rendered by the same stringifier <code>println</code> uses, so a <code>Double</code> keeps its <code>.0</code> and <code>null</code> reads as <code>null</code>. <code>\$</code> escapes a literal dollar.</p>
           <pre><code class="lang-kotlin">val x = 2
 println("x=$x sq=${x * x}")   // x=2 sq=4</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-33">
-          <h3><a class="doc-anchor" href="#doc-operators-33">#</a> <code>to</code></h3>
+        <article class="doc-entry" id="doc-operators-36">
+          <h3><a class="doc-anchor" href="#doc-operators-36">#</a> <code>to</code></h3>
           <pre><code class="lang-kotlin">first to second</code></pre>
           <p>The infix <code>Pair</code> constructor — the only way to build a <code>Pair</code> here, since <code>Pair(a, b)</code> is not a resolvable constructor. It is what <code>mapOf</code> takes as each argument.</p>
           <pre><code class="lang-kotlin">val p = 1 to "one"
 println(p.first)   // 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-34">
-          <h3><a class="doc-anchor" href="#doc-operators-34">#</a> <code>!in</code></h3>
+        <article class="doc-entry" id="doc-operators-37">
+          <h3><a class="doc-anchor" href="#doc-operators-37">#</a> <code>!in</code></h3>
           <pre><code class="lang-kotlin">value !in container</code></pre>
           <p>Negated membership, over the same containers <code>in</code> accepts. A <code>when</code> arm may also read <code>!in a..b</code>.</p>
           <pre><code class="lang-kotlin">println(4 !in 1..3)   // true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-35">
-          <h3><a class="doc-anchor" href="#doc-operators-35">#</a> <code>!is</code></h3>
+        <article class="doc-entry" id="doc-operators-38">
+          <h3><a class="doc-anchor" href="#doc-operators-38">#</a> <code>!is</code></h3>
           <pre><code class="lang-kotlin">value !is Type</code></pre>
           <p>Negated runtime type check, usable in a <code>when</code> arm and in ordinary expression position.</p>
           <pre><code class="lang-kotlin">val x: Any = 1
 println(x !is String)   // true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-36">
-          <h3><a class="doc-anchor" href="#doc-operators-36">#</a> <code>.</code></h3>
+        <article class="doc-entry" id="doc-operators-39">
+          <h3><a class="doc-anchor" href="#doc-operators-39">#</a> <code>.</code></h3>
           <pre><code class="lang-kotlin">recv.member
 recv.method(args)</code></pre>
           <p>Member access. kotlinrs does not distinguish a property from a zero-argument method: both resolve through the same dispatch, so <code>xs.size</code> and <code>xs.size()</code> — and <code>xs.sum</code> and <code>xs.sum()</code> — are the same call. Chains are left-associative and bind tighter than the prefix unary operators.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).size)   // 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-37">
-          <h3><a class="doc-anchor" href="#doc-operators-37">#</a> <code>:</code></h3>
+        <article class="doc-entry" id="doc-operators-40">
+          <h3><a class="doc-anchor" href="#doc-operators-40">#</a> <code>:</code></h3>
           <pre><code class="lang-kotlin">name: Type
 class C : Super(), Iface</code></pre>
           <p>Two roles: the type annotation separator on a binding, parameter or return type, and the supertype-list introducer on a class. Any identifier is accepted as a type name; only the eight primitives resolve to a static type, and every other name is carried as an opaque class name for dispatch.</p>
           <pre><code class="lang-kotlin">val n: Int = 1
 println(n)   // 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-38">
-          <h3><a class="doc-anchor" href="#doc-operators-38">#</a> <code>;</code></h3>
+        <article class="doc-entry" id="doc-operators-41">
+          <h3><a class="doc-anchor" href="#doc-operators-41">#</a> <code>;</code></h3>
           <pre><code class="lang-kotlin">stmt; stmt</code></pre>
           <p>The optional statement separator. Newlines already terminate statements, so <code>;</code> matters only when two statements share a line — including inside a <code>when</code> arm list written on one line.</p>
           <pre><code class="lang-kotlin">var a = 1; a += 1; println(a)   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-39">
-          <h3><a class="doc-anchor" href="#doc-operators-39">#</a> <code>as</code></h3>
+        <article class="doc-entry" id="doc-operators-42">
+          <h3><a class="doc-anchor" href="#doc-operators-42">#</a> <code>as</code></h3>
           <pre><code class="lang-kotlin">value as T
 value as? T</code></pre>
           <p>A checked cast. The runtime value is unchanged — what the cast supplies is the static type <code>T</code>, which then decides integer width and <code>/</code> dispatch downstream. A mismatch throws <code>ClassCastException</code>; the safe form <code>as?</code> yields <code>null</code> instead. <code>Int</code> and <code>Long</code> share one runtime representation here, so a cast cannot tell them apart.</p>
@@ -1036,6 +1061,66 @@ CharArray(size: Int) { i -&gt; … }: CharArray</code></pre>
           <pre><code class="lang-kotlin">Array(size: Int) { i -&gt; … }: Array&lt;T&gt;</code></pre>
           <p>Builds a generic array from an index lambda. Unlike the four primitive builders it exists *only* in the initializer form — Kotlin has no zero-filled <code>Array(n)</code> — and its descriptor is inferred from the elements the lambda produced.</p>
           <pre><code class="lang-kotlin">println(Array(3) { it * 2 }.joinToString())   // 0, 2, 4</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-33">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-33">#</a> <code>StringBuilder</code></h3>
+          <pre><code class="lang-kotlin">StringBuilder()
+StringBuilder(text: CharSequence)
+StringBuilder(capacity: Int)</code></pre>
+          <p>A mutable character sequence. Every mutator (<code>append</code>, <code>appendLine</code>, <code>insert</code>, <code>delete</code>, <code>replace</code>, <code>deleteCharAt</code>, <code>reverse</code>, <code>clear</code>) answers the RECEIVER, so calls chain and keep building one object. <code>setLength</code>/<code>setCharAt</code> answer <code>Unit</code>; <code>setLength</code> pads with <code>\u0000</code> when it grows. Content is held as UTF-16 code units, so <code>length</code>, <code>sb[i]</code>, and every index argument count <code>char</code>s the way the JVM does. <code>capacity()</code> is modelled too: 16 by default, <code>text.length + 16</code> from a text, and an append that does not fit grows to <code>max(2 * cap + 2, needed)</code>. The read-only <code>CharSequence</code> members (<code>length</code>, <code>indexOf</code>, <code>substring</code>, <code>startsWith</code>, <code>first</code>, <code>toList</code>, …) behave exactly as on <code>String</code>. It overrides neither <code>equals</code> nor <code>hashCode</code>, so two builders holding the same text are NOT equal.</p>
+          <pre><code class="lang-kotlin">val sb = StringBuilder()
+sb.append("a").append(1).append(true)
+println(sb)          // a1true
+println(sb.length)   // 6</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-34">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-34">#</a> <code>buildString</code></h3>
+          <pre><code class="lang-kotlin">buildString(block: StringBuilder.() -&gt; Unit): String
+buildString(capacity: Int, block: StringBuilder.() -&gt; Unit): String</code></pre>
+          <p>Runs the block against a fresh <code>StringBuilder</code> bound as <code>this</code> — so <code>append(x)</code> needs no qualifier — and yields its <code>toString()</code>. The capacity overload is accepted and its hint discarded.</p>
+          <pre><code class="lang-kotlin">println(buildString { append("a"); append(1) })   // a1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-35">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-35">#</a> <code>buildList</code></h3>
+          <pre><code class="lang-kotlin">buildList(block: MutableList&lt;T&gt;.() -&gt; Unit): List&lt;T&gt;</code></pre>
+          <p>The list counterpart of <code>buildString</code>: a fresh mutable list bound as the block's <code>this</code>, yielded once the block has filled it. <code>add</code>/<code>addAll</code> inside need no qualifier.</p>
+          <pre><code class="lang-kotlin">println(buildList { add(1); addAll(listOf(2, 3)) })   // [1, 2, 3]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-36">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-36">#</a> <code>listOfNotNull</code></h3>
+          <pre><code class="lang-kotlin">listOfNotNull(vararg elements: T?): List&lt;T&gt;</code></pre>
+          <p>Builds a <code>List</code> from its arguments with the <code>null</code>s dropped. <code>filterNotNull()</code> is the member form, on any existing collection.</p>
+          <pre><code class="lang-kotlin">println(listOfNotNull(1, null, 3))   // [1, 3]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-37">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-37">#</a> <code>repeat</code></h3>
+          <pre><code class="lang-kotlin">repeat(times: Int, action: (Int) -&gt; Unit)</code></pre>
+          <p>Runs the block <code>times</code> times with the zero-based index as <code>it</code>, and yields <code>Unit</code>. A non-positive count runs it not at all.</p>
+          <pre><code class="lang-kotlin">repeat(3) { print(it) }   // 012</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-38">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-38">#</a> <code>require</code></h3>
+          <pre><code class="lang-kotlin">require(value: Boolean)
+require(value: Boolean, lazyMessage: () -&gt; Any)
+requireNotNull(value: T?): T</code></pre>
+          <p>Argument preconditions. A false condition throws <code>IllegalArgumentException: Failed requirement.</code>, or the message the block produced — the block runs ONLY on the failing path. <code>requireNotNull</code> throws <code>Required value was null.</code> on <code>null</code> and otherwise answers the value.</p>
+          <pre><code class="lang-kotlin">try { require(1 &gt; 2) { "bad input" } } catch (e: Exception) { println(e.message) }   // bad input</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-39">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-39">#</a> <code>check</code></h3>
+          <pre><code class="lang-kotlin">check(value: Boolean)
+check(value: Boolean, lazyMessage: () -&gt; Any)
+checkNotNull(value: T?): T
+error(message: Any): Nothing</code></pre>
+          <p>State preconditions — the <code>IllegalStateException</code> mirror of <code>require</code>. The defaults are <code>Check failed.</code> and <code>Required value was null.</code>; <code>error(msg)</code> throws unconditionally with the message given.</p>
+          <pre><code class="lang-kotlin">try { check(false) } catch (e: Exception) { println(e.message) }   // Check failed.</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-builtin-functions-40">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-40">#</a> <code>TODO</code></h3>
+          <pre><code class="lang-kotlin">TODO(): Nothing
+TODO(reason: String): Nothing</code></pre>
+          <p>Throws <code>kotlin.NotImplementedError: An operation is not implemented</code>, with <code>: reason</code> appended when one is given. It is an <code>Error</code>, not an <code>Exception</code>, so <code>catch (e: Exception)</code> does not catch it.</p>
+          <pre><code class="lang-kotlin">try { TODO("later") } catch (e: Throwable) { println(e) }   // kotlin.NotImplementedError: An operation is not implemented: later</code></pre>
         </article>
       </section>
 
@@ -1650,7 +1735,7 @@ sum(): Double</code></pre>
         <article class="doc-entry" id="doc-sequence-members-30">
           <h3><a class="doc-anchor" href="#doc-sequence-members-30">#</a> <code>sorted</code></h3>
           <pre><code class="lang-kotlin">sorted(): List&lt;T&gt;</code></pre>
-          <p>Ascending sort into a new <code>List</code> — strings lexicographically, chars by code unit, everything else numerically. There is no <code>sortedWith</code> and no in-place <code>sort</code>.</p>
+          <p>Ascending sort into a new <code>List</code> — strings lexicographically, chars by code unit, everything else numerically. <code>sortedWith</code> takes an explicit ordering; there is no in-place <code>sort</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(3, 1, 2).sorted())   // [1, 2, 3]</code></pre>
         </article>
         <article class="doc-entry" id="doc-sequence-members-31">
@@ -1662,24 +1747,65 @@ sum(): Double</code></pre>
         <article class="doc-entry" id="doc-sequence-members-32">
           <h3><a class="doc-anchor" href="#doc-sequence-members-32">#</a> <code>take</code></h3>
           <pre><code class="lang-kotlin">take(n: Int): List&lt;T&gt;</code></pre>
-          <p>The first <code>n</code> elements as a <code>List</code>. An oversized <code>n</code> clamps to the whole sequence; a negative one raises <code>IllegalArgumentException: Requested element count N is less than zero.</code> There is no <code>takeWhile</code> and no <code>takeLast</code>.</p>
+          <p>The first <code>n</code> elements as a <code>List</code>. An oversized <code>n</code> clamps to the whole sequence; a negative one raises <code>IllegalArgumentException: Requested element count N is less than zero.</code> See <code>takeLast</code> for the other end and <code>takeWhile</code> for the predicate form.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).take(2))   // [1, 2]</code></pre>
         </article>
         <article class="doc-entry" id="doc-sequence-members-33">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-33">#</a> <code>drop</code></h3>
-          <pre><code class="lang-kotlin">drop(n: Int): List&lt;T&gt;</code></pre>
-          <p>Everything after the first <code>n</code> elements, as a <code>List</code>. An oversized <code>n</code> yields an empty list; a negative one raises <code>IllegalArgumentException</code>. There is no <code>dropWhile</code> and no <code>dropLast</code>.</p>
-          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).drop(1))   // [2, 3]</code></pre>
+          <h3><a class="doc-anchor" href="#doc-sequence-members-33">#</a> <code>takeLast</code></h3>
+          <pre><code class="lang-kotlin">takeLast(n: Int): List&lt;T&gt;</code></pre>
+          <p>The LAST <code>n</code> elements, with the same clamping and the same negative-count error as <code>take</code>. On a <code>String</code> receiver it answers a <code>String</code>, not a <code>List&lt;Char&gt;</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).takeLast(2))   // [2, 3]
+println("abcde".takeLast(2))            // de</code></pre>
         </article>
         <article class="doc-entry" id="doc-sequence-members-34">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-34">#</a> <code>joinToString</code></h3>
-          <pre><code class="lang-kotlin">joinToString(): String
-joinToString(separator: Any): String</code></pre>
-          <p>Renders the elements with the same stringifier <code>println</code> uses, joined by a separator that defaults to <code>", "</code>. Only the separator parameter exists — there is no <code>prefix</code>, <code>postfix</code>, <code>limit</code> or <code>transform</code>.</p>
-          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).joinToString("-"))   // 1-2-3</code></pre>
+          <h3><a class="doc-anchor" href="#doc-sequence-members-34">#</a> <code>drop</code></h3>
+          <pre><code class="lang-kotlin">drop(n: Int): List&lt;T&gt;</code></pre>
+          <p>Everything after the first <code>n</code> elements, as a <code>List</code>. An oversized <code>n</code> yields an empty list; a negative one raises <code>IllegalArgumentException</code>. See <code>dropLast</code> for the other end and <code>dropWhile</code> for the predicate form.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).drop(1))   // [2, 3]</code></pre>
         </article>
         <article class="doc-entry" id="doc-sequence-members-35">
-          <h3><a class="doc-anchor" href="#doc-sequence-members-35">#</a> <code>reversed</code></h3>
+          <h3><a class="doc-anchor" href="#doc-sequence-members-35">#</a> <code>dropLast</code></h3>
+          <pre><code class="lang-kotlin">dropLast(n: Int): List&lt;T&gt;</code></pre>
+          <p>Everything but the last <code>n</code> elements — the complement of <code>takeLast</code> at the same cut. On a <code>String</code> receiver it answers a <code>String</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).dropLast(1))   // [1, 2]
+println("abcde".dropLast(2))            // abc</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-36">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-36">#</a> <code>generateSequence</code></h3>
+          <pre><code class="lang-kotlin">generateSequence(seed: T?, next: (T) -&gt; T?): Sequence&lt;T&gt;</code></pre>
+          <p>A LAZY sequence: <code>next</code> runs on demand and ends the sequence by answering <code>null</code>. It is the one sequence here that is not materialized up front, because it is the one that can be endless — <code>generateSequence(1) { it * 2 }</code> is bounded only by a <code>take</code>, a <code>takeWhile</code>, or a short-circuiting search. <code>map</code>/<code>filter</code>/<code>filterNot</code>/<code>takeWhile</code>/<code>dropWhile</code>/<code>take</code>/<code>drop</code> stay lazy on it; anything else pulls the pipeline into a <code>List</code> first, which on an unbounded one raises rather than hanging.</p>
+          <pre><code class="lang-kotlin">println(generateSequence(1) { it * 2 }.take(5).toList())                     // [1, 2, 4, 8, 16]
+println(generateSequence(1) { if (it &lt; 20) it * 2 else null }.toList())      // [1, 2, 4, 8, 16, 32]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-37">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-37">#</a> <code>splitToSequence</code></h3>
+          <pre><code class="lang-kotlin">String.splitToSequence(vararg delimiters: String): Sequence&lt;String&gt;</code></pre>
+          <p><code>split</code> answering a sequence. The receiver bounds the result either way, so it is materialized like every other finite sequence here.</p>
+          <pre><code class="lang-kotlin">println("a,b,c".splitToSequence(",").toList())   // [a, b, c]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-38">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-38">#</a> <code>unzip</code></h3>
+          <pre><code class="lang-kotlin">unzip(): Pair&lt;List&lt;A&gt;, List&lt;B&gt;&gt;</code></pre>
+          <p><code>zip</code> run backwards: a sequence of pairs becomes a pair of sequences. A non-pair element is an error.</p>
+          <pre><code class="lang-kotlin">println(listOf(1 to "a", 2 to "b").unzip())   // ([1, 2], [a, b])</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-39">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-39">#</a> <code>zipWithNext</code></h3>
+          <pre><code class="lang-kotlin">zipWithNext(): List&lt;Pair&lt;T, T&gt;&gt;
+zipWithNext(transform: (T, T) -&gt; R): List&lt;R&gt;</code></pre>
+          <p>Pairs each element with its SUCCESSOR, so the result is one shorter than the receiver and empty for a receiver of one or none. The lambda overload transforms each such pair instead of yielding it.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).zipWithNext())                  // [(1, 2), (2, 3)]
+println(listOf(1, 2, 3).zipWithNext { a, b -&gt; a + b })   // [3, 5]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-40">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-40">#</a> <code>joinToString</code></h3>
+          <pre><code class="lang-kotlin">joinToString(): String
+joinToString(separator: Any): String</code></pre>
+          <p>Renders the elements with the same stringifier <code>println</code> uses, joined by a separator that defaults to <code>", "</code>. The positional <code>prefix</code>, <code>postfix</code>, <code>limit</code> and <code>truncated</code> parameters are honoured, and a trailing lambda transforms each element.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).joinToString("-"))   // 1-2-3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-41">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-41">#</a> <code>reversed</code></h3>
           <pre><code class="lang-kotlin">reversed(): List&lt;T&gt;
 IntRange.reversed(): IntProgression</code></pre>
           <p>Reverses the order. On a list, set or array the result is a reversed <code>List</code>; on a range it is instead a descending <code>IntProgression</code>, which prints in its <code>b downTo a step 1</code> form.</p>
@@ -1716,6 +1842,16 @@ println(xs)             // [2]</code></pre>
           <pre><code class="lang-kotlin">val xs = mutableListOf(1, 2)
 println(xs.removeAt(0))   // 1</code></pre>
         </article>
+        <article class="doc-entry" id="doc-mutable-collection-members-4">
+          <h3><a class="doc-anchor" href="#doc-mutable-collection-members-4">#</a> <code>addAll</code></h3>
+          <pre><code class="lang-kotlin">MutableCollection&lt;T&gt;.addAll(elements: Collection&lt;T&gt;): Boolean
+MutableCollection&lt;T&gt;.removeAll(elements: Collection&lt;T&gt;): Boolean
+MutableCollection&lt;T&gt;.retainAll(elements: Collection&lt;T&gt;): Boolean</code></pre>
+          <p>Bulk mutation. Each answers whether the receiver CHANGED, so <code>addAll(emptyList())</code> is <code>false</code>. A <code>MutableList</code> appends every element it is given; a <code>MutableSet</code> skips the ones it already holds.</p>
+          <pre><code class="lang-kotlin">val xs = mutableListOf(1, 2)
+println(xs.addAll(listOf(3)))   // true
+println(xs)                    // [1, 2, 3]</code></pre>
+        </article>
       </section>
 
       <section class="tutorial-section" id="ch-map-members">
@@ -1747,30 +1883,54 @@ println(xs.removeAt(0))   // 1</code></pre>
         <article class="doc-entry" id="doc-map-members-5">
           <h3><a class="doc-anchor" href="#doc-map-members-5">#</a> <code>get</code></h3>
           <pre><code class="lang-kotlin">Map.get(key: K): V?</code></pre>
-          <p>The value under a key, or <code>null</code> when the key is absent — the same lookup <code>m[k]</code> performs. It never raises. There is no <code>getOrDefault</code> or <code>getOrElse</code>.</p>
+          <p>The value under a key, or <code>null</code> when the key is absent — the same lookup <code>m[k]</code> performs. It never raises. <code>getOrElse(key) { … }</code> supplies a fallback; there is no <code>getOrDefault</code>.</p>
           <pre><code class="lang-kotlin">println(mapOf("a" to 1).get("z"))   // null</code></pre>
         </article>
         <article class="doc-entry" id="doc-map-members-6">
           <h3><a class="doc-anchor" href="#doc-map-members-6">#</a> <code>keys</code></h3>
-          <pre><code class="lang-kotlin">Map.keys: List&lt;K&gt;</code></pre>
-          <p>The keys in insertion order. It returns a **<code>List</code>**, not the <code>Set</code> Kotlin returns — so it prints as <code>[a, b]</code> and compares order-sensitively.</p>
+          <pre><code class="lang-kotlin">Map.keys: Set&lt;K&gt;</code></pre>
+          <p>The keys in the map's iteration order, as a <code>Set</code> — so it compares order-insensitively against another <code>Set</code>, as Kotlin's does.</p>
           <pre><code class="lang-kotlin">println(mapOf("a" to 1, "b" to 2).keys)   // [a, b]</code></pre>
         </article>
         <article class="doc-entry" id="doc-map-members-7">
           <h3><a class="doc-anchor" href="#doc-map-members-7">#</a> <code>values</code></h3>
           <pre><code class="lang-kotlin">Map.values: List&lt;V&gt;</code></pre>
-          <p>The values in insertion order, as a <code>List</code>. There is no <code>entries</code> member.</p>
+          <p>The values in the map's iteration order, as a <code>List</code>. <code>entries</code> yields the key/value entries themselves, which print as <code>k=v</code>.</p>
           <pre><code class="lang-kotlin">println(mapOf("a" to 1, "b" to 2).values)   // [1, 2]</code></pre>
         </article>
         <article class="doc-entry" id="doc-map-members-8">
-          <h3><a class="doc-anchor" href="#doc-map-members-8">#</a> <code>put</code></h3>
+          <h3><a class="doc-anchor" href="#doc-map-members-8">#</a> <code>toList</code></h3>
+          <pre><code class="lang-kotlin">Map.toList(): List&lt;Pair&lt;K, V&gt;&gt;</code></pre>
+          <p>The entries as <code>Pair</code>s, in iteration order. The pairs print <code>(k, v)</code> where the entries themselves print <code>k=v</code>, which is the whole reason this is not the generic sequence <code>toList</code>.</p>
+          <pre><code class="lang-kotlin">println(mapOf(1 to "a", 2 to "b").toList())   // [(1, a), (2, b)]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-members-9">
+          <h3><a class="doc-anchor" href="#doc-map-members-9">#</a> <code>filterKeys</code></h3>
+          <pre><code class="lang-kotlin">Map.filterKeys(predicate: (K) -&gt; Boolean): Map&lt;K, V&gt;</code></pre>
+          <p>The entries whose KEY satisfies the predicate. The lambda sees the key alone — not the entry, as <code>mapKeys</code> does.</p>
+          <pre><code class="lang-kotlin">println(mapOf(1 to "a", 2 to "b").filterKeys { it &gt; 1 })   // {2=b}</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-members-10">
+          <h3><a class="doc-anchor" href="#doc-map-members-10">#</a> <code>filterValues</code></h3>
+          <pre><code class="lang-kotlin">Map.filterValues(predicate: (V) -&gt; Boolean): Map&lt;K, V&gt;</code></pre>
+          <p>The entries whose VALUE satisfies the predicate, with the lambda seeing the value alone.</p>
+          <pre><code class="lang-kotlin">println(mapOf(1 to "a", 2 to "b").filterValues { it == "a" })   // {1=a}</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-members-11">
+          <h3><a class="doc-anchor" href="#doc-map-members-11">#</a> <code>toSortedMap</code></h3>
+          <pre><code class="lang-kotlin">Map.toSortedMap(): Map&lt;K, V&gt;</code></pre>
+          <p>A <code>java.util.TreeMap</code> over the same entries: ascending natural key order, kept across later writes rather than applied once.</p>
+          <pre><code class="lang-kotlin">println(mapOf(2 to "b", 1 to "a").toSortedMap())   // {1=a, 2=b}</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-members-12">
+          <h3><a class="doc-anchor" href="#doc-map-members-12">#</a> <code>put</code></h3>
           <pre><code class="lang-kotlin">MutableMap.put(key: K, value: V): V?</code></pre>
           <p>Sets a key, appending the entry when it is new. It answers the previous value, or <code>null</code> when there was none — the same write <code>m[k] = v</code> performs.</p>
           <pre><code class="lang-kotlin">val m = mutableMapOf("a" to 1)
 println(m.put("a", 2))   // 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-members-9">
-          <h3><a class="doc-anchor" href="#doc-map-members-9">#</a> <code>remove</code></h3>
+        <article class="doc-entry" id="doc-map-members-13">
+          <h3><a class="doc-anchor" href="#doc-map-members-13">#</a> <code>remove</code></h3>
           <pre><code class="lang-kotlin">MutableMap.remove(key: K): Boolean</code></pre>
           <p>Drops the entry under a key. It answers a <code>Boolean</code> — whether anything was removed — where Kotlin answers the removed value or <code>null</code>.</p>
           <pre><code class="lang-kotlin">val m = mutableMapOf("a" to 1)
@@ -2002,98 +2162,144 @@ fun main() { println(Pt(1, 2).copy(9)) }   // Pt(x=9, y=2)</code></pre>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).fold(0) { acc, n -&gt; acc + n })   // 6</code></pre>
         </article>
         <article class="doc-entry" id="doc-higher-order-collection-functions-14">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-14">#</a> <code>reduce</code></h3>
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-14">#</a> <code>foldRight</code></h3>
+          <pre><code class="lang-kotlin">foldRight(initial: R, operation: (T, R) -&gt; R): R</code></pre>
+          <p><code>fold</code> from the END, and — the part that catches people — its lambda takes the ELEMENT first and the accumulator second, the opposite of <code>fold</code>. Both differences show at once on the same lambda.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).foldRight("") { a, b -&gt; "$a$b" })   // 123</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-15">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-15">#</a> <code>reduce</code></h3>
           <pre><code class="lang-kotlin">reduce(operation: (T, T) -&gt; T): T</code></pre>
           <p>Like <code>fold</code> but seeded with the first element instead of an explicit initial. An empty receiver raises <code>UnsupportedOperationException: Empty collection can't be reduced.</code></p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).reduce { a, b -&gt; a * b })   // 6</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-15">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-15">#</a> <code>any</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-16">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-16">#</a> <code>reduceRight</code></h3>
+          <pre><code class="lang-kotlin">reduceRight(operation: (T, T) -&gt; T): T</code></pre>
+          <p><code>reduce</code> from the end: seeded with the LAST element, walking backwards, with the lambda taking <code>(element, acc)</code>. Same error on an empty receiver.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 2, 3).reduceRight { a, b -&gt; a - b })   // 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-17">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-17">#</a> <code>any</code></h3>
           <pre><code class="lang-kotlin">any(predicate: (T) -&gt; Boolean): Boolean</code></pre>
           <p>True as soon as one element satisfies the predicate, short-circuiting on the first hit. The no-argument <code>any()</code> overload is not implemented — use <code>isNotEmpty()</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).any { it &gt; 2 })   // true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-16">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-16">#</a> <code>all</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-18">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-18">#</a> <code>all</code></h3>
           <pre><code class="lang-kotlin">all(predicate: (T) -&gt; Boolean): Boolean</code></pre>
           <p>True when every element satisfies the predicate, short-circuiting on the first failure. Vacuously true for an empty receiver.</p>
           <pre><code class="lang-kotlin">println(listOf(2, 4).all { it % 2 == 0 })   // true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-17">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-17">#</a> <code>none</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-19">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-19">#</a> <code>none</code></h3>
           <pre><code class="lang-kotlin">none(predicate: (T) -&gt; Boolean): Boolean</code></pre>
           <p>True when no element satisfies the predicate, short-circuiting on the first hit.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2).none { it &gt; 5 })   // true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-18">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-18">#</a> <code>count</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-20">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-20">#</a> <code>count</code></h3>
           <pre><code class="lang-kotlin">count(predicate: (T) -&gt; Boolean): Int</code></pre>
           <p>How many elements satisfy the predicate. Called with no argument, <code>count()</code> is instead the sequence member that reports <code>size</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).count { it &gt; 1 })   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-19">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-19">#</a> <code>sumOf</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-21">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-21">#</a> <code>sumOf</code></h3>
           <pre><code class="lang-kotlin">sumOf(selector: (T) -&gt; Int): Int
 sumOf(selector: (T) -&gt; Double): Double</code></pre>
           <p>Sums the lambda's results, yielding an <code>Int</code> when every one is integral and a <code>Double</code> otherwise — the same rule <code>sum()</code> uses.</p>
           <pre><code class="lang-kotlin">println(listOf("ab", "c").sumOf { it.length })   // 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-20">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-20">#</a> <code>maxByOrNull</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-22">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-22">#</a> <code>maxByOrNull</code></h3>
           <pre><code class="lang-kotlin">maxByOrNull(selector: (T) -&gt; R): T?</code></pre>
           <p>The element whose selector value is largest, or <code>null</code> when the receiver is empty. Ties keep the first such element. The selector runs once per element.</p>
           <pre><code class="lang-kotlin">println(listOf("a", "abc").maxByOrNull { it.length })   // abc</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-21">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-21">#</a> <code>minByOrNull</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-23">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-23">#</a> <code>minByOrNull</code></h3>
           <pre><code class="lang-kotlin">minByOrNull(selector: (T) -&gt; R): T?</code></pre>
           <p>The element whose selector value is smallest, or <code>null</code> on an empty receiver, keeping the first of any tie.</p>
           <pre><code class="lang-kotlin">println(listOf("abc", "a").minByOrNull { it.length })   // a</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-22">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-22">#</a> <code>sortedBy</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-24">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-24">#</a> <code>sortedBy</code></h3>
           <pre><code class="lang-kotlin">sortedBy(selector: (T) -&gt; R): List&lt;T&gt;</code></pre>
           <p>Ascending sort by the selector's value, evaluated once per element and stable — equal keys keep their input order.</p>
           <pre><code class="lang-kotlin">println(listOf("abc", "a").sortedBy { it.length })   // [a, abc]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-23">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-23">#</a> <code>sortedByDescending</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-25">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-25">#</a> <code>sortedByDescending</code></h3>
           <pre><code class="lang-kotlin">sortedByDescending(selector: (T) -&gt; R): List&lt;T&gt;</code></pre>
           <p>Descending sort by the selector's value. The comparison is flipped rather than the result reversed, so ties still come out in input order as Kotlin requires.</p>
           <pre><code class="lang-kotlin">println(listOf("a", "abc").sortedByDescending { it.length })   // [abc, a]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-24">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-24">#</a> <code>associate</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-26">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-26">#</a> <code>sortedWith</code></h3>
+          <pre><code class="lang-kotlin">sortedWith(comparator: Comparator&lt;T&gt;): List&lt;T&gt;
+sortedWith(compare: (T, T) -&gt; Int): List&lt;T&gt;</code></pre>
+          <p>Stable sort under an explicit ordering — either a <code>Comparator</code> from <code>compareBy</code> or a plain two-argument lambda answering a negative/zero/positive <code>Int</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(3, 1, 2).sortedWith(compareBy { it }))       // [1, 2, 3]
+println(listOf(3, 1, 2).sortedWith { a, b -&gt; b - a })       // [3, 2, 1]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-27">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-27">#</a> <code>compareBy</code></h3>
+          <pre><code class="lang-kotlin">compareBy(vararg selectors: (T) -&gt; R): Comparator&lt;T&gt;</code></pre>
+          <p>Builds a <code>Comparator</code> from one or more key selectors, compared left to right with the first non-equal key deciding. Extend it with <code>thenBy</code>/<code>thenByDescending</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(3, 1, 2).sortedWith(compareBy { it }))   // [1, 2, 3]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-28">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-28">#</a> <code>compareByDescending</code></h3>
+          <pre><code class="lang-kotlin">compareByDescending(vararg selectors: (T) -&gt; R): Comparator&lt;T&gt;</code></pre>
+          <p><code>compareBy</code> with every key reversed.</p>
+          <pre><code class="lang-kotlin">println(listOf(1, 3, 2).sortedWith(compareByDescending { it }))   // [3, 2, 1]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-29">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-29">#</a> <code>thenBy</code></h3>
+          <pre><code class="lang-kotlin">Comparator&lt;T&gt;.thenBy(selector: (T) -&gt; R): Comparator&lt;T&gt;</code></pre>
+          <p>A NEW comparator with one more key appended as a tiebreak — the receiver is unchanged, as Kotlin's immutable comparators are. The added key is consulted only when every earlier key ties.</p>
+          <pre><code class="lang-kotlin">val byLen = compareBy&lt;String&gt; { it.length }
+println(listOf("cc", "a", "bb").sortedWith(byLen.thenBy { it }))   // [a, bb, cc]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-30">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-30">#</a> <code>thenByDescending</code></h3>
+          <pre><code class="lang-kotlin">Comparator&lt;T&gt;.thenByDescending(selector: (T) -&gt; R): Comparator&lt;T&gt;</code></pre>
+          <p><code>thenBy</code> with the added key reversed. Each key carries its own direction, so an ascending key can be broken by a descending one.</p>
+          <pre><code class="lang-kotlin">val byLen = compareBy&lt;String&gt; { it.length }
+println(listOf("cc", "a", "bb").sortedWith(byLen.thenByDescending { it }))   // [a, cc, bb]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-31">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-31">#</a> <code>associate</code></h3>
           <pre><code class="lang-kotlin">associate(transform: (T) -&gt; Pair&lt;K, V&gt;): Map&lt;K, V&gt;</code></pre>
           <p>Builds a <code>Map</code> from the <code>Pair</code> each lambda call returns. A lambda result that is not a <code>Pair</code> raises <code>kotlin: associate expects a Pair</code>. Later duplicate keys overwrite earlier ones.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2).associate { it to it * it })   // {1=1, 2=4}</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-25">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-25">#</a> <code>associateBy</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-32">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-32">#</a> <code>associateBy</code></h3>
           <pre><code class="lang-kotlin">associateBy(keySelector: (T) -&gt; K): Map&lt;K, T&gt;</code></pre>
           <p>Builds a <code>Map</code> whose keys are the lambda's results and whose values are the elements — the mirror image of <code>associateWith</code>.</p>
           <pre><code class="lang-kotlin">println(listOf("ab", "c").associateBy { it.length })   // {2=ab, 1=c}</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-26">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-26">#</a> <code>associateWith</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-33">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-33">#</a> <code>associateWith</code></h3>
           <pre><code class="lang-kotlin">associateWith(valueSelector: (T) -&gt; V): Map&lt;T, V&gt;</code></pre>
           <p>Builds a <code>Map</code> keyed by the elements, with the lambda's results as the values.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).associateWith { it * 2 })   // {1=2, 2=4, 3=6}</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-27">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-27">#</a> <code>groupBy</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-34">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-34">#</a> <code>groupBy</code></h3>
           <pre><code class="lang-kotlin">groupBy(keySelector: (T) -&gt; K): Map&lt;K, List&lt;T&gt;&gt;</code></pre>
           <p>Buckets the elements by the lambda's result. Keys appear in first-encounter order and each bucket keeps its elements in input order.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3, 4).groupBy { it % 2 })   // {1=[1, 3], 0=[2, 4]}</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-28">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-28">#</a> <code>groupingBy</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-35">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-35">#</a> <code>groupingBy</code></h3>
           <pre><code class="lang-kotlin">groupingBy(keySelector: (T) -&gt; K): Grouping&lt;T, K&gt;</code></pre>
           <p>Pairs the source with a key selector and does no work yet — the result is consumed by a terminal operation such as <code>eachCount</code>. That laziness is the difference from <code>groupBy</code>, which materializes the per-key lists.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3, 4).groupingBy { it % 2 }.eachCount())   // {1=2, 0=2}</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-29">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-29">#</a> <code>eachCount</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-36">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-36">#</a> <code>eachCount</code></h3>
           <pre><code class="lang-kotlin">eachCount(): Map&lt;K, Int&gt;</code></pre>
           <p>How many elements fell under each key of a <code>Grouping</code>. The keys come out in first-encounter order, as the <code>LinkedHashMap</code> it fills.</p>
           <pre><code class="lang-kotlin">println(listOf("a", "bb", "cc").groupingBy { it.length }.eachCount())   // {1=1, 2=2}</code></pre>

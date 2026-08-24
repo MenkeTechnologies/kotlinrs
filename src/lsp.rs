@@ -532,6 +532,13 @@ const CORPUS: &[Entry] = &[
         "val x: Int? = null\nprintln(x ?: 0)   // 0",
     ),
     (
+        "::",
+        "Operators",
+        "::fn\nType::member\nreceiver::member",
+        "Callable reference: names a function as a VALUE. With no receiver it is a top-level function or a primary constructor; with a TYPE receiver it is unbound, so the resulting function takes the receiver as its first parameter; with any other expression it is bound, and that receiver is evaluated once where the reference is written. `Type::class` is not supported.",
+        "fun inc(x: Int) = x + 1\nprintln(listOf(1, 2).map(::inc))            // [2, 3]\nprintln(listOf(\"aa\", \"b\").map(String::length))   // [2, 1]",
+    ),
+    (
         "!!",
         "Operators",
         "expr!!",

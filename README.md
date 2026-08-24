@@ -1355,6 +1355,50 @@ differential run over an alphabet of the awkward characters is what caught the
 first draft of the `…AnyOf` family reading its `startIndex` as a character index
 rather than a UTF-16 offset.
 
+The round after that took the three spellings that did not PARSE, and two loops
+that were quadratic.
+
+`::` did not lex, so every callable reference was `unexpected token Colon`.
+Kotlin's definition is that a reference denotes a FUNCTION, so it lowers to the
+lambda that calls it — arity from the callee's signature, body one call with the
+synthesized parameters forwarded — and capture, dispatch and passing it to
+`map`/`filter`/`fold`/`sortedBy` are then the closure path that already existed.
+All three receivers resolve: `::inc` / `::C` / `::println`, the UNBOUND
+`C::twice` / `C::v` / `String::length` whose function takes the receiver as its
+first parameter, and the BOUND `c::plusN` / `bump()::length`, whose computed
+receiver is pinned to a temporary so it is evaluated once where the reference is
+written rather than once per invocation. `Type::class` is not covered.
+
+`{ (k, v) -> … }` — the spelling `Map.map`/`filter`/`forEach`/`sortedBy` are
+almost always written with — was a parse error. Kotlin defines the group as ONE
+parameter whose components are unpacked in the body, so it lowers to a synthetic
+parameter plus the `componentN` destructuring node `val (k, v) = e` already
+produced, and needs no new runtime. The type-annotation scan needed a matching
+stop, since an annotated last component swallowed the group's closing paren and
+rolled the whole parameter list back.
+
+And two resolution rules stopped at FILE scope while working inside a function.
+A top-level property copied its class from the type ANNOTATION alone, so
+`val p = C()` carried none — and the operator conventions read exactly that
+field, so two objects that answered `K3` held in locals failed to compile held
+in top-level `val`s. A top-level `val` holding a lambda was not callable at all,
+because every remaining resolution arm looks for a callable DECLARATION and a
+property is not one; a top-level `fun` of the same name still wins, as it does
+on the reference.
+
+The two quadratic loops were both the way a Kotlin program grows a collection.
+`MutableList.add` ran a full membership probe — a whole-collection scan that
+re-enters the VM for a user `equals` — and discarded the result: only a `Set`
+needs it. `StringBuilder` dispatch cloned the builder's entire content before
+looking at the member name, so `append` copied the whole string it was appending
+to on every call, where only `toString` and the inherited `CharSequence`
+delegation need the content at all. 20 000 `xs.add(i)` calls went from 15.13 s
+to 0.04 s and 200 000 appends from 8.10 s to 0.61 s, both from four times the
+work per doubling to two. `m[k] = v` on a `MutableMap` is still quadratic and is
+recorded in BUGS.md: that one is the data structure, an association `Vec` that
+has to preserve iteration order and route equality through a user `equals`, not
+a redundant call.
+
 Next: `Regex` in every spelling, `sequence { … }`/`yield`, `lateinit`,
 `Throwable.cause` and the
 `(message, cause)` constructors, variance and bounds,

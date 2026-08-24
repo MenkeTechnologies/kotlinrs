@@ -205,3 +205,87 @@ The `String` collection-member rule is the reason for the last row: a
 `CharSequence` receiver is decomposed into its `Char`s and handed to the
 `Iterable` members, which gives the right answer for the two dozen that Kotlin
 does declare and three it does not.
+
+## `Float` is `Double` — the 32-bit width is not carried
+
+`Float` and `Double` share `Value::Float`, an `f64`, so nothing rounds to
+single precision and `Float.toString` never runs. Every answer below is a
+*number*, not a formatting difference: the reference's is the nearest `f32` and
+kotlinrs's is the `f64` the same literal denotes. Measured on `kotlinc` 2.4.10 /
+JRE 21.0.12.
+
+| program | kotlinrs | reference |
+| --- | --- | --- |
+| `1.0f / 3.0f` | `0.3333333333333333` | `0.33333334` |
+| `(0.1f).toDouble()` | `0.1` | `0.10000000149011612` |
+| `16777217.0f` | `1.6777217E7` | `1.6777216E7` |
+| `Float.MAX_VALUE` | `unresolved reference: Float` | `3.4028235E38` |
+| `Float.MIN_VALUE` | `unresolved reference: Float` | `1.4E-45` |
+| `Double.MIN_VALUE` | `unresolved reference: Double` | `4.9E-324` |
+
+`Double.MAX_VALUE` answers `1.7976931348623157E308` and is right, so the two
+companion objects are half-present rather than absent.
+
+Closing this means carrying the declared width on the value — the same substrate
+the 32-bit integer narrowing has been building, and the same substrate the
+`IllegalFormatConversionException` operand name above needs. A `Float`-flavoured
+`toString` alone would not do it: `1.0f / 3.0f` has to *divide* in single
+precision to reach `0.33333334`.
+
+## More `unresolved reference`, newly measured
+
+Each fails loudly with a diagnostic rather than answering wrongly. Recorded so
+the next round has the measurement rather than a guess.
+
+| program | kotlinrs | reference |
+| --- | --- | --- |
+| `x::class` / `Int::class` | `expected a name after \`::\`, found Class` | a `KClass`; `.simpleName` is `Int` |
+| `class Op(val v: Int) : Comparable<Op>` | `unresolved supertype Comparable of class Op` | compiles; `<` is the `compareTo` override |
+| `enumValues<E>().size` | `unresolved reference: enumValues` | `2` (`E.values()` DOES work) |
+| `n.orEmpty()` on a `String?` | `unresolved reference: orEmpty on value` | `` (the empty string) |
+| `n.isNullOrEmpty()` on a `String?` | `unresolved reference: isNullOrEmpty on value` | `true` |
+| `IntRange(1, 3)` | `unresolved reference: IntRange` | `1..3` (`1..3` itself works) |
+| `listOf(1).iterator()` | `unresolved reference: iterator on List` | works |
+
+The nullable-receiver extensions are one family, not three entries: `orEmpty`,
+`isNullOrEmpty` and `isNullOrBlank` are all declared on a NULLABLE receiver, and
+dispatch here reaches a member only through the receiver's runtime kind — a
+Kotlin `null` is `Value::Undef`, which has no members. `orEmpty` additionally
+needs the receiver's STATIC type to pick its empty value, since a `String?`
+answers `""` and a `List<T>?` answers `[]`.
+
+## A function VALUE prints as its arity, not as its signature
+
+```
+println(::f)                 kotlinrs: (lambda arity=2)   reference: fun f(kotlin.Int, kotlin.Int): kotlin.Int
+println(String::length)      kotlinrs: (lambda arity=1)   reference: val kotlin.String.length: kotlin.Int
+```
+
+A closure carries its arity and nothing else, so there is no declaration to
+render. The reference's form is a reflection surface — the callee's name, its
+parameter and return types, and for a property reference its `val`/`var` — none
+of which survives the lowering to a closure. Calling the value is unaffected;
+only printing it is.
+
+A REFERENCE is the whole gap; a plain lambda literal is not comparable at all.
+`println({ x: Int -> x })` answers `BKt$$Lambda/0x00000070010118c8@497470ed` on
+the reference — a synthetic class name carrying the loader's address and an
+identity hash, both of which change from run to run — so there is nothing there
+to match and nothing that could be frozen in the corpus.
+
+## `m[k] = v` is quadratic
+
+A `MutableMap` put costs a full scan, so filling one is O(n²): 20 000 puts took
+14.03 s (`/usr/bin/time -p` user, `cargo build` dev binary).
+
+This is the data structure, not a redundant call. A `Map` is a
+`Vec<(Value, Value)>` association list because it has to preserve iteration
+order — `mapOf` is insertion-ordered, `hashMapOf` is bucket-ordered and
+`sortedMapOf` is key-ordered, and all three are observable — and because key
+equality routes through a user `equals`/`hashCode`, which re-enters the VM and
+can reallocate the heap, so a lookup cannot hold a borrow across it.
+`index_set` already skips the scan for every non-`Map` receiver.
+
+The same round removed the two costs of this shape that WERE redundant calls
+(see CHANGELOG Round 10); this one needs a hash index beside the ordered `Vec`,
+maintained through every mutation, and a rule for which keys may use it.

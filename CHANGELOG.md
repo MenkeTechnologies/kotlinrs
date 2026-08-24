@@ -417,3 +417,145 @@ The corpus floor moved 655 → 675. 5 new `tests/lang.rs` tests, 248 → 253. On
 pre-existing doctest failure in `src/parser.rs` is fixed (an indented Kotlin
 snippet in a doc comment was being compiled as Rust, so `cargo test` was red on
 `main`). No test was deleted or weakened.
+
+## Round 10 — the spellings that did not parse, and two loops that were quadratic
+
+### The oracle
+
+`kotlinc-jvm 2.4.10 (JRE 21.0.12.1)`, as `scripts/capture-parity.sh` reported
+it while minting this round's records. Every value below came from a run of it.
+
+### Three resolution gaps at file scope and in a lambda's parameter list
+
+**A top-level `val` did not record its class.** `PropMeta.class` was copied from
+the type ANNOTATION alone, so `val p = C()` carried no class while
+`val p: C = C()` did — and `infer_class` reads exactly that field for a global.
+Everything keyed off a receiver's class therefore stopped at file scope while
+working inside a function, where the local binding table records it. The
+operator conventions resolved `K(1) + K(2)` and a local `val a = K(1); a + b`,
+and failed to compile the same two objects held in top-level `val`s with
+`unresolved reference: plus on K`. A forward pass over the properties in
+declaration order — the order their initializers run in — backfills it.
+
+**A top-level `val` holding a lambda was not callable.** `f(3)` for a file-scope
+`val f = { x: Int -> x + 1 }` was `unresolved reference: f`: the local-slot arm
+of `compile_call` covers the same shape inside a function, and at file scope
+every remaining arm looks for a callable DECLARATION, which a property is not.
+The new arm sits after the free-function lookup, so a top-level `fun f` still
+wins — Kotlin keeps functions and properties in separate namespaces and resolves
+a call against the function, and the reference prints `fun` for the pair. It is
+gated on the property's type, so `val n = 5; n(1)` keeps its compile-time
+diagnostic rather than becoming a closure call that only fails at run time.
+
+**`{ (k, v) -> … }` was a parse error** — `expected RParen, found Comma` — which
+is the spelling `Map.map`/`filter`/`forEach`/`sortedBy` are almost always
+written with. Kotlin defines the group as ONE parameter whose components are
+unpacked in the body, and that is how it lowers: a synthetic parameter, named
+unspellably so it cannot shadow anything the program wrote, plus the leading
+`StmtKind::Destructure` that `val (k, v) = e` already produced. No new runtime —
+`componentN` on a `Map.Entry`, a `Pair`, a `Triple` and a `data class` all
+already answered.
+
+`skip_lambda_param_type` needed a matching stop. It terminated only on `,` or
+`->` at depth 0, so an annotated last component — `{ (x: Int, y: Int) -> … }` —
+swallowed the group's `)`, drove the depth negative, missed the `->` and rolled
+the whole parameter list back. An UNBALANCED `)` closes something the annotation
+did not open, so it ends it; a function type's own parens are balanced and never
+reach depth 0 there. The scan stays speculative: `{ (a + b).toString() }` and
+`{ (it) }` still parse as bodies, which the reference agrees they are.
+
+### `::` did not lex
+
+Every spelling of the callable-reference operator was `unexpected token Colon`.
+Kotlin's definition is that a reference denotes a FUNCTION, so it lowers to the
+lambda that calls it — arity from the callee's signature, body one call with the
+synthesized parameters forwarded — and capture, dispatch and passing it to
+`map`/`filter`/`fold`/`sortedBy` are then the closure path that already existed.
+
+| spelling | what it denotes |
+| --- | --- |
+| `::inc`, `::C`, `::println` | a top-level function, a primary constructor, a built-in |
+| `C::twice`, `C::v`, `String::length` | UNBOUND — the receiver becomes the first parameter |
+| `c::plusN`, `bump()::length` | BOUND — the receiver is captured |
+
+A computed bound receiver is pinned to a temporary, so `bump()::length` calls
+`bump()` once where the reference is written and not once per invocation; the
+reference answers `1` for the counter and so does this. A local shadows a type
+in receiver position, which kotlinc also accepts: `val C = C(4)` makes
+`C::plusN` the bound reference on both.
+
+A built-in receiver type has no arity table here, so `String::length` lowers to
+a one-parameter member ACCESS — which covers a property and a zero-argument
+method alike. A built-in member that takes arguments is not expressible that way
+and fails with its own `unresolved reference` rather than binding a wrong arity
+silently. `Type::class` is not covered and is recorded in [BUGS.md](BUGS.md).
+
+### Six members that were `unresolved reference`
+
+`linkedMapOf` / `sortedMapOf` / `TreeMap` are the ordered `Map` builders whose
+`Set` counterparts already resolved, and each one's ITERATION order is why it
+exists, so it travels through the same trailing order spec. `TreeMap` also joins
+the JVM-constructor list, so `TreeMap(other)` is the COPY form.
+`Iterable<Pair<K, V>>.toMap()` shares `associate`'s duplicate-key rule —
+`listOf(1 to 2, 1 to 3).toMap()` is `{1=3}` — and `Map.toMap()` /
+`Map.toMutableMap()` copy the receiver in its own iteration order.
+
+Two spellings were measured and deliberately NOT added, because kotlinc rejects
+them: `List.toMutableMap()` and `List<Map.Entry>.toMap()`. Both were in a first
+draft; the probe against the reference is what took them out.
+
+### Two O(1) operations that cost O(n)
+
+Growing a collection one element at a time was quadratic on both of the two ways
+a Kotlin program does it. `/usr/bin/time -p` user seconds, `cargo build` (dev)
+binary, same machine and session.
+
+`MutableList.add` ran a full membership probe whose result it discarded. Only a
+`Set` needs it — it decides both the answer and whether the collection changes
+at all — while a `List` always appends and always answers `true`. The probe is a
+whole-collection scan that re-enters the VM for a user `equals`.
+
+| `xs.add(i)` | before | after |
+| --- | --- | --- |
+| n = 20 000 | 15.13 s | 0.04 s |
+| n = 40 000 | 59.28 s | 0.07 s |
+| n = 80 000 | 234.30 s | 0.14 s |
+
+`StringBuilder` dispatch cloned the builder's whole content before looking at
+the member name, so `append` copied the entire string it was appending to on
+every call. Only `toString` and the delegation of the inherited `CharSequence`
+members need the content; every mutating member reaches the buffer through
+`edit_builder`, which borrows it, and reads nothing but the length.
+
+| `sb.append("abcdefghij")` | before | after |
+| --- | --- | --- |
+| n = 25 000 | 0.17 s | 0.08 s |
+| n = 50 000 | 0.53 s | 0.15 s |
+| n = 100 000 | 2.04 s | 0.31 s |
+| n = 200 000 | 8.10 s | 0.61 s |
+
+Four times the work for twice the input in both tables before, two after.
+Behaviour is unchanged and was checked against the reference rather than
+assumed: `Set.add` still dedupes, including through a user `equals`/`hashCode`;
+`add(index, element)`, the `hashSetOf`/`sortedSetOf`/`linkedSetOf` orderings and
+the whole `append`/`reverse`/`setCharAt`/`insert`/`deleteCharAt`/`capacity`/
+surrogate-length surface all still answer byte-for-byte what kotlinc answers.
+
+### Not closed
+
+`m[k] = v` on a `MutableMap` is still quadratic — 20 000 puts, 14.03 s. That one
+is the data structure rather than a redundant call: a `Map` is an association
+`Vec` so that it can preserve iteration order and route equality through a user
+`equals`, and `index_set` already skips the scan for every non-`Map` receiver.
+Newly measured and recorded rather than fixed: `Float` is `Double` (so
+`1.0f / 3.0f` is `0.33333334` on the reference and `0.3333333333333333` here),
+`Type::class`, a `Comparable<T>` supertype, the nullable-receiver extensions,
+`enumValues<E>()`, `Float`/`Double` companion constants, and what a function
+VALUE prints. All in [BUGS.md](BUGS.md).
+
+### Provenance
+
+47 new records, each minted by `scripts/capture-parity.sh` from
+`kotlinc-jvm 2.4.10 (JRE 21.0.12.1)` in this run; 0 rejected. The corpus floor
+moved 675 → 722. 5 new `tests/lang.rs` tests, 253 → 258. No test was deleted or
+weakened, and no audit or report script was touched.
