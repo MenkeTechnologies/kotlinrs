@@ -5813,3 +5813,70 @@ fn a_top_level_val_holding_a_lambda_is_callable() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// A lambda parameter may be a DESTRUCTURING group.
+///
+/// `{ (k, v) -> … }` is how `Map.map`/`filter`/`forEach` are almost always
+/// written, and it was a parse error (`expected RParen, found Comma`). Kotlin
+/// defines the group as ONE parameter whose components are unpacked in the
+/// body, which is how it lowers here — a synthetic parameter plus the same
+/// `componentN` destructuring node `val (k, v) = e` produces. Every expectation
+/// below was captured from `kotlinc` 2.4.10 on JRE 21.0.12.
+#[test]
+fn a_lambda_parameter_may_be_a_destructuring_group() {
+    assert_eq!(
+        stdout(r#"println(mapOf("a" to 1, "b" to 2).map { (k, v) -> "$k=$v" })"#),
+        "[a=1, b=2]\n"
+    );
+    assert_eq!(
+        stdout(r#"println(mapOf("a" to 1, "b" to 2).filter { (k, v) -> v > 1 })"#),
+        "{b=2}\n"
+    );
+    assert_eq!(
+        stdout("println(listOf(1 to 2, 3 to 4).map { (a, b) -> a + b })"),
+        "[3, 7]\n"
+    );
+    // `_` discards a component, as it does in a `val` destructuring.
+    assert_eq!(
+        stdout("println(listOf(1 to 2).map { (a, _) -> a })"),
+        "[1]\n"
+    );
+    assert_eq!(
+        stdout("println(listOf(1 to 2, 3 to 1).sortedBy { (_, v) -> v })"),
+        "[(3, 1), (1, 2)]\n"
+    );
+    // An annotated component. The annotation is only consumed — the binding's
+    // type comes from `componentN`'s receiver — but the scan has to STOP at the
+    // group's `)`, which is what made this spelling a parse error of its own.
+    assert_eq!(
+        stdout("println(listOf(1 to 2).map { (x: Int, y: Int) -> x - y })"),
+        "[-1]\n"
+    );
+    // Three components, and a `data class`'s generated `componentN`.
+    assert_eq!(
+        stdout("println(listOf(Triple(1,2,3)).map { (x, y, z) -> x + y + z })"),
+        "[6]\n"
+    );
+    assert_eq!(
+        stdout(
+            "data class Rec(val n: String, val q: Int)\nfun main() { println(listOf(Rec(\"r\", 7)).map { (n, q) -> \"$n$q\" }) }"
+        ),
+        "[r7]\n"
+    );
+    assert_eq!(
+        stdout("println(mapOf(1 to 2).entries.map { (k, v) -> k * v })"),
+        "[2]\n"
+    );
+    assert_eq!(
+        stdout(r#"println(listOf(1 to "x").associate { (k, v) -> v to k })"#),
+        "{x=1}\n"
+    );
+    // The scan is SPECULATIVE: a body that merely opens with a parenthesis is
+    // still a body. Rolling this back wrongly would turn every such lambda into
+    // a parse error.
+    assert_eq!(
+        stdout("val a = 1\nval b = 2\nfun main() { println(listOf(1,2,3).map { (a + b).toString() }.size) }"),
+        "3\n"
+    );
+    assert_eq!(stdout("println(listOf(1).map { (it) })"), "[1]\n");
+}

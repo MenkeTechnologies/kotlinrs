@@ -2799,19 +2799,82 @@ impl Parser {
         Ok(e)
     }
 
-    /// A lambda literal `{ (p1, p2, …) -> body }` or `{ body }` (implicit `it`).
+    /// A lambda literal `{ p1, p2 -> body }` or `{ body }` (implicit `it`).
     /// The body is a statement sequence whose last statement's value is the
     /// lambda's result.
+    ///
+    /// A parameter slot may also be a DESTRUCTURING group — `{ (k, v) -> … }`,
+    /// the spelling `Map.map`/`forEach`/`sortedBy` are almost always written
+    /// with. Kotlin defines it as one parameter whose components are unpacked in
+    /// the body, and that is exactly how it is lowered here: the group takes a
+    /// synthetic single parameter and the body gains a leading
+    /// [`StmtKind::Destructure`], the same node `val (k, v) = e` produces. The
+    /// synthetic name is unspellable in Kotlin source, so it cannot shadow or be
+    /// captured by anything the program wrote.
     fn lambda(&mut self) -> Result<Expr, String> {
+        let lam_line = self.line();
         self.eat(&Tok::LBrace)?;
         // Optional parameter list ending in `->`. Speculatively scan a run of
-        // `IDENT (',' IDENT)* '->'`; roll back if it isn't there.
+        // `SLOT (',' SLOT)* '->'`, where a SLOT is `IDENT [: Type]` or a
+        // parenthesized destructuring group; roll back if the `->` isn't there.
         let mut params: Vec<(String, Type)> = Vec::new();
+        let mut destructures: Vec<(String, Vec<String>)> = Vec::new();
         let save = self.pos;
-        if matches!(self.peek(), Tok::Ident(_)) {
+        if matches!(self.peek(), Tok::Ident(_) | Tok::LParen) {
             let mut tmp: Vec<(String, Type)> = Vec::new();
+            let mut dtmp: Vec<(String, Vec<String>)> = Vec::new();
             let mut ok = true;
             loop {
+                // `( a, b )` — a destructuring group. Speculative like the rest
+                // of this scan: a body that merely OPENS with a parenthesis,
+                // `{ (a + b).toString() }`, fails one of the checks below or the
+                // `->` test after the loop, and rolls back.
+                if self.at(&Tok::LParen) {
+                    self.bump();
+                    let mut names: Vec<String> = Vec::new();
+                    loop {
+                        match self.peek() {
+                            Tok::Ident(n) => {
+                                let n = n.clone();
+                                self.bump();
+                                names.push(n);
+                            }
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        // A component may be annotated: `{ (k: String, v) -> … }`.
+                        // The annotation only has to be CONSUMED — the component
+                        // is bound through `componentN`, whose result type the
+                        // compiler infers from the receiver.
+                        if self.at(&Tok::Colon) {
+                            self.bump();
+                            if self.skip_lambda_param_type().is_none() {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if self.at(&Tok::Comma) {
+                            self.bump();
+                        } else {
+                            break;
+                        }
+                    }
+                    if !ok || names.is_empty() || !self.at(&Tok::RParen) {
+                        ok = false;
+                        break;
+                    }
+                    self.bump(); // `)`
+                    let synth = format!("<destructured{}>", tmp.len());
+                    dtmp.push((synth.clone(), names));
+                    tmp.push((synth, Type::Unknown));
+                    if self.at(&Tok::Comma) {
+                        self.bump();
+                        continue;
+                    }
+                    break;
+                }
                 let pname = match self.peek() {
                     Tok::Ident(n) => {
                         let n = n.clone();
@@ -2849,6 +2912,7 @@ impl Parser {
             if ok && self.at(&Tok::Arrow) {
                 self.bump();
                 params = tmp;
+                destructures = dtmp;
             } else {
                 self.pos = save;
             }
@@ -2864,6 +2928,21 @@ impl Parser {
             body.push(self.stmt()?);
         }
         self.eat(&Tok::RBrace)?;
+        // Unpack each destructuring group at the head of the body, in
+        // declaration order, so `{ (k, v), (a, b) -> … }` binds `k`/`v` before
+        // `a`/`b`. Inserting in reverse at index 0 keeps that order.
+        for (synth, names) in destructures.into_iter().rev() {
+            body.insert(
+                0,
+                Stmt::new(
+                    lam_line,
+                    StmtKind::Destructure {
+                        names,
+                        init: Expr::Var(synth),
+                    },
+                ),
+            );
+        }
         Ok(Expr::Lambda { params, body })
     }
 
@@ -2886,6 +2965,15 @@ impl Parser {
         loop {
             match self.peek() {
                 Tok::Comma | Tok::Arrow if depth == 0 => return Some(ty),
+                // An UNBALANCED `)` closes something this type did not open, so
+                // it ends the annotation rather than belonging to it — the last
+                // component of a destructuring group, `{ (x: Int, y: Int) -> … }`.
+                // A function type's own parens are entered through the `LParen`
+                // arm below and are balanced, so they never reach depth 0 here.
+                // Without this stop the scan swallowed the `)`, drove depth
+                // negative, missed the `->` and rolled the whole parameter list
+                // back — leaving `expected RParen, found Colon`.
+                Tok::RParen if depth == 0 => return Some(ty),
                 Tok::Lt | Tok::LParen | Tok::LBracket => {
                     depth += 1;
                     ty = Type::Unknown;
