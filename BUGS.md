@@ -246,6 +246,8 @@ the next round has the measurement rather than a guess.
 | `n.isNullOrEmpty()` on a `String?` | `unresolved reference: isNullOrEmpty on value` | `true` |
 | `IntRange(1, 3)` | `unresolved reference: IntRange` | `1..3` (`1..3` itself works) |
 | `listOf(1).iterator()` | `unresolved reference: iterator on List` | works |
+| `Result.success(1).getOrNull()` | `unresolved reference: Result` | `1` (`runCatching { 5 }.getOrNull()` DOES work) |
+| `e.javaClass.name` | `unresolved reference: javaClass on Exception` | `java.lang.Exception` |
 
 The nullable-receiver extensions are one family, not three entries: `orEmpty`,
 `isNullOrEmpty` and `isNullOrBlank` are all declared on a NULLABLE receiver, and
@@ -253,6 +255,29 @@ dispatch here reaches a member only through the receiver's runtime kind — a
 Kotlin `null` is `Value::Undef`, which has no members. `orEmpty` additionally
 needs the receiver's STATIC type to pick its empty value, since a `String?`
 answers `""` and a `List<T>?` answers `[]`.
+
+## `"%b".format(null)` reads a missing argument as `false`
+
+```
+"%b".format(null)   kotlinrs: false   reference: java.util.MissingFormatArgumentException: Format specifier '%b'
+```
+
+Not a `%b` bug. `format`'s parameter is `vararg args: Any?`, so a literal `null`
+is the ARRAY and not an element: the reference sees a call with no arguments at
+all and faults on the first specifier. kotlinrs packs the `null` into a
+one-element array and `%b` then renders an absent value, which is `false` —
+Java's `%b` answer for a null argument, and the right answer for the call this
+was mistaken for. Closing it means telling a `null` spread from a `null`
+element at the vararg packing site.
+
+## An identity hash is a small heap index
+
+`Object.toString` is `<class>@<hex identity hash>`, and neither side's number is
+reproducible — the reference's varies per run — so nothing here can be frozen in
+the corpus. The shapes still differ: kotlinrs prints the heap slot, so a first
+object is `C@0` where the reference prints a wide value like `C@6d9c638`. Only
+programs that PRINT a bare object without a `toString` override are affected,
+and no such program has a stable expectation on either side.
 
 ## A function VALUE prints as its arity, not as its signature
 
