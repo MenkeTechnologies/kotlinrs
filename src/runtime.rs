@@ -37,10 +37,32 @@ const INTERPRETER_STACK: usize = 1 << 29; // 512 MiB
 /// and hands back exactly what it returned.
 pub fn run_source(src: &str) -> Result<i32, String> {
     let owned = src.to_string();
+    on_interpreter_thread(
+        move || run_source_on_this_thread(&owned),
+        || run_source_on_this_thread(src),
+    )
+}
+
+/// Run `work` on a freshly spawned interpreter thread — the one with
+/// [`INTERPRETER_STACK`] reserved — and hand back what it returned. `inline` is
+/// the fallback for a system that cannot give us a thread at all.
+///
+/// Anything that has to observe the run's *own* thread state belongs in `work`
+/// rather than after the call: `host`'s run state is `thread_local!`, and so is
+/// fusevm's compiled-trace cache, so a caller that runs here and then asks
+/// about the result from the spawning thread is asking a different thread's
+/// tables. That is exactly what [`crate::tiers::report`] used to do — it ran
+/// the program here and then read the trace cache on the main thread, which
+/// that run never wrote to, so every program it reported on came back
+/// `traced=false` whatever the tiers had actually done with it.
+pub fn on_interpreter_thread<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+    inline: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
     let worker = std::thread::Builder::new()
         .name("kotlin".to_string())
         .stack_size(INTERPRETER_STACK)
-        .spawn(move || run_source_on_this_thread(&owned));
+        .spawn(work);
     match worker {
         Ok(h) => match h.join() {
             Ok(r) => r,
@@ -52,7 +74,7 @@ pub fn run_source(src: &str) -> Result<i32, String> {
         // No thread available (a hard resource limit). Running inline is worse
         // than not running at all only in stack depth, so fall back rather than
         // refuse the program.
-        Err(_) => run_source_on_this_thread(src),
+        Err(_) => inline(),
     }
 }
 

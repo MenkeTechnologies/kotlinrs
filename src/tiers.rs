@@ -131,13 +131,28 @@ impl std::fmt::Display for Report {
 /// has gone round enough times to be recorded. kotlinrs writes program output
 /// straight to the process stdout, so the program's own output precedes the
 /// report — what is measured is what an ordinary run does.
+///
+/// THE RUN AND THE INSPECTION HAPPEN ON THE SAME THREAD, and that is load-
+/// bearing rather than tidy: fusevm keeps its compiled-block and compiled-
+/// trace caches in `thread_local!` tables (`BLOCK_CACHE_TLS`, `TRACE_CACHE_TLS`
+/// in fusevm `src/jit.rs`), and kotlinrs runs every program on a freshly
+/// spawned interpreter thread (see [`crate::runtime::on_interpreter_thread`]).
+/// Reporting from the SPAWNING thread therefore read tables the run never
+/// touched, so `traced` and `block-JIT compiled` could only ever come back
+/// `false` — not because the tiers declined the program but because the
+/// question went to the wrong thread. A report that can only answer one way is
+/// the one failure a tier report must not have, whatever the true answer is.
 pub fn report(src: &str) -> Result<Report, String> {
-    // The chunk lowered here is the same bytecode the run below executes, and
-    // fusevm keys its compiled code by the chunk's op hash, so asking this copy
-    // is asking about the run that just happened.
-    let chunk = crate::runtime::compile(src)?;
-    crate::runtime::run_source(src)?;
-    Ok(inspect(&chunk))
+    let owned = src.to_string();
+    let measure = |src: &str| {
+        // The chunk lowered here is the same bytecode the run below executes,
+        // and fusevm keys its compiled code by the chunk's op hash, so asking
+        // this copy is asking about the run that just happened.
+        let chunk = crate::runtime::compile(src)?;
+        crate::runtime::run_source_on_this_thread(src)?;
+        Ok(inspect(&chunk))
+    };
+    crate::runtime::on_interpreter_thread(move || measure(&owned), || measure(src))
 }
 
 /// Report on an already-executed program chunk.
