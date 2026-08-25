@@ -920,3 +920,5 @@ fun main() { val s = sequence { var n = 0; while (n < 3) { yield("v$n"); n += 1 
 fun main() { val outer = sequence { for (x in sequence { yield(1); yield(2) }) yield(x * 10) }; println(outer.toList()) }	[10, 20]\n
 fun main() { val s = sequence { yield(1); yield(2); yield(3) }; var t = 0; for (v in s) t += v; println(t); println(s.map { it + 1 }.filter { it > 2 }.take(2).toList()) }	6\n[3, 4]\n
 fun main() { val s = generateSequence(1) { if (it < 5) it + 1 else null }; println(s.toList()); val t = sequence { yieldAll(listOf(1, 2)) }; println(t.toList()) }	[1, 2, 3, 4, 5]\n[1, 2]\n
+fun main() { data class K(val a: Int); val k = K(1); println(k); println(k.a); println(k == K(1)) }	K(a=1)\n1\ntrue\n
+fun main() { class Local(val v: Int) { fun twice() = v * 2 }; println(Local(3).twice()) }	6\n

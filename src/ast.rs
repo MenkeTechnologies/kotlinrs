@@ -507,6 +507,10 @@ impl Stmt {
 
 #[derive(Debug, Clone)]
 pub enum StmtKind {
+    /// A statement that produces no code — what a LOCAL class declaration
+    /// leaves behind once the declaration itself has been hoisted to the top
+    /// level. See the `class` arm of `Parser::statement`.
+    Empty,
     /// `val`/`var` binding. `mutable` distinguishes `var`.
     Let {
         name: String,

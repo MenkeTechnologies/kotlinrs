@@ -2164,6 +2164,9 @@ impl Compiler {
             // call to it — including a call from its own body — is an ordinary
             // direct `Op::Call`. Registration happens at the declaration's
             // position, which is where Kotlin makes the name visible.
+            // The declaration was hoisted to the top level at parse time, so
+            // nothing is left to emit here.
+            StmtKind::Empty => {}
             StmtKind::LocalFun(lf) => {
                 if lf.recv.is_some() {
                     return Err(format!(
@@ -8773,6 +8776,7 @@ fn hof_ret_type(name: &str) -> Type {
 /// True when any expression reachable from `body` satisfies `f`.
 fn body_any(body: &[Stmt], f: &dyn Fn(&Expr) -> bool) -> bool {
     body.iter().any(|s| match &s.kind {
+        StmtKind::Empty => false,
         StmtKind::Let { init, .. } => expr_any(init, f),
         StmtKind::Assign { value, .. } => expr_any(value, f),
         StmtKind::SetMember { recv, value, .. } => expr_any(recv, f) || expr_any(value, f),

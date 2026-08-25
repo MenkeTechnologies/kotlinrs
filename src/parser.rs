@@ -79,6 +79,8 @@ pub struct Parser {
     /// enum, and a subclass is a top-level `class` here; the entry is parsed
     /// deep inside [`Parser::class_decl_mods`], which can only return one
     /// declaration, so the extra ones queue here.
+    /// A LOCAL class — one declared inside a function body — queues here too,
+    /// for the same reason and through the same drain.
     pending_classes: Vec<ClassDecl>,
 }
 
@@ -2035,6 +2037,32 @@ impl Parser {
             Tok::Val | Tok::Var => self.let_decl()?,
             // A local `fun`, declared inside another function's body.
             Tok::Fun => StmtKind::LocalFun(self.fun_decl()?),
+            // A LOCAL class, declared inside a function body. Kotlin scopes it
+            // to that body; here it is hoisted to the top level and queued for
+            // the same drain an `enum` entry's subclass uses. The declaration
+            // itself produces no code, so the statement is an empty one.
+            //
+            // The one thing hoisting loses is CAPTURE: Kotlin's local class may
+            // close over the enclosing function's locals, and a hoisted one
+            // cannot see them. That fails loudly — the name is an
+            // `unresolved reference` when the class body is compiled — rather
+            // than silently reading something else, unless a top-level property
+            // of the same name exists.
+            Tok::Class | Tok::Data | Tok::Object => {
+                let decl = self.class_decl()?;
+                self.pending_classes.push(decl);
+                StmtKind::Empty
+            }
+            Tok::Ident(w) if w == "enum" && matches!(self.peek_at(1), Tok::Class) => {
+                let decl = self.class_decl()?;
+                self.pending_classes.push(decl);
+                StmtKind::Empty
+            }
+            Tok::Ident(w) if w == "interface" => {
+                let decl = self.class_decl()?;
+                self.pending_classes.push(decl);
+                StmtKind::Empty
+            }
             Tok::Return => {
                 self.bump();
                 // `return@label` — a LOCAL return from the lambda (or `fun`)
