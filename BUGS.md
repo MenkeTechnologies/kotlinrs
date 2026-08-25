@@ -255,19 +255,25 @@ what this table used to hold — `orEmpty`/`isNullOrEmpty`/`isNullOrBlank`,
 `IntRange(a, b)`, `iterator()`, `Result.success`/`failure`, `putAll`, `clear`,
 `::class` and `javaClass` — is implemented and pinned in the corpus.
 
-## `"%b".format(null)` reads a missing argument as `false`
+## Still unresolved: `sequence { yield(…) }` and a `reified` type parameter
 
-```
-"%b".format(null)   kotlinrs: false   reference: java.util.MissingFormatArgumentException: Format specifier '%b'
-```
+Both measured against kotlinc-jvm 2.4.10 and both loud, not silent.
 
-Not a `%b` bug. `format`'s parameter is `vararg args: Any?`, so a literal `null`
-is the ARRAY and not an element: the reference sees a call with no arguments at
-all and faults on the first specifier. kotlinrs packs the `null` into a
-one-element array and `%b` then renders an absent value, which is `false` —
-Java's `%b` answer for a null argument, and the right answer for the call this
-was mistaken for. Closing it means telling a `null` spread from a `null`
-element at the vararg packing site.
+| program | kotlinrs | reference |
+| --- | --- | --- |
+| `sequence { yield(1); yield(2) }` | `unresolved reference: sequence` | a lazy `Sequence`; `.toList()` is `[1, 2]` |
+| `inline fun <reified T> f() = T::class.simpleName` | `unresolved reference: T` | the argument's name |
+
+`sequence` is the one that cannot be faked. Its block SUSPENDS at every `yield`,
+so an eager implementation that ran the block to completion and wrapped the
+results would answer correctly for a finite builder and HANG on
+`sequence { var i = 0; while (true) yield(i++) }` — which is the shape the
+laziness exists for. `generateSequence` is the finite-state half and does work.
+
+A `reified` parameter needs the body INLINED per call site with the type
+argument substituted, which is what `inline` means in Kotlin and what this
+frontend does not do; the parser now keeps a call's single type argument (that
+is what `enumValues<E>()` uses), so the missing half is the inlining.
 
 ## An identity hash is a small heap index
 

@@ -3660,6 +3660,15 @@ impl Compiler {
                 .emit(Op::Extended(KT_CLASS_REF, u8::from(java)), line);
             return Ok(Type::Obj);
         }
+        // `"%b".format(null)` — a literal `null` in a `vararg args: Any?`
+        // position is the ARRAY and not an element, so the call has NO
+        // arguments and the first specifier faults with
+        // `MissingFormatArgumentException`. Packing it as a one-element array
+        // instead made `%b` render an absent value, which is `false` — the
+        // right answer for a call nobody wrote.
+        if name == "format" && args.len() == 1 && matches!(args[0], Expr::Null) {
+            return self.compile_member(sc, recv, name, &[], false, line);
+        }
         // A `Float` handed to a member that stores it or looks it UP by value
         // is in an erased position, so it is boxed like a collection element.
         // `setOf(1.0f).contains(1.0f)` needs it on both sides: a hashed lookup
