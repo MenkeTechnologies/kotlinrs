@@ -236,6 +236,25 @@ what the `IllegalFormatConversionException` operand name above needs: `%d` of a
 `Float` still says `d != java.lang.Double` where the reference says
 `d != java.lang.Float`, for the same reason.
 
+## `Map` members and key widths, newly measured
+
+Found while pinning `Map` behaviour around the key index. Each is a feature gap
+or an erasure limit, not a wrong answer produced silently — except the first,
+which is.
+
+| program | kotlinrs | reference |
+| --- | --- | --- |
+| `m[1] = "int"; m[1L] = "long"` on a `MutableMap<Any, String>` | one entry, `1=long` | two entries, `1=int, 1=long` |
+| `hashMapOf` over `"one".."five"` | `{two=3, three=5, five=4, four=4, one=3}` | `{four=4, one=3, two=3, three=5, five=4}` |
+| `m.putAll(mapOf(2 to 2))` | `unresolved reference: putAll on Map` | `{1=1, 2=2}` |
+| `m.clear()` | `unresolved reference: clear on Map` | `{}` |
+| `fun main() { data class K(val a: Int); … }` (a LOCAL data class) | `unexpected token Class` | compiles |
+
+The first is the `Int`/`Long` counterpart of the `Float` erasure above: both
+widths are `Value::Int` at run time, so `1` and `1L` are one key here and two on
+the JVM. The second is a `String`-keyed `HashMap` whose bucket order this
+frontend's `hash_order` does not reproduce; an `Int`-keyed one does.
+
 ## More `unresolved reference`, newly measured
 
 Each fails loudly with a diagnostic rather than answering wrongly. Recorded so

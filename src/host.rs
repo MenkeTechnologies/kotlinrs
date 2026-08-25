@@ -813,6 +813,9 @@ fn reorder(vm: &mut VM, v: &Value) {
         }
         _ => {}
     });
+    // Every position just moved and the length did not change, which is the one
+    // mutation a `KeyIndex` cannot detect for itself.
+    invalidate_key_index(v);
 }
 
 /// The positions of `keys` in `java.util.HashMap` ITERATION order.
@@ -1228,6 +1231,7 @@ fn difference_modulo(a: i64, b: i64, c: i64) -> i64 {
 fn reset_heap() {
     HEAP.with(|h| h.borrow_mut().clear());
     COLL_ORDER.with(|c| c.borrow_mut().clear());
+    MAP_INDEX.with(|t| t.borrow_mut().clear());
     LIST_IMPL.with(|t| t.borrow_mut().clear());
     SEQ_VIEW.with(|t| t.borrow_mut().clear());
     TYPES.with(|t| t.borrow_mut().clear());
@@ -4271,6 +4275,9 @@ fn operator_apply(vm: &mut VM, lhs: &Value, name: &str, rhs: &Value) -> Result<V
                     *slot = entries;
                 }
             });
+            // The whole entry vector was replaced, which can leave the length
+            // unchanged while every position means something else.
+            invalidate_key_index(lhs);
             reorder(vm, lhs);
             return Ok(Value::Undef);
         }
@@ -9212,6 +9219,145 @@ fn index_get(vm: &mut VM, recv: &Value, index: &Value) -> Result<Value, String> 
     out.unwrap_or_else(|| Err("indexing a non-object value".to_string()))
 }
 
+/// A hashable stand-in for the [`Value`]s a `Map` key can take, used only to
+/// bucket them inside [`KeyIndex`].
+///
+/// Two keys that [`member_eq`] calls equal MUST produce the same `IndexKey`, or
+/// a lookup would MISS where the scan it replaces would hit. The reverse costs
+/// nothing — candidates in a bucket are all confirmed with `member_eq` — so a
+/// collision is free and only a missing one would be a bug. [`index_key`]
+/// therefore declines, answering `None`, for every value whose equality is not
+/// decidable from its representation alone.
+#[derive(PartialEq, Eq, Hash)]
+enum IndexKey {
+    Int(i64),
+    Str(String),
+    Bool(bool),
+    /// A `Char`, whose reserved-region handle IS its value.
+    Char(u32),
+    Null,
+}
+
+/// The bucket `v` belongs in, or `None` when no provably-correct one exists.
+///
+/// Every REAL heap object declines, and that is the whole safety argument: a
+/// class instance compares through a user `equals`/`hashCode` override that only
+/// the VM can run, a `List`/`Map` compares structurally through its elements,
+/// and neither answer is a function of the handle. A `Char` is the one `Obj`
+/// that is exempt, its handle being its value.
+///
+/// A `Float` declines too. A map is a HASHED collection here, so its equality is
+/// `hashCode` then `equals` (see [`hash_eq_vm`]) rather than the numeric
+/// [`value_eq`], and `1.hashCode()` is `1` where `(1.0).hashCode()` is
+/// `1072693248` — so an `Int` and a `Float` of the same magnitude are NOT the
+/// same key, and bucketing a float alongside an integer would only add a
+/// collision. Declining keeps the float out of the index entirely, which is the
+/// same answer with less machinery.
+fn index_key(v: &Value) -> Option<IndexKey> {
+    Some(match v {
+        Value::Int(n) => IndexKey::Int(*n),
+        Value::Str(s) => IndexKey::Str(s.as_str().to_string()),
+        Value::Bool(b) => IndexKey::Bool(*b),
+        Value::Undef => IndexKey::Null,
+        Value::Obj(id) => match char_code(v) {
+            Some(_) => IndexKey::Char(*id),
+            None => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// A `Map`'s key → position accelerator.
+///
+/// Entries live in a `Vec` because insertion position is what every iteration,
+/// every `toString` and the `HashMap` bucket reordering are derived from, so
+/// finding a key was a linear scan — and `key_position` CLONED every key before
+/// scanning, so `n` puts cost O(n²) in both comparisons and allocations. 20k
+/// puts took 38.25s against 2.20s for 5k.
+///
+/// The index is an accelerator, never the authority. Three things follow from
+/// that and are what make it safe:
+///
+///   * A candidate is confirmed with [`member_eq`] — the same predicate the scan
+///     used — so a bucket collision cannot produce a wrong hit.
+///   * A key with no [`IndexKey`] sets `unindexed`, and while that is non-zero
+///     the index declines every lookup and the scan runs. So a map keyed by
+///     class instances behaves exactly as it did.
+///   * `built_len` records how many entries the index was built over.
+///     `entries.len()` larger means keys were APPENDED — the shape a loop
+///     filling a map takes — and only the tail is indexed. Smaller means a
+///     removal shifted positions, and the index is rebuilt. Both are checked on
+///     every lookup, so no write site has to remember to call anything.
+///
+/// The one shape those checks cannot see is a permutation that leaves the length
+/// alone, which is what `HashMap`'s bucket [`reorder`] does; that calls
+/// [`invalidate_key_index`] itself.
+#[derive(Default)]
+struct KeyIndex {
+    by_key: std::collections::HashMap<IndexKey, Vec<usize>>,
+    /// Indexed keys that had no `IndexKey`. While non-zero the index declines.
+    unindexed: usize,
+    /// How many entries `by_key` covers.
+    built_len: usize,
+}
+
+thread_local! {
+    /// Heap handle → that `Map`'s [`KeyIndex`].
+    ///
+    /// A side table for the same reason [`COLL_ORDER`] is one: `HeapObj::Map` is
+    /// matched at ~55 sites that want the entries and nothing else.
+    static MAP_INDEX: RefCell<std::collections::HashMap<u32, KeyIndex>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Drop a map's index, forcing a rebuild on its next lookup. Called where
+/// entries MOVE without the length changing — the one mutation `built_len`
+/// cannot detect.
+fn invalidate_key_index(v: &Value) {
+    if let Value::Obj(id) = v {
+        MAP_INDEX.with(|t| t.borrow_mut().remove(id));
+    }
+}
+
+/// Candidate positions for `q` among `recv`'s map keys, or `None` when the index
+/// declines and the caller must scan.
+///
+/// The heap borrow and the `MAP_INDEX` borrow are both released before the
+/// caller confirms, because [`member_eq`] can re-enter the VM and allocate.
+fn key_index_candidates(recv: &Value, q: &Value) -> Option<Vec<usize>> {
+    let Value::Obj(id) = recv else { return None };
+    let key = index_key(q)?;
+    MAP_INDEX.with(|t| {
+        let mut table = t.borrow_mut();
+        let idx = table.entry(*id).or_default();
+        // Bring the index up to date with what the map now holds, under one
+        // short heap borrow. A pure append costs only the appended keys.
+        let repaired = with_obj(recv, |o| {
+            let HeapObj::Map(entries) = o else {
+                return false;
+            };
+            if entries.len() < idx.built_len {
+                idx.by_key.clear();
+                idx.unindexed = 0;
+                idx.built_len = 0;
+            }
+            for (i, (k, _)) in entries.iter().enumerate().skip(idx.built_len) {
+                match index_key(k) {
+                    Some(key) => idx.by_key.entry(key).or_default().push(i),
+                    None => idx.unindexed += 1,
+                }
+            }
+            idx.built_len = entries.len();
+            true
+        })
+        .unwrap_or(false);
+        if !repaired || idx.unindexed > 0 {
+            return None;
+        }
+        Some(idx.by_key.get(&key).cloned().unwrap_or_default())
+    })
+}
+
 /// The index of the element (or map key) of `recv` that equals `v`.
 ///
 /// Kept apart from the mutating members that need it because structural equality
@@ -9220,6 +9366,29 @@ fn index_get(vm: &mut VM, recv: &Value, index: &Value) -> Result<Value, String> 
 /// the mutation takes would panic, which is why every mutator below locates
 /// first and mutates second.
 fn key_position(vm: &mut VM, recv: &Value, v: &Value) -> Option<usize> {
+    // A `Map` asks its [`KeyIndex`] first. The candidates it answers with are
+    // still confirmed below with the same `member_eq` the scan uses, so this
+    // changes which keys are COMPARED and nothing about the verdict.
+    if let Some(cands) = key_index_candidates(recv, v) {
+        for i in cands {
+            let k = with_obj(recv, |o| match o {
+                HeapObj::Map(entries) => entries.get(i).map(|(k, _)| k.clone()),
+                _ => None,
+            })
+            .flatten();
+            match k {
+                Some(k) if member_eq(vm, &k, v, true) => return Some(i),
+                Some(_) => {}
+                // The map shrank under us; fall through to the scan.
+                None => break,
+            }
+        }
+        // A complete index that named no match IS the answer: every stored key
+        // has an `IndexKey`, and two equal keys share one.
+        if with_obj(recv, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false) {
+            return None;
+        }
+    }
     // Extracted before the scan for the reason above, and because a user
     // `equals` re-enters the VM and can allocate.
     let (keys, hashed) = with_obj(recv, |o| match o {
