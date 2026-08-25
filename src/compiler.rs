@@ -7355,7 +7355,15 @@ impl Compiler {
             "HashSet" | "LinkedHashSet" | "TreeSet" | "HashMap" | "LinkedHashMap" | "TreeMap"
         );
         let shape = match (ctor, argc) {
-            (true, 0) => COLL_DEFAULT_CAP,
+            // Both the JVM constructor and the Kotlin builder have a NO-ARGUMENT
+            // overload that is the plain `HashMap()`/`HashSet()`, and so starts
+            // from Java's default 16-bucket table. Only the vararg builder sizes
+            // its table to what it was handed: `hashMapOf()` is `HashMap()`
+            // while `hashMapOf(a, b)` is `HashMap(mapCapacity(2))`. Reading the
+            // empty builder as a SIZED table of `mapCapacity(0)` — one bucket —
+            // gave a filled-afterwards `hashMapOf<String, Int>()` a different
+            // mask and so a different printed order from the reference.
+            (_, 0) => COLL_DEFAULT_CAP,
             (true, _) => COLL_COPY,
             _ => 0,
         };

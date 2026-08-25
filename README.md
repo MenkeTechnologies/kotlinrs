@@ -1439,9 +1439,17 @@ equality the scan used, a key it cannot represent takes the whole map back to
 the scan, and the ordered `Vec` is untouched, so iteration order is unchanged by
 construction. 20 000 puts and reads went from 38.25 s to 0.15 s, and the shape
 holds out to 640 000 (0.56 s / 1.18 s / 2.52 s / 4.91 s per doubling from
-80 000). The two maps that do not iterate in insertion order are not covered
-and are recorded in BUGS.md: a `hashMapOf` put reorders its whole entry vector,
-which is an O(n) pass per write before any lookup happens.
+80 000).
+
+The two collections that do NOT iterate in insertion order — `hashMapOf`/
+`hashSetOf` and `sortedMapOf`/`sortedSetOf` — stayed quadratic after that, and
+for a different reason: every mutation re-ranked all `n` keys to keep the stored
+sequence in bucket order. That order is a property of what a READER sees, so it
+is computed when one looks, which is what `java.util.HashMap` does — a put drops
+the entry in a bucket and the table is walked when something iterates it. A
+mutation now records one bit; the readers that consume an order restore it.
+`hashMapOf` at 20 000 went from 79.05 s to 0.09 s and `sortedMapOf` from
+46.95 s to 0.10 s, both to 2x per doubling out to 80 000.
 
 Next: `Regex` in every spelling, `sequence { … }`/`yield`, `lateinit`,
 `Throwable.cause` and the

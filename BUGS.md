@@ -244,13 +244,11 @@ which is.
 | program | kotlinrs | reference |
 | --- | --- | --- |
 | `m[1] = "int"; m[1L] = "long"` on a `MutableMap<Any, String>` | one entry, `1=long` | two entries, `1=int, 1=long` |
-| `hashMapOf` over `"one".."five"` | `{two=3, three=5, five=4, four=4, one=3}` | `{four=4, one=3, two=3, three=5, five=4}` |
 | `fun main() { data class K(val a: Int); … }` (a LOCAL data class) | `unexpected token Class` | compiles |
 
-The first is the `Int`/`Long` counterpart of the `Float` erasure above: both
-widths are `Value::Int` at run time, so `1` and `1L` are one key here and two on
-the JVM. The second is a `String`-keyed `HashMap` whose bucket order this
-frontend's `hash_order` does not reproduce; an `Int`-keyed one does.
+This is the `Int`/`Long` counterpart of the `Float` erasure above: both widths
+are `Value::Int` at run time, so `1` and `1L` are one key here and two on the
+JVM.
 
 ## More `unresolved reference`, newly measured
 
@@ -315,27 +313,4 @@ A REFERENCE is the whole gap; a plain lambda literal is not comparable at all.
 the reference — a synthetic class name carrying the loader's address and an
 identity hash, both of which change from run to run — so there is nothing there
 to match and nothing that could be frozen in the corpus.
-
-## A `hashMapOf`/`sortedMapOf` put is still quadratic
-
-`m[k] = v` is linear on the insertion-ordered maps and not on the two that
-iterate some other way. Measured, `cargo build` dev binary, `m[i] = i * 2` for
-each `i` then `m[i]` back:
-
-| receiver | 5 000 | 10 000 | 20 000 |
-| --- | --- | --- | --- |
-| `mutableMapOf` | 0.03 s | 0.07 s | 0.13 s |
-| `linkedMapOf` | 0.04 s | 0.18 s | 0.17 s |
-| `hashMapOf` | 1.46 s | 6.39 s | 25.40 s |
-
-The key index is not what is missing. A `hashMapOf` iterates its BUCKET table,
-so every put reorders the whole entry vector — `reorder` ranks all `n` keys
-through `hash_order` — and that is an O(n) pass per put on its own, before any
-lookup happens. Repairing the index through the permutation rather than dropping
-it would remove one O(n) term and leave the other.
-
-Closing it means making the bucket order a property computed at ITERATION
-rather than maintained at every write, which is what the JVM does: a `HashMap`
-does not move its entries on a put, it puts each one in a bucket and walks the
-table when asked.
 
