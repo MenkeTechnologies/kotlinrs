@@ -922,3 +922,18 @@ fun main() { val s = sequence { yield(1); yield(2); yield(3) }; var t = 0; for (
 fun main() { val s = generateSequence(1) { if (it < 5) it + 1 else null }; println(s.toList()); val t = sequence { yieldAll(listOf(1, 2)) }; println(t.toList()) }	[1, 2, 3, 4, 5]\n[1, 2]\n
 fun main() { data class K(val a: Int); val k = K(1); println(k); println(k.a); println(k == K(1)) }	K(a=1)\n1\ntrue\n
 fun main() { class Local(val v: Int) { fun twice() = v * 2 }; println(Local(3).twice()) }	6\n
+fun main() { val m = mutableMapOf<Any, String>(); m[1] = "int"; m[1L] = "long"; println(m); println(m[1]); println(m[1L]); println(m.size) }	{1=int, 1=long}\nint\nlong\n2\n
+fun main() { println(listOf<Any>(1, 1L).distinct()); println(setOf<Any>(1, 1L).size); println((1 as Any) == (1L as Any)) }	[1, 1]\n2\nfalse\n
+fun main() { val a: Any = 5L; val b: Any = 5; println(a is Long); println(a is Int); println(b is Long); println(a == b) }	true\nfalse\nfalse\nfalse\n
+fun main() { println(listOf<Any>(1L, 2L)); println(1L.hashCode()); println((5L as Any).hashCode()); println((5 as Any).hashCode()) }	[1, 2]\n1\n5\n5\n
+fun main() { println(1L.javaClass); println((1L as Any).javaClass); println(1L::class.simpleName); println(listOf<Any>(1L)[0]::class.simpleName) }	long\nclass java.lang.Long\nLong\nLong\n
+fun main() { println(listOf<Any>(1L, 2L)); println(listOf(1L, 2L).sum()); println(listOf(1L, 2L).max()); println(listOf(3L, 1L).sorted()) }	[1, 2]\n3\n2\n[1, 3]\n
+fun main() { val m = mutableMapOf<Long, String>(); m[1L] = "a"; m[2L] = "b"; println(m); println(m[1L]); println(m.containsKey(2L)); println(m.keys) }	{1=a, 2=b}\na\ntrue\n[1, 2]\n
+fun main() { println(listOf<Any>(1L)[0]); println((listOf<Any>(1L)[0] as Long) + 1L); println(listOf(1L, 2L).map { it * 3 }) }	1\n2\n[3, 6]\n
+fun main() { println("%d".format(5L)); println("%x".format(255L)); println("%s".format(5L)); println("" + 5L) }	5\nff\n5\n5\n
+fun main() { println(Long.MAX_VALUE); println(listOf<Any>(Long.MAX_VALUE)); println(Long.MAX_VALUE.hashCode()); println((Long.MAX_VALUE as Any).hashCode()) }	9223372036854775807\n[9223372036854775807]\n-2147483648\n-2147483648\n
+data class LB(val v: Long)\nfun main() { println(LB(9223372036854775807L)); println(LB(5L).v + 1L); println(LB(5L) == LB(5L)) }	LB(v=9223372036854775807)\n6\ntrue\n
+fun id(x: Any): Any = x\nfun main() { println(id(7L)); println(id(7L) is Long); println(id(7) is Long); println(id(7L) == id(7)) }	7\ntrue\nfalse\nfalse\n
+fun main() { var t = 0L; for (v in listOf(1L, 2L, 3L)) t += v; println(t); println(t is Long) }	6\ntrue\n
+fun main() { println(listOf<Any>(1, 1L, 1.0).map { it::class.simpleName }); println(setOf<Any>(1, 1L).toList()) }	[Int, Long, Double]\n[1, 1]\n
+fun main() { val s = sequence { yield(1L); yield(2L) }; println(s.toList()); println(s.sum()) }	[1, 2]\n3\n

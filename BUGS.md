@@ -220,11 +220,12 @@ needs a value that was never in a `Float`-typed position to begin with, so
 nothing that starts from a `Float` literal, parameter, property or collection
 element reaches it.
 
-The `Int`/`Long` erasure below is the same shape and is NOT closed: both widths
-are `Value::Int` at run time, so `m[1]` and `m[1L]` are one key here and two on
-the JVM. Closing it the same way would box every `Long`, which is a cost on the
-common integer path that the `Float` box does not have — a `Float` is rare in
-an erased position and a `Long` is not.
+The `Int`/`Long` erasure is closed the same way, and the reason given here for
+not closing it was WRONG: boxing a `Long` was said to cost the common integer
+path, but nothing on that path passes through the boxing hook. `listOf(1, 2, 3)`
+holds `Int`s and boxes nothing, and every native `Op::Add` still sees a
+`Value::Int`. Only a `Long` entering a position that keeps no type boxes, which
+is the same short list a `Float` does.
 
 ## `Map` members and key widths, newly measured
 
@@ -234,12 +235,10 @@ which is.
 
 | program | kotlinrs | reference |
 | --- | --- | --- |
-| `m[1] = "int"; m[1L] = "long"` on a `MutableMap<Any, String>` | one entry, `1=long` | two entries, `1=int, 1=long` |
 | `fun main() { data class K(val a: Int); … }` (a LOCAL data class) | `unexpected token Class` | compiles |
 
-This is the `Int`/`Long` counterpart of the `Float` erasure above: both widths
-are `Value::Int` at run time, so `1` and `1L` are one key here and two on the
-JVM.
+Everything this table used to hold is closed. `m[1]` and `m[1L]` are two keys
+now, as they are on the JVM.
 
 ## More `unresolved reference`, newly measured
 

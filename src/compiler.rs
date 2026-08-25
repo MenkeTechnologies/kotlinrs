@@ -22,17 +22,17 @@
 use crate::ast::*;
 use crate::host::{
     COLL_COPY, COLL_DEFAULT_CAP, COLL_HASH, COLL_LITERAL, COLL_SORTED, KT_ARRAY, KT_ARRAY_INIT,
-    KT_ARRAY_NEW, KT_AS, KT_BOX_F32, KT_BUILDER, KT_CHR_STRING, KT_CLASSOF, KT_CLASS_REF,
-    KT_CLOSURE_CALL, KT_COLL_HOF, KT_COMPARATOR, KT_COMPARE_REG, KT_DBG_LINE, KT_DDIV, KT_DISPLAY,
-    KT_ENUM_REG, KT_EQUALS_REG, KT_EXC_ABORT, KT_EXC_CUT, KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW,
-    KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND, KT_F32,
-    KT_F32_ARITH, KT_F32_STR, KT_FFI_CALL, KT_FFI_COMPILE, KT_GENSEQ, KT_GETFIELD, KT_HASH_REG,
-    KT_IDENTITY, KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL,
-    KT_ITER_GET, KT_ITER_SIZE, KT_ITER_SRC, KT_JOIN, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO,
-    KT_LIST_TAG, KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL,
-    KT_OBJEQ_VM, KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP,
-    KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM,
-    KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG, KT_YIELD,
+    KT_ARRAY_NEW, KT_AS, KT_BOX_F32, KT_BOX_I64, KT_BUILDER, KT_CHR_STRING, KT_CLASSOF,
+    KT_CLASS_REF, KT_CLOSURE_CALL, KT_COLL_HOF, KT_COMPARATOR, KT_COMPARE_REG, KT_DBG_LINE,
+    KT_DDIV, KT_DISPLAY, KT_ENUM_REG, KT_EQUALS_REG, KT_EXC_ABORT, KT_EXC_CUT, KT_EXC_DEPTH,
+    KT_EXC_MATCH, KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW,
+    KT_EXC_UNSTASH, KT_EXTEND, KT_F32, KT_F32_ARITH, KT_F32_STR, KT_FFI_CALL, KT_FFI_COMPILE,
+    KT_GENSEQ, KT_GETFIELD, KT_HASH_REG, KT_IDENTITY, KT_IDIV, KT_IMOD, KT_INDEX_GET_VM,
+    KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_ITER_SRC, KT_JOIN,
+    KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO, KT_LIST_TAG, KT_MAKE_CLOSURE, KT_MAP_VM,
+    KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OPER_VM, KT_PAIR, KT_PRECOND,
+    KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN,
+    KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG, KT_YIELD,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
@@ -102,19 +102,22 @@ fn is_primitive_type_name(name: &str) -> bool {
 /// program can spell, so it cannot shadow or be shadowed by one.
 const YIELD_ALL_VAR: &str = "$yieldAll";
 
-/// The intrinsic `compile_member_boxed` wraps a `Float` argument in, so the box
-/// is emitted through the ordinary call path rather than by rewriting the
-/// argument list into bytecode by hand. Not a name any Kotlin program can spell.
-const BOX_FLOAT: &str = "__box_float";
+/// The intrinsic `compile_member_boxed` wraps a `Float` or `Long` argument in,
+/// so the box is emitted through the ordinary call path rather than by
+/// rewriting the argument list into bytecode by hand. Not a name any Kotlin
+/// program can spell.
+const BOX_WIDTH: &str = "__box_width";
 
 /// The members whose ARGUMENT is a key or a stored element rather than a
-/// number to compute with — the argument positions that erase a `Float`'s
-/// width the way a collection literal's elements do.
+/// number to compute with — the argument positions that erase a `Float`'s or a
+/// `Long`'s width the way a collection literal's elements do.
 ///
-/// Deliberately a short explicit list and not "every stdlib member": a boxed
-/// argument reaching one that reads it as a NUMBER (`pow`, `coerceAtLeast`)
-/// would have its handle read instead of its value.
-fn float_erasing_member(name: &str) -> bool {
+/// Deliberately a short explicit list and not "every stdlib member", and the
+/// asymmetry is the point: a name wrongly LEFT OFF answers as it did before —
+/// `m.containsKey(2L)` missing a boxed key — while a name wrongly INCLUDED
+/// hands a box to a member that reads it as a NUMBER (`pow`,
+/// `coerceAtLeast`), which would read the handle instead of the value.
+fn width_erasing_member(name: &str) -> bool {
     matches!(
         name,
         "contains"
@@ -3142,7 +3145,11 @@ impl Compiler {
                 Ok(Type::Boolean)
             }
             Expr::Is { value, ty, negated } => {
-                self.compile_expr(sc, value)?;
+                // The operand is BOXED when its static type is one the runtime
+                // cannot tell apart on its own, because that is exactly what
+                // `is Long` and `is Float` ask about. Without it `1L is Long`
+                // reaches a bare `Value::Int` and answers for an `Int`.
+                self.compile_erased(sc, value)?;
                 let nidx = self.b.add_constant(Value::str(ty.clone()));
                 self.b.emit(Op::LoadConst(nidx), 0);
                 self.b.emit(Op::Extended(KT_IS, 0), 0);
@@ -3158,7 +3165,19 @@ impl Compiler {
             Expr::As {
                 value, ty, safe, ..
             } => {
-                self.compile_expr(sc, value)?;
+                // A cast to a type that keeps no width — `1L as Any` — is an
+                // erased position: the value leaves with the cast's static type
+                // and its own is gone. A cast that KEEPS the width (`x as Long`)
+                // needs no box, and taking one would put the native path behind
+                // a heap object.
+                match cast_type(ty, *safe) {
+                    Type::Long | Type::Float => {
+                        self.compile_expr(sc, value)?;
+                    }
+                    _ => {
+                        self.compile_erased(sc, value)?;
+                    }
+                }
                 let nidx = self.b.add_constant(Value::str(ty.clone()));
                 self.b.emit(Op::LoadConst(nidx), 0);
                 self.b.emit(Op::Extended(KT_AS, u8::from(*safe)), 0);
@@ -3680,13 +3699,18 @@ impl Compiler {
         if name == "format" && args.len() == 1 && matches!(args[0], Expr::Null) {
             return self.compile_member(sc, recv, name, &[], false, line);
         }
-        // A `Float` handed to a member that stores it or looks it UP by value
-        // is in an erased position, so it is boxed like a collection element.
+        // A `Float` or a `Long` handed to a member that stores it or looks it UP
+        // by value is in an erased position, so it is boxed like a collection
+        // element.
         // `setOf(1.0f).contains(1.0f)` needs it on both sides: a hashed lookup
         // asks `hashCode` first, and `java.lang.Float`'s is not
         // `java.lang.Double`'s, so an unboxed query misses a boxed element.
         // `format`'s `vararg args: Any?` is the same position by another name.
-        if float_erasing_member(name) && args.iter().any(|a| self.infer(sc, a) == Type::Float) {
+        if width_erasing_member(name)
+            && args
+                .iter()
+                .any(|a| matches!(self.infer(sc, a), Type::Float | Type::Long))
+        {
             return self.compile_member_boxed(sc, recv, name, args, line);
         }
         // `f.hashCode()` on a statically-`Float` receiver is
@@ -5391,11 +5415,10 @@ impl Compiler {
         // `__rust_compile("<base64>", line)` — the desugar target of a
         // `rust { ... }` block. Compile the base64 body string and hand it to the
         // FFI-compile extension op; the call evaluates to Unit.
-        // The `Float`-boxing intrinsic (see [`BOX_FLOAT`]).
-        if name == BOX_FLOAT {
+        // The width-boxing intrinsic (see [`BOX_WIDTH`]).
+        if name == BOX_WIDTH {
             if let Some(inner) = args.first() {
-                self.compile_expr(sc, inner)?;
-                self.b.emit(Op::Extended(KT_BOX_F32, 0), line);
+                self.compile_erased(sc, inner)?;
             }
             return Ok(Type::Obj);
         }
@@ -6159,16 +6182,13 @@ impl Compiler {
     ) -> Result<Type, String> {
         let boxed: Vec<Expr> = args
             .iter()
-            .map(|a| {
-                if self.infer(sc, a) == Type::Float {
-                    Expr::Call {
-                        name: BOX_FLOAT.to_string(),
-                        args: vec![a.clone()],
-                        line,
-                    }
-                } else {
-                    a.clone()
-                }
+            .map(|a| match self.infer(sc, a) {
+                Type::Float | Type::Long => Expr::Call {
+                    name: BOX_WIDTH.to_string(),
+                    args: vec![a.clone()],
+                    line,
+                },
+                _ => a.clone(),
             })
             .collect();
         self.compile_member(sc, recv, name, &boxed, false, line)
@@ -6203,17 +6223,23 @@ impl Compiler {
     /// the frontend cannot type — boxing a `Float` so its 32-bit width travels
     /// with the value.
     ///
-    /// Nothing else needs a box: every other static type either has a runtime
-    /// representation of its own (`Int`, `String`, `Char`, `Boolean`) or is the
-    /// representation the erased position would have read anyway. `Float` is
-    /// the one type that shares a runtime form with another — a `Double` — and
-    /// is told from it only by the type the position just discarded. See
-    /// [`crate::host::KT_BOX_F32`].
+    /// Two types need a box and no others: `Float`, which shares `Value::Float`
+    /// with `Double`, and `Long`, which shares `Value::Int` with `Int`. Every
+    /// other static type either has a runtime representation of its own
+    /// (`String`, `Char`, `Boolean`) or IS the representation the erased
+    /// position would have read anyway. See [`crate::host::KT_BOX_F32`] and
+    /// [`crate::host::KT_BOX_I64`].
+    ///
+    /// Nothing on the native path passes through here, which is what makes the
+    /// `Long` box affordable: `listOf(1, 2, 3)` holds `Int`s and boxes nothing,
+    /// and every `Op::Add` still sees a `Value::Int`.
     fn compile_erased(&mut self, sc: &mut Scope, e: &Expr) -> Result<Type, String> {
         let t = self.compile_expr(sc, e)?;
-        if t == Type::Float {
-            self.b.emit(Op::Extended(KT_BOX_F32, 0), 0);
-        }
+        match t {
+            Type::Float => self.b.emit(Op::Extended(KT_BOX_F32, 0), 0),
+            Type::Long => self.b.emit(Op::Extended(KT_BOX_I64, 0), 0),
+            _ => return Ok(t),
+        };
         Ok(t)
     }
 
