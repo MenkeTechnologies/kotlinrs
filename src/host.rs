@@ -211,6 +211,14 @@ pub const KT_F32: u16 = 43;
 /// leaves nothing for a tag.
 pub const KT_BOX_F32: u16 = 45;
 
+/// `KT_COMPARE_REG`: publish a class's `compareTo` override, so the ordering
+/// members can run it. Stack `[tagStr, subNameIdx]`, like [`KT_EQUALS_REG`].
+///
+/// `<` on a declaring class already resolves statically, but SORTING does not:
+/// `listOf(Op(3), Op(1)).sorted()` reaches the runtime with two handles and no
+/// static type at all, and without the registry it ordered them by heap slot.
+pub const KT_COMPARE_REG: u16 = 47;
+
 /// `KT_CLASS_REF`: the class object of the value below a static-type HINT.
 /// Stack `[value, hintStr]`; `arg` is `0` for Kotlin's `::class` (a `KClass`)
 /// and `1` for `javaClass` (a `java.lang.Class`).
@@ -484,6 +492,11 @@ thread_local! {
 
     /// Class tag → the name-pool index of its `hashCode()` subroutine, as
     /// published by [`KT_HASH_REG`]. Consulted by [`hash_vm`].
+    /// Class tag → the subroutine index of that class's `compareTo` override,
+    /// published by [`KT_COMPARE_REG`]. Consulted by [`compare_vm`].
+    static COMPARE_SUBS: RefCell<std::collections::HashMap<String, u16>> =
+        RefCell::new(std::collections::HashMap::new());
+
     static HASHCODE_SUBS: RefCell<std::collections::HashMap<String, u16>> =
         RefCell::new(std::collections::HashMap::new());
 
@@ -1453,6 +1466,7 @@ fn reset_heap() {
     TOSTRING_SUBS.with(|t| t.borrow_mut().clear());
     EQUALS_SUBS.with(|t| t.borrow_mut().clear());
     HASHCODE_SUBS.with(|t| t.borrow_mut().clear());
+    COMPARE_SUBS.with(|t| t.borrow_mut().clear());
     PENDING.with(|p| *p.borrow_mut() = None);
     STASH.with(|s| s.borrow_mut().clear());
 }
@@ -3017,6 +3031,12 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let tag = vm.pop().to_str();
             HASHCODE_SUBS.with(|t| t.borrow_mut().insert(tag, idx));
         }
+        KT_COMPARE_REG => {
+            // Stack: [tagStr, subNameIdx].
+            let idx = vm.pop().to_int() as u16;
+            let tag = vm.pop().to_str();
+            COMPARE_SUBS.with(|t| t.borrow_mut().insert(tag, idx));
+        }
         KT_BUILDER => {
             // Stack: [] or [arg]; `arg` is the argument count.
             let init = (arg == 1).then(|| vm.pop());
@@ -3963,6 +3983,7 @@ fn run_override(
 enum SubRegistry {
     Equals,
     HashCode,
+    Compare,
 }
 
 impl SubRegistry {
@@ -3970,6 +3991,7 @@ impl SubRegistry {
         match self {
             SubRegistry::Equals => EQUALS_SUBS.with(|t| t.borrow().get(tag).copied()),
             SubRegistry::HashCode => HASHCODE_SUBS.with(|t| t.borrow().get(tag).copied()),
+            SubRegistry::Compare => COMPARE_SUBS.with(|t| t.borrow().get(tag).copied()),
         }
     }
 }
@@ -5271,6 +5293,45 @@ fn truthy(v: &Value) -> bool {
 /// Total order over the comparable values a selector yields: strings compare
 /// lexicographically, everything else numerically. Used by `sortedBy` /
 /// `maxByOrNull` selector results.
+/// [`value_cmp`], with a user `compareTo` in play.
+///
+/// `Comparable` is what every ordering member is declared over, and a class that
+/// implements it is ordered by the body it wrote — through a nested `vm.run()`,
+/// the same re-entrant pattern `equals` and `toString` use. Dispatch is on the
+/// LEFT operand's class, as `a.compareTo(b)` is.
+fn compare_vm(vm: &mut VM, a: &Value, b: &Value) -> std::cmp::Ordering {
+    if let Some(r) = run_override(vm, SubRegistry::Compare, a, Some(b)) {
+        return r.to_int().cmp(&0);
+    }
+    value_cmp(a, b)
+}
+
+/// Sort `items` by [`compare_vm`], so a user `compareTo` decides the order.
+///
+/// `sort_by` cannot take the VM (its comparator is `Fn`, and running a body
+/// needs `&mut VM`), so the comparisons happen first: an insertion sort over
+/// the indices, which is what keeps every `compareTo` call outside the sort's
+/// own borrow. A user-`Comparable` list is short in practice; a list of
+/// anything else never reaches here, because the registry is empty for it.
+fn sort_vm(vm: &mut VM, items: &mut [Value]) {
+    let ordered = COMPARE_SUBS.with(|t| !t.borrow().is_empty());
+    if !ordered {
+        items.sort_by(value_cmp);
+        return;
+    }
+    for i in 1..items.len() {
+        let mut j = i;
+        while j > 0 {
+            let (a, b) = (items[j].clone(), items[j - 1].clone());
+            if compare_vm(vm, &a, &b) != std::cmp::Ordering::Less {
+                break;
+            }
+            items.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+}
+
 fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
@@ -9334,7 +9395,7 @@ fn sequence_member(
                 {
                     return Value::Float(f64::NAN);
                 }
-                let take_b = (value_cmp(&b, &a) == std::cmp::Ordering::Greater) == want_max;
+                let take_b = (compare_vm(vm, &b, &a) == std::cmp::Ordering::Greater) == want_max;
                 if take_b {
                     b
                 } else {
@@ -9513,7 +9574,10 @@ fn sequence_member(
         }
         "sorted" | "sortedDescending" => {
             let mut out = items.to_vec();
-            out.sort_by(value_cmp);
+            // `sort_vm`, not `sort_by(value_cmp)`: `sorted()` is declared over
+            // `Comparable`, and a class that implements it is ordered by the
+            // body it wrote. Without this a `List<Op>` sorted by heap slot.
+            sort_vm(vm, &mut out);
             if name == "sortedDescending" {
                 out.reverse();
             }

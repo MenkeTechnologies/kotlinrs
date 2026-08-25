@@ -888,3 +888,4 @@ interface Greeter { fun hi(): String }\nclass Impl : Greeter { override fun hi()
 class V(val a: Int, val b: Int) { operator fun plus(o: V) = V(a + o.a, b + o.b)\n override fun toString() = "V($a,$b)" }\nfun main() { println(V(1, 2) + V(3, 4)) }	V(4,6)\n
 fun main() { val (a, b) = Pair(1, 2); println("$a$b"); val (c, d, e) = Triple(1, 2, 3); println("$c$d$e"); for ((i, v) in listOf("x", "y").withIndex()) print("$i$v "); println() }	12\n123\n0x 1y \n
 enum class C { RED, GREEN }\nfun main() { println(C.values().size); println(C.valueOf("RED")); println(C.RED.ordinal); println(C.RED.name) }	2\nRED\n0\nRED\n
+class Op(val v: Int) : Comparable<Op> { override fun compareTo(other: Op): Int = v - other.v\n override fun toString(): String = "Op($v)" }\nfun main() { println(Op(1) < Op(2)); println(listOf(Op(3), Op(1)).sorted()); println(Op(1).compareTo(Op(2))) }	true\n[Op(1), Op(3)]\n-1\n

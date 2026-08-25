@@ -23,8 +23,8 @@ use crate::ast::*;
 use crate::host::{
     COLL_COPY, COLL_DEFAULT_CAP, COLL_HASH, COLL_LITERAL, COLL_SORTED, KT_ARRAY, KT_ARRAY_INIT,
     KT_ARRAY_NEW, KT_AS, KT_BOX_F32, KT_BUILDER, KT_CHR_STRING, KT_CLASSOF, KT_CLASS_REF,
-    KT_CLOSURE_CALL, KT_COLL_HOF, KT_COMPARATOR, KT_DBG_LINE, KT_DDIV, KT_DISPLAY, KT_ENUM_REG,
-    KT_EQUALS_REG, KT_EXC_ABORT, KT_EXC_CUT, KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW,
+    KT_CLOSURE_CALL, KT_COLL_HOF, KT_COMPARATOR, KT_COMPARE_REG, KT_DBG_LINE, KT_DDIV, KT_DISPLAY,
+    KT_ENUM_REG, KT_EQUALS_REG, KT_EXC_ABORT, KT_EXC_CUT, KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW,
     KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND, KT_F32,
     KT_F32_ARITH, KT_F32_STR, KT_FFI_CALL, KT_FFI_COMPILE, KT_GENSEQ, KT_GETFIELD, KT_HASH_REG,
     KT_IDENTITY, KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL,
@@ -1941,14 +1941,18 @@ impl Compiler {
     /// structural compare over a class whose author said otherwise, and a `Set`
     /// would fold an identity hash where the user supplied one.
     fn emit_equality_registry(&mut self) {
-        for name in ["equals", "hashCode"] {
+        // `compareTo` joins them for the same reason: `<` on a declaring class
+        // resolves statically, but `sorted()`/`max()` reach the runtime with two
+        // handles and no static type, and without the registry they ordered a
+        // user `Comparable` by heap slot.
+        for name in ["equals", "hashCode", "compareTo"] {
             if self.method_index.get(name).map_or(true, |t| t.is_empty()) {
                 continue;
             }
-            let op = if name == "equals" {
-                KT_EQUALS_REG
-            } else {
-                KT_HASH_REG
+            let op = match name {
+                "equals" => KT_EQUALS_REG,
+                "hashCode" => KT_HASH_REG,
+                _ => KT_COMPARE_REG,
             };
             self.emit_member_registry(name, op);
         }
