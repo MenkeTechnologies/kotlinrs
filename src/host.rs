@@ -482,6 +482,11 @@ thread_local! {
     static COLL_ORDER: RefCell<std::collections::HashMap<u32, CollOrder>> =
         RefCell::new(std::collections::HashMap::new());
 
+    /// The handles from [`COLL_ORDER`] whose stored sequence a mutation has
+    /// left OUT of that order. See [`mark_unordered`].
+    static COLL_UNORDERED: RefCell<std::collections::HashSet<u32>> =
+        RefCell::new(std::collections::HashSet::new());
+
     /// Heap handle → which JVM `List` implementation that handle stands for,
     /// for the two that are not `java.util.ArrayList`. See [`ListImpl`].
     ///
@@ -763,7 +768,8 @@ fn set_order(vm: &mut VM, v: &Value, ord: CollOrder) {
     if let Value::Obj(id) = v {
         COLL_ORDER.with(|c| c.borrow_mut().insert(*id, ord));
     }
-    reorder(vm, v);
+    let _ = vm;
+    mark_unordered(v);
 }
 
 /// The discipline recorded for `v`, if it is not the insertion-ordered default.
@@ -774,12 +780,129 @@ fn order_of(v: &Value) -> Option<CollOrder> {
     }
 }
 
-/// Restore `v`'s iteration order after a mutation.
+/// Note that `v`'s stored sequence is no longer in its iteration order, so the
+/// next reader that CARES restores it. O(1), and nothing at all for the
+/// insertion-ordered collections, which have no [`COLL_ORDER`] entry.
+///
+/// This is where the bucket order stopped being maintained at every write. It
+/// used to be: every mutation called [`reorder`], which re-ranks all `n` keys —
+/// a `hashCode` per key, through the user-override check, then a stable sort,
+/// then a rebuilt entry vector, then a discarded key index. Filling a
+/// `hashMapOf` therefore cost O(n²) with a large constant (20 000 puts: 79 s,
+/// against 0.5 s for the insertion-ordered `mutableMapOf`), and every one of
+/// those re-ranks but the last was thrown away unread.
+///
+/// The order is a property of what a reader SEES, so it is now computed when
+/// one looks — which is what `java.util.HashMap` does: a put drops the entry in
+/// a bucket, and the table is walked when something iterates it.
+fn mark_unordered(v: &Value) {
+    if let Value::Obj(id) = v {
+        // Only a collection that HAS a discipline can be out of it.
+        if COLL_ORDER.with(|c| c.borrow().contains_key(id)) {
+            COLL_UNORDERED.with(|d| {
+                d.borrow_mut().insert(*id);
+            });
+        }
+    }
+}
+
+/// Put `v` back in its iteration order if a mutation left it out of one.
+///
+/// Called by the readers that consume ORDER — display, `for`-in, the members
+/// that answer a sequence — and by nothing else, so a put/get loop never pays
+/// for it. Missing a call site costs a reader the bucket order, which the
+/// frozen corpus catches; calling one that did not need it costs a sort.
+fn ensure_ordered(vm: &mut VM, v: &Value) {
+    let Value::Obj(id) = v else { return };
+    if !COLL_UNORDERED.with(|d| d.borrow_mut().remove(id)) {
+        return;
+    }
+    reorder(vm, v);
+}
+
+/// The members that address a collection BY KEY or by count and never read its
+/// sequence, so calling one on a `hashMapOf` need not put it in bucket order
+/// first.
+///
+/// This is what keeps filling a `hashMapOf` linear through the method spelling
+/// (`m.put(k, v)`) as well as through the operator one (`m[k] = v`): a put
+/// neither reads the order nor has to restore it, and only the reader that
+/// eventually looks pays for the sort.
+fn order_agnostic_member(name: &str) -> bool {
+    matches!(
+        name,
+        "put"
+            | "putAll"
+            | "putIfAbsent"
+            | "get"
+            | "getOrDefault"
+            | "getOrPut"
+            | "getValue"
+            | "containsKey"
+            | "containsValue"
+            | "contains"
+            | "containsAll"
+            | "add"
+            | "addAll"
+            | "remove"
+            | "removeAll"
+            | "clear"
+            | "size"
+            | "isEmpty"
+            | "isNotEmpty"
+            | "hashCode"
+            | "equals"
+    )
+}
+
+/// How deep [`ensure_ordered_deep`] descends. A printed structure nests far
+/// less than this; the bound is only so a cyclic one terminates.
+const ORDER_DEPTH_LIMIT: usize = 64;
+
+/// [`ensure_ordered`] for `v` and for every collection reachable from it.
+///
+/// The display path needs this and not the shallow form: rendering a `List` of
+/// `HashMap`s reaches each inner map through [`display_obj`], which walks the
+/// heap with no VM in hand and so cannot order anything itself. The walk here
+/// happens where a VM IS in hand — the `KT_TO_STRING` coercion every printed
+/// and interpolated value goes through — and costs a pass over a structure that
+/// is about to be walked again anyway.
+fn ensure_ordered_deep(vm: &mut VM, v: &Value) {
+    fn walk(vm: &mut VM, v: &Value, depth: usize) {
+        if depth > ORDER_DEPTH_LIMIT {
+            return;
+        }
+        let Value::Obj(_) = v else { return };
+        ensure_ordered(vm, v);
+        // Cloned out from under the borrow: ordering a child takes the heap
+        // mutably, and `hashCode` on a key can re-enter the VM.
+        let children: Vec<Value> = with_obj(v, |o| match o {
+            HeapObj::List(items) | HeapObj::Set(items) | HeapObj::Array { items, .. } => {
+                items.clone()
+            }
+            HeapObj::Map(entries) => entries
+                .iter()
+                .flat_map(|(k, val)| [k.clone(), val.clone()])
+                .collect(),
+            HeapObj::Pair(a, b) | HeapObj::Entry(a, b) => vec![a.clone(), b.clone()],
+            HeapObj::Triple(a, b, c) => vec![a.clone(), b.clone(), c.clone()],
+            HeapObj::Instance { fields, .. } => fields.iter().map(|(_, x)| x.clone()).collect(),
+            _ => Vec::new(),
+        })
+        .unwrap_or_default();
+        for c in children {
+            walk(vm, &c, depth + 1);
+        }
+    }
+    walk(vm, v, 0);
+}
+
+/// Restore `v`'s iteration order.
 ///
 /// The stored sequence IS the iteration sequence — every reader walks the
-/// `Vec` — so a `HashMap` is kept permanently in bucket order rather than
-/// reordered at each read. An insertion-ordered collection has no entry in
-/// [`COLL_ORDER`] and costs nothing here.
+/// `Vec` — so this is what an out-of-order collection is put back into before a
+/// reader that cares looks at it. Reached through [`ensure_ordered`], never
+/// directly from a mutation.
 fn reorder(vm: &mut VM, v: &Value) {
     let Some(ord) = order_of(v) else {
         return;
@@ -1248,6 +1371,7 @@ fn difference_modulo(a: i64, b: i64, c: i64) -> i64 {
 fn reset_heap() {
     HEAP.with(|h| h.borrow_mut().clear());
     COLL_ORDER.with(|c| c.borrow_mut().clear());
+    COLL_UNORDERED.with(|d| d.borrow_mut().clear());
     MAP_INDEX.with(|t| t.borrow_mut().clear());
     LIST_IMPL.with(|t| t.borrow_mut().clear());
     SEQ_VIEW.with(|t| t.borrow_mut().clear());
@@ -2906,6 +3030,10 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
         }
         KT_TO_STRING => {
             let v = vm.pop();
+            // Deep, because the render walk below has no VM in hand: a
+            // `HashMap` nested inside what is being printed can only be put in
+            // bucket order from here.
+            ensure_ordered_deep(vm, &v);
             // Checked, not bare: this is the coercion string interpolation and
             // `+` go through, so a cyclic structure reaches the render walk
             // here as readily as through `println`.
@@ -3029,6 +3157,9 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
         }
         KT_ITER_SIZE => {
             let recv = vm.pop();
+            // `for (k in aHashMap)` walks the stored sequence, so it is the
+            // bucket order it has to walk. Taken once at the loop's head.
+            ensure_ordered(vm, &recv);
             match iter_len(&recv) {
                 Some(n) => vm.push(Value::Int(n)),
                 None => {
@@ -3043,6 +3174,10 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
         KT_ITER_GET => {
             let i = vm.pop().to_int();
             let recv = vm.pop();
+            // A body that mutates the collection it is walking puts it out of
+            // order again, so the check is per step and not only at the head.
+            // It is a set lookup when nothing changed.
+            ensure_ordered(vm, &recv);
             vm.push(iter_at(&recv, i));
         }
         KT_ARRAY => {
@@ -4025,6 +4160,7 @@ fn display_vm(vm: &mut VM, v: &Value) -> String {
 /// `KT_DISPLAY` — see [`KT_DISPLAY`].
 fn b_display(vm: &mut VM, _argc: u8) -> Value {
     let v = vm.pop();
+    ensure_ordered_deep(vm, &v);
     Value::str(display_checked(vm, &v))
 }
 
@@ -4295,7 +4431,7 @@ fn operator_apply(vm: &mut VM, lhs: &Value, name: &str, rhs: &Value) -> Result<V
             // The whole entry vector was replaced, which can leave the length
             // unchanged while every position means something else.
             invalidate_key_index(lhs);
-            reorder(vm, lhs);
+            mark_unordered(lhs);
             return Ok(Value::Undef);
         }
         return Ok(alloc(HeapObj::Map(entries)));
@@ -4361,7 +4497,7 @@ fn operator_apply(vm: &mut VM, lhs: &Value, name: &str, rhs: &Value) -> Result<V
             (HeapObj::Array { items: slot, .. }, HeapObj::List(v)) => *slot = v,
             _ => {}
         });
-        reorder(vm, lhs);
+        mark_unordered(lhs);
         return Ok(Value::Undef);
     }
     Ok(alloc(result))
@@ -4403,6 +4539,7 @@ fn b_join(vm: &mut VM, argc: u8) -> Value {
         ", ".to_string()
     };
     let recv = vm.pop();
+    ensure_ordered_deep(vm, &recv);
     let items = sequence_items(&recv);
     let body: Vec<String> = items.iter().map(|x| display_vm(vm, x)).collect();
     Value::str(body.join(&sep))
@@ -4525,6 +4662,9 @@ fn b_coll_hof(vm: &mut VM, argc: u8) -> Value {
     }
     extras.reverse();
     let recv = vm.pop();
+    // `map`/`filter`/`forEach`/`fold` over a `HashSet` visit its elements in
+    // ITS order, and the answer of a `fold` or a `joinToString` depends on it.
+    ensure_ordered(vm, &recv);
     let from_sequence = is_sequence_view(&recv);
     match coll_hof(vm, &name, &recv, &extras, &clo, seq_kind_of(&recv)) {
         Ok(v) => {
@@ -6815,6 +6955,16 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
     }
     // Heap objects (List/Map/Pair/data-class members) dispatch through the heap.
     if let Value::Obj(_) = recv {
+        // Most members read the collection AS A SEQUENCE — `keys`, `entries`,
+        // `first`, `toList`, `toString`, `componentN`, every `…OrNull` — so a
+        // `HashMap` left out of bucket order by a put is put back before the
+        // dispatch. The exceptions are named rather than the rule, and the
+        // asymmetry is deliberate: a name wrongly listed as order-agnostic
+        // would answer in the wrong order, while one wrongly left off the list
+        // only pays for a sort it did not need.
+        if !order_agnostic_member(name) {
+            ensure_ordered(vm, recv);
+        }
         let from_sequence = is_sequence_view(recv);
         let out = obj_method(vm, recv, name, args);
         // A DERIVED sequence is still a sequence. `Sequence.map`/`filter`/
@@ -6830,11 +6980,11 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
             }
         }
         // A mutating member (`add`, `put`, `remove`, …) may have appended to a
-        // collection that does not iterate in insertion order. Restoring the
-        // discipline here rather than at each mutation keeps the ~10 mutating
-        // members from having to remember to; it is a map lookup and no more
-        // for the insertion-ordered collections, which are the common case.
-        reorder(vm, recv);
+        // collection that does not iterate in insertion order. Noting it here
+        // rather than at each mutation keeps the ~10 mutating members from
+        // having to remember to, and it is one set insert; the order itself is
+        // restored by whichever reader next needs it.
+        mark_unordered(recv);
         return out;
     }
     match (recv, name) {
@@ -9606,8 +9756,10 @@ fn index_set(vm: &mut VM, recv: &Value, index: &Value, value: Value) -> Result<(
             obj_label(recv)
         )),
     });
-    // A new key appended to a `HashMap` belongs in its bucket, not at the end.
-    reorder(vm, recv);
+    // A new key appended to a `HashMap` belongs in its bucket, not at the end —
+    // which the next reader of its order will put it in.
+    let _ = vm;
+    mark_unordered(recv);
     out.unwrap_or_else(|| Err("indexing a non-object value".to_string()))
 }
 
