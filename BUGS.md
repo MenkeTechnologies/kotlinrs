@@ -20,7 +20,6 @@ shape. They are recorded here so the next round has the measurements.
 | --- | --- | --- |
 | `class C { lateinit var s: String }` then `C().s` | parse error: `expected \`fun\` or a property, found Ident("lateinit")` | `kotlin.UninitializedPropertyAccessException: lateinit property s has not been initialized` |
 | `mapOf("a" to 1).getValue("z")` | `unresolved reference: getValue on Map` | `java.util.NoSuchElementException: Key z is missing in the map.` |
-| `listOf(1).iterator()` | `unresolved reference: iterator on List` | (works; `next()` past the end is a bare `java.util.NoSuchElementException`) |
 | `throw RuntimeException("outer", IllegalStateException("inner"))` | `unresolved reference: RuntimeException` | `java.lang.RuntimeException: outer` |
 | `e.cause` | `unresolved reference: cause on <class>` | `null`, or the chained throwable |
 | `kotlin.math.ln(0.0)` | `unresolved reference: kotlin.math.ln` | `-Infinity` |
@@ -246,8 +245,6 @@ which is.
 | --- | --- | --- |
 | `m[1] = "int"; m[1L] = "long"` on a `MutableMap<Any, String>` | one entry, `1=long` | two entries, `1=int, 1=long` |
 | `hashMapOf` over `"one".."five"` | `{two=3, three=5, five=4, four=4, one=3}` | `{four=4, one=3, two=3, three=5, five=4}` |
-| `m.putAll(mapOf(2 to 2))` | `unresolved reference: putAll on Map` | `{1=1, 2=2}` |
-| `m.clear()` | `unresolved reference: clear on Map` | `{}` |
 | `fun main() { data class K(val a: Int); … }` (a LOCAL data class) | `unexpected token Class` | compiles |
 
 The first is the `Int`/`Long` counterpart of the `Float` erasure above: both
@@ -265,19 +262,17 @@ the next round has the measurement rather than a guess.
 | `x::class` / `Int::class` | `expected a name after \`::\`, found Class` | a `KClass`; `.simpleName` is `Int` |
 | `class Op(val v: Int) : Comparable<Op>` | `unresolved supertype Comparable of class Op` | compiles; `<` is the `compareTo` override |
 | `enumValues<E>().size` | `unresolved reference: enumValues` | `2` (`E.values()` DOES work) |
-| `n.orEmpty()` on a `String?` | `unresolved reference: orEmpty on value` | `` (the empty string) |
-| `n.isNullOrEmpty()` on a `String?` | `unresolved reference: isNullOrEmpty on value` | `true` |
-| `IntRange(1, 3)` | `unresolved reference: IntRange` | `1..3` (`1..3` itself works) |
-| `listOf(1).iterator()` | `unresolved reference: iterator on List` | works |
-| `Result.success(1).getOrNull()` | `unresolved reference: Result` | `1` (`runCatching { 5 }.getOrNull()` DOES work) |
 | `e.javaClass.name` | `unresolved reference: javaClass on Exception` | `java.lang.Exception` |
+| `1.javaClass` / `"x".javaClass` | `unresolved reference: javaClass on Int` | `int` / `class java.lang.String` |
 
-The nullable-receiver extensions are one family, not three entries: `orEmpty`,
-`isNullOrEmpty` and `isNullOrBlank` are all declared on a NULLABLE receiver, and
-dispatch here reaches a member only through the receiver's runtime kind — a
-Kotlin `null` is `Value::Undef`, which has no members. `orEmpty` additionally
-needs the receiver's STATIC type to pick its empty value, since a `String?`
-answers `""` and a `List<T>?` answers `[]`.
+`javaClass` needs a class-object value this frontend has no representation for,
+and its answer for a primitive is the JVM's boxing rule rather than the
+language's — `1.javaClass` is `int` where `"x".javaClass` is
+`class java.lang.String`. `::class`, `enumValues<E>()` and a `Comparable<T>`
+supertype are still open; the rest of what this table used to hold —
+`orEmpty`/`isNullOrEmpty`/`isNullOrBlank`, `IntRange(a, b)`, `iterator()`,
+`Result.success`/`failure`, `putAll` and `clear` — is implemented and pinned in
+the corpus.
 
 ## `"%b".format(null)` reads a missing argument as `false`
 
@@ -321,19 +316,26 @@ the reference — a synthetic class name carrying the loader's address and an
 identity hash, both of which change from run to run — so there is nothing there
 to match and nothing that could be frozen in the corpus.
 
-## `m[k] = v` is quadratic
+## A `hashMapOf`/`sortedMapOf` put is still quadratic
 
-A `MutableMap` put costs a full scan, so filling one is O(n²): 20 000 puts took
-14.03 s (`/usr/bin/time -p` user, `cargo build` dev binary).
+`m[k] = v` is linear on the insertion-ordered maps and not on the two that
+iterate some other way. Measured, `cargo build` dev binary, `m[i] = i * 2` for
+each `i` then `m[i]` back:
 
-This is the data structure, not a redundant call. A `Map` is a
-`Vec<(Value, Value)>` association list because it has to preserve iteration
-order — `mapOf` is insertion-ordered, `hashMapOf` is bucket-ordered and
-`sortedMapOf` is key-ordered, and all three are observable — and because key
-equality routes through a user `equals`/`hashCode`, which re-enters the VM and
-can reallocate the heap, so a lookup cannot hold a borrow across it.
-`index_set` already skips the scan for every non-`Map` receiver.
+| receiver | 5 000 | 10 000 | 20 000 |
+| --- | --- | --- | --- |
+| `mutableMapOf` | 0.03 s | 0.07 s | 0.13 s |
+| `linkedMapOf` | 0.04 s | 0.18 s | 0.17 s |
+| `hashMapOf` | 1.46 s | 6.39 s | 25.40 s |
 
-The same round removed the two costs of this shape that WERE redundant calls
-(see CHANGELOG Round 10); this one needs a hash index beside the ordered `Vec`,
-maintained through every mutation, and a rule for which keys may use it.
+The key index is not what is missing. A `hashMapOf` iterates its BUCKET table,
+so every put reorders the whole entry vector — `reorder` ranks all `n` keys
+through `hash_order` — and that is an O(n) pass per put on its own, before any
+lookup happens. Repairing the index through the permutation rather than dropping
+it would remove one O(n) term and leave the other.
+
+Closing it means making the bucket order a property computed at ITERATION
+rather than maintained at every write, which is what the JVM does: a `HashMap`
+does not move its entries on a put, it puts each one in a bucket and walks the
+table when asked.
+

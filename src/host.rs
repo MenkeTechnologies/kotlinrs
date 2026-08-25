@@ -813,9 +813,14 @@ fn reorder(vm: &mut VM, v: &Value) {
         }
         _ => {}
     });
-    // Every position just moved and the length did not change, which is the one
-    // mutation a `KeyIndex` cannot detect for itself.
-    invalidate_key_index(v);
+    // A real permutation moves positions without changing the length, which is
+    // the one mutation a `KeyIndex` cannot detect for itself. The identity
+    // ordering — what an already-ordered collection produces, and what every
+    // READ of a hashed one produces — moves nothing and is left alone, so a
+    // lookup on a `hashMapOf` does not throw its index away.
+    if order.iter().enumerate().any(|(i, &j)| i != j) {
+        invalidate_key_index(v);
+    }
 }
 
 /// The positions of `keys` in `java.util.HashMap` ITERATION order.
@@ -983,6 +988,18 @@ enum HeapObj {
         name_idx: u16,
         params: u8,
         captures: Vec<Value>,
+    },
+    /// The cursor `xs.iterator()` hands back: the collection it walks and how
+    /// far along it is.
+    ///
+    /// It holds the SOURCE rather than a snapshot of the elements, so it reads
+    /// through [`iter_len`]/[`iter_at`] — the same pair the `for (v in xs)`
+    /// lowering walks with. That is what makes the two spellings agree about
+    /// what a `Map` yields (a `Map.Entry` per step) and about a collection that
+    /// changed underneath.
+    Iter {
+        src: Value,
+        at: usize,
     },
     /// An `IntRange` / `IntProgression`. See [`RangeObj`].
     Range(RangeObj),
@@ -6764,6 +6781,33 @@ fn builder_method(
 }
 
 fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    // The two nullable-receiver extensions whose answer is a function of the
+    // VALUE, so they resolve ahead of every kind-specific table: a `null`
+    // receiver is `true` for both, and a present one asks its own emptiness.
+    // `orEmpty`, the third of the family, is NOT here — its answer for a `null`
+    // receiver depends on the receiver's declared type (`""` for a `String?`,
+    // `[]` for a `List?`), which the value cannot supply, so the compiler
+    // lowers it instead.
+    if args.is_empty() && matches!(name, "isNullOrEmpty" | "isNullOrBlank") {
+        if matches!(recv, Value::Undef) {
+            return Ok(Value::Bool(true));
+        }
+        if let Value::Str(s) = recv {
+            return Ok(Value::Bool(if name == "isNullOrBlank" {
+                s.chars().all(|c| c.is_whitespace())
+            } else {
+                s.is_empty()
+            }));
+        }
+        // `isNullOrEmpty` is also declared over collections; `isNullOrBlank` is
+        // `CharSequence`-only, so a collection receiver falls through to the
+        // ordinary unresolved-reference diagnostic.
+        if name == "isNullOrEmpty" {
+            if let Some(n) = iter_len(recv) {
+                return Ok(Value::Bool(n == 0));
+            }
+        }
+    }
     // A `Char` shares the `Value::Obj` variant with the heap but is not a heap
     // object, so its members resolve first.
     if let Some(code) = char_code(recv) {
@@ -7624,6 +7668,14 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
             }))
         }
 
+        // `"abc".iterator()` — a `CharSequence` cursor, the same object a
+        // collection's is. It is here rather than with the other `CharSequence`
+        // members because it holds the receiver, and `charseq_member` is handed
+        // the `&str` alone.
+        (Value::Str(_), "iterator") if args.is_empty() => Ok(alloc(HeapObj::Iter {
+            src: recv.clone(),
+            at: 0,
+        })),
         // A `String` member the text-specific arms above did not claim:
         // `kotlin.text` also mirrors the LAMBDA-FREE collection members on
         // `CharSequence`, over the characters. Reached last so a member that
@@ -7739,6 +7791,44 @@ fn char_method(code: i64, name: &str, args: &[Value]) -> Result<Value, String> {
 /// class's synthesized members). User-defined class methods never reach here —
 /// the compiler lowers those to direct `Op::Call`s on method subs.
 fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    // The iterator cursor. It resolves first because `next` and `hasNext` are
+    // its own and nothing else here declares them.
+    if let Some((src, at)) = with_obj(recv, |o| match o {
+        HeapObj::Iter { src, at } => Some((src.clone(), *at)),
+        _ => None,
+    })
+    .flatten()
+    {
+        let len = iter_len(&src).unwrap_or(0);
+        return match name {
+            "hasNext" => Ok(Value::Bool((at as i64) < len)),
+            "next" => {
+                if (at as i64) >= len {
+                    // `ArrayList$Itr.next` raises the no-argument constructor,
+                    // whose `message` is Kotlin `null` — it says nothing about
+                    // the index, unlike every bounds check.
+                    return Err("java.util.NoSuchElementException".to_string());
+                }
+                let v = iter_at(&src, at as i64);
+                with_obj_mut(recv, |o| {
+                    if let HeapObj::Iter { at, .. } = o {
+                        *at += 1;
+                    }
+                });
+                Ok(v)
+            }
+            _ => Err(format!("unresolved reference: {name} on Iterator")),
+        };
+    }
+    // `xs.iterator()` — the cursor over any iterable, including the `String`
+    // and `Map` forms, which is why the argument is the RECEIVER and not a
+    // materialized element list.
+    if name == "iterator" && args.is_empty() && iter_len(recv).is_some() {
+        return Ok(alloc(HeapObj::Iter {
+            src: recv.clone(),
+            at: 0,
+        }));
+    }
     // A `StringBuilder` resolves first and entirely on its own: it is a
     // `CharSequence`, not a collection, so none of the collection members below
     // apply to it, and the ones whose NAMES collide (`clear`, `remove`, `set`)
@@ -8181,6 +8271,60 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 set_order(vm, &sorted, CollOrder::Sorted);
                 return Ok(sorted);
             }
+        }
+        // `MutableMap.putAll(from)` — every entry of `from` written in ITS
+        // iteration order, a present key updated in place. Kotlin declares it
+        // over a `Map` and over an `Iterable<Pair>`, and both spellings reach
+        // here as the same entry sequence.
+        "putAll" => {
+            let from = args.first().cloned().unwrap_or(Value::Undef);
+            let pairs: Vec<(Value, Value)> = match with_obj(&from, |o| match o {
+                HeapObj::Map(entries) => Some(entries.clone()),
+                _ => None,
+            })
+            .flatten()
+            {
+                Some(entries) => entries,
+                None => as_iterable(&from)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|it| {
+                        with_obj(it, |o| match o {
+                            HeapObj::Pair(k, v) | HeapObj::Entry(k, v) => {
+                                Some((k.clone(), v.clone()))
+                            }
+                            _ => None,
+                        })
+                        .flatten()
+                    })
+                    .collect(),
+            };
+            for (k, v) in pairs {
+                // Located before the write, like every other map mutation here:
+                // a user `equals` re-enters the VM, which cannot happen under
+                // the mutable heap borrow.
+                let at = key_position(vm, recv, &k);
+                with_obj_mut(recv, |o| {
+                    if let HeapObj::Map(entries) = o {
+                        match at.and_then(|i| entries.get_mut(i)) {
+                            Some(slot) => slot.1 = v,
+                            None => entries.push((k, v)),
+                        }
+                    }
+                });
+            }
+            return Ok(Value::Undef);
+        }
+        // `MutableMap.clear()` — and the index with it, since every position it
+        // records is gone.
+        "clear" if with_obj(recv, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false) => {
+            with_obj_mut(recv, |o| {
+                if let HeapObj::Map(entries) = o {
+                    entries.clear();
+                }
+            });
+            invalidate_key_index(recv);
+            return Ok(Value::Undef);
         }
         "put" => {
             // Map.put(k, v) → previous value or null.
@@ -9141,6 +9285,7 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
         | HeapObj::Comparator(_)
         | HeapObj::Gen { .. }
         | HeapObj::Grouping { .. }
+        | HeapObj::Iter { .. }
         | HeapObj::Range(_)
         | HeapObj::Builder { .. }
         | HeapObj::Exc { .. } => None,
@@ -9740,8 +9885,8 @@ fn obj_hash(recv: &Value) -> Option<i32> {
             h.wrapping_add(value_hash(k, false) ^ value_hash(v, false))
         })),
         // A `by lazy` cell inherits `Object.hashCode` — identity, which
-        // `value_hash` reports by answering `None`.
-        HeapObj::Lazy { .. } | HeapObj::Res { .. } => None,
+        // `value_hash` reports by answering `None`. So does an iterator cursor.
+        HeapObj::Lazy { .. } | HeapObj::Res { .. } | HeapObj::Iter { .. } => None,
         // `Map.Entry.hashCode()` is `key ^ value`; a `Pair` is a `data class`,
         // so it folds like one.
         HeapObj::Entry(k, v) => Some(value_hash(k, false) ^ value_hash(v, false)),
@@ -9805,6 +9950,7 @@ fn obj_label(recv: &Value) -> String {
         HeapObj::Entry(_, _) => "Map.Entry".to_string(),
         HeapObj::Closure { .. } => "Function".to_string(),
         HeapObj::Comparator(_) => "Comparator".to_string(),
+        HeapObj::Iter { .. } => "Iterator".to_string(),
         HeapObj::Gen { .. } => "Sequence".to_string(),
         HeapObj::Grouping { .. } => "Grouping".to_string(),
         HeapObj::Range(r) => match (r.is_char, r.progression) {
@@ -9945,8 +10091,10 @@ fn display_obj(id: u32) -> String {
             HeapObj::Gen { stages, .. } => format!("(sequence stages={})", stages.len()),
             // A `Grouping` is an anonymous object on the JVM, so it has no
             // meaningful printed form; it exists to be consumed by a terminal
-            // operation, not displayed.
+            // operation, not displayed. Nor has an iterator cursor, which the
+            // JVM renders as `java.util.ArrayList$Itr@…` — an identity hash.
             HeapObj::Grouping { items, .. } => format!("(grouping size={})", items.len()),
+            HeapObj::Iter { at, .. } => format!("(iterator at={at})"),
             // `IntRange.toString` is `first..last`; `IntProgression.toString` is
             // `first..last step n` ascending and `first downTo last step n`
             // descending, where `last` is the last element actually reached

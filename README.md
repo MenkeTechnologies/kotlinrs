@@ -331,7 +331,8 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `.toList()`/`.toSet()`, `.distinct()`, `.sorted()`/`.sortedDescending()`,
   `.take(n)`/`.drop(n)` (both clamp rather than fault), `.flatten()`,
   `.zip(other)`, `.chunked(n)`/`.windowed(n, step, partialWindows)`,
-  `.subList(from, to)`, `.slice(indices)`,
+  `.subList(from, to)`, `.slice(indices)`, `.iterator()` (`hasNext`/`next`,
+  which walks a `String`'s characters and a `Map`'s entries as well),
   `.union`/`.intersect`/`.subtract` — in the infix spelling (`a union b`) as
   well as the method one, the infix form reading only when it is on the same
   line as its left operand, exactly as Kotlin's grammar admits it —
@@ -342,7 +343,8 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `.sortDescending()`, `.reverse()`, `.sortBy { }`, `.sortByDescending { }` —
   which answer `Unit` and reorder the receiver, where `sorted…`/`reversed()`
   answer a new list and leave it alone. A `Map` adds `.getOrPut(k) { }` (which
-  keys on a null VALUE, not on an absent key) and `.getOrDefault(k, v)`. The
+  keys on a null VALUE, not on an absent key), `.getOrDefault(k, v)`,
+  `.putAll(from)` (over a `Map` or an `Iterable<Pair>`) and `.clear()`. The
   `…OrNull` members answer `null` where their plain counterparts throw:
   `.maxOrNull()`/`.minOrNull()`, `.firstOrNull()`/`.lastOrNull()`,
   `.getOrNull(i)`/`.elementAtOrNull(i)` beside `.elementAt(i)`.
@@ -1397,10 +1399,49 @@ looking at the member name, so `append` copied the whole string it was appending
 to on every call, where only `toString` and the inherited `CharSequence`
 delegation need the content at all. 20 000 `xs.add(i)` calls went from 15.13 s
 to 0.04 s and 200 000 appends from 8.10 s to 0.61 s, both from four times the
-work per doubling to two. `m[k] = v` on a `MutableMap` is still quadratic and is
-recorded in BUGS.md: that one is the data structure, an association `Vec` that
-has to preserve iteration order and route equality through a user `equals`, not
-a redundant call.
+work per doubling to two.
+
+The round after THAT took the loop shape, the `Float` width, and the third
+quadratic loop.
+
+Every loop kotlinrs emitted closed with an unconditional `Jump` back to a test
+at the top, and fusevm's tracing JIT closes a trace only on a CONDITIONAL
+backward branch — so no Kotlin loop had ever run native code however hot it got.
+`while`, `do`/`while` and both `for` forms now lower ROTATED: the test emitted
+once as an entry guard and once at the bottom as a conditional back-branch, the
+same number of evaluations and one jump per iteration fewer. An `if` or `when`
+STATEMENT was separately compiled for its value and popped, which puts a
+`LoadUndef` the JIT refuses on the else path, so one `if` in a loop body took
+the whole loop out of the tracing tier; both statement forms are stack-neutral
+now. `kotlin --tiers` reports `traced=true` and `reaches native code true` for
+all three loop shapes where it reported `false` for every one of them, and a
+30 000 000-iteration `while` went from 147.33 s to 0.02 s.
+
+`Float` was an alias for `Double`. It is a static type of its own now, so the
+`f` suffix rounds at the literal, arithmetic on two `Float`s rounds ONCE at 32
+bits rather than computing in `f64` and narrowing after, and display goes
+through `Float.toString`'s 32-bit shortest-repr: `1.0f / 3.0f` is `0.33333334`,
+`(0.1f).toDouble()` is `0.10000000149011612` and `16777217.0f * 0.2f` is
+`3355443.2` — which the narrow-after route cannot produce. Rendering needed the
+JVM's own decimal selection rather than Rust's shortest-round-trip, in two
+places that both show: a scientific mantissa carries at least one fractional
+digit (so `Float.MIN_VALUE` is `1.4E-45`, not `1E-45`), and an exact tie breaks
+to the even last digit (so `3355443.25f` is `3355443.2`, where Rust rounds away
+from zero). Both rules apply to `Double` too, which is what lets
+`Double.MIN_VALUE` — `4.9E-324` — be resolved at all.
+
+`m[k] = v` on a `MutableMap` was the third, and it was the data structure rather
+than a redundant call: a `Map` is an association `Vec` because iteration order
+is observable three different ways, and key equality routes through a user
+`equals`/`hashCode` that re-enters the VM. A key index now sits BESIDE that
+`Vec` as an accelerator — every candidate it names is confirmed with the same
+equality the scan used, a key it cannot represent takes the whole map back to
+the scan, and the ordered `Vec` is untouched, so iteration order is unchanged by
+construction. 20 000 puts and reads went from 38.25 s to 0.15 s, and the shape
+holds out to 640 000 (0.56 s / 1.18 s / 2.52 s / 4.91 s per doubling from
+80 000). The two maps that do not iterate in insertion order are not covered
+and are recorded in BUGS.md: a `hashMapOf` put reorders its whole entry vector,
+which is an O(n) pass per write before any lookup happens.
 
 Next: `Regex` in every spelling, `sequence { … }`/`yield`, `lateinit`,
 `Throwable.cause` and the

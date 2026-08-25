@@ -511,6 +511,12 @@ pub enum StmtKind {
     Let {
         name: String,
         ty: Option<Type>,
+        /// The CLASS the annotation named, when it named one — `List` for
+        /// `val l: List<Int>?`. The coarse [`Type`] cannot carry it, and the
+        /// initializer need not reveal it: `= null` reveals nothing at all, and
+        /// that is exactly the declaration whose members have to resolve from
+        /// the annotation or not at all.
+        class: Option<String>,
         /// The PARAMETER types when the annotation is a function type
         /// (`val f: (Int) -> Int`), empty otherwise. The coarse [`Type`] cannot
         /// carry a signature, but a lambda initializer takes its parameter types

@@ -808,3 +808,19 @@ fun main() { val m = mutableMapOf<Int, Int>(); var i = 0; while (i < 30) { m[i] 
 fun main() { val m = mutableMapOf<Int, Int>(); var i = 29; while (i >= 0) { m[i] = i; i -= 1 }; println(m.keys.first()); println(m.keys.last()); println(m[15]) }	29\n0\n15\n
 fun main() { val a = mutableMapOf<Int, Int>(); val b = mutableMapOf<Int, Int>(); var i = 0; while (i < 20) { a[i] = i; b[i * 2] = i; i += 1 }; println(a[7]); println(b[14]); println(b[7]); println(a == b) }	7\n7\nnull\nfalse\n
 fun main() { val m = mutableMapOf<String, Int>(); var i = 0; while (i < 30) { m["k$i"] = i; i += 1 }; println(m["k17"]); println(m["nope"]); println(m.size); println(m.containsKey("k29")) }	17\nnull\n30\ntrue\n
+fun main() { val m = mutableMapOf(1 to 1); m.putAll(mapOf(2 to 2, 3 to 3)); println(m); println(m[3]); m.putAll(listOf(4 to 4)); println(m) }	{1=1, 2=2, 3=3}\n3\n{1=1, 2=2, 3=3, 4=4}\n
+fun main() { val m = mutableMapOf(1 to 1, 2 to 2); m.clear(); println(m); println(m.size); m[7] = 7; println(m) }	{}\n0\n{7=7}\n
+fun main() { val s: String? = null; println(s.orEmpty()); println(s.isNullOrEmpty()); println(s.isNullOrBlank()) }	\ntrue\ntrue\n
+fun main() { val s: String? = " "; println(s.orEmpty()); println(s.isNullOrEmpty()); println(s.isNullOrBlank()) }	 \nfalse\ntrue\n
+fun main() { val l: List<Int>? = null; println(l.orEmpty()); println(l.orEmpty().size) }	[]\n0\n
+fun main() { println(IntRange(1, 5)); println(IntRange(1, 5).toList()); println(IntRange(5, 1).isEmpty()) }	1..5\n[1, 2, 3, 4, 5]\ntrue\n
+fun main() { val it = listOf(1, 2, 3).iterator(); println(it.hasNext()); println(it.next()); println(it.next()); println(it.next()); println(it.hasNext()) }	true\n1\n2\n3\nfalse\n
+fun main() { val r = Result.success(5); println(r.isSuccess); println(r.getOrNull()); println(r) }	true\n5\nSuccess(5)\n
+fun main() { val r: Result<Int> = Result.failure(RuntimeException("x")); println(r.isFailure); println(r.getOrNull()); println(r.exceptionOrNull()?.message) }	true\nnull\nx\n
+fun main() { val it = listOf(1, 2, 3).iterator(); println(it.hasNext()); println(it.next()); println(it.next()); println(it.next()); println(it.hasNext()) }	true\n1\n2\n3\nfalse\n
+fun main() { val it = listOf(1).iterator(); it.next(); try { it.next() } catch (e: NoSuchElementException) { println("caught ${e.message}") } }	caught null\n
+fun main() { val it = emptyList<Int>().iterator(); println(it.hasNext()); val s = setOf("a", "b").iterator(); println(s.next()); println(s.next()); println(s.hasNext()) }	false\na\nb\nfalse\n
+fun main() { val m = mapOf(1 to "a", 2 to "b"); val it = m.iterator(); val e = it.next(); println(e.key); println(e.value); println(it.hasNext()) }	1\na\ntrue\n
+fun main() { val it = (1..3).iterator(); var s = 0; while (it.hasNext()) s += it.next(); println(s) }	6\n
+fun main() { val it = "abc".iterator(); println(it.next()); println(it.hasNext()) }	a\ntrue\n
+fun main() { val it = mutableListOf(1, 2, 3).iterator(); var s = 0; while (it.hasNext()) { s += it.next() }; println(s); println(it.hasNext()) }	6\nfalse\n

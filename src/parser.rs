@@ -2103,19 +2103,20 @@ impl Parser {
             return Ok(StmtKind::Destructure { names, init });
         }
         let name = self.ident()?;
-        let (ty, type_args, fn_params, fn_ret) = if self.at(&Tok::Colon) {
+        let (ty, class, type_args, fn_params, fn_ret) = if self.at(&Tok::Colon) {
             self.bump();
             let before = self.fn_param_types.len();
             let ret_before = self.fn_ret_types.len();
             let t = self.type_ref()?;
             (
                 Some(t.ty),
+                t.class,
                 t.args,
                 self.fn_param_types.split_off(before),
                 self.fn_ret_types.split_off(ret_before).pop(),
             )
         } else {
-            (None, Vec::new(), Vec::new(), None)
+            (None, None, Vec::new(), Vec::new(), None)
         };
         // `val x by lazy { … }` on a LOCAL, the same soft-keyword position a
         // class property uses. Only `lazy` is accepted here: the general
@@ -2138,6 +2139,7 @@ impl Parser {
             return Ok(StmtKind::Let {
                 name,
                 ty,
+                class,
                 fn_params,
                 fn_ret,
                 type_args,
@@ -2151,6 +2153,7 @@ impl Parser {
         Ok(StmtKind::Let {
             name,
             ty,
+            class: class.clone(),
             fn_params,
             fn_ret,
             type_args,

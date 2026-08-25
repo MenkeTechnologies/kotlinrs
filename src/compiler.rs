@@ -2072,6 +2072,7 @@ impl Compiler {
             StmtKind::Let {
                 name,
                 ty,
+                class: annotated_class,
                 fn_params,
                 fn_ret,
                 type_args: annotated,
@@ -2079,7 +2080,16 @@ impl Compiler {
                 mutable,
                 lazy,
             } => {
-                let class = self.infer_class(sc, init);
+                // The initializer names the class where it can, and the
+                // annotation stands in where it cannot. `= null` is the case
+                // that needs it: `val l: List<Int>? = null` has to know `l` is a
+                // `List` for `l.orEmpty()` to resolve, and nothing about the
+                // value says so. The initializer wins where both speak, so a
+                // `val x: List<Int> = mutableListOf()` keeps dispatching as the
+                // ArrayList it is.
+                let class = self
+                    .infer_class(sc, init)
+                    .or_else(|| annotated_class.clone());
                 // Read the initializer's element type BEFORE lowering, while
                 // the initializer expression is still in hand: it is what a
                 // later `xs.map { … }` types its parameter from.
@@ -3440,6 +3450,42 @@ impl Compiler {
                 by: Box::new(args[0].clone()),
             };
             return self.compile_expr(sc, &stepped);
+        }
+        // `x.orEmpty()` — the nullable-receiver extension, lowered as the elvis
+        // it is defined to be. The EMPTY it falls back to depends on the
+        // receiver's declared type and not on its value (a `null` `String?`
+        // yields `""` where a `null` `List?` yields `[]`), and at run time the
+        // two are the same absent value — so this is the compiler's to answer,
+        // and it declines rather than guesses where the type does not say.
+        // `compile_elvis` evaluates its left side ONCE, which is what keeps
+        // `f().orEmpty()` from calling `f` twice.
+        if name == "orEmpty" && args.is_empty() {
+            if let Some(empty) = self.empty_of_type(sc, recv) {
+                return self.compile_elvis(sc, recv, &empty);
+            }
+        }
+        // `Result.success(v)` / `Result.failure(e)` — the two companion
+        // factories, lowered onto `runCatching`, which is the same object:
+        // `runCatching { v }` IS a successful `Result` holding `v` and
+        // `runCatching { throw e }` IS a failed one holding `e`. Going through
+        // the block rather than allocating a `Result` directly means the two
+        // spellings can never disagree about what a `Result` is.
+        if args.len() == 1
+            && matches!(name, "success" | "failure")
+            && self.qualifier(sc, recv).as_deref() == Some("Result")
+        {
+            {
+                let body = if name == "success" {
+                    StmtKind::Expr(args[0].clone())
+                } else {
+                    StmtKind::Expr(Expr::Throw(Box::new(args[0].clone())))
+                };
+                let block = Expr::Lambda {
+                    params: Vec::new(),
+                    body: vec![Stmt::new(line, body)],
+                };
+                return self.compile_call(sc, "runCatching", &[block], line);
+            }
         }
         // `f.toString()` on a statically-`Float` receiver is `Float.toString`,
         // not the runtime-value one every other receiver reaches: only the
@@ -5368,6 +5414,19 @@ impl Compiler {
                     _ => Type::Unit,
                 })
             }
+            // `IntRange(start, endInclusive)` / `LongRange(…)` — the
+            // CONSTRUCTOR spelling of `start..endInclusive`, which is the same
+            // object: Kotlin's `1..5` compiles to `new IntRange(1, 5)`. An
+            // empty one (`IntRange(5, 1)`) is a range whose end precedes its
+            // start, exactly as `5..1` is.
+            "IntRange" | "LongRange" if args.len() == 2 => self.compile_expr(
+                sc,
+                &Expr::Range {
+                    start: Box::new(args[0].clone()),
+                    end: Box::new(args[1].clone()),
+                    kind: RangeKind::Inclusive,
+                },
+            ),
             // `listOfNotNull(a, b, c)` is `listOf(a, b, c).filterNotNull()` —
             // the nulls are dropped at run time because the frontend cannot see
             // which arguments are null (`listOfNotNull(maybe, "b")` depends on
@@ -5804,6 +5863,27 @@ impl Compiler {
     fn companion_of(&self, cls: &str) -> Option<String> {
         let comp = companion_name(cls);
         (self.classes.contains_key(cls) && self.classes.contains_key(&comp)).then_some(comp)
+    }
+
+    /// The empty value `x.orEmpty()` falls back to for a receiver of `recv`'s
+    /// declared type, or `None` when the frontend cannot name that type — in
+    /// which case the call is left unresolved rather than answered with a guess
+    /// that could be the wrong KIND of empty.
+    fn empty_of_type(&self, sc: &Scope, recv: &Expr) -> Option<Expr> {
+        if self.infer(sc, recv).is_str() {
+            return Some(Expr::Str(Vec::new()));
+        }
+        let builder = match self.infer_class(sc, recv).as_deref()? {
+            "Map" | "MutableMap" | "HashMap" | "LinkedHashMap" | "TreeMap" => "mapOf",
+            "Set" | "MutableSet" | "HashSet" | "LinkedHashSet" | "TreeSet" => "setOf",
+            "List" | "MutableList" | "ArrayList" | "Collection" | "Iterable" => "listOf",
+            _ => return None,
+        };
+        Some(Expr::Call {
+            name: builder.to_string(),
+            args: Vec::new(),
+            line: 0,
+        })
     }
 
     /// The receiver's spelled type name for extension lookup, or `None` when the
@@ -8444,11 +8524,21 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
 /// per-statement unwind checks and the suppressible print builtins.
 pub fn uses_exceptions(program: &Program) -> bool {
     // `runCatching` catches, so a program containing one needs the pending-slot
-    // machinery even with no `try` written anywhere.
+    // machinery even with no `try` written anywhere. So do `Result.success` and
+    // `Result.failure`, which `compile_member` lowers ONTO `runCatching` — and
+    // `failure` onto a `throw` inside it, which without the machinery would
+    // abort the program instead of being captured. This runs before any scope
+    // exists, so the receiver is matched by spelling; a program that shadows
+    // `Result` only pays for machinery it does not use.
     let has = |body: &[Stmt]| {
         body_any(body, &|e| match e {
             Expr::Try(_) | Expr::Throw(_) => true,
-            Expr::Call { name, .. } | Expr::MethodCall { name, .. } => name == "runCatching",
+            Expr::Call { name, .. } => name == "runCatching",
+            Expr::MethodCall { recv, name, .. } => {
+                name == "runCatching"
+                    || (matches!(name.as_str(), "success" | "failure")
+                        && matches!(&**recv, Expr::Var(v) if v == "Result"))
+            }
             _ => false,
         })
     };
