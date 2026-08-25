@@ -723,6 +723,10 @@ pub enum UnOp {
     Not,
 }
 
+/// The reserved member name `x::class` lowers to. `class` is a Kotlin keyword,
+/// so no program can spell a member of this name and the two cannot collide.
+pub const CLASS_REF: &str = "class";
+
 #[derive(Debug, Clone)]
 pub enum Expr {
     Int(i64),

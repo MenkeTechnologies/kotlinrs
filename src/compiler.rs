@@ -21,21 +21,50 @@
 
 use crate::ast::*;
 use crate::host::{
-    COLL_COPY, COLL_DEFAULT_CAP, COLL_HASH, COLL_SORTED, KT_ARRAY, KT_ARRAY_INIT, KT_ARRAY_NEW,
-    KT_AS, KT_BOX_F32, KT_BUILDER, KT_CHR_STRING, KT_CLASSOF, KT_CLOSURE_CALL, KT_COLL_HOF,
-    KT_COMPARATOR, KT_DBG_LINE, KT_DDIV, KT_DISPLAY, KT_ENUM_REG, KT_EQUALS_REG, KT_EXC_ABORT,
-    KT_EXC_CUT, KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE,
-    KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND, KT_F32, KT_F32_ARITH, KT_F32_STR, KT_FFI_CALL,
-    KT_FFI_COMPILE, KT_GENSEQ, KT_GETFIELD, KT_HASH_REG, KT_IDENTITY, KT_IDIV, KT_IMOD,
-    KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE,
-    KT_JOIN, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO, KT_LIST_TAG, KT_MAKE_CLOSURE,
-    KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OPER_VM, KT_PAIR,
-    KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_RESULT_HOF, KT_RUN_CATCHING,
-    KT_SCOPE_FN, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG,
+    COLL_COPY, COLL_DEFAULT_CAP, COLL_HASH, COLL_LITERAL, COLL_SORTED, KT_ARRAY, KT_ARRAY_INIT,
+    KT_ARRAY_NEW, KT_AS, KT_BOX_F32, KT_BUILDER, KT_CHR_STRING, KT_CLASSOF, KT_CLASS_REF,
+    KT_CLOSURE_CALL, KT_COLL_HOF, KT_COMPARATOR, KT_DBG_LINE, KT_DDIV, KT_DISPLAY, KT_ENUM_REG,
+    KT_EQUALS_REG, KT_EXC_ABORT, KT_EXC_CUT, KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW,
+    KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND, KT_F32,
+    KT_F32_ARITH, KT_F32_STR, KT_FFI_CALL, KT_FFI_COMPILE, KT_GENSEQ, KT_GETFIELD, KT_HASH_REG,
+    KT_IDENTITY, KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL,
+    KT_ITER_GET, KT_ITER_SIZE, KT_JOIN, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO, KT_LIST_TAG,
+    KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OPER_VM,
+    KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_RESULT_HOF,
+    KT_RUN_CATCHING, KT_SCOPE_FN, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG, KT_TO_STRING,
+    KT_TYPE_REG,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+
+/// Whether `name` spells one of Kotlin's builtin types, so `name::class` is a
+/// class reference rather than a read of a value called `name`.
+fn is_builtin_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Int"
+            | "Long"
+            | "Short"
+            | "Byte"
+            | "Double"
+            | "Float"
+            | "Boolean"
+            | "Char"
+            | "String"
+            | "Unit"
+            | "Any"
+    )
+}
+
+/// Whether `name` spells a type that compiles to a JVM PRIMITIVE, which is the
+/// only static type `javaClass` answers differently for.
+fn is_primitive_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Int" | "Long" | "Short" | "Byte" | "Double" | "Float" | "Boolean" | "Char"
+    )
+}
 
 /// The intrinsic `compile_member_boxed` wraps a `Float` argument in, so the box
 /// is emitted through the ordinary call path rather than by rewriting the
@@ -3546,6 +3575,48 @@ impl Compiler {
                 return self.compile_call(sc, "runCatching", &[block], line);
             }
         }
+        // `x::class` / `Type::class` and `x.javaClass` — the two class-object
+        // spellings. Both need the receiver's STATIC type, which is the only
+        // thing that separates `1.javaClass` (the primitive `int`) from
+        // `(1 as Any).javaClass` (`java.lang.Integer`), so it rides along as a
+        // hint string rather than being inferred from the value.
+        if matches!(name, CLASS_REF | "javaClass") && args.is_empty() {
+            let java = name == "javaClass";
+            // A TYPE in receiver position — `Int::class`, `P::class` — names its
+            // own class and has no value to read. `LoadUndef` stands in for the
+            // receiver; the hint is what answers. A local binding of the same
+            // spelling shadows the type, exactly as it does everywhere else.
+            let type_ref = match recv {
+                Expr::Var(n) => (!self.declares_local(sc, n)
+                    && (self.classes.contains_key(n) || is_builtin_type_name(n)))
+                .then(|| n.clone()),
+                _ => None,
+            };
+            let hint = match type_ref {
+                Some(n) => {
+                    self.b.emit(Op::LoadUndef, line);
+                    n
+                }
+                None => {
+                    self.compile_expr(sc, recv)?;
+                    // Only a PRIMITIVE static type is passed on. `javaClass` is
+                    // `getClass()`, which answers the RUNTIME class — `val x:
+                    // Any = 5; x.javaClass` is `java.lang.Integer` and not
+                    // `java.lang.Object` — and the single exception is a
+                    // receiver whose static type is a primitive, where Kotlin
+                    // compiles the primitive class instead. Handing the runtime
+                    // any wider a hint would answer for the DECLARED type.
+                    self.recv_type_name(sc, recv)
+                        .filter(|n| is_primitive_type_name(n))
+                        .unwrap_or_default()
+                }
+            };
+            let hidx = self.b.add_constant(Value::str(hint));
+            self.b.emit(Op::LoadConst(hidx), line);
+            self.b
+                .emit(Op::Extended(KT_CLASS_REF, u8::from(java)), line);
+            return Ok(Type::Obj);
+        }
         // A `Float` handed to a member that stores it or looks it UP by value
         // is in an erased position, so it is boxed like a collection element.
         // `setOf(1.0f).contains(1.0f)` needs it on both sides: a hashed lookup
@@ -6150,6 +6221,12 @@ impl Compiler {
         }
     }
 
+    /// Whether a local binding of this name is in scope, which shadows a type
+    /// of the same spelling.
+    fn declares_local(&self, sc: &Scope, name: &str) -> bool {
+        sc.slot(name).is_some()
+    }
+
     /// Whether `name` names a built-in type (rather than a value) in this
     /// program — the receiver position of a companion constant. A local binding
     /// or a user class of the same name shadows it, exactly as with `Math`.
@@ -7529,6 +7606,14 @@ impl Compiler {
             name,
             "HashSet" | "LinkedHashSet" | "TreeSet" | "HashMap" | "LinkedHashMap" | "TreeMap"
         );
+        // The read-only literal builders, whose result collapses onto
+        // `EmptySet`/`SingletonSet` at the two small sizes — see
+        // [`COLL_LITERAL`].
+        let literal = if matches!(name, "setOf" | "mapOf" | "emptySet" | "emptyMap") {
+            COLL_LITERAL
+        } else {
+            0
+        };
         let shape = match (ctor, argc) {
             // Both the JVM constructor and the Kotlin builder have a NO-ARGUMENT
             // overload that is the plain `HashMap()`/`HashSet()`, and so starts
@@ -7542,7 +7627,8 @@ impl Compiler {
             (true, _) => COLL_COPY,
             _ => 0,
         };
-        self.b.emit(Op::LoadInt(i64::from(order | shape)), 0);
+        self.b
+            .emit(Op::LoadInt(i64::from(order | shape | literal)), 0);
     }
 
     /// Emit the runtime operator-convention dispatch for a heap receiver whose

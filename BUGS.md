@@ -248,20 +248,12 @@ the next round has the measurement rather than a guess.
 
 | program | kotlinrs | reference |
 | --- | --- | --- |
-| `x::class` / `Int::class` | `expected a name after \`::\`, found Class` | a `KClass`; `.simpleName` is `Int` |
 | `class Op(val v: Int) : Comparable<Op>` | `unresolved supertype Comparable of class Op` | compiles; `<` is the `compareTo` override |
 | `enumValues<E>().size` | `unresolved reference: enumValues` | `2` (`E.values()` DOES work) |
-| `e.javaClass.name` | `unresolved reference: javaClass on Exception` | `java.lang.Exception` |
-| `1.javaClass` / `"x".javaClass` | `unresolved reference: javaClass on Int` | `int` / `class java.lang.String` |
-
-`javaClass` needs a class-object value this frontend has no representation for,
-and its answer for a primitive is the JVM's boxing rule rather than the
-language's — `1.javaClass` is `int` where `"x".javaClass` is
-`class java.lang.String`. `::class`, `enumValues<E>()` and a `Comparable<T>`
-supertype are still open; the rest of what this table used to hold —
-`orEmpty`/`isNullOrEmpty`/`isNullOrBlank`, `IntRange(a, b)`, `iterator()`,
-`Result.success`/`failure`, `putAll` and `clear` — is implemented and pinned in
-the corpus.
+`enumValues<E>()` and a `Comparable<T>` supertype are still open; the rest of
+what this table used to hold — `orEmpty`/`isNullOrEmpty`/`isNullOrBlank`,
+`IntRange(a, b)`, `iterator()`, `Result.success`/`failure`, `putAll`, `clear`,
+`::class` and `javaClass` — is implemented and pinned in the corpus.
 
 ## `"%b".format(null)` reads a missing argument as `false`
 

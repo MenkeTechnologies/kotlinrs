@@ -865,3 +865,20 @@ fun main() { val a: Any = 1.0f / 3.0f; val b: Any = 1.0f / 3.0f; println(a == b)
 fun main() { println(listOf(1.0f / 3.0f).indexOf(1.0f / 3.0f)); println(listOf(1.0f).joinToString { it.toString() }) }	0\n1.0\n
 fun main() { var t = 0.0f; listOf(0.1f, 0.2f).forEach { t += it }; println(t); println(listOf(0.1f, 0.2f).sumOf { it.toDouble() }) }	0.3\n0.30000000447034836\n
 fun main() { println(listOf(1.0f).first() + 1.0f); println(listOf(1.0f)[0] * 3); println(listOf(1.0f)[0].toInt()) }	2.0\n3.0\n1\n
+fun main() { println(1.javaClass); println("x".javaClass); println(1.0.javaClass); println(true.javaClass); println('c'.javaClass); println(1L.javaClass) }	int\nclass java.lang.String\ndouble\nboolean\nchar\nlong\n
+fun main() { println(listOf(1).javaClass); println(mapOf(1 to 2).javaClass); println(setOf(1).javaClass); println(mutableListOf(1).javaClass) }	class java.util.Collections$SingletonList\nclass java.util.Collections$SingletonMap\nclass java.util.Collections$SingletonSet\nclass java.util.ArrayList\n
+class P(val a: Int)\nfun main() { println(P(1).javaClass); println(P(1).javaClass.name); println(P(1).javaClass.simpleName) }	class P\nP\nP\n
+fun main() { println(Int::class); println(String::class); println(Double::class); println(Boolean::class) }	class kotlin.Int\nclass kotlin.String\nclass kotlin.Double\nclass kotlin.Boolean\n
+fun main() { println(Int::class.simpleName); println(String::class.simpleName); println(String::class.qualifiedName); println(Int::class.qualifiedName) }	Int\nString\nkotlin.String\nkotlin.Int\n
+class P(val a: Int)\nfun main() { println(P::class); println(P::class.simpleName); println(P::class.qualifiedName); println(P(1)::class.simpleName) }	class P\nP\nP\nP\n
+fun main() { println(1::class); println(1::class.simpleName); println("x"::class.simpleName); println(listOf(1)::class.simpleName) }	class kotlin.Int\nInt\nString\nSingletonList\n
+fun main() { println(Int::class.java); println(String::class.java); println(String::class.java.name); println(Int::class.java.simpleName) }	int\nclass java.lang.String\njava.lang.String\nint\n
+fun main() { val x: Any = 5; println(x::class.simpleName); println(x.javaClass.name); println(x.javaClass.simpleName) }	Int\njava.lang.Integer\nInteger\n
+fun main() { println(1.javaClass.name); println("x".javaClass.name); println(1.0.javaClass.simpleName); println(true.javaClass.name) }	int\njava.lang.String\ndouble\nboolean\n
+fun main() { try { throw RuntimeException("z") } catch (e: Exception) { println(e.javaClass.name); println(e.javaClass.simpleName); println(e::class.simpleName) } }	java.lang.RuntimeException\nRuntimeException\nRuntimeException\n
+enum class E { A, B }\nfun main() { println(E.A.javaClass.name); println(E.A::class.simpleName); println(E::class.simpleName) }	E\nE\nE\n
+fun main() { println(emptySet<Int>().javaClass.name); println(setOf(1).javaClass.name); println(setOf(1, 2).javaClass.name); println(mutableSetOf(1).javaClass.name) }	kotlin.collections.EmptySet\njava.util.Collections$SingletonSet\njava.util.LinkedHashSet\njava.util.LinkedHashSet\n
+fun main() { println(emptyMap<Int, Int>().javaClass.name); println(mapOf(1 to 1).javaClass.name); println(mapOf(1 to 1, 2 to 2).javaClass.name); println(mutableMapOf(1 to 1).javaClass.name) }	kotlin.collections.EmptyMap\njava.util.Collections$SingletonMap\njava.util.LinkedHashMap\njava.util.LinkedHashMap\n
+fun main() { println(hashSetOf(1).javaClass.name); println(sortedSetOf(1).javaClass.name); println(hashMapOf(1 to 1).javaClass.name); println(sortedMapOf(1 to 1).javaClass.name) }	java.util.HashSet\njava.util.TreeSet\njava.util.HashMap\njava.util.TreeMap\n
+fun main() { println(linkedSetOf(1).javaClass.name); println(linkedMapOf(1 to 1).javaClass.name); println(HashSet<Int>().javaClass.name); println(LinkedHashMap<Int, Int>().javaClass.name) }	java.util.LinkedHashSet\njava.util.LinkedHashMap\njava.util.HashSet\njava.util.LinkedHashMap\n
+fun main() { println(setOf(1).javaClass.simpleName); println(mapOf(1 to 1).javaClass.simpleName); println(setOf(1)::class.simpleName); println(mapOf(1 to 1)::class.simpleName) }	SingletonSet\nSingletonMap\nSingletonSet\nSingletonMap\n

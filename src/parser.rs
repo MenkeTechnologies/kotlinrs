@@ -2704,6 +2704,21 @@ impl Parser {
             if self.at(&Tok::ColonColon) {
                 let line = self.line();
                 self.bump();
+                // `x::class` / `Type::class` — a class REFERENCE, not a member
+                // one. `class` is a keyword, so it can never be the name of a
+                // member and the two spellings cannot collide; it lowers as a
+                // member read of that reserved name, which is where the
+                // compiler's receiver machinery already lives.
+                if self.at(&Tok::Class) {
+                    self.bump();
+                    e = Expr::Member {
+                        recv: Box::new(e),
+                        name: CLASS_REF.to_string(),
+                        safe: false,
+                        line,
+                    };
+                    continue;
+                }
                 let name = match self.peek().clone() {
                     Tok::Ident(n) => {
                         self.bump();

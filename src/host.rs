@@ -211,6 +211,17 @@ pub const KT_F32: u16 = 43;
 /// leaves nothing for a tag.
 pub const KT_BOX_F32: u16 = 45;
 
+/// `KT_CLASS_REF`: the class object of the value below a static-type HINT.
+/// Stack `[value, hintStr]`; `arg` is `0` for Kotlin's `::class` (a `KClass`)
+/// and `1` for `javaClass` (a `java.lang.Class`).
+///
+/// The hint is the receiver's static type name, or the empty string where the
+/// frontend could not name it, and it is what separates `1.javaClass` — `int`,
+/// the PRIMITIVE class — from `val x: Any = 1; x.javaClass`, which is
+/// `java.lang.Integer`. Only the compiler knows which was written; the runtime
+/// value is the same `Value::Int` either way.
+pub const KT_CLASS_REF: u16 = 46;
+
 /// `KT_F32_STR`: `Float.toString` of the top of stack.
 ///
 /// A separate op from [`KT_TO_STRING`] because the two disagree on the same
@@ -500,6 +511,12 @@ thread_local! {
     static COLL_ORDER: RefCell<std::collections::HashMap<u32, CollOrder>> =
         RefCell::new(std::collections::HashMap::new());
 
+    /// The handles built by a READ-ONLY `Set`/`Map` literal — see
+    /// [`COLL_LITERAL`]. What a list records in [`LIST_IMPL`], for the two
+    /// collections that have no such tag of their own.
+    static COLL_LITERAL_TAG: RefCell<std::collections::HashSet<u32>> =
+        RefCell::new(std::collections::HashSet::new());
+
     /// The handles from [`COLL_ORDER`] whose stored sequence a mutation has
     /// left OUT of that order. See [`mark_unordered`].
     static COLL_UNORDERED: RefCell<std::collections::HashSet<u32>> =
@@ -734,6 +751,14 @@ pub const COLL_COPY: u8 = 0x10;
 /// Spec flag: the no-argument constructor, which starts from Java's default
 /// 16-bucket table instead of one sized to the element count.
 pub const COLL_DEFAULT_CAP: u8 = 0x20;
+/// Spec flag: a READ-ONLY literal — `setOf`/`mapOf`/`emptySet`/`emptyMap`.
+///
+/// Kotlin collapses those at the two small sizes exactly as it collapses
+/// `listOf`: `setOf()` is a `kotlin.collections.EmptySet`, `setOf(1)` a
+/// `java.util.Collections$SingletonSet`, and only from two elements up is it
+/// the `java.util.LinkedHashSet` the mutable builders always are. Nothing about
+/// the built collection says which builder made it, so the call site does.
+pub const COLL_LITERAL: u8 = 0x40;
 
 /// The collection discipline a builder call asks for, as the compiler encodes it
 /// in the trailing argument of `KT_SET_VM`/`KT_MAP_VM`.
@@ -752,6 +777,8 @@ struct CollSpec {
     copy: bool,
     /// The no-argument constructor: Java's default table, not a sized one.
     default_cap: bool,
+    /// A read-only literal builder — see [`COLL_LITERAL`].
+    literal: bool,
 }
 
 impl CollSpec {
@@ -766,11 +793,22 @@ impl CollSpec {
             },
             copy: code & COLL_COPY != 0,
             default_cap: code & COLL_DEFAULT_CAP != 0,
+            literal: code & COLL_LITERAL != 0,
         }
     }
 
     /// Record the built collection's discipline and put it in that order.
     fn apply(self, vm: &mut VM, v: &Value, size: usize) {
+        // Recorded before the order, which most builders do not have: the
+        // read-only flag is what names the JVM class of an insertion-ordered
+        // `Set`/`Map`, and those are exactly the ones with no `CollOrder`.
+        if self.literal {
+            if let Value::Obj(id) = v {
+                COLL_LITERAL_TAG.with(|t| {
+                    t.borrow_mut().insert(*id);
+                });
+            }
+        }
         let ord = match self.order {
             Some(CollOrder::Hash(_)) if self.default_cap => CollOrder::Hash(DEFAULT_CAPACITY),
             Some(CollOrder::Hash(_)) => CollOrder::Hash(map_capacity(size)),
@@ -1130,6 +1168,20 @@ enum HeapObj {
         params: u8,
         captures: Vec<Value>,
     },
+    /// A class object — `x::class` (a `kotlin.reflect.KClass`) or `x.javaClass`
+    /// (a `java.lang.Class`). See [`KT_CLASS_REF`].
+    Klass {
+        /// `simpleName` — `Int`, `String`, `SingletonList`, `int`.
+        simple: String,
+        /// `qualifiedName` for a `KClass` (`kotlin.Int`), the binary `name` for
+        /// a `java.lang.Class` (`java.lang.Integer`, `int`).
+        qualified: String,
+        /// A `java.lang.Class` rather than a `KClass`.
+        java: bool,
+        /// A PRIMITIVE java class, whose printed form is the bare name with no
+        /// `class ` before it — `int`, not `class int`.
+        primitive: bool,
+    },
     /// A boxed `Float` — see [`KT_BOX_F32`]. Carries the `f32` itself, so the
     /// 32-bit width survives every position where the static type does not.
     F32(f32),
@@ -1393,6 +1445,7 @@ fn reset_heap() {
     HEAP.with(|h| h.borrow_mut().clear());
     COLL_ORDER.with(|c| c.borrow_mut().clear());
     COLL_UNORDERED.with(|d| d.borrow_mut().clear());
+    COLL_LITERAL_TAG.with(|t| t.borrow_mut().clear());
     MAP_INDEX.with(|t| t.borrow_mut().clear());
     LIST_IMPL.with(|t| t.borrow_mut().clear());
     SEQ_VIEW.with(|t| t.borrow_mut().clear());
@@ -3348,6 +3401,11 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
                 _ => a + b,
             };
             vm.push(Value::Float(r as f64));
+        }
+        KT_CLASS_REF => {
+            let hint = vm.pop().to_str();
+            let v = vm.pop();
+            vm.push(class_ref(&v, &hint, arg == 1));
         }
         KT_BOX_F32 => {
             let v = vm.pop();
@@ -8080,6 +8138,46 @@ fn char_method(code: i64, name: &str, args: &[Value]) -> Result<Value, String> {
 /// class's synthesized members). User-defined class methods never reach here —
 /// the compiler lowers those to direct `Op::Call`s on method subs.
 fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    // A class object. Its members are reflection's, not a container's.
+    if let Some((simple, qualified, java)) = with_obj(recv, |o| match o {
+        HeapObj::Klass {
+            simple,
+            qualified,
+            java,
+            ..
+        } => Some((simple.clone(), qualified.clone(), *java)),
+        _ => None,
+    })
+    .flatten()
+    {
+        return match name {
+            "simpleName" => Ok(Value::str(simple)),
+            // `qualifiedName` is a `KClass` member and `name` a `Class` one;
+            // both answer the same string on the object that declares them.
+            "qualifiedName" | "name" => Ok(Value::str(qualified)),
+            // `KClass.java` is the `java.lang.Class` for the same class, which
+            // for a Kotlin primitive is the PRIMITIVE one — `Int::class.java`
+            // is `int`.
+            "java" if !java => {
+                let prim = java_primitive(&simple);
+                let binary = prim
+                    .map(|p| p.to_string())
+                    .or_else(|| jvm_class(&simple).map(|(n, _)| n.to_string()))
+                    .unwrap_or_else(|| qualified.clone());
+                Ok(alloc(HeapObj::Klass {
+                    simple: simple_of(&binary),
+                    qualified: binary,
+                    java: true,
+                    primitive: prim.is_some(),
+                }))
+            }
+            "toString" => Ok(Value::str(kotlin_string(recv))),
+            _ => Err(format!(
+                "unresolved reference: {name} on {}",
+                if java { "Class" } else { "KClass" }
+            )),
+        };
+    }
     // The iterator cursor. It resolves first because `next` and `hasNext` are
     // its own and nothing else here declares them.
     if let Some((src, at)) = with_obj(recv, |o| match o {
@@ -9576,6 +9674,7 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
         | HeapObj::Gen { .. }
         | HeapObj::Grouping { .. }
         | HeapObj::Iter { .. }
+        | HeapObj::Klass { .. }
         | HeapObj::Range(_)
         | HeapObj::Builder { .. }
         | HeapObj::Exc { .. } => None,
@@ -10200,7 +10299,10 @@ fn obj_hash(recv: &Value) -> Option<i32> {
         })),
         // A `by lazy` cell inherits `Object.hashCode` — identity, which
         // `value_hash` reports by answering `None`. So does an iterator cursor.
-        HeapObj::Lazy { .. } | HeapObj::Res { .. } | HeapObj::Iter { .. } => None,
+        HeapObj::Lazy { .. }
+        | HeapObj::Res { .. }
+        | HeapObj::Iter { .. }
+        | HeapObj::Klass { .. } => None,
         // `java.lang.Float.hashCode()` is `floatToIntBits`, which is NOT the
         // `Double` fold of the same magnitude — `1.0f` hashes to `1065353216`
         // where `1.0` hashes to `1072693248`.
@@ -10269,6 +10371,7 @@ fn obj_label(recv: &Value) -> String {
         HeapObj::Closure { .. } => "Function".to_string(),
         HeapObj::Comparator(_) => "Comparator".to_string(),
         HeapObj::F32(_) => "Float".to_string(),
+        HeapObj::Klass { java, .. } => if *java { "Class" } else { "KClass" }.to_string(),
         HeapObj::Iter { .. } => "Iterator".to_string(),
         HeapObj::Gen { .. } => "Sequence".to_string(),
         HeapObj::Grouping { .. } => "Grouping".to_string(),
@@ -10417,6 +10520,20 @@ fn display_obj(id: u32) -> String {
             // only the value can carry it, so it renders through
             // `Float.toString` and not `Double`'s.
             HeapObj::F32(f) => format_float(*f),
+            // `Class.toString` is `class <name>` — except for a PRIMITIVE
+            // class, which prints its bare name. `KClass.toString` is
+            // `class <qualifiedName>` for every class.
+            HeapObj::Klass {
+                qualified,
+                primitive,
+                ..
+            } => {
+                if *primitive {
+                    qualified.clone()
+                } else {
+                    format!("class {qualified}")
+                }
+            }
             HeapObj::Iter { at, .. } => format!("(iterator at={at})"),
             // `IntRange.toString` is `first..last`; `IntProgression.toString` is
             // `first..last step n` ascending and `first downTo last step n`
@@ -10483,6 +10600,148 @@ fn jvm_class(ty: &str) -> Option<(&'static str, bool)> {
     })
 }
 
+/// The Kotlin builtin a type NAME denotes, as `(simpleName, qualifiedName)`.
+fn kotlin_class(ty: &str) -> Option<(&'static str, &'static str)> {
+    Some(match ty {
+        "Int" => ("Int", "kotlin.Int"),
+        "Long" => ("Long", "kotlin.Long"),
+        "Short" => ("Short", "kotlin.Short"),
+        "Byte" => ("Byte", "kotlin.Byte"),
+        "Double" => ("Double", "kotlin.Double"),
+        "Float" => ("Float", "kotlin.Float"),
+        "Boolean" => ("Boolean", "kotlin.Boolean"),
+        "Char" => ("Char", "kotlin.Char"),
+        "String" => ("String", "kotlin.String"),
+        "Unit" => ("Unit", "kotlin.Unit"),
+        "Any" => ("Any", "kotlin.Any"),
+        _ => return None,
+    })
+}
+
+/// The PRIMITIVE java class a Kotlin type name compiles to when the receiver's
+/// static type is that type rather than a supertype. `1.javaClass` is `int`
+/// where `(1 as Any).javaClass` is `java.lang.Integer`, and the difference is
+/// the static type alone.
+fn java_primitive(ty: &str) -> Option<&'static str> {
+    Some(match ty {
+        "Int" => "int",
+        "Long" => "long",
+        "Short" => "short",
+        "Byte" => "byte",
+        "Double" => "double",
+        "Float" => "float",
+        "Boolean" => "boolean",
+        "Char" => "char",
+        _ => return None,
+    })
+}
+
+/// The simple name of a binary one — the last segment after a `.` or a `$`, so
+/// `java.util.Collections$SingletonList` is `SingletonList`.
+fn simple_of(binary: &str) -> String {
+    binary
+        .rsplit(['.', '$'])
+        .next()
+        .unwrap_or(binary)
+        .to_string()
+}
+
+/// The class object for `v`, given the receiver's static type `hint` (empty
+/// when the frontend could not name it). See [`KT_CLASS_REF`].
+fn class_ref(v: &Value, hint: &str, java: bool) -> Value {
+    // A primitive static type is the one case the runtime value cannot answer,
+    // and it only changes the JAVA class: `1::class` is `kotlin.Int` either way.
+    if java {
+        if let Some(prim) = java_primitive(hint) {
+            return alloc(HeapObj::Klass {
+                simple: prim.to_string(),
+                qualified: prim.to_string(),
+                java: true,
+                primitive: true,
+            });
+        }
+    }
+    // A TYPE in receiver position — `P::class`, `String::class` — comes with no
+    // value at all, so the hint IS the answer. A Kotlin builtin has a qualified
+    // name of its own (`kotlin.String`); anything else is a class this program
+    // declared, whose simple and qualified names are the same unqualified one.
+    if matches!(v, Value::Undef) && !hint.is_empty() {
+        let (simple, qualified) = match kotlin_class(hint) {
+            Some((s, q)) => (s.to_string(), q.to_string()),
+            None => (hint.to_string(), hint.to_string()),
+        };
+        let binary = jvm_class(hint)
+            .map(|(n, _)| n.to_string())
+            .unwrap_or_else(|| qualified.clone());
+        return alloc(HeapObj::Klass {
+            simple: if java { simple_of(&binary) } else { simple },
+            qualified: if java { binary } else { qualified },
+            java,
+            primitive: false,
+        });
+    }
+    // A user class, an `object`, an enum constant or a throwable names itself.
+    let named = instance_tag(v).or_else(|| {
+        with_obj(v, |o| match o {
+            HeapObj::Exc { class, .. } => Some(class.clone()),
+            _ => None,
+        })
+        .flatten()
+    });
+    if let Some(class) = named {
+        return alloc(HeapObj::Klass {
+            simple: simple_of(&class),
+            qualified: class,
+            java,
+            primitive: false,
+        });
+    }
+    // A container, whose class turns on how the handle was built.
+    if let Some((binary, _)) = runtime_jvm_class(v) {
+        let simple = simple_of(&binary);
+        return alloc(HeapObj::Klass {
+            simple,
+            qualified: binary,
+            java,
+            primitive: false,
+        });
+    }
+    // A scalar. The hint names its Kotlin type where the frontend had one;
+    // otherwise the runtime kind does, which cannot separate `Int` from `Long`
+    // (one `Value::Int`) or `Double` from a boxed `Float` (told apart by the
+    // box, which is why the box is checked first).
+    let ty = if kotlin_class(hint).is_some() {
+        hint.to_string()
+    } else {
+        match v {
+            _ if f32_box(v).is_some() => "Float",
+            _ if char_code(v).is_some() => "Char",
+            Value::Int(_) => "Int",
+            Value::Float(_) => "Double",
+            Value::Bool(_) => "Boolean",
+            Value::Str(_) => "String",
+            _ => "Any",
+        }
+        .to_string()
+    };
+    let (simple, qualified) = kotlin_class(&ty).unwrap_or(("Any", "kotlin.Any"));
+    if java {
+        let binary = jvm_class(&ty).map(|(n, _)| n).unwrap_or("java.lang.Object");
+        return alloc(HeapObj::Klass {
+            simple: simple_of(binary),
+            qualified: binary.to_string(),
+            java: true,
+            primitive: false,
+        });
+    }
+    alloc(HeapObj::Klass {
+        simple: simple.to_string(),
+        qualified: qualified.to_string(),
+        java: false,
+        primitive: false,
+    })
+}
+
 /// The JVM binary name of the class a runtime VALUE is, and whether it lives in
 /// `java.base`.
 ///
@@ -10532,6 +10791,13 @@ fn runtime_jvm_class(v: &Value) -> Option<(String, bool)> {
                 _ => ("java.util.ArrayList".to_string(), true),
             })
         }
+        // A `Set`/`Map`'s class turns on the same literal-versus-mutable
+        // provenance a list's does, plus the iteration discipline: a read-only
+        // literal collapses onto `EmptySet`/`SingletonSet` at the two small
+        // sizes, `hashSetOf` is a `HashSet` and `sortedSetOf` a `TreeSet`, and
+        // everything else is the `LinkedHashSet` the mutable builders answer.
+        HeapObj::Set(items) => Some(coll_jvm_class(v, items.len(), true)),
+        HeapObj::Map(entries) => Some(coll_jvm_class(v, entries.len(), false)),
         HeapObj::Pair(_, _) => Some(("kotlin.Pair".to_string(), false)),
         HeapObj::Triple(_, _, _) => Some(("kotlin.Triple".to_string(), false)),
         HeapObj::Range(r) => Some((
@@ -10547,6 +10813,69 @@ fn runtime_jvm_class(v: &Value) -> Option<(String, bool)> {
         _ => None,
     })
     .flatten()
+}
+
+/// The JVM class of a `Set` (`set`) or a `Map`, from its discipline, its
+/// read-only tag and its size. See [`runtime_jvm_class`].
+fn coll_jvm_class(v: &Value, len: usize, set: bool) -> (String, bool) {
+    match order_of(v) {
+        Some(CollOrder::Hash(_)) => {
+            return (
+                if set {
+                    "java.util.HashSet"
+                } else {
+                    "java.util.HashMap"
+                }
+                .to_string(),
+                true,
+            )
+        }
+        Some(CollOrder::Sorted) => {
+            return (
+                if set {
+                    "java.util.TreeSet"
+                } else {
+                    "java.util.TreeMap"
+                }
+                .to_string(),
+                true,
+            )
+        }
+        None => {}
+    }
+    let literal = match v {
+        Value::Obj(id) => COLL_LITERAL_TAG.with(|t| t.borrow().contains(id)),
+        _ => false,
+    };
+    match (literal, len) {
+        (true, 0) => (
+            if set {
+                "kotlin.collections.EmptySet"
+            } else {
+                "kotlin.collections.EmptyMap"
+            }
+            .to_string(),
+            false,
+        ),
+        (true, 1) => (
+            if set {
+                "java.util.Collections$SingletonSet"
+            } else {
+                "java.util.Collections$SingletonMap"
+            }
+            .to_string(),
+            true,
+        ),
+        _ => (
+            if set {
+                "java.util.LinkedHashSet"
+            } else {
+                "java.util.LinkedHashMap"
+            }
+            .to_string(),
+            true,
+        ),
+    }
 }
 
 /// Where a class lives, as the JVM's `ClassCastException` spells it.

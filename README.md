@@ -169,6 +169,15 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   are equal under it. `Char.MIN_VALUE`/`MAX_VALUE`
   bound the UTF-16 code unit, so the top is `￿` and not the highest code
   point.
+- **Class objects** — `x::class` and `Type::class` (a `KClass`, with
+  `.simpleName`, `.qualifiedName` and `.java`) and `x.javaClass` (a
+  `java.lang.Class`, with `.name` and `.simpleName`). A receiver whose STATIC
+  type is a primitive answers the primitive class, which is the one thing the
+  runtime value cannot decide: `1.javaClass` is `int` where a `val x: Any = 1`
+  answers `java.lang.Integer`. A collection answers the JVM class its builder
+  actually produced — `setOf(1)` is a `java.util.Collections$SingletonSet`,
+  `setOf(1, 2)` a `LinkedHashSet`, `hashSetOf` a `HashSet` and `sortedSetOf` a
+  `TreeSet`.
 - **Member access** — chainable postfix `.`: `String.length`,
   `.uppercase()`/`.lowercase()`, `.trim()`/`.trimStart()`/`.trimEnd()` — each in
   all three overloads, the no-argument whitespace one, the vararg `Char` SET
