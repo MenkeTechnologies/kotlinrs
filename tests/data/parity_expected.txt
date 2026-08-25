@@ -720,3 +720,28 @@ fun main() {\n    println(hashMapOf(3 to 1, 1 to 2).toMap())\n}	{1=2, 3=1}\n
 fun main() {\n    val sb = StringBuilder()\n    for (i in 1..5) {\n        sb.append("ab")\n    }\n    println(sb.toString())\n    println(sb.length)\n}	ababababab\n10\n
 fun main() {\n    val xs = mutableListOf<Int>()\n    for (i in 1..5) {\n        xs.add(i)\n    }\n    println(xs)\n    println(xs.add(3))\n}	[1, 2, 3, 4, 5]\ntrue\n
 fun main() {\n    val s = mutableSetOf(1, 2)\n    println(s.add(2))\n    println(s.add(3))\n    println(s)\n}	false\ntrue\n[1, 2, 3]\n
+fun main() { var i = 0; var s = ""; while (i < 6) { i += 1; if (i % 2 == 0) continue; s += i }; println(s) }	135\n
+fun main() { var i = 0; var s = ""; while (i < 10) { i += 1; if (i == 4) break; s += i }; println("$s|$i") }	123|4\n
+fun main() { var i = 0; var s = ""; do { i += 1; if (i % 2 == 0) continue; s += i } while (i < 6); println("$s|$i") }	135|6\n
+fun main() { var i = 0; do { i += 1 } while (false); println(i) }	1\n
+fun main() { var i = 10; var n = 0; while (i < 5) { n += 1 }; println("$i $n") }	10 0\n
+fun main() { var s = ""; outer@ for (i in 0 until 3) { for (j in 0 until 3) { if (j == 1) continue@outer; s += "$i$j " } }; println(s) }	00 10 20 \n
+fun main() { var s = ""; outer@ for (i in 0 until 3) { for (j in 0 until 3) { if (i == 1 && j == 1) break@outer; s += "$i$j " } }; println(s) }	00 01 02 10 \n
+fun main() { var s = ""; outer@ while (true) { for (j in 0 until 3) { s += j; if (j == 1) break@outer }; s += "x" }; println(s) }	01\n
+fun main() { var s = ""; for (i in 5 downTo 1) s += i; println(s) }	54321\n
+fun main() { var s = ""; for (i in 0 until 0) s += i; println("[$s]") }	[]\n
+fun main() { var s = ""; for (i in 3..1) s += i; println("[$s]") }	[]\n
+fun main() { val xs = listOf(1, 2, 3, 4); var s = ""; for (x in xs) { if (x == 2) continue; if (x == 4) break; s += x }; println("[$s]") }	[13]\n
+fun main() { val xs = listOf<Int>(); var n = 0; for (x in xs) n += 1; println(n) }	0\n
+fun main() { var i = 0; var s = ""; while (i < 4) { i += 1; when (i) { 2 -> continue; 3 -> { s += "T" } }; s += i }; println(s) }	1T34\n
+fun main() { var i = 0; var t = 0; while (i < 5) { i += 1; if (i > 2) { t += 10 } else { t += 1 } }; println(t) }	32\n
+fun main() { var n = 0; try { var i = 0; while (i < 10) { i += 1; if (i == 3) throw RuntimeException("stop"); n = i } } catch (e: RuntimeException) { println("caught ${e.message} n=$n") } }	caught stop n=2\n
+fun main() { var n = 0; try { var i = 0; do { i += 1; if (i == 3) throw RuntimeException("d"); n = i } while (i < 10) } catch (e: RuntimeException) { println("caught ${e.message} n=$n") } }	caught d n=2\n
+fun f(n: Int): Int { var t = 0; var i = 0; while (i < n) { t += i; i += 1 }; return t }\nfun main() { println(f(0)); println(f(1)); println(f(100)) }	0\n0\n4950\n
+fun g(): Int { var i = 0; while (true) { i += 1; if (i == 7) return i } }\nfun main() { println(g()) }	7\n
+fun main() { var s = ""; var i = 0; while (i < 3) { var j = 0; while (j < 2) { s += "$i$j "; j += 1 }; i += 1 }; println(s) }	00 01 10 11 20 21 \n
+fun main() { var s = ""; for (c in "abc") s += c.uppercaseChar(); println(s) }	ABC\n
+fun main() { val a = intArrayOf(3, 1, 2); var s = 0; for (v in a) s += v; println(s) }	6\n
+fun main() { var i = 0; var s = ""; while (i++ < 3) s += i; println(s) }	123\n
+fun main() { var s = ""; for (i in 0..10 step 3) s += "$i "; println(s) }	0 3 6 9 \n
+fun main() { var n = 0; repeat(4) { n += it }; println(n) }	6\n
