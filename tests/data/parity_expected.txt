@@ -909,3 +909,14 @@ fun main() { val h = hashSetOf<String>(); for (k in listOf("q", "w", "e", "r", "
 fun main() { val t = sortedMapOf<String, Int>(); for (k in listOf("pear", "fig", "apple")) t[k] = k.length; println(t); println(t.keys.first()); println(t.entries.last()) }	{apple=5, fig=3, pear=4}\napple\npear=4\n
 fun main() { val h = hashMapOf<Int, Int>(); var i = 0; while (i < 18) { h[i] = i * i; i += 1 }; var s = ""; for ((k, v) in h) s += "$k "; println(s.trim()) }	0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17\n
 fun main() { val h = hashMapOf(1 to "a", 2 to "b"); println(h == hashMapOf(2 to "b", 1 to "a")); println(hashSetOf(1, 2) == hashSetOf(2, 1)); println(h.hashCode() == hashMapOf(2 to "b", 1 to "a").hashCode()) }	true\ntrue\ntrue\n
+fun main() { val s = sequence { yield(1); yield(2); yield(3) }; println(s.toList()); println(s.map { it * 2 }.toList()); println(s.filter { it % 2 == 1 }.toList()) }	[1, 2, 3]\n[2, 4, 6]\n[1, 3]\n
+fun main() { var i = 0; val inf = sequence { while (true) { yield(i); i += 1 } }; println(inf.take(5).toList()) }	[0, 1, 2, 3, 4]\n
+fun main() { val fib = sequence { var a = 0; var b = 1; while (true) { yield(a); val t = a + b; a = b; b = t } }; println(fib.take(10).toList()); println(fib.take(3).toList()) }	[0, 1, 1, 2, 3, 5, 8, 13, 21, 34]\n[0, 1, 1]\n
+fun main() { println(sequence<Int> { }.toList()); println(sequence { yield(7) }.first()); println(sequence { yield(1); yield(2) }.count()) }	[]\n7\n2\n
+fun main() { val s = sequence { for (i in 1..5) yield(i * i) }; println(s.toList()); println(s.sum()); println(s.max()) }	[1, 4, 9, 16, 25]\n55\n25\n
+fun main() { val s = sequence { yield(1); yield(2); yield(3); yield(4) }; println(s.drop(2).toList()); println(s.takeWhile { it < 3 }.toList()); println(s.dropWhile { it < 3 }.toList()) }	[3, 4]\n[1, 2]\n[3, 4]\n
+fun main() { val s = sequence { println("side"); yield(1); yield(2) }; println(s.take(1).toList()) }	side\n[1]\n
+fun main() { val s = sequence { var n = 0; while (n < 3) { yield("v$n"); n += 1 } }; println(s.joinToString()); println(s.toList().size) }	v0, v1, v2\n3\n
+fun main() { val outer = sequence { for (x in sequence { yield(1); yield(2) }) yield(x * 10) }; println(outer.toList()) }	[10, 20]\n
+fun main() { val s = sequence { yield(1); yield(2); yield(3) }; var t = 0; for (v in s) t += v; println(t); println(s.map { it + 1 }.filter { it > 2 }.take(2).toList()) }	6\n[3, 4]\n
+fun main() { val s = generateSequence(1) { if (it < 5) it + 1 else null }; println(s.toList()); val t = sequence { yieldAll(listOf(1, 2)) }; println(t.toList()) }	[1, 2, 3, 4, 5]\n[1, 2]\n

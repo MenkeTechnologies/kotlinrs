@@ -211,6 +211,42 @@ pub const KT_F32: u16 = 43;
 /// leaves nothing for a tag.
 pub const KT_BOX_F32: u16 = 45;
 
+/// `KT_YIELD`: suspend the running `sequence { … }` block, handing its argument
+/// to whoever is pulling from it. Stack `[value]`; leaves the `Unit` the call
+/// evaluates to.
+///
+/// This is a REAL suspension and not a collected value: the block stops where it
+/// stands, its frames and operand stack are lifted off the VM and parked on the
+/// coroutine, and the next pull puts them back and continues from the op after
+/// this one. That is what makes `sequence { var i = 0; while (true) yield(i++) }
+/// .take(5)` terminate — an implementation that ran the block to completion and
+/// wrapped the results would be right for a finite builder and hang on the
+/// infinite one laziness exists for.
+pub const KT_YIELD: u16 = 48;
+
+/// `KT_ITER_SRC`: normalize the value a `for (v in …)` header evaluated to into
+/// something the loop can index. Stack `[value]`; leaves it unchanged except
+/// for a lazy `Sequence`, which is pulled into a `List`.
+///
+/// `for`-in walks a length and an index, and a `Sequence` has neither: it is a
+/// pull, and its length is not known until it ends. Pulling it here — once, at
+/// the loop's head, where the header expression is evaluated exactly once
+/// anyway — is what lets the ordinary lowering iterate one. An endless sequence
+/// hits the pipeline's own `GEN_PULL_CAP` diagnostic rather than looping
+/// forever, which is what an endless `for` over one does on the reference.
+///
+/// A BUILTIN and not an `Op::Extended`, for the reason the note above the
+/// builtin ids gives: `Op::Extended` takes the extension handler out of the VM
+/// for the duration of the call, so a nested `vm.run()` started from one finds
+/// no handler — and `KT_YIELD`, which the pull below has to reach, is an
+/// extension op. Pulling a `sequence { … }` from an extension op answered an
+/// empty list, silently.
+pub const KT_ITER_SRC: u16 = 137;
+
+/// `KT_SEQ_NEW`: build the lazy `Sequence` a `sequence { … }` block denotes.
+/// Stack `[blockClosure]`; pushes a `Gen` whose source is a fresh coroutine.
+pub const KT_SEQ_NEW: u16 = 49;
+
 /// `KT_COMPARE_REG`: publish a class's `compareTo` override, so the ordering
 /// members can run it. Stack `[tagStr, subNameIdx]`, like [`KT_EQUALS_REG`].
 ///
@@ -1181,6 +1217,25 @@ enum HeapObj {
         params: u8,
         captures: Vec<Value>,
     },
+    /// A suspended `sequence { … }` block — see [`KT_YIELD`].
+    ///
+    /// While the block is parked, its frames and its slice of the operand stack
+    /// live HERE and not on the VM, because the consumer goes on running on the
+    /// same VM in between two pulls and would otherwise read the block's frame
+    /// as its own. Each frame's `stack_base` is stored relative to the block's
+    /// own base, so it can be put back at whatever depth the consumer happens to
+    /// be at when it asks for the next element.
+    Coro {
+        /// The block itself, entered on the first pull.
+        body: Value,
+        /// Parked call frames, innermost last, with `stack_base` rebased to 0.
+        frames: Vec<Frame>,
+        /// The block's slice of the operand stack.
+        stack: Vec<Value>,
+        /// Where the block resumes — the op after the `KT_YIELD` that parked it.
+        ip: usize,
+        state: CoroState,
+    },
     /// A class object — `x::class` (a `kotlin.reflect.KClass`) or `x.javaClass`
     /// (a `java.lang.Class`). See [`KT_CLASS_REF`].
     Klass {
@@ -1266,6 +1321,17 @@ enum HeapObj {
     /// terminal operation pulls — which is what makes `.take(5).toList()` a
     /// five-element list rather than a hang.
     Gen {
+        /// The `sequence { … }` BLOCK this pipeline pulls from, or `None` for
+        /// the `generateSequence(seed) { … }` form below. The two are the same
+        /// pipeline over two different SOURCES; everything downstream — `map`,
+        /// `filter`, `take` — is written once against both.
+        ///
+        /// The block and not a live coroutine, because Kotlin's `sequence { … }`
+        /// is RE-ITERABLE: its `iterator()` enters the block afresh every time,
+        /// so `s.toList()` followed by `s.map { … }.toList()` reads it twice.
+        /// A traversal instantiates its own coroutine from this, which is also
+        /// what keeps two pipelines built from one sequence independent.
+        block: Option<Value>,
         /// The next element to yield, or `None` once the step answered `null`.
         seed: Option<Value>,
         /// `(T) -> T?` — the step. Answering Kotlin `null` ends the sequence.
@@ -1282,6 +1348,17 @@ enum HeapObj {
     /// direction: `compareBy { a }.thenByDescending { b }` sorts ascending by
     /// `a` and descending by `b`, which a single sign cannot express.
     Comparator(Vec<(Value, bool)>),
+}
+
+/// How far a `sequence { … }` block has got.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CoroState {
+    /// Never entered; the next pull starts it.
+    Fresh,
+    /// Parked at a `yield`; the next pull puts its frames back.
+    Suspended,
+    /// Ran off the end of the block; every further pull answers nothing.
+    Done,
 }
 
 /// One stage of a lazy [`HeapObj::Gen`] pipeline, in application order.
@@ -3422,6 +3499,27 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             };
             vm.push(Value::Float(r as f64));
         }
+        KT_YIELD => {
+            let v = vm.pop();
+            YIELDED.with(|y| *y.borrow_mut() = Some(v));
+            // The `Unit` the call evaluates to, which the statement's own `Pop`
+            // takes when the block RESUMES.
+            vm.push(Value::Undef);
+            // And a sentinel above it, because `VM::run` pops one value on its
+            // way out of the dispatch loop. Without it that pop would take the
+            // `Unit` — and on the next park, whatever the block had underneath.
+            vm.push(Value::Undef);
+            vm.request_halt();
+        }
+        KT_SEQ_NEW => {
+            let body = vm.pop();
+            vm.push(alloc(HeapObj::Gen {
+                block: Some(body),
+                seed: None,
+                step: Value::Undef,
+                stages: Vec::new(),
+            }));
+        }
         KT_CLASS_REF => {
             let hint = vm.pop().to_str();
             let v = vm.pop();
@@ -3545,6 +3643,7 @@ fn register_builtins(vm: &mut VM) {
     vm.register_builtin(KT_PRECOND, b_precond);
     vm.register_builtin(KT_COMPARATOR, b_comparator);
     vm.register_builtin(KT_GENSEQ, b_genseq);
+    vm.register_builtin(KT_ITER_SRC, b_iter_src);
     vm.register_builtin(KT_EXC_NEW, b_exc_new);
     vm.register_builtin(KT_EXC_THROW, b_exc_throw);
     vm.register_builtin(KT_EXC_PENDING, b_exc_pending);
@@ -4920,13 +5019,22 @@ fn result_parts(v: &Value) -> Option<(Value, Option<Value>)> {
 }
 
 /// The `(seed, step, stages)` of a lazy sequence, or `None` for anything else.
-fn gen_parts(v: &Value) -> Option<(Option<Value>, Value, Vec<Stage>)> {
+fn gen_parts(v: &Value) -> Option<GenParts> {
     with_obj(v, |o| match o {
-        HeapObj::Gen { seed, step, stages } => Some((seed.clone(), step.clone(), stages.clone())),
+        HeapObj::Gen {
+            block,
+            seed,
+            step,
+            stages,
+        } => Some((block.clone(), seed.clone(), step.clone(), stages.clone())),
         _ => None,
     })
     .flatten()
 }
+
+/// What a lazy sequence is made of: its `sequence { … }` block (or `None` for
+/// the seed/step form), its current seed, its step, and its pipeline.
+type GenParts = (Option<Value>, Option<Value>, Value, Vec<Stage>);
 
 /// A new lazy sequence: `gen` with `stage` appended.
 ///
@@ -4934,11 +5042,16 @@ fn gen_parts(v: &Value) -> Option<(Option<Value>, Value, Vec<Stage>)> {
 /// carries per-pull state — two pipelines built from one base must not see each
 /// other's progress.
 fn gen_with(vm: &mut VM, gen: &Value, stage: Stage) -> Result<Value, String> {
-    let (seed, step, mut stages) =
+    let (block, seed, step, mut stages) =
         gen_parts(gen).ok_or_else(|| format!("unresolved reference on {}", obj_label(gen)))?;
     let _ = vm;
     stages.push(stage);
-    Ok(alloc(HeapObj::Gen { seed, step, stages }))
+    Ok(alloc(HeapObj::Gen {
+        block,
+        seed,
+        step,
+        stages,
+    }))
 }
 
 /// Pull from a lazy sequence until `want` elements have come out, the generator
@@ -4949,8 +5062,25 @@ fn gen_with(vm: &mut VM, gen: &Value, stage: Stage) -> Result<Value, String> {
 /// That is exactly the contract Kotlin gives: an unbounded pipeline with a
 /// non-short-circuiting terminal does not finish.
 fn gen_pull(vm: &mut VM, gen: &Value, want: Option<usize>) -> Result<Vec<Value>, String> {
-    let (mut seed, step, mut stages) =
+    let (block, mut seed, step, mut stages) =
         gen_parts(gen).ok_or_else(|| format!("unresolved reference on {}", obj_label(gen)))?;
+    // THIS traversal's coroutine, entered from the block afresh — see the
+    // `block` field on [`HeapObj::Gen`] for why it is not shared. A coroutine
+    // source has no seed to prime the loop with either, so the first pull
+    // happens here; every later one happens at the bottom of the loop, in the
+    // same place the seed/step form advances.
+    let coro = block.map(|body| {
+        alloc(HeapObj::Coro {
+            body,
+            frames: Vec::new(),
+            stack: Vec::new(),
+            ip: 0,
+            state: CoroState::Fresh,
+        })
+    });
+    if let Some(c) = &coro {
+        seed = coro_next(vm, c)?;
+    }
     let mut out: Vec<Value> = Vec::new();
     let mut pulled = 0usize;
     'source: while let Some(cur) = seed.clone() {
@@ -4966,11 +5096,12 @@ fn gen_pull(vm: &mut VM, gen: &Value, want: Option<usize>) -> Result<Vec<Value>,
         }
         // Advance the source BEFORE the stages run: a stage may end the
         // sequence, and the next seed is a property of the source alone.
-        let next = invoke_closure(vm, &step, std::slice::from_ref(&cur))?;
-        seed = if matches!(next, Value::Undef) {
-            None
-        } else {
-            Some(next)
+        seed = match &coro {
+            Some(c) => coro_next(vm, c)?,
+            None => {
+                let next = invoke_closure(vm, &step, std::slice::from_ref(&cur))?;
+                (!matches!(next, Value::Undef)).then_some(next)
+            }
         };
 
         let mut v = cur;
@@ -5014,6 +5145,158 @@ fn gen_pull(vm: &mut VM, gen: &Value, want: Option<usize>) -> Result<Vec<Value>,
     Ok(out)
 }
 
+thread_local! {
+    /// The value the innermost `KT_YIELD` handed over, read by [`coro_next`]
+    /// immediately after the `vm.run()` it parked. `None` means the block
+    /// stopped for some other reason — it ran off its end, or it faulted.
+    static YIELDED: RefCell<Option<Value>> = const { RefCell::new(None) };
+}
+
+/// Pull the next element out of a `sequence { … }` block, running it until its
+/// next `yield` and then parking it again. `None` once the block has ended.
+///
+/// The context switch is the whole of it. On the way IN the block's parked
+/// frames and operand-stack slice are appended to the VM's own, with every
+/// frame's `stack_base` rebased onto wherever the consumer's stack happens to
+/// end; on the way OUT they are split back off and rebased to zero. Both halves
+/// are needed because the consumer keeps running on the same VM between two
+/// pulls: leaving the block's frame on the VM would make the consumer's next
+/// `GetSlot` read the block's locals.
+fn coro_next(vm: &mut VM, handle: &Value) -> Result<Option<Value>, String> {
+    let Some((body, frames, stack, ip, state)) = with_obj(handle, |o| match o {
+        HeapObj::Coro {
+            body,
+            frames,
+            stack,
+            ip,
+            state,
+        } => Some((body.clone(), frames.clone(), stack.clone(), *ip, *state)),
+        _ => None,
+    })
+    .flatten() else {
+        return Ok(None);
+    };
+    if state == CoroState::Done {
+        return Ok(None);
+    }
+    // The same budget every other re-entrant run is held to; a `sequence` block
+    // that pulls from itself recurses exactly as a lambda that calls itself.
+    let depth = NESTED_DEPTH.with(|d| d.get());
+    if depth >= NESTED_RUN_LIMIT {
+        fault(vm, "java.lang.StackOverflowError");
+        return Ok(None);
+    }
+
+    let stack_base = vm.stack.len();
+    let frame_base = vm.frames.len();
+    let saved_ip = vm.ip;
+    match state {
+        CoroState::Fresh => {
+            // Enter the block for the first time, with the closure prologue the
+            // ordinary lambda call uses: no parameters, then the captures.
+            let Some((name_idx, _params, captures)) = closure_meta(&body) else {
+                return Err("kotlin: sequence block is not a function".to_string());
+            };
+            let Some(entry) = vm.chunk.find_sub(name_idx) else {
+                return Err("kotlin: sequence block body not found".to_string());
+            };
+            for cap in &captures {
+                vm.stack.push(cap.clone());
+            }
+            vm.frames.push(Frame {
+                return_ip: vm.chunk.ops.len(),
+                stack_base,
+                slots: Vec::new(),
+                entry_ip: Some(entry),
+            });
+            vm.ip = entry;
+        }
+        _ => {
+            vm.stack.extend(stack);
+            for mut f in frames {
+                f.stack_base += stack_base;
+                vm.frames.push(f);
+            }
+            vm.ip = ip;
+            // The park was a halt, and a halted VM runs no ops until it is
+            // cleared — this is the resume half of the same protocol fusevm's
+            // own scheduler uses for a goroutine.
+            vm.clear_halt();
+        }
+    }
+
+    YIELDED.with(|y| *y.borrow_mut() = None);
+    NESTED_DEPTH.with(|d| d.set(depth + 1));
+    let result = vm.run();
+    NESTED_DEPTH.with(|d| d.set(depth));
+    vm.ip = match YIELDED.with(|y| y.borrow().is_some()) {
+        // Parked at a `yield`: lift the block's frames and stack off the VM,
+        // rebase them to their own zero, and remember where to resume.
+        true => {
+            let resume_ip = vm.ip;
+            let parked_frames: Vec<Frame> = vm
+                .frames
+                .split_off(frame_base)
+                .into_iter()
+                .map(|mut f| {
+                    f.stack_base -= stack_base;
+                    f
+                })
+                .collect();
+            let parked_stack = vm.stack.split_off(stack_base);
+            with_obj_mut(handle, |o| {
+                if let HeapObj::Coro {
+                    frames,
+                    stack,
+                    ip,
+                    state,
+                    ..
+                } = o
+                {
+                    *frames = parked_frames;
+                    *stack = parked_stack;
+                    *ip = resume_ip;
+                    *state = CoroState::Suspended;
+                }
+            });
+            vm.clear_halt();
+            saved_ip
+        }
+        // Ran off the end (or faulted): nothing to park, and nothing further to
+        // answer. The frames the body left behind are dropped rather than
+        // trusted, so a fault mid-block cannot leave one on the consumer's VM.
+        false => {
+            vm.frames.truncate(frame_base);
+            vm.stack.truncate(stack_base);
+            with_obj_mut(handle, |o| {
+                if let HeapObj::Coro { state, .. } = o {
+                    *state = CoroState::Done;
+                }
+            });
+            saved_ip
+        }
+    };
+    if let VMResult::Error(e) = result {
+        return Err(e);
+    }
+    Ok(YIELDED.with(|y| y.borrow_mut().take()))
+}
+
+/// `KT_ITER_SRC` — see [`KT_ITER_SRC`].
+fn b_iter_src(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.pop();
+    if gen_parts(&v).is_none() {
+        return v;
+    }
+    match gen_pull(vm, &v, None) {
+        Ok(items) => alloc_ro_list(items),
+        Err(e) => {
+            fault(vm, e);
+            alloc_ro_list(Vec::new())
+        }
+    }
+}
+
 /// `KT_GENSEQ` — see [`KT_GENSEQ`].
 fn b_genseq(vm: &mut VM, _argc: u8) -> Value {
     let step = vm.pop();
@@ -5021,6 +5304,7 @@ fn b_genseq(vm: &mut VM, _argc: u8) -> Value {
     // A `null` seed is an empty sequence, exactly as it ends one.
     let seed = (!matches!(seed, Value::Undef)).then_some(seed);
     alloc(HeapObj::Gen {
+        block: None,
         seed,
         step,
         stages: Vec::new(),
@@ -9740,6 +10024,7 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
         HeapObj::Map(_)
         | HeapObj::Closure { .. }
         | HeapObj::Comparator(_)
+        | HeapObj::Coro { .. }
         | HeapObj::F32(_)
         | HeapObj::Gen { .. }
         | HeapObj::Grouping { .. }
@@ -10372,6 +10657,7 @@ fn obj_hash(recv: &Value) -> Option<i32> {
         HeapObj::Lazy { .. }
         | HeapObj::Res { .. }
         | HeapObj::Iter { .. }
+        | HeapObj::Coro { .. }
         | HeapObj::Klass { .. } => None,
         // `java.lang.Float.hashCode()` is `floatToIntBits`, which is NOT the
         // `Double` fold of the same magnitude — `1.0f` hashes to `1065353216`
@@ -10444,6 +10730,7 @@ fn obj_label(recv: &Value) -> String {
         HeapObj::Klass { java, .. } => if *java { "Class" } else { "KClass" }.to_string(),
         HeapObj::Iter { .. } => "Iterator".to_string(),
         HeapObj::Gen { .. } => "Sequence".to_string(),
+        HeapObj::Coro { .. } => "SequenceScope".to_string(),
         HeapObj::Grouping { .. } => "Grouping".to_string(),
         HeapObj::Range(r) => match (r.is_char, r.progression) {
             (true, true) => "CharProgression",
@@ -10581,6 +10868,17 @@ fn display_obj(id: u32) -> String {
             // the JVM renders it as `kotlin.sequences.GeneratorSequence@…`,
             // an identity hash. It exists to be consumed, not displayed.
             HeapObj::Gen { stages, .. } => format!("(sequence stages={})", stages.len()),
+            // A parked block is never a value a program holds — it is reached
+            // only through the `Gen` that pulls from it — so this is a shape
+            // for a diagnostic and not a rendering Kotlin has.
+            HeapObj::Coro { state, .. } => format!(
+                "(sequence block {})",
+                match state {
+                    CoroState::Fresh => "unstarted",
+                    CoroState::Suspended => "suspended",
+                    CoroState::Done => "done",
+                }
+            ),
             // A `Grouping` is an anonymous object on the JVM, so it has no
             // meaningful printed form; it exists to be consumed by a terminal
             // operation, not displayed. Nor has an iterator cursor, which the

@@ -28,11 +28,11 @@ use crate::host::{
     KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND, KT_F32,
     KT_F32_ARITH, KT_F32_STR, KT_FFI_CALL, KT_FFI_COMPILE, KT_GENSEQ, KT_GETFIELD, KT_HASH_REG,
     KT_IDENTITY, KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL,
-    KT_ITER_GET, KT_ITER_SIZE, KT_JOIN, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO, KT_LIST_TAG,
-    KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OPER_VM,
-    KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_RESULT_HOF,
-    KT_RUN_CATCHING, KT_SCOPE_FN, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG, KT_TO_STRING,
-    KT_TYPE_REG,
+    KT_ITER_GET, KT_ITER_SIZE, KT_ITER_SRC, KT_JOIN, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO,
+    KT_LIST_TAG, KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL,
+    KT_OBJEQ_VM, KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP,
+    KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM,
+    KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG, KT_YIELD,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
@@ -97,6 +97,10 @@ fn is_primitive_type_name(name: &str) -> bool {
         "Int" | "Long" | "Short" | "Byte" | "Double" | "Float" | "Boolean" | "Char"
     )
 }
+
+/// The loop variable `yieldAll(xs)` desugars through. Not a name a Kotlin
+/// program can spell, so it cannot shadow or be shadowed by one.
+const YIELD_ALL_VAR: &str = "$yieldAll";
 
 /// The intrinsic `compile_member_boxed` wraps a `Float` argument in, so the box
 /// is emitted through the ordinary call path rather than by rewriting the
@@ -2759,6 +2763,10 @@ impl Compiler {
         // The iterable and the loop's index/length temporaries.
         let cslot = sc.temp();
         self.compile_expr(sc, iter)?;
+        // A lazy `Sequence` has no length and no index, so it is pulled into a
+        // list here — at the head, where Kotlin evaluates the header expression
+        // exactly once. Every other iterable passes straight through.
+        self.b.emit(Op::CallBuiltin(KT_ITER_SRC, 1), 0);
         self.b.emit(Op::SetSlot(cslot), 0);
         let nslot = sc.temp();
         self.b.emit(Op::GetSlot(cslot), 0);
@@ -5640,6 +5648,52 @@ impl Compiler {
                     "requireNotNull" | "checkNotNull" => Type::Unknown,
                     _ => Type::Unit,
                 })
+            }
+            // `sequence { … }` — a lazy sequence whose block SUSPENDS at every
+            // `yield`. The block is an ordinary closure here; what makes it a
+            // coroutine is the op below, which parks it on a heap object the
+            // pipeline pulls from. See [`crate::host::KT_YIELD`].
+            "sequence" | "iterator" if args.len() == 1 => {
+                self.compile_expr(sc, &args[0])?;
+                self.b.emit(Op::Extended(KT_SEQ_NEW, 0), line);
+                Ok(Type::Obj)
+            }
+            // `yieldAll(xs)` is `for (x in xs) yield(x)` — the stdlib declares
+            // it as exactly that, and lowering it that way keeps ONE suspension
+            // path rather than a second one that would have to re-implement it.
+            "yieldAll" if args.len() == 1 => {
+                let body = vec![Stmt::new(
+                    line,
+                    StmtKind::Expr(Expr::Call {
+                        name: "yield".to_string(),
+                        args: vec![Expr::Var(YIELD_ALL_VAR.to_string())],
+                        line,
+                    }),
+                )];
+                self.compile_stmt(
+                    sc,
+                    &Stmt::new(
+                        line,
+                        StmtKind::ForIn {
+                            var: YIELD_ALL_VAR.to_string(),
+                            parts: Vec::new(),
+                            iter: args[0].clone(),
+                            body,
+                            label: None,
+                        },
+                    ),
+                )?;
+                self.b.emit(Op::LoadUndef, line);
+                Ok(Type::Unit)
+            }
+            // `yield(v)` inside such a block. Kotlin declares it on
+            // `SequenceScope`, so it can only appear inside one; here it is a
+            // free name, and a program that declares its own `fun yield` shadows
+            // it through the local/global lookup that precedes this match.
+            "yield" if args.len() == 1 => {
+                self.compile_expr(sc, &args[0])?;
+                self.b.emit(Op::Extended(KT_YIELD, 0), line);
+                Ok(Type::Unit)
             }
             // `IntRange(start, endInclusive)` / `LongRange(…)` — the
             // CONSTRUCTOR spelling of `start..endInclusive`, which is the same
