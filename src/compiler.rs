@@ -38,6 +38,38 @@ use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
+/// The stdlib supertypes a class may declare that contribute NOTHING to
+/// dispatch: every member they declare is abstract, so the class supplies its
+/// own and nothing is inherited to lose. Naming them is what lets
+/// `class Op(val v: Int) : Comparable<Op>` compile, where the `compareTo` the
+/// `<` operator resolves against is the class's own override either way.
+///
+/// The collection interfaces are deliberately absent: declaring `: Iterable<T>`
+/// promises `for (x in c)` over the class, which is dispatch this frontend
+/// would have to route and does not, so accepting one would trade a loud error
+/// for a silent gap.
+fn is_marker_supertype(name: &str) -> bool {
+    matches!(
+        name,
+        "Comparable" | "Cloneable" | "Serializable" | "Runnable" | "AutoCloseable" | "Closeable"
+    )
+}
+
+/// Whether the marker supertype `parent` declares a member of this name and
+/// arity, so an `override` of it in an implementing class overrides something.
+///
+/// The members are abstract in each of these interfaces, which is why
+/// [`is_marker_supertype`] can accept the supertype without modelling it: there
+/// is no body to inherit, only a name the class must supply.
+fn marker_member(parent: &str, name: &str, arity: usize) -> bool {
+    match parent {
+        "Comparable" => name == "compareTo" && arity == 1,
+        "Runnable" => name == "run" && arity == 0,
+        "AutoCloseable" | "Closeable" => name == "close" && arity == 0,
+        _ => false,
+    }
+}
+
 /// Whether `name` spells one of Kotlin's builtin types, so `name::class` is a
 /// class reference rather than a read of a value called `name`.
 fn is_builtin_type_name(name: &str) -> bool {
@@ -959,7 +991,11 @@ fn check_modifiers(
         match (m.is_override, found) {
             (true, None)
                 if !ANY_MEMBERS.contains(&m.name.as_str())
-                    && !inherited_prop(&m.name, m.params.len()) =>
+                    && !inherited_prop(&m.name, m.params.len())
+                    && !cd
+                        .parents
+                        .iter()
+                        .any(|p| marker_member(p, &m.name, m.params.len())) =>
             {
                 return Err(format!(
                     "class {}: `{}` overrides nothing (line {})",
@@ -1021,7 +1057,10 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
         // A supertype that is neither declared nor a built-in throwable would
         // silently vanish from dispatch, so it is rejected up front.
         for p in &cd.parents {
-            if !by_name.contains_key(p.as_str()) && crate::host::throwable_fqn(p).is_none() {
+            if !by_name.contains_key(p.as_str())
+                && crate::host::throwable_fqn(p).is_none()
+                && !is_marker_supertype(p)
+            {
                 return Err(format!("unresolved supertype {p} of class {}", cd.name));
             }
         }

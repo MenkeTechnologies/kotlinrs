@@ -882,3 +882,9 @@ fun main() { println(emptyMap<Int, Int>().javaClass.name); println(mapOf(1 to 1)
 fun main() { println(hashSetOf(1).javaClass.name); println(sortedSetOf(1).javaClass.name); println(hashMapOf(1 to 1).javaClass.name); println(sortedMapOf(1 to 1).javaClass.name) }	java.util.HashSet\njava.util.TreeSet\njava.util.HashMap\njava.util.TreeMap\n
 fun main() { println(linkedSetOf(1).javaClass.name); println(linkedMapOf(1 to 1).javaClass.name); println(HashSet<Int>().javaClass.name); println(LinkedHashMap<Int, Int>().javaClass.name) }	java.util.LinkedHashSet\njava.util.LinkedHashMap\njava.util.HashSet\njava.util.LinkedHashMap\n
 fun main() { println(setOf(1).javaClass.simpleName); println(mapOf(1 to 1).javaClass.simpleName); println(setOf(1)::class.simpleName); println(mapOf(1 to 1)::class.simpleName) }	SingletonSet\nSingletonMap\nSingletonSet\nSingletonMap\n
+enum class E { A, B }\nfun main() { println(enumValues<E>().size); println(enumValues<E>().joinToString()); println(enumValueOf<E>("B")) }	2\nA, B\nB\n
+sealed class S\nclass A : S()\nclass B : S()\nfun main() { val x: S = A(); val r = when (x) { is A -> "a"; is B -> "b" }; println(r) }	a\n
+interface Greeter { fun hi(): String }\nclass Impl : Greeter { override fun hi() = "hello" }\nclass Wrap(g: Greeter) : Greeter by g\nfun main() { println(Wrap(Impl()).hi()) }	hello\n
+class V(val a: Int, val b: Int) { operator fun plus(o: V) = V(a + o.a, b + o.b)\n override fun toString() = "V($a,$b)" }\nfun main() { println(V(1, 2) + V(3, 4)) }	V(4,6)\n
+fun main() { val (a, b) = Pair(1, 2); println("$a$b"); val (c, d, e) = Triple(1, 2, 3); println("$c$d$e"); for ((i, v) in listOf("x", "y").withIndex()) print("$i$v "); println() }	12\n123\n0x 1y \n
+enum class C { RED, GREEN }\nfun main() { println(C.values().size); println(C.valueOf("RED")); println(C.RED.ordinal); println(C.RED.name) }	2\nRED\n0\nRED\n

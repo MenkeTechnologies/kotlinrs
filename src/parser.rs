@@ -3043,6 +3043,23 @@ impl Parser {
     /// in `>` immediately followed by `(`. Anything else rolls back, so
     /// `a < b` stays a comparison. Kotlin resolves the same ambiguity the same
     /// way: `a<b>(c)` is a generic call.
+    /// [`Parser::skip_call_type_args`], answering the FIRST type argument's
+    /// name when the list held exactly one plain one. That is all the two
+    /// `reified` enum intrinsics need, and it is the only place a call's type
+    /// argument means anything to this frontend.
+    fn call_type_arg(&mut self) -> Option<String> {
+        let start = self.pos;
+        self.skip_call_type_args();
+        // One `<`, one name, one `>` — anything else is not a bare type name.
+        match self.pos - start {
+            3 => match &self.toks[start + 1].tok {
+                Tok::Ident(n) => Some(n.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn skip_call_type_args(&mut self) {
         if !self.at(&Tok::Lt) {
             return;
@@ -3209,7 +3226,7 @@ impl Parser {
                 // coarse); the speculative scan below is what keeps `a < b` a
                 // comparison, since a type-argument list may only hold names and
                 // must be followed by `(`.
-                self.skip_call_type_args();
+                let targ = self.call_type_arg();
                 if self.at(&Tok::LParen) {
                     self.bump();
                     let mut args = Vec::new();
@@ -3225,6 +3242,27 @@ impl Parser {
                     // Trailing-lambda syntax on a free call: `apply(x) { … }`.
                     if self.at(&Tok::LBrace) && !self.no_trailing_lambda {
                         args.push(self.lambda()?);
+                    }
+                    // `enumValues<E>()` / `enumValueOf<E>(s)` are the two calls
+                    // whose TYPE ARGUMENT is the whole meaning — they are
+                    // `reified` in the stdlib, which is Kotlin's way of saying
+                    // the compiler substitutes it. Here that substitution is the
+                    // rewrite: they are exactly `E.values()` and `E.valueOf(s)`,
+                    // which the enum companion already answers.
+                    if let Some(e) =
+                        targ.filter(|_| matches!(name.as_str(), "enumValues" | "enumValueOf"))
+                    {
+                        return Ok(Expr::MethodCall {
+                            recv: Box::new(Expr::Var(e)),
+                            name: if name == "enumValues" {
+                                "values".to_string()
+                            } else {
+                                "valueOf".to_string()
+                            },
+                            args,
+                            safe: false,
+                            line,
+                        });
                     }
                     Ok(Expr::Call { name, args, line })
                 } else if self.at(&Tok::LBrace) && !self.no_trailing_lambda {
