@@ -205,35 +205,26 @@ The `String` collection-member rule is the reason for the last row: a
 `Iterable` members, which gives the right answer for the two dozen that Kotlin
 does declare and three it does not.
 
-## `Float` loses its width in an ERASED position
+## `Float` in an erased position, closed
 
-`Float` is a static type now: a literal with the `f` suffix, a `Float`
-annotation, `toFloat()`, `floatArrayOf`, the `Float` companion constants and
-`kotlin.math`'s `Float` overloads all carry 32-bit width, arithmetic on them
-rounds once at 32 bits, and they render through `Float.toString`. What is left
-is every position where the value outlives the static type — a `List`, a `Map`,
-an `Any` parameter, a `%s` conversion — because a `Float` and a `Double` are the
-same `Value::Float` at run time and only the compiler knew which.
+`Float` carries its width everywhere now. A value whose static type is thrown
+away — a `List`/`Set`/`Map` element, a `Map` key, an `Any` binding or parameter
+or return, a `data class` property, a lambda's result, a `%s` conversion — is
+boxed as a `HeapObj::F32`, the same point the JVM boxes into `java.lang.Float`,
+and the box is what the display, equality, ordering, hashing and arithmetic
+paths read the width off.
 
-| program | kotlinrs | reference |
-| --- | --- | --- |
-| `println(listOf(1.0f / 3.0f))` | `[0.3333333432674408]` | `[0.33333334]` |
-| `println(mapOf("k" to 1.0f / 3.0f))` | `{k=0.3333333432674408}` | `{k=0.33333334}` |
-| `fun id(x: Any) = x; println(id(1.0f / 3.0f))` | `0.3333333432674408` | `0.33333334` |
-| `"%s".format(1.0f / 3.0f)` | `0.3333333432674408` | `0.33333334` |
+What is left is narrower and stated exactly: an operator whose operands are
+BOTH statically untyped and neither of which is a box computes in `f64`. That
+needs a value that was never in a `Float`-typed position to begin with, so
+nothing that starts from a `Float` literal, parameter, property or collection
+element reaches it.
 
-Note what is NOT in the table: `1.0f / 3.0f`, `(0.1f).toDouble()`,
-`16777217.0f`, `Float.MAX_VALUE`/`MIN_VALUE`, `1.0e-45f`, `floatArrayOf(…)[0]`,
-a `Float` parameter and a `Float` return all answer exactly what the reference
-does. The arithmetic is genuinely single-precision — `16777217.0f * 0.2f` is
-`3355443.2`, which computing in `f64` and narrowing afterwards cannot produce.
-
-Closing the rest means carrying the width on the VALUE rather than on the static
-type — a `Float` tag in the reserved handle region the way `Char` has one — so
-that a value read back out of a `List` still knows it is 32-bit. That is also
-what the `IllegalFormatConversionException` operand name above needs: `%d` of a
-`Float` still says `d != java.lang.Double` where the reference says
-`d != java.lang.Float`, for the same reason.
+The `Int`/`Long` erasure below is the same shape and is NOT closed: both widths
+are `Value::Int` at run time, so `m[1]` and `m[1L]` are one key here and two on
+the JVM. Closing it the same way would box every `Long`, which is a cost on the
+common integer path that the `Float` box does not have — a `Float` is rare in
+an erased position and a `Long` is not.
 
 ## `Map` members and key widths, newly measured
 

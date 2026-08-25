@@ -694,6 +694,12 @@ pub struct Compiler {
     /// so an exception-free program keeps byte-identical bytecode — and its
     /// speed. See the “Exception unwinding” section in [`crate::host`].
     has_try: bool,
+    /// The declared return type of the function whose body is being lowered, so
+    /// a `return` knows whether it is handing a value to a position that keeps
+    /// the static type. `fun g(): Any = 1.0f / 3.0f` is the case that needs it:
+    /// the value leaves as an `Any` and only a box can carry its width past the
+    /// frame. `None` outside a function body.
+    cur_ret: Option<Type>,
     /// Where a pending exception unwinds to from the statement being compiled —
     /// innermost last. Empty means “leave this frame”.
     unwind: Vec<UnwindFrame>,
@@ -1384,6 +1390,7 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
         math_scope: HashMap::new(),
         math_star: false,
         has_try: uses_exceptions(program),
+        cur_ret: None,
         unwind: Vec::new(),
         finally_returns: Vec::new(),
         finally_exits: Vec::new(),
@@ -1963,12 +1970,14 @@ impl Compiler {
         // what the drain loop installs before calling here.
         let outer_locals = self.local_funs.clone();
         let outer_local_sigs = self.local_sigs.clone();
+        let outer_ret = self.cur_ret.replace(f.ret);
         let res: Result<(), String> = (|| {
             for s in &f.body {
                 self.compile_stmt(&mut sc, s)?;
             }
             Ok(())
         })();
+        self.cur_ret = outer_ret;
         self.local_funs = outer_locals;
         self.local_sigs = outer_local_sigs;
         self.boxed_vars = outer_boxed;
@@ -2326,7 +2335,17 @@ impl Compiler {
             StmtKind::Return(e) => {
                 match e {
                     Some(e) => {
-                        self.compile_expr(sc, e)?;
+                        // A value returned into a position that is not declared
+                        // `Float` leaves the frame with its static type behind
+                        // it, so the width goes in the box.
+                        match self.cur_ret {
+                            Some(Type::Float) => {
+                                self.compile_expr(sc, e)?;
+                            }
+                            _ => {
+                                self.compile_erased(sc, e)?;
+                            }
+                        }
                     }
                     None => {
                         self.b.emit(Op::LoadUndef, 0);
@@ -3716,9 +3735,7 @@ impl Compiler {
             if let Some((sub, sig)) = self.resolve_ext(sc, recv, name) {
                 let full = self.expand_args(name, &sig.params, args)?;
                 self.compile_expr(sc, recv)?;
-                for a in &full {
-                    self.compile_expr(sc, a)?;
-                }
+                self.compile_call_args(sc, &sig.params, &full)?;
                 let idx = self.b.add_name(&sub);
                 self.b.emit(Op::Call(idx, (full.len() + 1) as u8), line);
                 return Ok(sig.ret);
@@ -4606,6 +4623,10 @@ impl Compiler {
         let outer_locals = std::mem::replace(&mut self.local_funs, pl.local_funs.clone());
         let outer_local_sigs = std::mem::replace(&mut self.local_sigs, pl.local_sigs.clone());
         let outer_boxed = std::mem::replace(&mut self.boxed_vars, lambda_writes(&pl.body));
+        // A lambda declares no return type, so a `return@label` inside one is
+        // handing its value to the same erased position the fallthrough result
+        // is. See the box after `compile_block_value` below.
+        let outer_ret = self.cur_ret.take();
         // A lambda body is invoked through a nested `vm.run()`, so it is its own
         // frame for unwinding too: a raise inside it returns out, and the host
         // suppresses any further invocation while the exception is in flight.
@@ -4619,6 +4640,7 @@ impl Compiler {
         self.cur_class = saved;
         self.finally_returns = outer_returns;
         self.finally_exits = outer_exits;
+        self.cur_ret = outer_ret;
         let here = self.b.current_pos();
         self.pop_unwind_to(here);
         // A lambda's RESULT is an erased position: a closure carries no return
@@ -4766,7 +4788,10 @@ impl Compiler {
             return Ok(());
         }
         self.compile_expr(sc, recv)?; // [recv]
-        self.compile_expr(sc, index)?; // [recv, index]
+                                      // The KEY erases the same way the value below does, and it has to: a
+                                      // stored key that is not the shape a later lookup asks with would never
+                                      // be found again.
+        self.compile_erased(sc, index)?; // [recv, index]
         let store = self.compound_value(recv, "", Some(index), op, value);
         // The stored value lands in a container that keeps no static type, so a
         // `Float` is boxed on the way in — `m["a"] = 1.0f / 3.0f` then
@@ -5683,9 +5708,7 @@ impl Compiler {
                     .cloned()
                 {
                     let full = self.expand_args(&format!("function {name}"), &sig.params, args)?;
-                    for a in &full {
-                        self.compile_expr(sc, a)?;
-                    }
+                    self.compile_call_args(sc, &sig.params, &full)?;
                     // A local `fun` shadows a top-level one of the same name and
                     // lives under its mangled sub.
                     let sub = self.local_funs.get(name).cloned();
@@ -5971,6 +5994,30 @@ impl Compiler {
         self.compile_member(sc, recv, name, &boxed, false, line)
     }
 
+    /// Compile a call's arguments, boxing a `Float` whose PARAMETER is not
+    /// declared `Float` — `id(1.0f / 3.0f)` for `fun id(x: Any)`. A parameter
+    /// that IS declared `Float` keeps the static type on the callee's side and
+    /// needs no box, which is what keeps an ordinary numeric call allocation-
+    /// free.
+    fn compile_call_args(
+        &mut self,
+        sc: &mut Scope,
+        params: &[Param],
+        full: &[Expr],
+    ) -> Result<(), String> {
+        for (i, a) in full.iter().enumerate() {
+            match params.get(i).map(|p| p.ty) {
+                Some(Type::Float) => {
+                    self.compile_expr(sc, a)?;
+                }
+                _ => {
+                    self.compile_erased(sc, a)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Compile `e` for a position that ERASES its static type — a collection
     /// element, a `Pair` half, a `Map` value, an argument bound to a parameter
     /// the frontend cannot type — boxing a `Float` so its 32-bit width travels
@@ -6233,8 +6280,11 @@ impl Compiler {
         }
         let (sec, params) = self.select_ctor(sc, meta, args);
         let full = self.expand_args(&format!("constructor {}", meta.name), &params, args)?;
+        // An instance's fields are a `(name, value)` list with no types in it,
+        // so a `Float` property erases however it was declared — which is what
+        // made a `data class`'s generated `toString` render one as a `Double`.
         for a in &full {
-            self.compile_expr(sc, a)?;
+            self.compile_erased(sc, a)?;
         }
         let name = match sec {
             Some(i) => sec_ctor_sub_name(&meta.name, i),

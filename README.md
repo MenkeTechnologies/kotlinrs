@@ -1430,6 +1430,15 @@ to the even last digit (so `3355443.25f` is `3355443.2`, where Rust rounds away
 from zero). Both rules apply to `Double` too, which is what lets
 `Double.MIN_VALUE` — `4.9E-324` — be resolved at all.
 
+The round after that carried the width into the positions that erase it. A
+`Float` and a `Double` are the same `Value::Float`, so one that outlived its
+static type — a `List` element, a `Map` key, an `Any` binding, a `data class`
+property, a lambda's result — rendered through `Double`'s rules. It is boxed
+now, as a heap object holding the `f32` itself, at the same points the JVM boxes
+into `java.lang.Float`; the `Char` tag scheme does not transfer, because a
+`Char`'s 16-bit payload fits beside a tag inside the `u32` a handle carries and
+an `f32`'s 32-bit payload leaves nothing for one.
+
 `m[k] = v` on a `MutableMap` was the third, and it was the data structure rather
 than a redundant call: a `Map` is an association `Vec` because iteration order
 is observable three different ways, and key equality routes through a user

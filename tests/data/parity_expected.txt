@@ -851,3 +851,17 @@ fun main() { val x: Any = 1.0f; println(x is Float); println(x is Double); print
 fun main() { println(listOf(1.0f).hashCode() == listOf(1.0f).hashCode()); println((1.0f).hashCode()); println(listOf(1.0f)[0].hashCode()) }	true\n1065353216\n1065353216\n
 fun main() { var t = 0.0f; for (v in listOf(0.1f, 0.2f, 0.3f)) t += v; println(t) }	0.6\n
 fun main() { println(listOf(1.0f, 2.0f).joinToString()); println(listOf(1.0f / 3.0f).toString()) }	1.0, 2.0\n[0.33333334]\n
+data class B(val v: Float)\nfun main() { println(B(1.0f / 3.0f)); println(B(1.0f / 3.0f).v); println(listOf(B(1.0f / 3.0f))) }	B(v=0.33333334)\n0.33333334\n[B(v=0.33333334)]\n
+class C(val v: Float) { override fun toString(): String = "C($v)" }\nfun main() { println(C(1.0f / 3.0f)); println(C(1.0f / 3.0f).v) }	C(0.33333334)\n0.33333334\n
+fun id(x: Any): Any = x\nfun main() { println(id(1.0f / 3.0f)); println(listOf(id(1.0f / 3.0f))) }	0.33333334\n[0.33333334]\n
+fun g(): Any = 1.0f / 3.0f\nfun main() { println(g()); println(listOf(g())) }	0.33333334\n[0.33333334]\n
+fun main() { try { println("%d".format(5.0f)) } catch (e: Exception) { println(e.message) } }	d != java.lang.Float\n
+fun main() { val xs = mutableListOf<Float>(); xs.add(1.0f / 3.0f); println(xs); println(xs[0]); xs[0] = 2.0f / 3.0f; println(xs) }	[0.33333334]\n0.33333334\n[0.6666667]\n
+fun main() { val s = mutableSetOf<Float>(); s.add(1.0f / 3.0f); println(s); println(s.contains(1.0f / 3.0f)); s.remove(1.0f / 3.0f); println(s) }	[0.33333334]\ntrue\n[]\n
+fun main() { println(listOf(1.0f, 2.0f).fold(0.0f) { a, b -> a + b }); println(listOf(1.0f, 2.0f).reduce { a, b -> a / b }) }	3.0\n0.5\n
+fun main() { val m = mutableMapOf<Float, String>(); m[1.0f / 3.0f] = "x"; println(m); println(m[1.0f / 3.0f]); println(m.containsKey(1.0f / 3.0f)) }	{0.33333334=x}\nx\ntrue\n
+fun main() { println(arrayOf(1.0f / 3.0f).toList()); println(listOf(listOf(1.0f / 3.0f))); println(Pair(1.0f / 3.0f, 1.0)) }	[0.33333334]\n[[0.33333334]]\n(0.33333334, 1.0)\n
+fun main() { val a: Any = 1.0f / 3.0f; val b: Any = 1.0f / 3.0f; println(a == b); println(a.hashCode() == b.hashCode()); println(a.toString()) }	true\ntrue\n0.33333334\n
+fun main() { println(listOf(1.0f / 3.0f).indexOf(1.0f / 3.0f)); println(listOf(1.0f).joinToString { it.toString() }) }	0\n1.0\n
+fun main() { var t = 0.0f; listOf(0.1f, 0.2f).forEach { t += it }; println(t); println(listOf(0.1f, 0.2f).sumOf { it.toDouble() }) }	0.3\n0.30000000447034836\n
+fun main() { println(listOf(1.0f).first() + 1.0f); println(listOf(1.0f)[0] * 3); println(listOf(1.0f)[0].toInt()) }	2.0\n3.0\n1\n
