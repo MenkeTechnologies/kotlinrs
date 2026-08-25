@@ -44,7 +44,7 @@ pub fn run_source(src: &str) -> Result<i32, String> {
 }
 
 /// Run `work` on a freshly spawned interpreter thread — the one with
-/// [`INTERPRETER_STACK`] reserved — and hand back what it returned. `inline` is
+/// `INTERPRETER_STACK` reserved — and hand back what it returned. `inline` is
 /// the fallback for a system that cannot give us a thread at all.
 ///
 /// Anything that has to observe the run's *own* thread state belongs in `work`
