@@ -11,6 +11,14 @@
 pub enum Type {
     Int,
     Long,
+    /// `Float` — 32-bit. fusevm has one floating representation, so a `Float`
+    /// is carried in the same `Value::Float` an `f64` uses, holding a value
+    /// that is EXACTLY representable in 32 bits. This type is what says so, and
+    /// it is load-bearing in two places: arithmetic on it rounds ONCE at 32
+    /// bits (see `KT_F32_ARITH`) rather than computing in `f64` and narrowing
+    /// afterwards, and display renders it through `Float.toString`'s
+    /// shortest-`f32` repr rather than the `f64` one.
+    Float,
     Double,
     Boolean,
     Char,
@@ -45,8 +53,13 @@ impl Type {
     pub fn is_num(self) -> bool {
         matches!(
             self,
-            Type::Int | Type::Long | Type::Double | Type::Char | Type::Unknown
+            Type::Int | Type::Long | Type::Float | Type::Double | Type::Char | Type::Unknown
         )
+    }
+    /// The floating kinds. Both are `Value::Float` at run time; they differ in
+    /// the WIDTH their arithmetic rounds to and in how they render.
+    pub fn is_float(self) -> bool {
+        matches!(self, Type::Float | Type::Double)
     }
     /// Parse a type annotation name (`Int`, `Double`, `String`, …).
     pub fn from_name(s: &str) -> Type {
@@ -59,7 +72,8 @@ impl Type {
             // `toByte()`/`toShort()` conversions carry the narrower behaviour.
             "Int" | "Byte" | "Short" => Type::Int,
             "Long" => Type::Long,
-            "Double" | "Float" => Type::Double,
+            "Double" => Type::Double,
+            "Float" => Type::Float,
             "Boolean" => Type::Boolean,
             "Char" => Type::Char,
             "String" => Type::String,
@@ -711,6 +725,13 @@ pub enum Expr {
     /// keeps the surrounding arithmetic 64-bit instead of narrowing to `Int`.
     Long(i64),
     Float(f64),
+    /// An `f`/`F`-suffixed literal (`1.0f`). Carries the value already ROUNDED
+    /// to 32 bits and widened back — `1.0e-45f` is the subnormal `1.4E-45`,
+    /// not the `f64` the digits spell — so the node's value is what a `float`
+    /// register would hold. The node exists so the value's static width is
+    /// [`Type::Float`], which is what keeps the surrounding arithmetic
+    /// single-precision.
+    Float32(f64),
     Bool(bool),
     /// A `Char` literal, carrying its UTF-16 code unit.
     Char(i64),

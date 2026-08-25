@@ -110,7 +110,9 @@ fun main() {
 
 The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 
-- **Types** — `Int`/`Long` (`i64`), `Double`/`Float` (`f64`), `Boolean`,
+- **Types** — `Int`/`Long` (`i64`), `Double` (`f64`), `Float` (32-bit: the
+  arithmetic rounds once at single precision and the display is
+  `Float.toString`), `Boolean`,
   `Char` (a distinct runtime type — see below), `String`, `Unit`; annotations
   optional (including nullable `T?`), coarsely inferred otherwise.
 - **Declarations** — top-level `fun` with typed parameters and return type,
@@ -122,9 +124,10 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `Double` division is IEEE. The bitwise operations are Kotlin's infix member
   functions — `and`, `or`, `xor`, `shl`, `shr`, `ushr` and `inv()`.
 - **Literals** — decimal, hexadecimal (`0xFF`) and binary (`0b1010`) integers,
-  each accepting `_` separators and an `L` suffix; and the companion constants
+  each accepting `_` separators and an `L` suffix; floating literals with an
+  `f`/`F` suffix, rounded to 32 bits at the literal; and the companion constants
   `Int.MAX_VALUE`/`MIN_VALUE` (likewise `Long`/`Short`/`Byte`),
-  `Double.MAX_VALUE`, and `Double`/`Float` `POSITIVE_INFINITY`/
+  `Double`/`Float` `MAX_VALUE`/`MIN_VALUE` and `POSITIVE_INFINITY`/
   `NEGATIVE_INFINITY`/`NaN`.
 - **Strings** — literals with `\n`/`\t`/`\\`/`\"`/`\$` escapes and `$name` /
   `${expr}` templates; `+` concatenates when either side is a `String`.

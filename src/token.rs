@@ -24,6 +24,8 @@ pub enum Tok {
     /// surrounding arithmetic narrows back to 32 bits.
     Long(i64),
     Float(f64),
+    /// An `f`/`F`-suffixed literal, already narrowed to 32-bit precision.
+    Float32(f64),
     Str(Vec<StrPart>),
     Bool(bool),
     /// A `Char` literal (`'A'`), carrying its UTF-16 code unit as an integer.

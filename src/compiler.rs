@@ -25,13 +25,13 @@ use crate::host::{
     KT_AS, KT_BUILDER, KT_CHR_STRING, KT_CLASSOF, KT_CLOSURE_CALL, KT_COLL_HOF, KT_COMPARATOR,
     KT_DBG_LINE, KT_DDIV, KT_DISPLAY, KT_ENUM_REG, KT_EQUALS_REG, KT_EXC_ABORT, KT_EXC_CUT,
     KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE,
-    KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND, KT_FFI_CALL, KT_FFI_COMPILE, KT_GENSEQ, KT_GETFIELD,
-    KT_HASH_REG, KT_IDENTITY, KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS,
-    KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_JOIN, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO,
-    KT_LIST_TAG, KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL,
-    KT_OBJEQ_VM, KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP,
-    KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG,
-    KT_TO_STRING, KT_TYPE_REG,
+    KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND, KT_F32, KT_F32_ARITH, KT_F32_STR, KT_FFI_CALL,
+    KT_FFI_COMPILE, KT_GENSEQ, KT_GETFIELD, KT_HASH_REG, KT_IDENTITY, KT_IDIV, KT_IMOD,
+    KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE,
+    KT_JOIN, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO, KT_LIST_TAG, KT_MAKE_CLOSURE,
+    KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OPER_VM, KT_PAIR,
+    KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_RESULT_HOF, KT_RUN_CATCHING,
+    KT_SCOPE_FN, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
@@ -2749,6 +2749,13 @@ impl Compiler {
                 self.b.emit(Op::LoadFloat(*f), 0);
                 Ok(Type::Double)
             }
+            // The lexer already rounded the digits to 32 bits, so the constant
+            // loaded here is what a `float` register would hold and no
+            // narrowing op is needed at the literal.
+            Expr::Float32(f) => {
+                self.b.emit(Op::LoadFloat(*f), 0);
+                Ok(Type::Float)
+            }
             Expr::Bool(b) => {
                 self.b
                     .emit(if *b { Op::LoadTrue } else { Op::LoadFalse }, 0);
@@ -2862,6 +2869,9 @@ impl Compiler {
                         self.b.emit(Op::Negate, 0);
                         let ty = match t {
                             Type::Double => Type::Double,
+                            // Negation is exact at every width, so the `f32`
+                            // stays one and needs no narrowing op.
+                            Type::Float => Type::Float,
                             Type::Long => Type::Long,
                             _ => Type::Int,
                         };
@@ -3325,6 +3335,13 @@ impl Compiler {
             Type::Char => {
                 self.b.emit(Op::Extended(KT_CHR_STRING, 0), 0);
             }
+            // A `Float` and a `Double` are the same bits here; only the width
+            // the shortest-repr is taken at differs, and that is the whole
+            // observable difference between `0.33333334` and
+            // `0.3333333432674408`.
+            Type::Float => {
+                self.b.emit(Op::Extended(KT_F32_STR, 0), 0);
+            }
             Type::Unit => {
                 self.b.emit(Op::Pop, 0);
                 let idx = self.b.add_constant(Value::str("kotlin.Unit"));
@@ -3423,6 +3440,16 @@ impl Compiler {
                 by: Box::new(args[0].clone()),
             };
             return self.compile_expr(sc, &stepped);
+        }
+        // `f.toString()` on a statically-`Float` receiver is `Float.toString`,
+        // not the runtime-value one every other receiver reaches: only the
+        // static type says the bits are a 32-bit value, so the host's generic
+        // dispatch would render `(1.0f / 3.0f).toString()` through `Double`'s
+        // rules and answer `0.3333333432674408`.
+        if name == "toString" && args.is_empty() && self.infer(sc, recv) == Type::Float {
+            self.compile_expr(sc, recv)?;
+            self.emit_display(Type::Float);
+            return Ok(Type::String);
         }
         // `super.m(args)` — the *statically* resolved supertype implementation,
         // never the virtual one, which is the whole point of the keyword.
@@ -4841,10 +4868,10 @@ impl Compiler {
         let native_eq = (lt.is_str() && rt.is_str())
             || (matches!(
                 lt,
-                Type::Int | Type::Long | Type::Double | Type::Char | Type::Boolean
+                Type::Int | Type::Long | Type::Float | Type::Double | Type::Char | Type::Boolean
             ) && matches!(
                 rt,
-                Type::Int | Type::Long | Type::Double | Type::Char | Type::Boolean
+                Type::Int | Type::Long | Type::Float | Type::Double | Type::Char | Type::Boolean
             ));
         if matches!(op, BinOp::Eq | BinOp::Ne) && !native_eq {
             self.compile_expr(sc, l)?;
@@ -4909,6 +4936,20 @@ impl Compiler {
 
         self.compile_expr(sc, l)?;
         self.compile_expr(sc, r)?;
+
+        // `Float` arithmetic is the one case that cannot use a native op.
+        // Kotlin rounds a `Float` operation ONCE, at 32 bits; computing it in
+        // `f64` and narrowing afterwards rounds twice and can land a ulp away
+        // (`16777217.0f * 0.2f` is `3355443.2`, not `3355443.4`). So the
+        // operation itself moves to the host. Comparisons are exempt: both
+        // operands already hold exactly-representable `f32` values, so the
+        // native compare answers what a 32-bit compare would.
+        if promote(lt, rt) == Type::Float {
+            if let Some(code) = f32_op_code(op) {
+                self.b.emit(Op::Extended(KT_F32_ARITH, code), 0);
+                return Ok(Type::Float);
+            }
+        }
 
         let both_str = lt.is_str() && rt.is_str();
         // A statically known `Double` on either side is the only thing that
@@ -5774,6 +5815,7 @@ impl Compiler {
         match self.infer(sc, recv) {
             Type::Int => Some("Int".into()),
             Type::Long => Some("Long".into()),
+            Type::Float => Some("Float".into()),
             Type::Double => Some("Double".into()),
             Type::Boolean => Some("Boolean".into()),
             Type::Char => Some("Char".into()),
@@ -5898,6 +5940,16 @@ impl Compiler {
         // no argument width to narrow it with, so it happens here.
         if ty == Type::Int && tys.iter().copied().all(is_int_width) {
             self.emit_wrap32();
+        }
+        // The `Float` overloads. `kotlin.math.sqrt(Float)` answers a `Float`,
+        // and the host computed in `f64` — the same narrow-after the arithmetic
+        // operators refuse. It is exact here and not there: these are single
+        // correctly-rounded operations (`sqrt`) or exact ones (`abs`, `min`,
+        // `max`, the rounding family), so narrowing the `f64` answer lands on
+        // the `f32` the single-precision overload would have produced, whereas
+        // an arithmetic CHAIN accumulates the intermediate `f64` rounding.
+        if ty == Type::Float {
+            self.b.emit(Op::Extended(KT_F32, 0), line);
         }
         Ok(ty)
     }
@@ -6293,6 +6345,7 @@ impl Compiler {
             Expr::Int(_) => Type::Int,
             Expr::Long(_) => Type::Long,
             Expr::Float(_) => Type::Double,
+            Expr::Float32(_) => Type::Float,
             Expr::Bool(_) => Type::Boolean,
             Expr::Char(_) => Type::Char,
             Expr::Null => Type::Unknown,
@@ -6340,6 +6393,7 @@ impl Compiler {
                 UnOp::Not => Type::Boolean,
                 UnOp::Neg => match self.infer(sc, expr) {
                     Type::Double => Type::Double,
+                    Type::Float => Type::Float,
                     Type::Long => Type::Long,
                     _ => Type::Int,
                 },
@@ -6666,6 +6720,7 @@ impl Compiler {
         match self.infer_class(sc, recv).as_deref() {
             Some("IntArray") => Type::Int,
             Some("DoubleArray") => Type::Double,
+            Some("FloatArray") => Type::Float,
             Some("CharArray") => Type::Char,
             Some("BooleanArray") => Type::Boolean,
             // `xs[i]` is one element, so it has the receiver's element type.
@@ -6778,7 +6833,8 @@ impl Compiler {
                 }
                 "intArrayOf" => Type::Int,
                 "longArrayOf" => Type::Long,
-                "doubleArrayOf" | "floatArrayOf" => Type::Double,
+                "doubleArrayOf" => Type::Double,
+                "floatArrayOf" => Type::Float,
                 "charArrayOf" => Type::Char,
                 "booleanArrayOf" => Type::Boolean,
                 _ => Type::Unknown,
@@ -7300,6 +7356,7 @@ impl Compiler {
                     "Triple" => return Some("Triple".to_string()),
                     "intArrayOf" | "IntArray" => return Some("IntArray".to_string()),
                     "doubleArrayOf" | "DoubleArray" => return Some("DoubleArray".to_string()),
+                    "floatArrayOf" | "FloatArray" => return Some("FloatArray".to_string()),
                     "charArrayOf" | "CharArray" => return Some("CharArray".to_string()),
                     "booleanArrayOf" | "BooleanArray" => return Some("BooleanArray".to_string()),
                     _ => {}
@@ -7446,10 +7503,15 @@ fn auto_math_fn(name: &str) -> Option<&'static str> {
 /// whether a following `/` lowers to truncating integer or IEEE division.
 fn math_ret_type(name: &str, args: &[Type]) -> Type {
     match name {
+        // The `Float` overloads answer a `Float`, so a `Float` argument selects
+        // one and the result must not widen — `sqrt(2.0f)` is `1.4142135`, not
+        // the `Double` root's `1.4142135623730951`.
+        "sqrt" | "floor" | "ceil" if args.contains(&Type::Float) => Type::Float,
         "sqrt" | "floor" | "ceil" | "round" => Type::Double,
         // `java.lang.Math.round` is the odd one out: `Long`, not `Double`.
         "jround" => Type::Long,
         _ if args.contains(&Type::Double) => Type::Double,
+        _ if args.contains(&Type::Float) => Type::Float,
         // `abs`/`max`/`min` keep their argument's width, so a `Long` argument
         // selects the `Long` overload and the result must not narrow.
         _ if args.contains(&Type::Long) => Type::Long,
@@ -7596,7 +7658,13 @@ fn params_accept(params: &[Param], args: &[Type]) -> bool {
     fn primitive(t: Type) -> bool {
         matches!(
             t,
-            Type::Int | Type::Long | Type::Double | Type::Boolean | Type::Char | Type::String
+            Type::Int
+                | Type::Long
+                | Type::Float
+                | Type::Double
+                | Type::Boolean
+                | Type::Char
+                | Type::String
         )
     }
     !params.iter().zip(args).any(|(p, a)| {
@@ -7648,6 +7716,7 @@ fn vararg_array(elem: Type, items: &[Expr]) -> Expr {
     let name = match elem {
         Type::Int | Type::Long => "intArrayOf",
         Type::Double => "doubleArrayOf",
+        Type::Float => "floatArrayOf",
         Type::Boolean => "booleanArrayOf",
         Type::Char => "charArrayOf",
         _ => "arrayOf",
@@ -7701,13 +7770,13 @@ fn bind_args<'a>(
 /// The companion constant `ty.name` (`Int.MAX_VALUE`, `Double.NaN`), or `None`
 /// when the pair is not one of them.
 ///
-/// `Double.MIN_VALUE` and the `Float` bounds are deliberately absent: they are
-/// the shortest decimal that round-trips a subnormal `Double` / a 32-bit
-/// `Float`, and this frontend carries every floating value as an `f64` and
-/// renders it with the `f64` shortest-repr — so it would print
-/// `5.0E-324`/`3.4028234663852886E38` where Kotlin prints `4.9E-324`/
-/// `3.4028235E38`. Leaving them unresolved keeps the divergence out of running
-/// programs.
+/// The `MIN_VALUE` subnormals used to be absent here, because Rust's
+/// shortest-repr renders them `5e-324` / `1e-45` where Kotlin prints
+/// `4.9E-324` / `1.4E-45`, and leaving them unresolved kept the divergence out
+/// of running programs. `format_double`/`format_float` now implement the JVM's
+/// own rule — a scientific mantissa carries at least one fractional digit, so
+/// the decimal chosen is the closest TWO-digit one — and both render exactly as
+/// Kotlin does, so both are resolved.
 /// The constant's static type rides along with its value: `Long.MAX_VALUE` is a
 /// `Long`, and the difference decides whether the arithmetic around it narrows
 /// to 32 bits (`Int.MAX_VALUE + 1` is `-2147483648`, `Long.MAX_VALUE + 1L` is
@@ -7723,11 +7792,20 @@ fn primitive_const(ty: &str, name: &str) -> Option<(Value, Type)> {
         ("Long", "MAX_VALUE") => (Value::Int(i64::MAX), Type::Long),
         ("Long", "MIN_VALUE") => (Value::Int(i64::MIN), Type::Long),
         ("Double", "MAX_VALUE") => (Value::Float(f64::MAX), Type::Double),
-        ("Double" | "Float", "POSITIVE_INFINITY") => (Value::Float(f64::INFINITY), Type::Double),
-        ("Double" | "Float", "NEGATIVE_INFINITY") => {
-            (Value::Float(f64::NEG_INFINITY), Type::Double)
-        }
-        ("Double" | "Float", "NaN") => (Value::Float(f64::NAN), Type::Double),
+        // The smallest POSITIVE `Double`, which is the subnormal `4.9E-324`
+        // rather than `f64::MIN` — Kotlin's constant is Java's.
+        ("Double", "MIN_VALUE") => (Value::Float(f64::from_bits(1)), Type::Double),
+        ("Float", "MAX_VALUE") => (Value::Float(f32::MAX as f64), Type::Float),
+        // The smallest POSITIVE value, which is the subnormal `1.4E-45` and not
+        // `f32::MIN`. Kotlin's `Float.MIN_VALUE` is Java's, and Java's is the
+        // subnormal.
+        ("Float", "MIN_VALUE") => (Value::Float(f32::from_bits(1) as f64), Type::Float),
+        ("Double", "POSITIVE_INFINITY") => (Value::Float(f64::INFINITY), Type::Double),
+        ("Double", "NEGATIVE_INFINITY") => (Value::Float(f64::NEG_INFINITY), Type::Double),
+        ("Double", "NaN") => (Value::Float(f64::NAN), Type::Double),
+        ("Float", "POSITIVE_INFINITY") => (Value::Float(f64::INFINITY), Type::Float),
+        ("Float", "NEGATIVE_INFINITY") => (Value::Float(f64::NEG_INFINITY), Type::Float),
+        ("Float", "NaN") => (Value::Float(f64::NAN), Type::Float),
         // `Char.MIN_VALUE`/`MAX_VALUE` bound the UTF-16 CODE UNIT, so the top is
         // `￿` and not the highest code point — both halves of a surrogate
         // pair are ordinary `Char`s below it.
@@ -7799,11 +7877,30 @@ fn operator_assign_fn(op: BinOp) -> Option<&'static str> {
 /// `Double` then printed `4` where the reference toolchain prints `4.0`.
 /// `Unknown` routes the display through the runtime-tagged stringifier, which
 /// reads the width off the value instead of guessing it.
+/// The [`KT_F32_ARITH`] payload for an arithmetic operator, or `None` for an
+/// operator that is not one — the comparisons and the short-circuits, which a
+/// `Float` operand does not divert from their native ops.
+fn f32_op_code(op: BinOp) -> Option<u8> {
+    Some(match op {
+        BinOp::Add => crate::host::f32_op::ADD,
+        BinOp::Sub => crate::host::f32_op::SUB,
+        BinOp::Mul => crate::host::f32_op::MUL,
+        BinOp::Div => crate::host::f32_op::DIV,
+        BinOp::Mod => crate::host::f32_op::REM,
+        _ => return None,
+    })
+}
+
 fn promote(lt: Type, rt: Type) -> Type {
     if lt == Type::Unknown || rt == Type::Unknown {
         Type::Unknown
     } else if lt == Type::Double || rt == Type::Double {
         Type::Double
+    } else if lt == Type::Float || rt == Type::Float {
+        // `Float` outranks both integral widths and is outranked by `Double`,
+        // so `1.0f + 1L` is a `Float` and `1.0f + 1.0` a `Double` — the same
+        // order Kotlin's binary numeric promotion uses.
+        Type::Float
     } else if lt == Type::Long || rt == Type::Long {
         Type::Long
     } else {
@@ -7822,6 +7919,7 @@ fn is_primitive_recv(t: Type) -> bool {
         t,
         Type::Int
             | Type::Long
+            | Type::Float
             | Type::Double
             | Type::Boolean
             | Type::Char
@@ -7886,7 +7984,8 @@ fn method_ret_type(name: &str) -> Type {
         // both before every operator), so `Int` is their arithmetic type here.
         "toInt" | "toByte" | "toShort" => Type::Int,
         "toLong" => Type::Long,
-        "toDouble" | "toFloat" => Type::Double,
+        "toDouble" => Type::Double,
+        "toFloat" => Type::Float,
         "isEmpty" | "isNotEmpty" => Type::Boolean,
         "toChar" => Type::Char,
         "uppercase" | "toUpperCase" | "lowercase" | "toLowerCase" | "trim" | "toString" => {
@@ -8322,6 +8421,7 @@ fn expr_any(e: &Expr, f: &dyn Fn(&Expr) -> bool) -> bool {
         Expr::Int(_)
         | Expr::Long(_)
         | Expr::Float(_)
+        | Expr::Float32(_)
         | Expr::Bool(_)
         | Expr::Char(_)
         | Expr::Null

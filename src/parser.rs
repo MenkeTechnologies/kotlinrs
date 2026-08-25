@@ -3116,6 +3116,10 @@ impl Parser {
                 self.bump();
                 Ok(Expr::Float(f))
             }
+            Tok::Float32(f) => {
+                self.bump();
+                Ok(Expr::Float32(f))
+            }
             Tok::Bool(b) => {
                 self.bump();
                 Ok(Expr::Bool(b))

@@ -206,31 +206,35 @@ The `String` collection-member rule is the reason for the last row: a
 `Iterable` members, which gives the right answer for the two dozen that Kotlin
 does declare and three it does not.
 
-## `Float` is `Double` — the 32-bit width is not carried
+## `Float` loses its width in an ERASED position
 
-`Float` and `Double` share `Value::Float`, an `f64`, so nothing rounds to
-single precision and `Float.toString` never runs. Every answer below is a
-*number*, not a formatting difference: the reference's is the nearest `f32` and
-kotlinrs's is the `f64` the same literal denotes. Measured on `kotlinc` 2.4.10 /
-JRE 21.0.12.
+`Float` is a static type now: a literal with the `f` suffix, a `Float`
+annotation, `toFloat()`, `floatArrayOf`, the `Float` companion constants and
+`kotlin.math`'s `Float` overloads all carry 32-bit width, arithmetic on them
+rounds once at 32 bits, and they render through `Float.toString`. What is left
+is every position where the value outlives the static type — a `List`, a `Map`,
+an `Any` parameter, a `%s` conversion — because a `Float` and a `Double` are the
+same `Value::Float` at run time and only the compiler knew which.
 
 | program | kotlinrs | reference |
 | --- | --- | --- |
-| `1.0f / 3.0f` | `0.3333333333333333` | `0.33333334` |
-| `(0.1f).toDouble()` | `0.1` | `0.10000000149011612` |
-| `16777217.0f` | `1.6777217E7` | `1.6777216E7` |
-| `Float.MAX_VALUE` | `unresolved reference: Float` | `3.4028235E38` |
-| `Float.MIN_VALUE` | `unresolved reference: Float` | `1.4E-45` |
-| `Double.MIN_VALUE` | `unresolved reference: Double` | `4.9E-324` |
+| `println(listOf(1.0f / 3.0f))` | `[0.3333333432674408]` | `[0.33333334]` |
+| `println(mapOf("k" to 1.0f / 3.0f))` | `{k=0.3333333432674408}` | `{k=0.33333334}` |
+| `fun id(x: Any) = x; println(id(1.0f / 3.0f))` | `0.3333333432674408` | `0.33333334` |
+| `"%s".format(1.0f / 3.0f)` | `0.3333333432674408` | `0.33333334` |
 
-`Double.MAX_VALUE` answers `1.7976931348623157E308` and is right, so the two
-companion objects are half-present rather than absent.
+Note what is NOT in the table: `1.0f / 3.0f`, `(0.1f).toDouble()`,
+`16777217.0f`, `Float.MAX_VALUE`/`MIN_VALUE`, `1.0e-45f`, `floatArrayOf(…)[0]`,
+a `Float` parameter and a `Float` return all answer exactly what the reference
+does. The arithmetic is genuinely single-precision — `16777217.0f * 0.2f` is
+`3355443.2`, which computing in `f64` and narrowing afterwards cannot produce.
 
-Closing this means carrying the declared width on the value — the same substrate
-the 32-bit integer narrowing has been building, and the same substrate the
-`IllegalFormatConversionException` operand name above needs. A `Float`-flavoured
-`toString` alone would not do it: `1.0f / 3.0f` has to *divide* in single
-precision to reach `0.33333334`.
+Closing the rest means carrying the width on the VALUE rather than on the static
+type — a `Float` tag in the reserved handle region the way `Char` has one — so
+that a value read back out of a `List` still knows it is 32-bit. That is also
+what the `IllegalFormatConversionException` operand name above needs: `%d` of a
+`Float` still says `d != java.lang.Double` where the reference says
+`d != java.lang.Float`, for the same reason.
 
 ## More `unresolved reference`, newly measured
 

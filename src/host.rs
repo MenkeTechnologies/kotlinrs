@@ -176,6 +176,41 @@ pub const KT_BUILDER: u16 = 40;
 /// back into Kotlin: it is a handle comparison and nothing more.
 pub const KT_IDENTITY: u16 = 41;
 
+/// `KT_F32_ARITH`: one arithmetic operation performed at 32-bit `Float` width.
+/// Stack `[lhs, rhs]`; the operator rides in the extension payload as one of
+/// the [`f32_op`] codes.
+///
+/// Narrowing the `f64` result afterwards is NOT the same computation: a double
+/// rounding can land a ulp away from the single one Kotlin performs.
+/// `16777217.0f * 0.2f` is `3355443.2` in Kotlin and `3355443.4` if the product
+/// is formed in `f64` and narrowed after. So a `Float` operation is done in
+/// `f32` throughout, which is why it costs a host op rather than a native one —
+/// the only Kotlin arithmetic in kotlinrs that does.
+pub const KT_F32_ARITH: u16 = 42;
+
+/// `KT_F32`: round the top of stack to 32-bit `Float` precision, leaving the
+/// result in the `f64` every floating value is carried in. Backs `toFloat()`
+/// and every widening of a `Double`-typed value into a `Float` position.
+pub const KT_F32: u16 = 43;
+
+/// `KT_F32_STR`: `Float.toString` of the top of stack.
+///
+/// A separate op from [`KT_TO_STRING`] because the two disagree on the same
+/// bits: `Float.toString` prints the shortest decimal that round-trips through
+/// 32 bits and `Double.toString` the shortest through 64, so one `f64` holding
+/// `1.0f / 3.0f` renders `0.33333334` here and `0.3333333432674408` there.
+pub const KT_F32_STR: u16 = 44;
+
+/// The [`KT_F32_ARITH`] operator codes, shared with the compiler. They ride in
+/// the extension op's payload, which the handler receives as a `u8`.
+pub mod f32_op {
+    pub const ADD: u8 = 0;
+    pub const SUB: u8 = 1;
+    pub const MUL: u8 = 2;
+    pub const DIV: u8 = 3;
+    pub const REM: u8 = 4;
+}
+
 // ── Builtin ids (`Op::CallBuiltin`) ─────────────────────────────────────────
 //
 // These are a SEPARATE dispatch namespace from the `Op::Extended` ids above:
@@ -3049,6 +3084,31 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let b = vm.pop();
             let a = vm.pop();
             vm.push(Value::Float(a.to_float() / b.to_float()));
+        }
+        // Both operands narrowed BEFORE the operation and the result taken
+        // straight out of the `f32` — see [`KT_F32_ARITH`] on why the
+        // narrow-after form is a different answer. Division by zero needs no
+        // special case: IEEE `f32` division yields the signed infinity and the
+        // NaN Kotlin's `Float` division does, unlike the integral `/`.
+        KT_F32_ARITH => {
+            let b = vm.pop().to_float() as f32;
+            let a = vm.pop().to_float() as f32;
+            let r = match arg {
+                f32_op::SUB => a - b,
+                f32_op::MUL => a * b,
+                f32_op::DIV => a / b,
+                f32_op::REM => a % b,
+                _ => a + b,
+            };
+            vm.push(Value::Float(r as f64));
+        }
+        KT_F32 => {
+            let v = vm.pop();
+            vm.push(Value::Float(v.to_float() as f32 as f64));
+        }
+        KT_F32_STR => {
+            let v = vm.pop();
+            vm.push(Value::str(format_float(v.to_float() as f32)));
         }
         KT_IDIV => {
             let b = vm.pop();
@@ -7290,13 +7350,19 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         // one every other numeric parse uses. `Integer.parseInt` does not do
         // this: `"".toInt()` still says `For input string: ""`.
         (Value::Str(s), "toDouble" | "toFloat") => {
-            java_parse_double(s).map(Value::Float).ok_or_else(|| {
-                if s.trim_matches(|c: char| c <= ' ').is_empty() {
-                    "java.lang.NumberFormatException: empty String".to_string()
-                } else {
-                    format!("java.lang.NumberFormatException: For input string: \"{s}\"")
-                }
-            })
+            // `toFloat` parses at 32-bit width, so `"0.1".toFloat()` holds the
+            // `f32` nearest 0.1 rather than the `f64` one — the same value the
+            // literal `0.1f` carries, and the reason the two compare equal.
+            let narrow = name == "toFloat";
+            java_parse_double(s)
+                .map(|d| Value::Float(if narrow { d as f32 as f64 } else { d }))
+                .ok_or_else(|| {
+                    if s.trim_matches(|c: char| c <= ' ').is_empty() {
+                        "java.lang.NumberFormatException: empty String".to_string()
+                    } else {
+                        format!("java.lang.NumberFormatException: For input string: \"{s}\"")
+                    }
+                })
         }
         (Value::Str(s), "toDoubleOrNull" | "toFloatOrNull") => Ok(java_parse_double(s)
             .map(Value::Float)
@@ -7498,7 +7564,8 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
                 }))
             }
         }
-        (Value::Int(n), "toDouble" | "toFloat") => Ok(Value::Float(*n as f64)),
+        (Value::Int(n), "toDouble") => Ok(Value::Float(*n as f64)),
+        (Value::Int(n), "toFloat") => Ok(Value::Float(*n as f32 as f64)),
         // Integer-to-integer conversions TRUNCATE to the target width (they are
         // the JVM's `i2b`/`i2s`/`l2i`), so `2147483648L.toInt()` is
         // `-2147483648` and `200.toByte()` is `-56`. `toLong` is the identity:
@@ -7507,7 +7574,11 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         (Value::Int(n), "toShort") => Ok(Value::Int(*n as i16 as i64)),
         (Value::Int(n), "toByte") => Ok(Value::Int(*n as i8 as i64)),
         (Value::Int(n), "toLong") => Ok(Value::Int(*n)),
-        (Value::Float(f), "toDouble" | "toFloat") => Ok(Value::Float(*f)),
+        (Value::Float(f), "toDouble") => Ok(Value::Float(*f)),
+        // The narrowing conversion, and the one place a `Double` becomes a
+        // `Float`: `(1.0 / 3.0).toFloat()` is `0.33333334`, not the `f64`
+        // quotient's digits.
+        (Value::Float(f), "toFloat") => Ok(Value::Float(*f as f32 as f64)),
         // A floating-to-integer conversion SATURATES at the target width and
         // maps NaN to zero — Rust's `as` cast has exactly those semantics.
         (Value::Float(f), "toInt") => Ok(Value::Int(*f as i32 as i64)),
@@ -10029,14 +10100,29 @@ pub fn kotlin_string(v: &Value) -> String {
     }
 }
 
+/// Kotlin `Float.toString()` — the JVM's rendering, at 32-bit width.
+pub fn format_float(f: f32) -> String {
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return if f > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    if f == 0.0 {
+        return if f.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
+    }
+    // `f32`'s longest exact decimal expansion is the smallest subnormal's, at
+    // 105 significant digits.
+    let (digits, exp) = java_decimal(
+        &format!("{:e}", f.abs()),
+        &|k| format!("{:.*e}", k, f.abs()),
+        120,
+    );
+    render_decimal(f.is_sign_negative(), &digits, exp)
+}
+
 /// Kotlin `Double.toString()`: shortest round-trip, whole values keep a trailing
 /// `.0`, and the non-finite forms are `NaN` / `Infinity` / `-Infinity`.
-///
-/// Kotlin delegates to the JVM's `Double.toString`, which uses plain decimal
-/// only inside `[1e-3, 1e7)` and switches to "computerized scientific notation"
-/// outside that range. Rust's `{}` never switches, so the range test has to be
-/// explicit or large and small magnitudes print as long digit strings
-/// (`25000000.0` where Kotlin says `2.5E7`, `0.0009999` where it says `9.999E-4`).
 pub fn format_double(f: f64) -> String {
     if f.is_nan() {
         return "NaN".to_string();
@@ -10048,25 +10134,116 @@ pub fn format_double(f: f64) -> String {
         // The signed zeroes are distinguished: `-0.0` prints with its sign.
         return if f.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
     }
+    // `f64`'s longest exact decimal expansion is the smallest subnormal's, at
+    // 751 significant digits.
+    let (digits, exp) = java_decimal(
+        &format!("{:e}", f.abs()),
+        &|k| format!("{:.*e}", k, f.abs()),
+        800,
+    );
+    render_decimal(f.is_sign_negative(), &digits, exp)
+}
 
-    let mag = f.abs();
-    if (1e-3..1e7).contains(&mag) {
-        let s = format!("{f}");
-        return if s.contains('.') { s } else { format!("{s}.0") };
+/// Split Rust's `{:e}` form into its significant digits and its decimal
+/// exponent, so that the value is `d1.d2…dn × 10^exp`.
+fn split_sci(s: &str) -> (String, i32) {
+    let (mant, exp) = s.split_once('e').unwrap_or((s, "0"));
+    let digits: String = mant.chars().filter(|c| c.is_ascii_digit()).collect();
+    (digits, exp.parse().unwrap_or(0))
+}
+
+/// The decimal `Float.toString` / `Double.toString` renders, as significant
+/// digits plus the exponent of the leading one. `v` is finite, positive and
+/// non-zero; `sci` is its shortest round-trip `{:e}` form and `round_to(k)` its
+/// `{:.k$e}` form. `exact_digits` is a significant-digit count that exceeds the
+/// type's longest exact decimal expansion.
+///
+/// Rust's shortest round-trip form is the answer in the common case, but the
+/// JVM's two rules for choosing among the decimals that round to `v` diverge
+/// from it in two places, both of which running programs hit:
+///
+///   * **A minimum of TWO significant digits.** Where one digit already
+///     round-trips, the JVM still picks the closest decimal of length one *or
+///     two*, which is the two-digit one. `Float.MIN_VALUE` is `1.4E-45` and not
+///     the `1E-45` that round-trips just as well, and `Double.MIN_VALUE` is
+///     `4.9E-324`, not `5E-324`.
+///   * **Ties break to the EVEN last digit.** An `f32`/`f64` whose exact value
+///     sits midway between two decimals of the chosen length has two shortest
+///     round-trip forms, and Rust rounds such a tie away from zero where the
+///     JVM takes the even one: `16777217.0f * 0.2f` is exactly `3355443.25`,
+///     which Rust renders `3355443.3` and Kotlin `3355443.2`.
+///
+/// The exact expansion is only consulted when the digit past the chosen length
+/// rounds to `5`, which is the only way a tie can present — so the ordinary
+/// value pays two cheap formats and nothing else.
+fn java_decimal(
+    sci: &str,
+    round_to: &dyn Fn(usize) -> String,
+    exact_digits: usize,
+) -> (String, i32) {
+    let (short_digits, short_exp) = split_sci(sci);
+    // Two significant digits minimum, but ONLY where the value renders in
+    // scientific form: what the JVM requires is a fractional digit in the
+    // rendered mantissa, and the plain form's `0.1` / `100.0` already has one
+    // while `1E-45`'s does not. That is why `Float.MIN_VALUE` is `1.4E-45`
+    // while `0.1f`, whose shortest form is one digit too, stays `0.1`.
+    let p = if short_digits.len() < 2 && !is_plain(short_exp) {
+        2
+    } else {
+        short_digits.len()
+    };
+    let (cand, cand_exp) = split_sci(&round_to(p - 1));
+
+    // A tie shows as an exact `5` one digit past the chosen length. Anything
+    // else there rules one out, and that is the overwhelmingly common case.
+    let (probe, _) = split_sci(&round_to(p));
+    if !probe.ends_with('5') {
+        return (cand, cand_exp);
     }
 
-    // Scientific form. Rust renders `2.5e7` / `1e7`; the JVM wants `2.5E7` /
-    // `1.0E7` — uppercase exponent, no `+`, and a mantissa that always carries a
-    // fractional digit.
-    let s = format!("{f:e}");
-    let (mantissa, exp) = match s.split_once('e') {
-        Some((m, e)) => (m, e),
-        None => return s,
-    };
-    let mantissa = if mantissa.contains('.') {
-        mantissa.to_string()
+    let (exact, exact_exp) = split_sci(&round_to(exact_digits));
+    let tail = &exact[p.min(exact.len())..];
+    let is_tie = tail.starts_with('5') && tail[1..].bytes().all(|b| b == b'0');
+    if !is_tie {
+        return (cand, cand_exp);
+    }
+    // `cand` rounded the tie away from zero, so it is the UPPER of the two
+    // candidates and the lower one is the exact expansion truncated. Exactly one
+    // of the two ends in an even digit.
+    let lower = &exact[..p];
+    if lower.as_bytes()[p - 1] % 2 == 0 {
+        (lower.to_string(), exact_exp)
     } else {
-        format!("{mantissa}.0")
-    };
-    format!("{mantissa}E{exp}")
+        (cand, cand_exp)
+    }
+}
+
+/// Whether a decimal with this leading-digit exponent renders in plain form.
+/// The JVM's window is `[1e-3, 1e7)`, which is `-3 <= exp <= 6`.
+fn is_plain(exp: i32) -> bool {
+    (-3..=6).contains(&exp)
+}
+
+/// Render a chosen decimal — the value `d1.d2…dn × 10^exp` — the way the JVM
+/// does: plain decimal inside `[1e-3, 1e7)`, "computerized scientific notation"
+/// outside it, always with at least one digit on each side of the point.
+fn render_decimal(neg: bool, digits: &str, exp: i32) -> String {
+    let sign = if neg { "-" } else { "" };
+    if is_plain(exp) {
+        if exp < 0 {
+            // `0.00…d1d2…` — the leading zero, then `-exp - 1` more.
+            let lead = "0".repeat((-exp - 1) as usize);
+            return format!("{sign}0.{lead}{digits}");
+        }
+        let point = exp as usize + 1;
+        return if point >= digits.len() {
+            // More integer places than digits: pad, and the fraction is `.0`.
+            let pad = "0".repeat(point - digits.len());
+            format!("{sign}{digits}{pad}.0")
+        } else {
+            format!("{sign}{}.{}", &digits[..point], &digits[point..])
+        };
+    }
+    let frac = if digits.len() > 1 { &digits[1..] } else { "0" };
+    format!("{sign}{}.{frac}E{exp}", &digits[..1])
 }

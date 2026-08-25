@@ -255,7 +255,14 @@ impl<'a> Lexer<'a> {
         }
         if matches!(suffix, b'f' | b'F') {
             self.bump();
-            return Tok::Float(raw.parse().unwrap_or(0.0));
+            // Parsed AS an `f32`, not parsed as an `f64` and narrowed: the two
+            // disagree by a ulp on a value that sits between two `f32`s, and
+            // they disagree completely below the `f64`-subnormal boundary —
+            // `1.0e-45f` is `1.4E-45` (the smallest `f32` subnormal) where
+            // `1.0e-45_f64 as f32` is the same value only by luck of rounding
+            // and `4.9e-324f` would round to zero. The `f64` it is widened back
+            // into is exactly representable, so nothing is lost carrying it.
+            return Tok::Float32(raw.parse::<f32>().unwrap_or(0.0) as f64);
         }
         if is_float {
             Tok::Float(raw.parse().unwrap_or(0.0))
