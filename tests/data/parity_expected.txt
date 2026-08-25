@@ -937,3 +937,9 @@ fun id(x: Any): Any = x\nfun main() { println(id(7L)); println(id(7L) is Long); 
 fun main() { var t = 0L; for (v in listOf(1L, 2L, 3L)) t += v; println(t); println(t is Long) }	6\ntrue\n
 fun main() { println(listOf<Any>(1, 1L, 1.0).map { it::class.simpleName }); println(setOf<Any>(1, 1L).toList()) }	[Int, Long, Double]\n[1, 1]\n
 fun main() { val s = sequence { yield(1L); yield(2L) }; println(s.toList()); println(s.sum()) }	[1, 2]\n3\n
+inline fun twice(f: () -> Int): Int = f() + f()\nfun main() { println(twice { 3 }); var n = 0; println(twice { n += 1; n }) }	6\n3\n
+inline fun apply2(x: Int, crossinline f: (Int) -> Int): Int = f(f(x))\nfun main() { println(apply2(2) { it * 3 }) }	18\n
+@JvmInline value class Uid(val v: Int)\nfun main() { println(Uid(7)); println(Uid(7).v); println(Uid(7) == Uid(7)) }	Uid(v=7)\n7\ntrue\n
+class C { val a by lazy { println("init"); 41 + 1 } }\nfun main() { val c = C(); println(c.a); println(c.a) }	init\n42\n42\n
+sealed interface Ev\ndata object Started : Ev\ndata class Done(val n: Int) : Ev\nfun main() { val xs = listOf<Ev>(Started, Done(3)); for (e in xs) println(when (e) { is Started -> "s"; is Done -> "d${e.n}" }) }	s\nd3\n
+fun main() { val m = buildMap<String, Int> { put("a", 1); put("b", 2) }; println(m); val l = buildList { add(1); add(2) }; println(l) }	{a=1, b=2}\n[1, 2]\n

@@ -5612,11 +5612,14 @@ impl Compiler {
             //
             // The capacity overload (`buildString(64) { … }`) is accepted and
             // its hint discarded: nothing observable depends on it.
-            "buildString" | "buildList" if args.last().is_some_and(is_lambda) => {
-                let ctor = if name == "buildString" {
-                    "StringBuilder"
-                } else {
-                    "mutableListOf"
+            "buildString" | "buildList" | "buildMap" | "buildSet"
+                if args.last().is_some_and(is_lambda) =>
+            {
+                let ctor = match name {
+                    "buildString" => "StringBuilder",
+                    "buildMap" => "mutableMapOf",
+                    "buildSet" => "mutableSetOf",
+                    _ => "mutableListOf",
                 };
                 let fresh = Expr::Call {
                     name: ctor.to_string(),
@@ -6926,7 +6929,7 @@ impl Compiler {
                 // two builders. `buildList` yields a list; `buildString`
                 // yields the plain `String` its `toString()` produced.
                 "StringBuilder" | "StringBuffer" if args.len() <= 1 => Type::Obj,
-                "buildList" | "listOfNotNull" => Type::Obj,
+                "buildList" | "buildMap" | "buildSet" | "listOfNotNull" => Type::Obj,
                 "buildString" => Type::String,
                 // `with(x) { … }` / `run { … }` evaluate to their block, whose
                 // type the frontend does not track.

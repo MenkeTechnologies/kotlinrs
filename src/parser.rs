@@ -142,6 +142,14 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
     let mut prog = Program::default();
     while !p.at(&Tok::Eof) {
         // A modifier run only starts a declaration; anything else keeps its
+        // `@JvmInline`, `@JvmStatic`, `@Suppress("…")` and the rest — a JVM
+        // instruction about how to COMPILE the declaration below, which this
+        // frontend does not compile that way. Consumed with its argument list
+        // where it has one; the declaration itself parses as if it were absent.
+        p.skip_annotations();
+        if p.at(&Tok::Eof) {
+            break;
+        }
         // ordinary identifier meaning (an `import`/`package` line, say).
         if !p.at_decl_kw() && matches!(p.peek(), Tok::Ident(w) if is_modifier_word(w)) {
             let mods = p.modifiers();
@@ -174,6 +182,12 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
             // `enum class E { … }`. `enum` is a soft keyword, so it is matched
             // positionally — only one directly followed by `class` starts a
             // declaration, leaving a variable or function named `enum` alone.
+            // `value class Uid(…)` — a soft keyword, matched positionally the
+            // way `enum` is, so a variable or function named `value` is left
+            // alone.
+            Tok::Ident(w) if w == "value" && matches!(p.peek_at(1), Tok::Class) => {
+                prog.classes.push(p.class_decl()?)
+            }
             Tok::Ident(w) if w == "enum" && matches!(p.peek_at(1), Tok::Class) => {
                 prog.classes.push(p.class_decl()?)
             }
@@ -619,9 +633,23 @@ impl Parser {
         // The type variable each parameter was declared with, positionally.
         let mut param_tps: Vec<Option<String>> = Vec::new();
         while !self.at(&Tok::RParen) {
-            let is_vararg = matches!(self.peek(), Tok::Ident(w) if w == "vararg");
-            if is_vararg {
-                self.bump();
+            // `vararg`, and the two lambda-parameter modifiers. `crossinline`
+            // and `noinline` both constrain what an INLINED lambda may do —
+            // a non-local return, and being stored rather than called — and
+            // neither changes what the call computes, so they are consumed the
+            // way the declaration modifiers above are.
+            let mut is_vararg = false;
+            loop {
+                match self.peek() {
+                    Tok::Ident(w) if w == "vararg" => {
+                        is_vararg = true;
+                        self.bump();
+                    }
+                    Tok::Ident(w) if w == "crossinline" || w == "noinline" => {
+                        self.bump();
+                    }
+                    _ => break,
+                }
             }
             let pname = self.ident()?;
             let ann = if self.at(&Tok::Colon) {
@@ -756,12 +784,32 @@ impl Parser {
         companion_of: Option<&str>,
     ) -> Result<ClassDecl, String> {
         let line = self.line();
-        let is_data = if self.at(&Tok::Data) {
+        // `value class Uid(val v: Int)` — a class with one property that the
+        // JVM may represent as the property itself. What a program can OBSERVE
+        // of one is a `data class`'s surface: a `toString` naming the property,
+        // and equality over it. The representation is what `value` changes, and
+        // this frontend has no representation to change.
+        let is_value = matches!(self.peek(), Tok::Ident(w) if w == "value")
+            && matches!(self.peek_at(1), Tok::Class);
+        if is_value {
+            self.bump();
+        }
+        let mut is_data = if self.at(&Tok::Data) {
             self.bump();
             true
         } else {
-            false
+            is_value
         };
+        // `data object X` is an `object`, not a `data class`: it has no
+        // constructor properties for the generated members to be over. The one
+        // thing the `data` adds that a program can observe is a `toString`
+        // answering the NAME — a plain `object` renders as `X@<hash>` — and a
+        // synthesized override below supplies exactly that. Its equality is
+        // identity either way, a singleton having only itself to equal.
+        let is_data_object = is_data && self.at(&Tok::Object);
+        if is_data_object {
+            is_data = false;
+        }
         // `enum class E(…) { A, B; … }`. A soft keyword, matched positionally so
         // only an `enum` directly in front of `class` is one.
         let is_enum = matches!(self.peek(), Tok::Ident(w) if w == "enum")
@@ -774,9 +822,6 @@ impl Parser {
             self.bump();
             false
         } else if self.at(&Tok::Object) {
-            if is_data {
-                return Err("`data object` is not supported".into());
-            }
             self.bump();
             true
         } else {
@@ -1084,6 +1129,30 @@ impl Parser {
 
         self.type_params = outer_tps;
         self.class_type_params = outer_ctps;
+        // The `data object`'s one generated member, synthesized rather than
+        // special-cased downstream: it is an ordinary `override toString`, so
+        // the display path, the `toString` registry and a nested render all
+        // reach it the way they reach a hand-written one.
+        if is_data_object {
+            methods.push(FunDecl {
+                name: "toString".to_string(),
+                recv: None,
+                params: Vec::new(),
+                ret: Type::String,
+                ret_class: None,
+                ret_type_param_of: None,
+                ret_class_type_param_of: None,
+                ret_type_args: Vec::new(),
+                body: vec![Stmt::new(
+                    line,
+                    StmtKind::Return(Some(Expr::Str(vec![StrExpr::Text(name.clone())]))),
+                )],
+                line,
+                is_abstract: false,
+                is_open: false,
+                is_override: true,
+            });
+        }
         Ok(ClassDecl {
             name,
             type_params: tps,
@@ -1778,6 +1847,44 @@ impl Parser {
 
     /// Consume a `<…>` type-argument list if one is present, discarding it.
     /// Coarse typing keeps only the head name of a generic supertype.
+    /// Consume any run of `@Annotation` / `@Annotation(args)` prefixes.
+    ///
+    /// Every one of them is a directive to the JVM back end — how to represent
+    /// a `value class`, where to put a static, which warning to suppress — and
+    /// none of them changes what the annotated declaration computes.
+    fn skip_annotations(&mut self) {
+        while self.at(&Tok::At) {
+            self.bump();
+            if matches!(self.peek(), Tok::Ident(_)) {
+                self.bump();
+            }
+            // A use-site target (`@file:JvmName("…")`) writes the target, a
+            // colon, then the annotation itself.
+            if self.at(&Tok::Colon) {
+                self.bump();
+                if matches!(self.peek(), Tok::Ident(_)) {
+                    self.bump();
+                }
+            }
+            if self.at(&Tok::LParen) {
+                let mut depth = 0i32;
+                loop {
+                    match self.bump() {
+                        Tok::LParen => depth += 1,
+                        Tok::RParen => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        Tok::Eof => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
     fn skip_type_args(&mut self) {
         if !self.at(&Tok::Lt) {
             return;
@@ -2053,7 +2160,9 @@ impl Parser {
                 self.pending_classes.push(decl);
                 StmtKind::Empty
             }
-            Tok::Ident(w) if w == "enum" && matches!(self.peek_at(1), Tok::Class) => {
+            Tok::Ident(w)
+                if (w == "enum" || w == "value") && matches!(self.peek_at(1), Tok::Class) =>
+            {
                 let decl = self.class_decl()?;
                 self.pending_classes.push(decl);
                 StmtKind::Empty
