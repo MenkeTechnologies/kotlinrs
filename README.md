@@ -1466,8 +1466,26 @@ sequence in bucket order. That order is a property of what a READER sees, so it
 is computed when one looks, which is what `java.util.HashMap` does — a put drops
 the entry in a bucket and the table is walked when something iterates it. A
 mutation now records one bit; the readers that consume an order restore it.
-`hashMapOf` at 20 000 went from 79.05 s to 0.09 s and `sortedMapOf` from
-46.95 s to 0.10 s, both to 2x per doubling out to 80 000.
+
+Measured by running the two binaries INTERLEAVED, three repetitions per cell,
+reporting the minimum — the machine is shared, and contention can only add time.
+`m[i] = i * 2` for each `i`, then `m[i]` back:
+
+| n | `mutableMapOf` | `hashMapOf` before | `hashMapOf` after | `sortedMapOf` before | `sortedMapOf` after |
+| --- | --- | --- | --- | --- | --- |
+| 5 000 | 0.04 s | 1.39 s | 0.04 s | 2.97 s | 0.05 s |
+| 10 000 | 0.07 s | 6.07 s | 0.08 s | 14.15 s | 0.10 s |
+| 20 000 | 0.13 s | 23.18 s | 0.13 s | 20.45 s | 0.13 s |
+| 40 000 | 0.36 s | — | 0.28 s | — | 0.29 s |
+| 80 000 | 0.56 s | — | 0.81 s | — | 0.53 s |
+
+The before column stops at 20 000 because one run past it is minutes. Its shape
+is 4.4x then 3.8x per doubling for `hashMapOf`; the `sortedMapOf` 10 000 cell
+caught a load spike and reads high against its own 20 000, which is why the
+comparison to make is 5 000 -> 20 000 — 6.9x for four times the data. After,
+every column doubles with the input out to 40 000; the 80 000 `hashMapOf` cell
+varied from 0.81 s to 1.32 s across repetitions and is reported as the minimum
+rather than trusted to three digits.
 
 Next: `Regex` in every spelling, `sequence { … }`/`yield`, `lateinit`,
 `Throwable.cause` and the

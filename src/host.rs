@@ -4468,6 +4468,12 @@ fn b_operator(vm: &mut VM, _argc: u8) -> Value {
     let name = vm.pop().to_str();
     let rhs = vm.pop();
     let lhs = vm.pop();
+    // `map + pair` / `set - x` copy the operands' SEQUENCES into the result, so
+    // the result's iteration order is the operands'. Both are put in theirs
+    // first; without it a `hashMapOf` left out of order by a put would hand its
+    // insertion sequence to the new map.
+    ensure_ordered(vm, &lhs);
+    ensure_ordered(vm, &rhs);
     match operator_apply(vm, &lhs, &name, &rhs) {
         Ok(v) => v,
         Err(e) => {
