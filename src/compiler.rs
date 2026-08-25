@@ -197,6 +197,9 @@ struct Binding {
     /// This `val` was declared `by lazy`, so the slot holds an unforced cell
     /// and every read forces it (see [`crate::host::KT_LAZY_GET`]).
     lazy: bool,
+    /// Declared `by <delegate>` with something other than `lazy`: the slot
+    /// holds the delegate and every read is a `getValue` on it.
+    delegated: bool,
 }
 
 /// A checkpoint of scope state, taken on block entry and restored on block exit
@@ -264,6 +267,7 @@ impl Scope {
                 type_args: Vec::new(),
                 boxed: false,
                 lazy: false,
+                delegated: false,
             },
         );
         self.undo.push((name.to_string(), prev));
@@ -385,6 +389,14 @@ impl Scope {
     }
     fn is_lazy(&self, name: &str) -> bool {
         self.map.get(name).is_some_and(|b| b.lazy)
+    }
+    fn mark_delegated(&mut self, name: &str) {
+        if let Some(b) = self.map.get_mut(name) {
+            b.delegated = true;
+        }
+    }
+    fn is_delegated(&self, name: &str) -> bool {
+        self.map.get(name).is_some_and(|b| b.delegated)
     }
 }
 
@@ -2226,6 +2238,7 @@ impl Compiler {
                 init,
                 mutable,
                 lazy,
+                delegated,
             } => {
                 // The initializer names the class where it can, and the
                 // annotation stands in where it cannot. `= null` is the case
@@ -2289,12 +2302,47 @@ impl Compiler {
                     self.b.emit(Op::Extended(KT_LAZY_NEW, 0), 0);
                     vty = Type::Unknown;
                 }
+                // The slot's value is the delegate, not the property, so the
+                // binding carries no useful static type — what a READ answers is
+                // whatever `getValue` returns.
+                if *delegated {
+                    vty = Type::Unknown;
+                }
+                // The delegate's CLASS, which is what names the `getValue` /
+                // `setValue` subroutine each access calls. Recorded on the
+                // binding, exactly as a class property records it.
+                let class = if *delegated {
+                    // The class must declare `getValue`, not merely exist: the
+                    // access below is a DIRECT call to its subroutine, and a
+                    // class without one would fail as a missing sub long after
+                    // the declaration that named it.
+                    let dc = delegate_class_of(init).filter(|c| {
+                        self.classes
+                            .get(c)
+                            .is_some_and(|m| m.methods.contains_key("getValue"))
+                    });
+                    if dc.is_none() {
+                        return Err(format!(
+                            "local {name}: delegates to a value whose class is not a user \
+                             class declaring `operator fun getValue`; only that form of \
+                             `by` is supported (besides `by lazy`)"
+                        ));
+                    }
+                    dc
+                } else {
+                    class
+                };
                 let slot = sc.declare_full(name, vty, *mutable, class, elem);
                 if !type_args.is_empty() {
                     sc.set_type_args(name, type_args);
                 }
                 if *lazy {
                     sc.mark_lazy(name);
+                }
+                // A delegated local holds the DELEGATE; every read below is a
+                // `getValue` on it and every write a `setValue`.
+                if *delegated {
+                    sc.mark_delegated(name);
                 }
                 if let Some(r) = fn_ret {
                     sc.set_fn_ret(name, *r);
@@ -2336,6 +2384,26 @@ impl Compiler {
                         }
                     }
                     return Err(format!("val cannot be reassigned: {name}"));
+                }
+                // A delegated local: the slot holds the delegate, so the write
+                // is `delegate.setValue(null, null, value)` and the compound
+                // form reads through `getValue` first.
+                if let Some(slot) = sc.slot(name).filter(|_| sc.is_delegated(name)) {
+                    let full = match op {
+                        None => value.clone(),
+                        Some(binop) => Expr::Binary {
+                            op: *binop,
+                            l: Box::new(Expr::Var(name.clone())),
+                            r: Box::new(value.clone()),
+                        },
+                    };
+                    self.b.emit(Op::GetSlot(slot), 0);
+                    self.b.emit(Op::LoadUndef, 0);
+                    self.b.emit(Op::LoadUndef, 0);
+                    let dc = sc.class_of(name);
+                    self.compile_expr(sc, &full)?;
+                    self.emit_delegate_set(dc)?;
+                    return Ok(());
                 }
                 // A bare `name = …` that is not a local but is a property of the
                 // enclosing class is an implicit-`this` field write.
@@ -2969,6 +3037,14 @@ impl Compiler {
                     // runs the thunk — the first read only.
                     if sc.is_lazy(name) {
                         self.b.emit(Op::CallBuiltin(KT_LAZY_GET, 0), 0);
+                    }
+                    // A delegated local holds the DELEGATE, and reading it is
+                    // `delegate.getValue(thisRef, property)`. Both arguments are
+                    // null: a local has no receiver, and the `KProperty` a real
+                    // one is handed carries only reflection this frontend has no
+                    // value for.
+                    if sc.is_delegated(name) {
+                        self.emit_delegate_get(sc.class_of(name))?;
                     }
                     return Ok(sc.ty(name));
                 }
@@ -5425,6 +5501,34 @@ impl Compiler {
             self.emit_wrap32();
         }
         Ok(ty)
+    }
+
+    /// `delegate.getValue(thisRef, property)` on the delegate already on the
+    /// stack. Both arguments are null: a local has no receiver, and the
+    /// `KProperty` a real one is handed carries only reflection this frontend
+    /// has no value for.
+    ///
+    /// A direct call to the delegate class's subroutine, the way a delegated
+    /// CLASS property already dispatches — the runtime member table has no
+    /// entry for a user `getValue`.
+    fn emit_delegate_get(&mut self, dc: Option<String>) -> Result<(), String> {
+        let dc = dc.ok_or_else(|| "delegate class is not known".to_string())?;
+        self.b.emit(Op::LoadUndef, 0);
+        self.b.emit(Op::LoadUndef, 0);
+        let idx = self.b.add_name(&method_sub_name(&dc, "getValue"));
+        self.b.emit(Op::Call(idx, 3), 0);
+        Ok(())
+    }
+
+    /// `delegate.setValue(thisRef, property, value)`, with the delegate, the two
+    /// nulls and the value already on the stack. Leaves nothing: a property
+    /// write is a statement.
+    fn emit_delegate_set(&mut self, dc: Option<String>) -> Result<(), String> {
+        let dc = dc.ok_or_else(|| "delegate class is not known".to_string())?;
+        let idx = self.b.add_name(&method_sub_name(&dc, "setValue"));
+        self.b.emit(Op::Call(idx, 4), 0);
+        self.b.emit(Op::Pop, 0);
+        Ok(())
     }
 
     /// Narrow the value on top of the stack to a signed 32-bit `Int` — Kotlin's

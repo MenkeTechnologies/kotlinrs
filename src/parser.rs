@@ -2306,12 +2306,27 @@ impl Parser {
         // delegate, and a local has none.
         if matches!(self.peek(), Tok::Ident(w) if w == "by") {
             self.bump();
-            if !matches!(self.peek(), Tok::Ident(w) if w == "lazy")
-                || !matches!(self.peek_at(1), Tok::LBrace)
-            {
-                return Err(format!(
-                    "local {name}: only `by lazy {{ … }}` is supported after `by`"
-                ));
+            // The general delegate protocol: anything but `lazy` after `by` is
+            // an expression producing a delegate, whose `getValue`/`setValue`
+            // every read and write of the binding goes through. `lazy` keeps
+            // its own lowering — an unforced cell — because its thunk runs at
+            // the first read and a `getValue` call would run it at every one.
+            let is_lazy = matches!(self.peek(), Tok::Ident(w) if w == "lazy")
+                && matches!(self.peek_at(1), Tok::LBrace);
+            if !is_lazy {
+                let init = self.expr()?;
+                return Ok(StmtKind::Let {
+                    name,
+                    ty,
+                    class: class.clone(),
+                    fn_params,
+                    fn_ret,
+                    type_args,
+                    init,
+                    mutable,
+                    lazy: false,
+                    delegated: true,
+                });
             }
             self.bump();
             if mutable {
@@ -2328,6 +2343,7 @@ impl Parser {
                 init,
                 mutable,
                 lazy: true,
+                delegated: false,
             });
         }
         self.eat(&Tok::Assign)?;
@@ -2342,6 +2358,7 @@ impl Parser {
             init,
             mutable,
             lazy: false,
+            delegated: false,
         })
     }
 

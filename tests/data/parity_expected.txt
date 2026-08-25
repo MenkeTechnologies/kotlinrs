@@ -949,3 +949,4 @@ inline fun <reified T> nameOf(): String = T::class.simpleName ?: "?"\ninline fun
 class P(val a: Int)\ninline fun <reified T> castOr(x: Any, d: Any): Any = (x as? T) ?: d\nfun main() { println(castOr<Int>(5, -1)); println(castOr<Int>("s", -1)); println(castOr<String>("s", "?")) }	5\n-1\ns\n
 inline fun <reified T> tagged(x: Any): String = "${T::class.simpleName}:${x is T}"\ninline fun <reified U> outer(x: Any): String = tagged<Int>(x) + "/" + tagged<U>(x)\nfun main() { println(outer<String>("s")); println(outer<Int>(3)) }	Int:false/String:true\nInt:true/Int:true\n
 inline fun <reified T> boxName(): String = T::class.java.name\nfun main() { println(boxName<Int>()); println(boxName<String>()) }	java.lang.Integer\njava.lang.String\n
+class Holder { var v: String = "x"\n  operator fun getValue(t: Any?, p: Any?): String = v\n  operator fun setValue(t: Any?, p: Any?, x: String) { v = x } }\nfun main() { var s: String by Holder(); println(s); s = "y"; println(s) }	x\ny\n

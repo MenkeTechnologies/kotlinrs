@@ -549,6 +549,11 @@ pub enum StmtKind {
         /// than at the declaration — which is the whole observable difference
         /// between `by lazy` and an ordinary initializer.
         lazy: bool,
+        /// Declared `var x by <delegate>` with a delegate that is not `lazy`.
+        /// The slot holds the DELEGATE and every read is a `getValue` on it,
+        /// every write a `setValue` — the general property-delegate protocol,
+        /// of which `lazy` is one instance with a lowering of its own.
+        delegated: bool,
     },
     /// `name (op)= value`, where `op` is `None` for a plain `=`.
     Assign {

@@ -4155,9 +4155,9 @@ fun main() {
 }
 
 #[test]
-fn by_on_a_local_accepts_only_lazy_and_only_on_a_val() {
-    // A local has no property object to hand a general `getValue` delegate, so
-    // the other `by` forms are rejected rather than silently mis-lowered.
+fn by_lazy_on_a_local_still_requires_a_val() {
+    // `by lazy` keeps its own lowering — an unforced cell whose thunk runs at
+    // the first read — and a `var` has no such shape.
     let out = eval("var x by lazy { 1 }; println(x)");
     assert!(!out.status.success());
     assert!(
@@ -4165,10 +4165,42 @@ fn by_on_a_local_accepts_only_lazy_and_only_on_a_val() {
         "stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let out = eval("val x by foo { 1 }; println(x)");
+}
+
+#[test]
+fn a_local_delegates_to_a_user_getvalue_and_setvalue() {
+    // This test used to assert that a local could NOT: "a local has no property
+    // object to hand a general `getValue` delegate". It has none still — both
+    // arguments are null, a local having no receiver and no `KProperty` this
+    // frontend can build — and that turns out to be all the protocol needs.
+    // A read is `getValue`, a write is `setValue`, and a compound write is one
+    // of each.
+    let src = "class Holder { var v: String = \"x\"\n\
+               operator fun getValue(t: Any?, p: Any?): String = v\n\
+               operator fun setValue(t: Any?, p: Any?, x: String) { v = x } }\n\
+               fun main() { var s: String by Holder(); println(s); s = \"y\"; \
+               println(s); s += \"z\"; println(s) }";
+    assert_eq!(prog(src), "x\ny\nyz\n");
+}
+
+#[test]
+fn a_local_by_a_delegate_with_no_getvalue_is_rejected() {
+    // The half of the old rule that still holds: a delegate whose class the
+    // frontend cannot name — and so whose `getValue` it cannot call — fails
+    // loudly rather than being silently mis-lowered.
+    let out = eval("val x by listOf(1); println(x)");
     assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("only `by lazy"),
+        String::from_utf8_lossy(&out.stderr).contains("operator fun getValue"),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // And a class that exists but declares no `getValue` — which would
+    // otherwise fail as a missing subroutine, long after the declaration.
+    let out = eval("class NoGet(val v: Int)\nfun main() { val x by NoGet(1); println(x) }");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("operator fun getValue"),
         "stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
