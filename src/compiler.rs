@@ -22,9 +22,9 @@
 use crate::ast::*;
 use crate::host::{
     COLL_COPY, COLL_DEFAULT_CAP, COLL_HASH, COLL_SORTED, KT_ARRAY, KT_ARRAY_INIT, KT_ARRAY_NEW,
-    KT_AS, KT_BUILDER, KT_CHR_STRING, KT_CLASSOF, KT_CLOSURE_CALL, KT_COLL_HOF, KT_COMPARATOR,
-    KT_DBG_LINE, KT_DDIV, KT_DISPLAY, KT_ENUM_REG, KT_EQUALS_REG, KT_EXC_ABORT, KT_EXC_CUT,
-    KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE,
+    KT_AS, KT_BOX_F32, KT_BUILDER, KT_CHR_STRING, KT_CLASSOF, KT_CLOSURE_CALL, KT_COLL_HOF,
+    KT_COMPARATOR, KT_DBG_LINE, KT_DDIV, KT_DISPLAY, KT_ENUM_REG, KT_EQUALS_REG, KT_EXC_ABORT,
+    KT_EXC_CUT, KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE,
     KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND, KT_F32, KT_F32_ARITH, KT_F32_STR, KT_FFI_CALL,
     KT_FFI_COMPILE, KT_GENSEQ, KT_GETFIELD, KT_HASH_REG, KT_IDENTITY, KT_IDIV, KT_IMOD,
     KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE,
@@ -36,6 +36,36 @@ use crate::host::{
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+
+/// The intrinsic `compile_member_boxed` wraps a `Float` argument in, so the box
+/// is emitted through the ordinary call path rather than by rewriting the
+/// argument list into bytecode by hand. Not a name any Kotlin program can spell.
+const BOX_FLOAT: &str = "__box_float";
+
+/// The members whose ARGUMENT is a key or a stored element rather than a
+/// number to compute with — the argument positions that erase a `Float`'s
+/// width the way a collection literal's elements do.
+///
+/// Deliberately a short explicit list and not "every stdlib member": a boxed
+/// argument reaching one that reads it as a NUMBER (`pow`, `coerceAtLeast`)
+/// would have its handle read instead of its value.
+fn float_erasing_member(name: &str) -> bool {
+    matches!(
+        name,
+        "contains"
+            | "containsKey"
+            | "containsValue"
+            | "containsAll"
+            | "indexOf"
+            | "lastIndexOf"
+            | "add"
+            | "addAll"
+            | "put"
+            | "putIfAbsent"
+            | "remove"
+            | "format"
+    )
+}
 
 /// The desugar target a `rust { ... }` block lowers to (see [`crate::rust_ffi`]).
 const RUST_COMPILE: &str = "__rust_compile";
@@ -2113,7 +2143,14 @@ impl Compiler {
                     self.lambda_hint =
                         Some(fn_params.iter().map(|t| (*t, Type::Unknown)).collect());
                 }
-                let it = self.compile_expr(sc, init)?;
+                // `val x: Any = 1.0f` is an erased position as much as a list
+                // element is: the declaration throws the width away, so the
+                // value has to carry it. A `val x: Float` or an unannotated
+                // one keeps the static type and needs no box.
+                let it = match ty {
+                    Some(t) if *t != Type::Float => self.compile_erased(sc, init)?,
+                    _ => self.compile_expr(sc, init)?,
+                };
                 let mut vty = ty.unwrap_or(it);
                 // A binding with a known class/container is a heap object.
                 if class.is_some() {
@@ -2934,13 +2971,16 @@ impl Compiler {
                 }
                 let ty = self.index_elem_ty(sc, recv);
                 self.compile_expr(sc, recv)?;
-                self.compile_expr(sc, index)?;
+                // A `Float` INDEX can only be a `Map` key — a list indexes by
+                // `Int` — and a hashed lookup asks `hashCode` first, so the
+                // query has to be the same boxed shape the stored key is.
+                self.compile_erased(sc, index)?;
                 self.b.emit(Op::CallBuiltin(KT_INDEX_GET_VM, 2), *line);
                 Ok(ty)
             }
             Expr::Pair { first, second } => {
-                self.compile_expr(sc, first)?;
-                self.compile_expr(sc, second)?;
+                self.compile_erased(sc, first)?;
+                self.compile_erased(sc, second)?;
                 self.b.emit(Op::Extended(KT_PAIR, 0), 0);
                 Ok(Type::Obj)
             }
@@ -3486,6 +3526,25 @@ impl Compiler {
                 };
                 return self.compile_call(sc, "runCatching", &[block], line);
             }
+        }
+        // A `Float` handed to a member that stores it or looks it UP by value
+        // is in an erased position, so it is boxed like a collection element.
+        // `setOf(1.0f).contains(1.0f)` needs it on both sides: a hashed lookup
+        // asks `hashCode` first, and `java.lang.Float`'s is not
+        // `java.lang.Double`'s, so an unboxed query misses a boxed element.
+        // `format`'s `vararg args: Any?` is the same position by another name.
+        if float_erasing_member(name) && args.iter().any(|a| self.infer(sc, a) == Type::Float) {
+            return self.compile_member_boxed(sc, recv, name, args, line);
+        }
+        // `f.hashCode()` on a statically-`Float` receiver is
+        // `java.lang.Float.hashCode` — `floatToIntBits`, not the `Double` fold.
+        if name == "hashCode" && args.is_empty() && self.infer(sc, recv) == Type::Float {
+            self.compile_expr(sc, recv)?;
+            self.b.emit(Op::Extended(KT_BOX_F32, 0), line);
+            let nidx = self.b.add_constant(Value::str("hashCode"));
+            self.b.emit(Op::LoadConst(nidx), line);
+            self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 0), line);
+            return Ok(Type::Int);
         }
         // `f.toString()` on a statically-`Float` receiver is `Float.toString`,
         // not the runtime-value one every other receiver reaches: only the
@@ -4562,6 +4621,15 @@ impl Compiler {
         self.finally_exits = outer_exits;
         let here = self.b.current_pos();
         self.pop_unwind_to(here);
+        // A lambda's RESULT is an erased position: a closure carries no return
+        // type, so the value goes into whatever the caller does with it — a
+        // `map`'s output list, a `fold`'s accumulator — knowing only what it
+        // itself is. `xs.map { it / 3.0f }` over a `List<Float>` is the shape:
+        // the division is single-precision because both operands are typed, and
+        // the box is what carries that into the list it lands in.
+        if res.as_ref().is_ok_and(|t| *t == Type::Float) {
+            self.b.emit(Op::Extended(KT_BOX_F32, 0), 0);
+        }
         res?;
         self.b.emit(Op::ReturnValue, 0);
         Ok(())
@@ -4700,7 +4768,10 @@ impl Compiler {
         self.compile_expr(sc, recv)?; // [recv]
         self.compile_expr(sc, index)?; // [recv, index]
         let store = self.compound_value(recv, "", Some(index), op, value);
-        self.compile_expr(sc, &store)?; // [recv, index, value]
+        // The stored value lands in a container that keeps no static type, so a
+        // `Float` is boxed on the way in — `m["a"] = 1.0f / 3.0f` then
+        // `println(m)` reads its width off the value and nothing else.
+        self.compile_erased(sc, &store)?; // [recv, index, value]
         self.b.emit(Op::CallBuiltin(KT_INDEX_SET_VM, 3), 0);
         self.b.emit(Op::Pop, 0);
         Ok(())
@@ -5161,6 +5232,14 @@ impl Compiler {
         // `__rust_compile("<base64>", line)` — the desugar target of a
         // `rust { ... }` block. Compile the base64 body string and hand it to the
         // FFI-compile extension op; the call evaluates to Unit.
+        // The `Float`-boxing intrinsic (see [`BOX_FLOAT`]).
+        if name == BOX_FLOAT {
+            if let Some(inner) = args.first() {
+                self.compile_expr(sc, inner)?;
+                self.b.emit(Op::Extended(KT_BOX_F32, 0), line);
+            }
+            return Ok(Type::Obj);
+        }
         if name == RUST_COMPILE {
             if let Some(body) = args.first() {
                 self.compile_expr(sc, body)?;
@@ -5317,14 +5396,14 @@ impl Compiler {
             // what `a to b` already builds.
             "Pair" if args.len() == 2 => {
                 for a in args {
-                    self.compile_expr(sc, a)?;
+                    self.compile_erased(sc, a)?;
                 }
                 self.b.emit(Op::Extended(KT_PAIR, 0), line);
                 Ok(Type::Obj)
             }
             "Triple" if args.len() == 3 => {
                 for a in args {
-                    self.compile_expr(sc, a)?;
+                    self.compile_erased(sc, a)?;
                 }
                 self.b.emit(Op::Extended(KT_PAIR, 1), line);
                 Ok(Type::Obj)
@@ -5433,7 +5512,7 @@ impl Compiler {
             // a value, not a type).
             "listOfNotNull" => {
                 for a in args {
-                    self.compile_expr(sc, a)?;
+                    self.compile_erased(sc, a)?;
                 }
                 self.b.emit(Op::Extended(KT_LIST, args.len() as u8), line);
                 let nidx = self.b.add_constant(Value::str("filterNotNull".to_string()));
@@ -5469,7 +5548,7 @@ impl Compiler {
             // `host::ListImpl`.
             "listOf" | "emptyList" => {
                 for a in args {
-                    self.compile_expr(sc, a)?;
+                    self.compile_erased(sc, a)?;
                 }
                 self.b
                     .emit(Op::Extended(KT_LIST_RO, args.len() as u8), line);
@@ -5477,7 +5556,7 @@ impl Compiler {
             }
             "mutableListOf" | "arrayListOf" | "ArrayList" => {
                 for a in args {
-                    self.compile_expr(sc, a)?;
+                    self.compile_erased(sc, a)?;
                 }
                 self.b.emit(Op::Extended(KT_LIST, args.len() as u8), line);
                 Ok(Type::Obj)
@@ -5494,7 +5573,7 @@ impl Compiler {
             "arrayOf" | "intArrayOf" | "longArrayOf" | "doubleArrayOf" | "floatArrayOf"
             | "booleanArrayOf" | "charArrayOf" => {
                 for a in args {
-                    self.compile_expr(sc, a)?;
+                    self.compile_erased(sc, a)?;
                 }
                 let didx = self.b.add_constant(Value::str(array_literal_desc(name)));
                 self.b.emit(Op::LoadConst(didx), line);
@@ -5572,7 +5651,7 @@ impl Compiler {
             "setOf" | "mutableSetOf" | "hashSetOf" | "linkedSetOf" | "sortedSetOf" | "emptySet"
             | "HashSet" | "LinkedHashSet" | "TreeSet" => {
                 for a in args {
-                    self.compile_expr(sc, a)?;
+                    self.compile_erased(sc, a)?;
                 }
                 self.emit_coll_spec(name, args.len());
                 self.b
@@ -5863,6 +5942,52 @@ impl Compiler {
     fn companion_of(&self, cls: &str) -> Option<String> {
         let comp = companion_name(cls);
         (self.classes.contains_key(cls) && self.classes.contains_key(&comp)).then_some(comp)
+    }
+
+    /// Dispatch `recv.name(args)` with every `Float` argument boxed. Used for
+    /// the members [`float_erasing_member`] names.
+    fn compile_member_boxed(
+        &mut self,
+        sc: &mut Scope,
+        recv: &Expr,
+        name: &str,
+        args: &[Expr],
+        line: u32,
+    ) -> Result<Type, String> {
+        let boxed: Vec<Expr> = args
+            .iter()
+            .map(|a| {
+                if self.infer(sc, a) == Type::Float {
+                    Expr::Call {
+                        name: BOX_FLOAT.to_string(),
+                        args: vec![a.clone()],
+                        line,
+                    }
+                } else {
+                    a.clone()
+                }
+            })
+            .collect();
+        self.compile_member(sc, recv, name, &boxed, false, line)
+    }
+
+    /// Compile `e` for a position that ERASES its static type — a collection
+    /// element, a `Pair` half, a `Map` value, an argument bound to a parameter
+    /// the frontend cannot type — boxing a `Float` so its 32-bit width travels
+    /// with the value.
+    ///
+    /// Nothing else needs a box: every other static type either has a runtime
+    /// representation of its own (`Int`, `String`, `Char`, `Boolean`) or is the
+    /// representation the erased position would have read anyway. `Float` is
+    /// the one type that shares a runtime form with another — a `Double` — and
+    /// is told from it only by the type the position just discarded. See
+    /// [`crate::host::KT_BOX_F32`].
+    fn compile_erased(&mut self, sc: &mut Scope, e: &Expr) -> Result<Type, String> {
+        let t = self.compile_expr(sc, e)?;
+        if t == Type::Float {
+            self.b.emit(Op::Extended(KT_BOX_F32, 0), 0);
+        }
+        Ok(t)
     }
 
     /// The empty value `x.orEmpty()` falls back to for a receiver of `recv`'s

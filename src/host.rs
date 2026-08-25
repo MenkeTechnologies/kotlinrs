@@ -193,6 +193,24 @@ pub const KT_F32_ARITH: u16 = 42;
 /// and every widening of a `Double`-typed value into a `Float` position.
 pub const KT_F32: u16 = 43;
 
+/// `KT_BOX_F32`: box the `Float` on top of the stack, so that a value whose
+/// 32-bit width the COMPILER knows keeps it in a position where only the value
+/// can say.
+///
+/// A `Float` and a `Double` are the same `Value::Float` at run time and the
+/// static type is what tells them apart, so a `Float` that outlives its static
+/// type — put in a `List`, used as a `Map` value, passed to an `Any` parameter —
+/// used to render through `Double`'s rules: `listOf(1.0f / 3.0f)` printed
+/// `[0.3333333432674408]`. The box is a heap object carrying an `f32`, so the
+/// width travels with the value, which is what the JVM's own boxing into
+/// `java.lang.Float` does at exactly the same points.
+///
+/// It is a HEAP object and not a tagged handle the way [`CHAR_TAG`] is: a
+/// `Char`'s payload is 16 bits and fits beside a 16-bit tag inside the `u32` a
+/// `Value::Obj` carries, while an `f32`'s payload is the whole 32 bits and
+/// leaves nothing for a tag.
+pub const KT_BOX_F32: u16 = 45;
+
 /// `KT_F32_STR`: `Float.toString` of the top of stack.
 ///
 /// A separate op from [`KT_TO_STRING`] because the two disagree on the same
@@ -1112,6 +1130,9 @@ enum HeapObj {
         params: u8,
         captures: Vec<Value>,
     },
+    /// A boxed `Float` — see [`KT_BOX_F32`]. Carries the `f32` itself, so the
+    /// 32-bit width survives every position where the static type does not.
+    F32(f32),
     /// The cursor `xs.iterator()` hands back: the collection it walks and how
     /// far along it is.
     ///
@@ -2582,6 +2603,48 @@ pub fn char_code(v: &Value) -> Option<i64> {
     }
 }
 
+/// Box `f` (already at 32-bit precision) so its width survives an erased
+/// position. See [`KT_BOX_F32`].
+fn box_f32(f: f64) -> Value {
+    alloc(HeapObj::F32(f as f32))
+}
+
+/// `a / b` at 32-bit width when either operand is a boxed `Float`, else `None`.
+/// `_long` is unused; the shape mirrors [`float32_mod`].
+fn float32_div(a: &Value, b: &Value, _long: bool) -> Option<Value> {
+    if f32_box(a).is_none() && f32_box(b).is_none() {
+        return None;
+    }
+    Some(box_f32((num_f64(a) as f32 / num_f64(b) as f32) as f64))
+}
+
+/// `a % b` at 32-bit width when either operand is a boxed `Float`, else `None`.
+fn float32_mod(a: &Value, b: &Value) -> Option<Value> {
+    if f32_box(a).is_none() && f32_box(b).is_none() {
+        return None;
+    }
+    Some(box_f32((num_f64(a) as f32 % num_f64(b) as f32) as f64))
+}
+
+/// `Some(f32)` when `v` is a boxed `Float`.
+fn f32_box(v: &Value) -> Option<f32> {
+    with_obj(v, |o| match o {
+        HeapObj::F32(f) => Some(*f),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// `v` as an `f64`, unboxing a boxed `Float` on the way. Every numeric reader
+/// goes through this rather than `Value::to_float`, which would read a box's
+/// HANDLE as a number.
+fn num_f64(v: &Value) -> f64 {
+    match f32_box(v) {
+        Some(f) => f as f64,
+        None => v.to_float(),
+    }
+}
+
 /// Whether `v` is a `Char`.
 fn is_char(v: &Value) -> bool {
     char_code(v).is_some()
@@ -2627,6 +2690,29 @@ fn num_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
             kotlin_string(a),
             kotlin_string(b)
         )));
+    }
+    // A boxed `Float` operand keeps the operation at 32-bit width and re-boxes,
+    // exactly as the statically-`Float` path does — this is what makes
+    // `xs.map { it * 2 }` over a `List<Float>` answer in single precision, where
+    // `it` carries no static type at all. The comparisons answer a `Bool` and so
+    // leave the box behind.
+    if f32_box(a).is_some() || f32_box(b).is_some() {
+        let (x, y) = (num_f64(a) as f32, num_f64(b) as f32);
+        return Ok(match op {
+            Add => box_f32((x + y) as f64),
+            Sub => box_f32((x - y) as f64),
+            Mul => box_f32((x * y) as f64),
+            Div => box_f32((x / y) as f64),
+            Mod => box_f32((x % y) as f64),
+            Neg => box_f32(-x as f64),
+            Pow => box_f32(x.powf(y) as f64),
+            Lt => Value::Bool(x < y),
+            Gt => Value::Bool(x > y),
+            Le => Value::Bool(x <= y),
+            Ge => Value::Bool(x >= y),
+            Eq => Value::Bool(x == y),
+            Ne => Value::Bool(x != y),
+        });
     }
     if is_char(a) || is_char(b) {
         let (x, y) = (num_of(a), num_of(b));
@@ -3239,7 +3325,10 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
         KT_DDIV => {
             let b = vm.pop();
             let a = vm.pop();
-            vm.push(Value::Float(a.to_float() / b.to_float()));
+            vm.push(match float32_div(&a, &b, false) {
+                Some(v) => v,
+                None => Value::Float(a.to_float() / b.to_float()),
+            });
         }
         // Both operands narrowed BEFORE the operation and the result taken
         // straight out of the `f32` — see [`KT_F32_ARITH`] on why the
@@ -3247,8 +3336,10 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
         // special case: IEEE `f32` division yields the signed infinity and the
         // NaN Kotlin's `Float` division does, unlike the integral `/`.
         KT_F32_ARITH => {
-            let b = vm.pop().to_float() as f32;
-            let a = vm.pop().to_float() as f32;
+            // `num_f64`, not `to_float`: an operand read out of a `FloatArray`
+            // or a `List<Float>` is a BOXED float, whose handle is not a number.
+            let b = num_f64(&vm.pop()) as f32;
+            let a = num_f64(&vm.pop()) as f32;
             let r = match arg {
                 f32_op::SUB => a - b,
                 f32_op::MUL => a * b,
@@ -3258,18 +3349,34 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             };
             vm.push(Value::Float(r as f64));
         }
+        KT_BOX_F32 => {
+            let v = vm.pop();
+            vm.push(match v {
+                Value::Float(f) => box_f32(f),
+                // An `Int` reaching a `Float` position is one Kotlin widened;
+                // anything else is not a float at all and passes through.
+                Value::Int(n) => box_f32(n as f64),
+                other => other,
+            });
+        }
         KT_F32 => {
             let v = vm.pop();
-            vm.push(Value::Float(v.to_float() as f32 as f64));
+            vm.push(Value::Float(num_f64(&v) as f32 as f64));
         }
         KT_F32_STR => {
             let v = vm.pop();
-            vm.push(Value::str(format_float(v.to_float() as f32)));
+            vm.push(Value::str(format_float(num_f64(&v) as f32)));
         }
         KT_IDIV => {
             let b = vm.pop();
             let a = vm.pop();
-            if is_int(&a) && is_int(&b) {
+            // A boxed `Float` operand resolves before the integral test: it is
+            // not an `Int`, and dividing it through `to_float` would read its
+            // HANDLE. This is the `xs.map { it / 3.0f }` shape, where `it`
+            // carries no static type and only the value knows it is 32-bit.
+            if let Some(v) = float32_div(&a, &b, false) {
+                vm.push(v);
+            } else if is_int(&a) && is_int(&b) {
                 let d = b.to_int();
                 if d == 0 {
                     fault(vm, "java.lang.ArithmeticException: / by zero");
@@ -3284,7 +3391,9 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
         KT_IMOD => {
             let b = vm.pop();
             let a = vm.pop();
-            if is_int(&a) && is_int(&b) {
+            if let Some(v) = float32_mod(&a, &b) {
+                vm.push(v);
+            } else if is_int(&a) && is_int(&b) {
                 let d = b.to_int();
                 if d == 0 {
                     fault(vm, "java.lang.ArithmeticException: / by zero");
@@ -5146,7 +5255,10 @@ fn value_cmp_scalar(a: &Value, b: &Value) -> std::cmp::Ordering {
         // would collapse two `Long`s that differ past the 53-bit mantissa.
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        _ => double_compare(a.to_float(), b.to_float()),
+        // `num_f64`, not `to_float`: a boxed `Float` is a `Value::Obj`, whose
+        // `to_float` would read the HANDLE as a number and sort by allocation
+        // order.
+        _ => double_compare(num_f64(a), num_f64(b)),
     }
 }
 
@@ -6345,7 +6457,9 @@ fn conversion_accepts(conv: char, arg: &Value) -> bool {
     match conv {
         // Integral only. A `Char` is a `Character`, not an integral box.
         'd' | 'x' | 'X' | 'o' => matches!(arg, Value::Int(_)) && !is_char,
-        'f' | 'e' | 'E' => matches!(arg, Value::Float(_)),
+        // A boxed `Float` is a `java.lang.Float`, which the floating
+        // conversions take exactly as they take a `Double`.
+        'f' | 'e' | 'E' => matches!(arg, Value::Float(_)) || f32_box(arg).is_some(),
         'c' => is_char || matches!(arg, Value::Int(_)),
         _ => true,
     }
@@ -6461,9 +6575,11 @@ fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
             'x' => format!("{:x}", arg.to_int()),
             'X' => format!("{:X}", arg.to_int()),
             'o' => format!("{:o}", arg.to_int()),
-            'f' => format_fixed(arg.to_float(), prec.unwrap_or(6)),
+            // `num_f64` throughout: a boxed `Float` argument is a `Value::Obj`,
+            // and `to_float` would format its handle.
+            'f' => format_fixed(num_f64(&arg), prec.unwrap_or(6)),
             'e' | 'E' => {
-                let s = format!("{:.*e}", prec.unwrap_or(6), arg.to_float());
+                let s = format!("{:.*e}", prec.unwrap_or(6), num_f64(&arg));
                 // Rust writes `1.5e2`; the JVM writes `1.500000e+02`.
                 let s = match s.split_once('e') {
                     Some((m, x)) => {
@@ -6947,6 +7063,29 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
                 return Ok(Value::Bool(n == 0));
             }
         }
+    }
+    // A boxed `Float` is a heap object, but its MEMBERS are a `Float`'s and not
+    // a container's, so it unboxes here and takes the primitive path below.
+    // `toString` is the exception: the whole point of the box is that this
+    // receiver renders through `Float.toString`.
+    if let Some(f) = f32_box(recv) {
+        if name == "toString" && args.is_empty() {
+            return Ok(Value::str(format_float(f)));
+        }
+        if name == "toFloat" && args.is_empty() {
+            return Ok(recv.clone());
+        }
+        // `java.lang.Float.hashCode` is `floatToIntBits`, which is not the
+        // `Double` fold of the same magnitude: `1.0f` is `1065353216` where
+        // `1.0` is `1072693248`.
+        if name == "hashCode" && args.is_empty() {
+            return Ok(Value::Int(f.to_bits() as i32 as i64));
+        }
+        if name == "equals" && args.len() == 1 {
+            return Ok(Value::Bool(value_eq(recv, &args[0])));
+        }
+        let unboxed = Value::Float(f as f64);
+        return kt_method(vm, &unboxed, name, args);
     }
     // A `Char` shares the `Value::Obj` variant with the heap but is not a heap
     // object, so its members resolve first.
@@ -9074,9 +9213,9 @@ fn sequence_member(
         }
         "sum" => sum_values(items),
         // An empty average is NaN in Kotlin, not an error.
-        "average" => {
-            Value::Float(items.iter().map(|v| v.to_float()).sum::<f64>() / items.len() as f64)
-        }
+        // `average()` answers a `Double` for every element type, so the boxed
+        // elements widen here rather than accumulating at 32 bits.
+        "average" => Value::Float(items.iter().map(num_f64).sum::<f64>() / items.len() as f64),
         // `max`/`min` throw on an empty sequence; the `…OrNull` pair answers
         // null instead. That is the only difference between them.
         //
@@ -9433,6 +9572,7 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
         HeapObj::Map(_)
         | HeapObj::Closure { .. }
         | HeapObj::Comparator(_)
+        | HeapObj::F32(_)
         | HeapObj::Gen { .. }
         | HeapObj::Grouping { .. }
         | HeapObj::Iter { .. }
@@ -9448,10 +9588,15 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
 /// `Double` (Kotlin `List<Int>.sum()` / `List<Double>.sum()`).
 fn sum_values(items: &[Value]) -> Value {
     if items.iter().all(|v| matches!(v, Value::Int(_))) {
-        Value::Int(items.iter().map(|v| v.to_int()).sum())
-    } else {
-        Value::Float(items.iter().map(|v| v.to_float()).sum())
+        return Value::Int(items.iter().map(|v| v.to_int()).sum());
     }
+    // `List<Float>.sum()` accumulates at 32-bit width and answers a `Float`, so
+    // it neither widens the elements nor renders through `Double`'s rules.
+    if !items.is_empty() && items.iter().all(|v| f32_box(v).is_some()) {
+        let total: f32 = items.iter().map(|v| num_f64(v) as f32).sum();
+        return box_f32(total as f64);
+    }
+    Value::Float(items.iter().map(num_f64).sum())
 }
 
 /// `recv[index]` — list element (bounds-checked) or map value (null if absent).
@@ -9767,6 +9912,23 @@ fn index_set(vm: &mut VM, recv: &Value, index: &Value, value: Value) -> Result<(
 /// equality over primitives. Ints and Doubles compare by numeric value.
 pub fn value_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
+        // A boxed `Float` compares by its VALUE and not by its handle, which is
+        // what Kotlin's `==` (`equals`) does for a boxed primitive. `Float
+        // .equals` compares `floatToIntBits`, so — like `Double.equals` below —
+        // `NaN` equals itself and `0.0f` does not equal `-0.0f`.
+        _ if f32_box(a).is_some() || f32_box(b).is_some() => {
+            match (f32_box(a), f32_box(b)) {
+                (Some(x), Some(y)) => (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits(),
+                // A box against a bare number compares numerically, the way an
+                // `Int` and a `Double` do above.
+                _ if matches!(a, Value::Int(_) | Value::Float(_))
+                    || matches!(b, Value::Int(_) | Value::Float(_)) =>
+                {
+                    num_f64(a) == num_f64(b)
+                }
+                _ => false,
+            }
+        }
         // The same handle is the same object — this is what makes the identity
         // equality an array inherits from `Object` come out `true` for `a == a`
         // while `arrayOf(1) == arrayOf(1)` stays `false`. It is also all a
@@ -10039,6 +10201,10 @@ fn obj_hash(recv: &Value) -> Option<i32> {
         // A `by lazy` cell inherits `Object.hashCode` — identity, which
         // `value_hash` reports by answering `None`. So does an iterator cursor.
         HeapObj::Lazy { .. } | HeapObj::Res { .. } | HeapObj::Iter { .. } => None,
+        // `java.lang.Float.hashCode()` is `floatToIntBits`, which is NOT the
+        // `Double` fold of the same magnitude — `1.0f` hashes to `1065353216`
+        // where `1.0` hashes to `1072693248`.
+        HeapObj::F32(f) => Some(f.to_bits() as i32),
         // `Map.Entry.hashCode()` is `key ^ value`; a `Pair` is a `data class`,
         // so it folds like one.
         HeapObj::Entry(k, v) => Some(value_hash(k, false) ^ value_hash(v, false)),
@@ -10102,6 +10268,7 @@ fn obj_label(recv: &Value) -> String {
         HeapObj::Entry(_, _) => "Map.Entry".to_string(),
         HeapObj::Closure { .. } => "Function".to_string(),
         HeapObj::Comparator(_) => "Comparator".to_string(),
+        HeapObj::F32(_) => "Float".to_string(),
         HeapObj::Iter { .. } => "Iterator".to_string(),
         HeapObj::Gen { .. } => "Sequence".to_string(),
         HeapObj::Grouping { .. } => "Grouping".to_string(),
@@ -10246,6 +10413,10 @@ fn display_obj(id: u32) -> String {
             // operation, not displayed. Nor has an iterator cursor, which the
             // JVM renders as `java.util.ArrayList$Itr@…` — an identity hash.
             HeapObj::Grouping { items, .. } => format!("(grouping size={})", items.len()),
+            // The whole reason the box exists: 32-bit width in a position where
+            // only the value can carry it, so it renders through
+            // `Float.toString` and not `Double`'s.
+            HeapObj::F32(f) => format_float(*f),
             HeapObj::Iter { at, .. } => format!("(iterator at={at})"),
             // `IntRange.toString` is `first..last`; `IntProgression.toString` is
             // `first..last step n` ascending and `first downTo last step n`
@@ -10477,7 +10648,10 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         // answer for exactly one value kind each.
         "Char" => is_char(v),
         "Int" | "Long" | "Byte" | "Short" => matches!(v, Value::Int(_)),
-        "Double" | "Float" => matches!(v, Value::Float(_)),
+        // A boxed `Float` answers `is Float` and NOT `is Double`, which is the
+        // one place the two runtime forms of a floating value are told apart.
+        "Float" => matches!(v, Value::Float(_)) || f32_box(v).is_some(),
+        "Double" => matches!(v, Value::Float(_)),
         "Boolean" => matches!(v, Value::Bool(_)),
         "String" => matches!(v, Value::Str(_)),
         // A `StringBuilder` is a `CharSequence` alongside `String`, but neither
@@ -10565,6 +10739,7 @@ pub fn kotlin_string(v: &Value) -> String {
             Some(code) => char_string(code),
             None => display_obj(*id),
         },
+
         other => other.to_str(),
     }
 }

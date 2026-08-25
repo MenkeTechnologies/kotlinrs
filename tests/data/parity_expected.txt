@@ -839,3 +839,15 @@ fun main() { val h = hashMapOf<String, Int>("x" to 1); h.putAll(mapOf("y" to 2, 
 fun main() { val h = hashMapOf<Int, String>(); for (i in 1..20) h[i] = "v$i"; val c = h.toList(); println(c.take(6)); println(h.toSortedMap()) }	[(1, v1), (2, v2), (3, v3), (4, v4), (5, v5), (6, v6)]\n{1=v1, 2=v2, 3=v3, 4=v4, 5=v5, 6=v6, 7=v7, 8=v8, 9=v9, 10=v10, 11=v11, 12=v12, 13=v13, 14=v14, 15=v15, 16=v16, 17=v17, 18=v18, 19=v19, 20=v20}\n
 fun main() { val a = hashSetOf(1, 2, 3); val b = hashSetOf(3, 2, 1); println(a == b); println(a.hashCode() == b.hashCode()); println(a) }	true\ntrue\n[1, 2, 3]\n
 fun main() { val h = hashMapOf<Int, Int>(); var i = 0; while (i < 20) { h[i] = i; i += 1 }; var s = 0; for ((k, v) in h) { s = s * 2 + k }; println(s) }	1048555\n
+fun main() { println(listOf(1.0f / 3.0f)); println(setOf(1.0f / 3.0f)); println(mapOf("k" to 1.0f / 3.0f)) }	[0.33333334]\n[0.33333334]\n{k=0.33333334}\n
+fun main() { val m = mutableMapOf<String, Float>(); m["a"] = 1.0f / 3.0f; println(m); println(m["a"]); println(m.values) }	{a=0.33333334}\n0.33333334\n[0.33333334]\n
+fun main() { println("%s".format(1.0f / 3.0f)); println("" + (1.0f / 3.0f)); println("v=${1.0f / 3.0f}") }	0.33333334\n0.33333334\nv=0.33333334\n
+fun main() { println(listOf(1.0f, 2.0f).sum()); println(listOf(1.0f, 2.0f).average()); println(listOf(3.0f, 1.0f).sorted()); println(listOf(3.0f, 1.0f).max()) }	3.0\n1.5\n[1.0, 3.0]\n3.0\n
+fun main() { println(listOf(1.0f, 2.0f).map { it * 2 }); println(listOf(1.0f, 2.0f).map { it / 3.0f }); println(listOf(1.0f, 2.0f).filter { it > 1.5f }) }	[2.0, 4.0]\n[0.33333334, 0.6666667]\n[2.0]\n
+fun main() { println(floatArrayOf(1.0f / 3.0f).joinToString()); println(floatArrayOf(1.0f, 3.0f).toList()); println(floatArrayOf(1.0f, 3.0f).sum()) }	0.33333334\n[1.0, 3.0]\n4.0\n
+fun main() { val p = 1.0f / 3.0f to 2.0f; println(p); println(p.first); println(p.second) }	(0.33333334, 2.0)\n0.33333334\n2.0\n
+fun main() { println(listOf(1.0f / 3.0f) == listOf(1.0f / 3.0f)); println(setOf(1.0f).contains(1.0f)); println(mapOf(1.0f to "a")[1.0f]) }	true\ntrue\na\n
+fun main() { val x: Any = 1.0f; println(x is Float); println(x is Double); println(x is Int); println(x) }	true\nfalse\nfalse\n1.0\n
+fun main() { println(listOf(1.0f).hashCode() == listOf(1.0f).hashCode()); println((1.0f).hashCode()); println(listOf(1.0f)[0].hashCode()) }	true\n1065353216\n1065353216\n
+fun main() { var t = 0.0f; for (v in listOf(0.1f, 0.2f, 0.3f)) t += v; println(t) }	0.6\n
+fun main() { println(listOf(1.0f, 2.0f).joinToString()); println(listOf(1.0f / 3.0f).toString()) }	1.0, 2.0\n[0.33333334]\n
