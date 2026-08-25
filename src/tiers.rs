@@ -293,23 +293,76 @@ mod tests {
         assert!(report.reaches_native(), "{report}");
     }
 
-    /// A counted loop in a function counts in frame slots, so its body holds
-    /// nothing the tiers refuse and fusevm's recorder accepts the sequence. It
-    /// still installs no trace: the loop is emitted in the unrotated shape — a
-    /// forward `JumpIfFalse` exit closed by an unconditional backward `Jump` —
-    /// which the trace compiler records and then declines. This pins the gap
-    /// the report exists to expose; if loop lowering is rotated later, this
-    /// test is the one that says so.
+    /// A counted loop written in the frontend's own syntax reaches a compiled
+    /// trace. This used to assert the opposite, and said so — the loop was
+    /// lowered with a forward `JumpIfFalse` exit closed by an unconditional
+    /// backward `Jump`, which the trace compiler records and then declines, so
+    /// the hottest shape a Kotlin program has stayed in the interpreter however
+    /// hot it got. `Compiler::compile_stmt_inner` now emits every loop rotated:
+    /// the test duplicated as an entry guard and a conditional backward branch,
+    /// which is the shape [`a_rotated_slot_loop_reaches_a_compiled_trace`]
+    /// proves fusevm accepts.
+    ///
+    /// It is ALSO the pin on where the report is taken from. fusevm's trace
+    /// cache is a `thread_local!` and kotlinrs runs every program on a spawned
+    /// interpreter thread, so [`report`] reading that cache from the spawning
+    /// thread found it empty and answered `traced=false` for every program on
+    /// earth. Move the inspection back off the interpreter thread and this
+    /// fails.
     #[test]
-    fn a_counted_loop_is_trace_eligible_but_installs_no_trace() {
+    fn a_counted_loop_reaches_a_compiled_trace() {
         let report = report(PROGRAM).expect("runs");
         let counted = report.chunks[0]
             .loops
             .iter()
             .find(|l| l.trace_eligible)
             .unwrap_or_else(|| panic!("a trace-eligible loop: {report}"));
-        assert!(!counted.traced, "{report}");
+        assert!(counted.traced, "{report}");
         assert!(!counted.blacklisted, "{report}");
-        assert!(!report.reaches_native(), "{report}");
+        assert!(report.reaches_native(), "{report}");
+    }
+
+    /// A loop body holding an `if` STATEMENT still reaches native code.
+    ///
+    /// Statement position used to compile the `if` for its value and pop it,
+    /// which puts a `LoadUndef` on the else path — an op fusevm's JIT refuses —
+    /// so one `if` anywhere in a loop body reported `trace-eligible=false` and
+    /// took the whole loop out of the tracing tier. Since that is what most
+    /// loops worth compiling contain, the rotation above would have bought
+    /// almost nothing on its own.
+    #[test]
+    fn a_loop_whose_body_branches_reaches_a_compiled_trace() {
+        let report = report(
+            "fun f(n: Int): Int {\n var t = 0\n var i = 0\n \
+             while (i < n) { t = t + 3; if (t > 1000) { t = 0 }; i = i + 1 }\n \
+             return t\n}\nfun main() { f(200000) }",
+        )
+        .expect("runs");
+        let counted = report.chunks[0]
+            .loops
+            .iter()
+            .find(|l| l.trace_eligible)
+            .unwrap_or_else(|| panic!("a trace-eligible loop: {report}"));
+        assert!(counted.traced, "{report}");
+        assert!(report.reaches_native(), "{report}");
+    }
+
+    /// The same for a `when` statement, whose non-exhaustive form emitted the
+    /// same refused `LoadUndef` as the `if` above.
+    #[test]
+    fn a_loop_whose_body_holds_a_when_statement_reaches_a_compiled_trace() {
+        let report = report(
+            "fun f(n: Int): Int {\n var t = 0\n var i = 0\n \
+             while (i < n) { when (t) { 1000 -> { t = 0 } }; t = t + 3; i = i + 1 }\n \
+             return t\n}\nfun main() { f(200000) }",
+        )
+        .expect("runs");
+        let counted = report.chunks[0]
+            .loops
+            .iter()
+            .find(|l| l.trace_eligible)
+            .unwrap_or_else(|| panic!("a trace-eligible loop: {report}"));
+        assert!(counted.traced, "{report}");
+        assert!(report.reaches_native(), "{report}");
     }
 }

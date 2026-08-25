@@ -2304,8 +2304,23 @@ impl Compiler {
                     }
                 }
             }
+            // `while (cond) { … }`, lowered **rotated**: the test is emitted
+            // once as an entry guard and once at the bottom, so the loop closes
+            // with a *conditional* backward branch rather than an unconditional
+            // `Jump` back to a test at the top.
+            //
+            // That shape is what fusevm's tracing JIT needs: it closes a trace
+            // only on a conditional backward branch. Emitted the other way,
+            // `kotlin --tiers` reported `trace-eligible=true traced=false` and
+            // `reaches native code false` for every loop kotlinrs produced, so
+            // the hottest shape a Kotlin program has stayed in the interpreter
+            // however hot it got. Rotation costs one copy of the condition's
+            // code and saves one jump per iteration; the evaluation count is
+            // unchanged, since a top-test loop runs the test n + 1 times for n
+            // iterations and so does this.
+            //
+            // Every other loop form below is rotated the same way.
             StmtKind::While { cond, body, label } => {
-                let start = self.b.current_pos();
                 self.compile_expr(sc, cond)?;
                 let jf = self.b.emit(Op::JumpIfFalse(0), 0);
                 self.loops.push(LoopCtx {
@@ -2313,22 +2328,30 @@ impl Compiler {
                     breaks: Vec::new(),
                     continues: Vec::new(),
                 });
-                // A raise inside the body (or in the condition just evaluated)
-                // leaves the loop; the check after the loop statement carries it
-                // further out.
+                // A raise inside the body (or in the entry condition just
+                // evaluated) leaves the loop; the check after the loop statement
+                // carries it further out.
                 self.push_unwind(UnwindKind::Loop);
                 self.unwind_check();
+                let top = self.b.current_pos();
                 let mark = sc.enter();
                 for s in body {
                     self.compile_stmt(sc, s)?;
                 }
                 sc.exit(mark);
                 let ctx = self.loops.pop().unwrap();
-                // `continue` re-tests the condition, so it targets the loop top.
+                // `continue` re-tests the condition, which is now the bottom
+                // copy of it.
+                let test = self.b.current_pos();
                 for j in &ctx.continues {
-                    self.b.patch_jump(*j, start);
+                    self.b.patch_jump(*j, test);
                 }
-                self.b.emit(Op::Jump(start), 0);
+                self.compile_expr(sc, cond)?;
+                // A raise while evaluating the bottom test would otherwise take
+                // the back edge on a garbage value and spin; the check drops the
+                // condition's value and leaves the loop.
+                self.unwind_check_dropping(1);
+                self.b.emit(Op::JumpIfTrue(top), 0);
                 let end = self.b.current_pos();
                 self.b.patch_jump(jf, end);
                 self.pop_unwind_to(end);
@@ -2336,9 +2359,10 @@ impl Compiler {
                     self.b.patch_jump(*j, end);
                 }
             }
-            // `do { … } while (cond)` — the body first, then the test jumping
-            // back. `continue` targets the *test*, not the loop top, so the
-            // condition still runs on the iteration it skipped out of.
+            // `do { … } while (cond)` — the body first, then the test as a
+            // conditional backward branch. `continue` targets the *test*, not
+            // the loop top, so the condition still runs on the iteration it
+            // skipped out of.
             StmtKind::DoWhile { cond, body, label } => {
                 let start = self.b.current_pos();
                 self.loops.push(LoopCtx {
@@ -2358,15 +2382,14 @@ impl Compiler {
                     self.b.patch_jump(*j, test);
                 }
                 self.compile_expr(sc, cond)?;
-                let jf = self.b.emit(Op::JumpIfFalse(0), 0);
-                // The repeat path. A raise while evaluating the condition would
-                // otherwise spin here forever, so the check goes between the
-                // test and the back-jump; a false condition exits to `end`,
-                // where the statement's own check carries the raise outward.
-                self.unwind_check();
-                self.b.emit(Op::Jump(start), 0);
+                // A raise while evaluating the condition would otherwise take
+                // the back edge on a garbage value and spin here forever, so the
+                // check goes between the test and the branch and drops the
+                // condition's value; it leaves the loop at `end`, where the
+                // statement's own check carries the raise outward.
+                self.unwind_check_dropping(1);
+                self.b.emit(Op::JumpIfTrue(start), 0);
                 let end = self.b.current_pos();
-                self.b.patch_jump(jf, end);
                 self.pop_unwind_to(end);
                 for j in &ctx.breaks {
                     self.b.patch_jump(*j, end);
@@ -2401,12 +2424,10 @@ impl Compiler {
                 self.route_loop_exit(j, false, label, s.line)?;
             }
             StmtKind::If(ie) => {
-                self.compile_if(sc, ie)?;
-                self.b.emit(Op::Pop, ie.line); // statement position discards value
+                self.compile_if_stmt(sc, ie)?;
             }
             StmtKind::When(w) => {
-                self.compile_when(sc, w)?;
-                self.b.emit(Op::Pop, w.line); // statement position discards value
+                self.compile_when_stmt(sc, w)?;
             }
             StmtKind::Expr(e) => {
                 self.compile_expr(sc, e)?;
@@ -2499,17 +2520,12 @@ impl Compiler {
             None
         };
 
-        let top = self.b.current_pos();
-        self.b.emit(Op::GetSlot(vslot), 0);
-        self.b.emit(Op::GetSlot(eslot), 0);
-        self.b.emit(
-            match kind {
-                RangeKind::Inclusive => Op::NumLe,
-                RangeKind::Until => Op::NumLt,
-                RangeKind::DownTo => Op::NumGe,
-            },
-            0,
-        );
+        // Rotated: the counter test is emitted once as an entry guard and once
+        // at the bottom as a conditional backward branch. See
+        // the note on `while` in [`Compiler::compile_stmt_inner`]. Both copies
+        // read slots, so neither can raise
+        // and neither needs an unwind check of its own.
+        self.emit_range_test(vslot, eslot, kind);
         let jf = self.b.emit(Op::JumpIfFalse(0), 0);
 
         self.loops.push(LoopCtx {
@@ -2519,6 +2535,7 @@ impl Compiler {
         });
         self.push_unwind(UnwindKind::Loop);
         self.unwind_check();
+        let top = self.b.current_pos();
         for s in body {
             self.compile_stmt(sc, s)?;
         }
@@ -2545,7 +2562,8 @@ impl Compiler {
             0,
         );
         self.b.emit(Op::SetSlot(vslot), 0);
-        self.b.emit(Op::Jump(top), 0);
+        self.emit_range_test(vslot, eslot, kind);
+        self.b.emit(Op::JumpIfTrue(top), 0);
         let done = self.b.current_pos();
         self.b.patch_jump(jf, done);
         self.pop_unwind_to(done);
@@ -2554,6 +2572,22 @@ impl Compiler {
         }
         sc.exit(mark);
         Ok(())
+    }
+
+    /// The counted `for`'s bounds test — `counter <op> limit`, both read from
+    /// their slots. Emitted twice per loop (entry guard and bottom branch), so
+    /// it lives in one place.
+    fn emit_range_test(&mut self, vslot: u16, eslot: u16, kind: RangeKind) {
+        self.b.emit(Op::GetSlot(vslot), 0);
+        self.b.emit(Op::GetSlot(eslot), 0);
+        self.b.emit(
+            match kind {
+                RangeKind::Inclusive => Op::NumLe,
+                RangeKind::Until => Op::NumLt,
+                RangeKind::DownTo => Op::NumGe,
+            },
+            0,
+        );
     }
 
     /// `for (v in iterable)` over a value — a `List`, an array, or a range held
@@ -2619,11 +2653,12 @@ impl Compiler {
             },
         );
 
-        let top = self.b.current_pos();
-        self.b.emit(Op::GetSlot(islot), 0);
-        self.b.emit(Op::GetSlot(nslot), 0);
-        self.b.emit(Op::NumLt, 0);
+        // Rotated, like every other loop here: the index test guards the entry
+        // and closes the loop as a conditional backward branch. See
+        // the note on `while` in [`Compiler::compile_stmt_inner`].
+        self.emit_index_test(islot, nslot);
         let jf = self.b.emit(Op::JumpIfFalse(0), 0);
+        let top = self.b.current_pos();
         self.b.emit(Op::GetSlot(cslot), 0);
         self.b.emit(Op::GetSlot(islot), 0);
         self.b.emit(Op::Extended(KT_ITER_GET, 0), 0);
@@ -2667,7 +2702,8 @@ impl Compiler {
         self.b.emit(Op::LoadInt(1), 0);
         self.b.emit(Op::Add, 0);
         self.b.emit(Op::SetSlot(islot), 0);
-        self.b.emit(Op::Jump(top), 0);
+        self.emit_index_test(islot, nslot);
+        self.b.emit(Op::JumpIfTrue(top), 0);
         let done = self.b.current_pos();
         self.b.patch_jump(jf, done);
         self.pop_unwind_to(done);
@@ -2676,6 +2712,15 @@ impl Compiler {
         }
         sc.exit(mark);
         Ok(())
+    }
+
+    /// `for (v in iterable)`'s bounds test — `index < length`, both read from
+    /// their slots. Emitted twice per loop, for the reason
+    /// [`Compiler::emit_range_test`] gives.
+    fn emit_index_test(&mut self, islot: u16, nslot: u16) {
+        self.b.emit(Op::GetSlot(islot), 0);
+        self.b.emit(Op::GetSlot(nslot), 0);
+        self.b.emit(Op::NumLt, 0);
     }
 
     // ── Expressions (leave exactly one value) ──────────────────────
@@ -5943,6 +5988,50 @@ impl Compiler {
         Ok(Type::Obj)
     }
 
+    /// `if` in STATEMENT position — stack-neutral, so neither branch produces a
+    /// value and a missing `else` produces no code at all.
+    ///
+    /// Compiling it as an expression and popping the result costs a `LoadUndef`
+    /// on the else path and a `Pop` on both, and `LoadUndef` is one of the ops
+    /// fusevm's JIT refuses. A single `if` statement anywhere in a loop body
+    /// therefore took the whole loop out of the tracing tier — `kotlin --tiers`
+    /// reported `trace-eligible=false` — which is most loops worth compiling.
+    fn compile_if_stmt(&mut self, sc: &mut Scope, ie: &IfExpr) -> Result<(), String> {
+        self.compile_expr(sc, &ie.cond)?;
+        let jf = self.b.emit(Op::JumpIfFalse(0), ie.line);
+        self.compile_block_stmts(sc, &ie.then)?;
+        match &ie.els {
+            Some(els) => {
+                let jmp = self.b.emit(Op::Jump(0), ie.line);
+                let else_pos = self.b.current_pos();
+                self.b.patch_jump(jf, else_pos);
+                self.compile_block_stmts(sc, els)?;
+                let end = self.b.current_pos();
+                self.b.patch_jump(jmp, end);
+            }
+            None => {
+                let end = self.b.current_pos();
+                self.b.patch_jump(jf, end);
+            }
+        }
+        Ok(())
+    }
+
+    /// A branch body in statement position: every statement compiled for effect,
+    /// in its own lexical scope, leaving nothing on the stack.
+    fn compile_block_stmts(&mut self, sc: &mut Scope, body: &[Stmt]) -> Result<(), String> {
+        let mark = sc.enter();
+        let mut res = Ok(());
+        for s in body {
+            if let Err(e) = self.compile_stmt(sc, s) {
+                res = Err(e);
+                break;
+            }
+        }
+        sc.exit(mark);
+        res
+    }
+
     fn compile_if(&mut self, sc: &mut Scope, ie: &IfExpr) -> Result<Type, String> {
         self.compile_expr(sc, &ie.cond)?;
         let jf = self.b.emit(Op::JumpIfFalse(0), ie.line);
@@ -5968,6 +6057,26 @@ impl Compiler {
     /// `when`'s value. With no matching arm and no `else`, the value is `null`
     /// (Unit in statement position, discarded by the caller).
     fn compile_when(&mut self, sc: &mut Scope, w: &WhenExpr) -> Result<Type, String> {
+        self.compile_when_inner(sc, w, true)
+    }
+
+    /// `when` in STATEMENT position — stack-neutral, for the reason
+    /// [`Compiler::compile_if_stmt`] gives: an arm body compiled for its value
+    /// and popped, plus the `LoadUndef` a non-exhaustive `when` produces, take
+    /// the enclosing loop out of fusevm's tracing tier.
+    fn compile_when_stmt(&mut self, sc: &mut Scope, w: &WhenExpr) -> Result<(), String> {
+        self.compile_when_inner(sc, w, false).map(|_| ())
+    }
+
+    /// The shared lowering. `want_value` picks between the expression form
+    /// (every arm leaves one value, and a non-exhaustive `when` leaves `null`)
+    /// and the statement form (every arm leaves nothing).
+    fn compile_when_inner(
+        &mut self,
+        sc: &mut Scope,
+        w: &WhenExpr,
+        want_value: bool,
+    ) -> Result<Type, String> {
         let mark = sc.enter();
         // Evaluate the subject once; remember its static type for `==` op choice.
         let subj = if let Some(subject) = &w.subject {
@@ -5992,7 +6101,7 @@ impl Compiler {
             match &arm.guard {
                 WhenGuard::Else => {
                     has_else = true;
-                    let t = self.compile_block_value(sc, &arm.body)?;
+                    let t = self.compile_arm_body(sc, &arm.body, want_value)?;
                     result_ty = Some(join_ty(result_ty, t));
                     // `else` is terminal — later arms are unreachable.
                     break;
@@ -6010,7 +6119,7 @@ impl Compiler {
                     for j in hit_jumps {
                         self.b.patch_jump(j, body_pos);
                     }
-                    let t = self.compile_block_value(sc, &arm.body)?;
+                    let t = self.compile_arm_body(sc, &arm.body, want_value)?;
                     result_ty = Some(join_ty(result_ty, t));
                     end_jumps.push(self.b.emit(Op::Jump(0), 0));
                     let next = self.b.current_pos();
@@ -6018,9 +6127,12 @@ impl Compiler {
                 }
             }
         }
-        // Non-exhaustive fallthrough: the value is `null` (Undef).
+        // Non-exhaustive fallthrough: the value is `null` (Undef). In statement
+        // position there is no value to leave, so nothing is emitted.
         if !has_else {
-            self.b.emit(Op::LoadUndef, 0);
+            if want_value {
+                self.b.emit(Op::LoadUndef, 0);
+            }
             result_ty = Some(join_ty(result_ty, Type::Unit));
         }
         let end = self.b.current_pos();
@@ -6029,6 +6141,22 @@ impl Compiler {
         }
         sc.exit(mark);
         Ok(result_ty.unwrap_or(Type::Unit))
+    }
+
+    /// One `when` arm's body, in whichever of the two positions the `when`
+    /// itself is in.
+    fn compile_arm_body(
+        &mut self,
+        sc: &mut Scope,
+        body: &[Stmt],
+        want_value: bool,
+    ) -> Result<Type, String> {
+        if want_value {
+            self.compile_block_value(sc, body)
+        } else {
+            self.compile_block_stmts(sc, body)?;
+            Ok(Type::Unit)
+        }
     }
 
     /// Compile one `when` arm condition, leaving a `Bool` on the stack.
