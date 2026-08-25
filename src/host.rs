@@ -211,6 +211,22 @@ pub const KT_F32: u16 = 43;
 /// leaves nothing for a tag.
 pub const KT_BOX_F32: u16 = 45;
 
+/// `KT_REIFY`: bind (`arg == 0`, taking the type name off the stack) or unbind
+/// (`arg == 1`) the type argument of the `reified` call being entered.
+///
+/// Kotlin's `reified` means the type argument is available AT RUN TIME inside
+/// the body, which the JVM back end arranges by inlining the body at the call
+/// site with the type substituted. This frontend reaches the same place without
+/// an inliner, by passing the type: the call site binds the name here, the body
+/// reads it through [`KT_REIFIED`], and the bind is undone when the call
+/// returns. A stack rather than a slot, so a reified function may call another
+/// one — or itself — without losing its own binding.
+pub const KT_REIFY: u16 = 52;
+
+/// `KT_REIFIED`: push the type name currently bound by [`KT_REIFY`], which is
+/// what `T::class`, `x is T` and `x as T` inside a `reified` body read.
+pub const KT_REIFIED: u16 = 53;
+
 /// `KT_BOX_I64`: box the `Long` on top of the stack, for the reason
 /// [`KT_BOX_F32`] boxes a `Float` — a width the COMPILER knows and the value
 /// does not, entering a position that keeps no type.
@@ -273,8 +289,9 @@ pub const KT_SEQ_NEW: u16 = 49;
 pub const KT_COMPARE_REG: u16 = 47;
 
 /// `KT_CLASS_REF`: the class object of the value below a static-type HINT.
-/// Stack `[value, hintStr]`; `arg` is `0` for Kotlin's `::class` (a `KClass`)
-/// and `1` for `javaClass` (a `java.lang.Class`).
+/// Stack `[value, hintStr]`. Bit 0 of `arg` picks Kotlin's `::class` (a
+/// `KClass`) from `javaClass` (a `java.lang.Class`); bit 1 says the hint came
+/// from a `reified` binding, whose java class is the BOXED one.
 ///
 /// The hint is the receiver's static type name, or the empty string where the
 /// frontend could not name it, and it is what separates `1.javaClass` — `int`,
@@ -1266,6 +1283,11 @@ enum HeapObj {
         /// A PRIMITIVE java class, whose printed form is the bare name with no
         /// `class ` before it — `int`, not `class int`.
         primitive: bool,
+        /// The type came from a `reified` binding rather than a written name.
+        /// `Int::class.java` is `int`, but `T::class.java` with `T` reified to
+        /// `Int` is `java.lang.Integer` — a reified type argument is the BOXED
+        /// type at run time, there being nothing else for it to be.
+        reified: bool,
     },
     /// A boxed `Float` — see [`KT_BOX_F32`]. Carries the `f32` itself, so the
     /// 32-bit width survives every position where the static type does not.
@@ -1564,6 +1586,7 @@ fn reset_heap() {
     EQUALS_SUBS.with(|t| t.borrow_mut().clear());
     HASHCODE_SUBS.with(|t| t.borrow_mut().clear());
     COMPARE_SUBS.with(|t| t.borrow_mut().clear());
+    REIFIED.with(|r| r.borrow_mut().clear());
     PENDING.with(|p| *p.borrow_mut() = None);
     STASH.with(|s| s.borrow_mut().clear());
 }
@@ -3615,7 +3638,24 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
         KT_CLASS_REF => {
             let hint = vm.pop().to_str();
             let v = vm.pop();
-            vm.push(class_ref(&v, &hint, arg == 1));
+            vm.push(class_ref(&v, &hint, arg & 1 == 1, arg & 2 == 2));
+        }
+        KT_REIFY if arg == 1 => {
+            REIFIED.with(|r| {
+                r.borrow_mut().pop();
+            });
+        }
+        KT_REIFY => {
+            let ty = vm.pop().to_str();
+            REIFIED.with(|r| r.borrow_mut().push(ty));
+        }
+        KT_REIFIED => {
+            // The empty string when nothing is bound, which is what every
+            // consumer already reads as "no static type was supplied" — a
+            // `reified` body is only reachable through a call that binds one,
+            // so this is a floor and not a case a program produces.
+            let ty = REIFIED.with(|r| r.borrow().last().cloned().unwrap_or_default());
+            vm.push(Value::str(ty));
         }
         KT_BOX_I64 => {
             let v = vm.pop();
@@ -5242,6 +5282,12 @@ fn gen_pull(vm: &mut VM, gen: &Value, want: Option<usize>) -> Result<Vec<Value>,
         out.push(v);
     }
     Ok(out)
+}
+
+thread_local! {
+    /// The `reified` type arguments of the calls currently on the stack,
+    /// innermost last. See [`KT_REIFY`].
+    static REIFIED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 thread_local! {
@@ -8621,13 +8667,14 @@ fn char_method(code: i64, name: &str, args: &[Value]) -> Result<Value, String> {
 /// the compiler lowers those to direct `Op::Call`s on method subs.
 fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     // A class object. Its members are reflection's, not a container's.
-    if let Some((simple, qualified, java)) = with_obj(recv, |o| match o {
+    if let Some((simple, qualified, java, reified)) = with_obj(recv, |o| match o {
         HeapObj::Klass {
             simple,
             qualified,
             java,
+            reified,
             ..
-        } => Some((simple.clone(), qualified.clone(), *java)),
+        } => Some((simple.clone(), qualified.clone(), *java, *reified)),
         _ => None,
     })
     .flatten()
@@ -8641,7 +8688,13 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             // for a Kotlin primitive is the PRIMITIVE one — `Int::class.java`
             // is `int`.
             "java" if !java => {
-                let prim = java_primitive(&simple);
+                // A `reified` type argument is the boxed class, so the
+                // primitive spelling is skipped for one.
+                let prim = if reified {
+                    None
+                } else {
+                    java_primitive(&simple)
+                };
                 let binary = prim
                     .map(|p| p.to_string())
                     .or_else(|| jvm_class(&simple).map(|(n, _)| n.to_string()))
@@ -8651,6 +8704,7 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                     qualified: binary,
                     java: true,
                     primitive: prim.is_some(),
+                    reified: false,
                 }))
             }
             "toString" => Ok(Value::str(kotlin_string(recv))),
@@ -11182,16 +11236,17 @@ fn simple_of(binary: &str) -> String {
 
 /// The class object for `v`, given the receiver's static type `hint` (empty
 /// when the frontend could not name it). See [`KT_CLASS_REF`].
-fn class_ref(v: &Value, hint: &str, java: bool) -> Value {
+fn class_ref(v: &Value, hint: &str, java: bool, reified: bool) -> Value {
     // A primitive static type is the one case the runtime value cannot answer,
     // and it only changes the JAVA class: `1::class` is `kotlin.Int` either way.
-    if java {
+    if java && !reified {
         if let Some(prim) = java_primitive(hint) {
             return alloc(HeapObj::Klass {
                 simple: prim.to_string(),
                 qualified: prim.to_string(),
                 java: true,
                 primitive: true,
+                reified,
             });
         }
     }
@@ -11212,6 +11267,7 @@ fn class_ref(v: &Value, hint: &str, java: bool) -> Value {
             qualified: if java { binary } else { qualified },
             java,
             primitive: false,
+            reified,
         });
     }
     // A user class, an `object`, an enum constant or a throwable names itself.
@@ -11228,6 +11284,7 @@ fn class_ref(v: &Value, hint: &str, java: bool) -> Value {
             qualified: class,
             java,
             primitive: false,
+            reified,
         });
     }
     // A container, whose class turns on how the handle was built.
@@ -11238,6 +11295,7 @@ fn class_ref(v: &Value, hint: &str, java: bool) -> Value {
             qualified: binary,
             java,
             primitive: false,
+            reified,
         });
     }
     // A scalar. The hint names its Kotlin type where the frontend had one;
@@ -11267,6 +11325,7 @@ fn class_ref(v: &Value, hint: &str, java: bool) -> Value {
             qualified: binary.to_string(),
             java: true,
             primitive: false,
+            reified,
         });
     }
     alloc(HeapObj::Klass {
@@ -11274,6 +11333,7 @@ fn class_ref(v: &Value, hint: &str, java: bool) -> Value {
         qualified: qualified.to_string(),
         java: false,
         primitive: false,
+        reified,
     })
 }
 

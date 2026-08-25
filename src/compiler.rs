@@ -31,8 +31,9 @@ use crate::host::{
     KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_ITER_SRC, KT_JOIN,
     KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO, KT_LIST_TAG, KT_MAKE_CLOSURE, KT_MAP_VM,
     KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OPER_VM, KT_PAIR, KT_PRECOND,
-    KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN,
-    KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG, KT_YIELD,
+    KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_REIFIED, KT_REIFY, KT_RESULT_HOF,
+    KT_RUN_CATCHING, KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG,
+    KT_TO_STRING, KT_TYPE_REG, KT_YIELD,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
@@ -96,6 +97,18 @@ fn is_primitive_type_name(name: &str) -> bool {
         name,
         "Int" | "Long" | "Short" | "Byte" | "Double" | "Float" | "Boolean" | "Char"
     )
+}
+
+/// The type-argument name a [`REIFY_CALL`] wrapper carries, when it is a plain
+/// one — which is the only shape the parser builds.
+fn reify_arg_name(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Str(parts) => match parts.as_slice() {
+            [StrExpr::Text(n)] => Some(n.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// The loop variable `yieldAll(xs)` desugars through. Not a name a Kotlin
@@ -768,6 +781,10 @@ pub struct Compiler {
     /// the value leaves as an `Any` and only a box can carry its width past the
     /// frame. `None` outside a function body.
     cur_ret: Option<Type>,
+    /// The `reified` type-parameter names of the function whose body is being
+    /// lowered. A `T::class`, `x is T` or `x as T` naming one of these reads
+    /// the type the CALL bound rather than a constant. Empty everywhere else.
+    cur_reified: Vec<String>,
     /// Where a pending exception unwinds to from the statement being compiled —
     /// innermost last. Empty means “leave this frame”.
     unwind: Vec<UnwindFrame>,
@@ -876,6 +893,12 @@ struct PendingLambda {
     /// after the frame that declared those names finished lowering.
     local_funs: HashMap<String, String>,
     local_sigs: HashMap<String, FnSig>,
+    /// The `reified` type-parameter names in scope at the literal. A lambda
+    /// inside a `reified` body sees them — Kotlin inlines the lambda into that
+    /// body, so `xs.firstOrNull { it is T }` is a test against the CALL's type
+    /// argument — and the body is emitted long after that function's own
+    /// lowering finished, so they are snapshotted here too.
+    reified: Vec<String>,
 }
 
 /// One captured binding as a lambda sees it. `slot` is the ENCLOSING frame's,
@@ -1466,6 +1489,7 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
         math_star: false,
         has_try: uses_exceptions(program),
         cur_ret: None,
+        cur_reified: Vec::new(),
         unwind: Vec::new(),
         finally_returns: Vec::new(),
         finally_exits: Vec::new(),
@@ -2050,6 +2074,7 @@ impl Compiler {
         let outer_locals = self.local_funs.clone();
         let outer_local_sigs = self.local_sigs.clone();
         let outer_ret = self.cur_ret.replace(f.ret);
+        let outer_reified = std::mem::replace(&mut self.cur_reified, f.reified.clone());
         let res: Result<(), String> = (|| {
             for s in &f.body {
                 self.compile_stmt(&mut sc, s)?;
@@ -2057,6 +2082,7 @@ impl Compiler {
             Ok(())
         })();
         self.cur_ret = outer_ret;
+        self.cur_reified = outer_reified;
         self.local_funs = outer_locals;
         self.local_sigs = outer_local_sigs;
         self.boxed_vars = outer_boxed;
@@ -3144,6 +3170,27 @@ impl Compiler {
                 }
                 Ok(Type::Boolean)
             }
+            // `x is T` / `x as T` / `T::class` where `T` is the enclosing
+            // function's `reified` parameter: the type name is not a constant
+            // here, it is whatever the CALL bound. See
+            // [`crate::host::KT_REIFY`].
+            Expr::Is { value, ty, negated } if self.cur_reified.contains(ty) => {
+                self.compile_erased(sc, value)?;
+                self.b.emit(Op::Extended(KT_REIFIED, 0), 0);
+                self.b.emit(Op::Extended(KT_IS, 0), 0);
+                if *negated {
+                    self.b.emit(Op::LogNot, 0);
+                }
+                Ok(Type::Boolean)
+            }
+            Expr::As {
+                value, ty, safe, ..
+            } if self.cur_reified.contains(ty) => {
+                self.compile_erased(sc, value)?;
+                self.b.emit(Op::Extended(KT_REIFIED, 0), 0);
+                self.b.emit(Op::Extended(KT_AS, u8::from(*safe)), 0);
+                Ok(Type::Unknown)
+            }
             Expr::Is { value, ty, negated } => {
                 // The operand is BOXED when its static type is one the runtime
                 // cannot tell apart on its own, because that is exactly what
@@ -3659,6 +3706,22 @@ impl Compiler {
             // own class and has no value to read. `LoadUndef` stands in for the
             // receiver; the hint is what answers. A local binding of the same
             // spelling shadows the type, exactly as it does everywhere else.
+            // `T::class` inside a `reified` body: the type is not a name here,
+            // it is whatever the CALL bound, so the hint comes off the binding
+            // stack rather than out of the constant pool.
+            if let Expr::Var(n) = recv {
+                if self.cur_reified.contains(n) {
+                    self.b.emit(Op::LoadUndef, line);
+                    self.b.emit(Op::Extended(KT_REIFIED, 0), line);
+                    // Bit 1 says the hint came from a reified binding, whose
+                    // java class is the BOXED one: `Int::class.java` is `int`
+                    // where `T::class.java` with T reified to Int is
+                    // `java.lang.Integer`.
+                    self.b
+                        .emit(Op::Extended(KT_CLASS_REF, u8::from(java) | 2), line);
+                    return Ok(Type::Obj);
+                }
+            }
             let type_ref = match recv {
                 Expr::Var(n) => (!self.declares_local(sc, n)
                     && (self.classes.contains_key(n) || is_builtin_type_name(n)))
@@ -4584,6 +4647,7 @@ impl Compiler {
             recv_class,
             local_funs: self.local_funs.clone(),
             local_sigs: self.local_sigs.clone(),
+            reified: self.cur_reified.clone(),
         });
         self.b.emit(Op::LoadInt(name_idx as i64), 0);
         self.b.emit(Op::LoadInt(effective.len() as i64), 0);
@@ -4785,6 +4849,11 @@ impl Compiler {
         // handing its value to the same erased position the fallthrough result
         // is. See the box after `compile_block_value` below.
         let outer_ret = self.cur_ret.take();
+        // The `reified` names in scope where the literal was written. Kotlin
+        // inlines the lambda into the reified body, so `xs.firstOrNull { it is
+        // T }` is a test against the call's type argument and not an
+        // unresolvable name.
+        let outer_reified = std::mem::replace(&mut self.cur_reified, pl.reified.clone());
         // A lambda body is invoked through a nested `vm.run()`, so it is its own
         // frame for unwinding too: a raise inside it returns out, and the host
         // suppresses any further invocation while the exception is in flight.
@@ -4799,6 +4868,7 @@ impl Compiler {
         self.finally_returns = outer_returns;
         self.finally_exits = outer_exits;
         self.cur_ret = outer_ret;
+        self.cur_reified = outer_reified;
         let here = self.b.current_pos();
         self.pop_unwind_to(here);
         // A lambda's RESULT is an erased position: a closure carries no return
@@ -5415,6 +5485,26 @@ impl Compiler {
         // `__rust_compile("<base64>", line)` — the desugar target of a
         // `rust { ... }` block. Compile the base64 body string and hand it to the
         // FFI-compile extension op; the call evaluates to Unit.
+        // The reification intrinsic (see [`crate::ast::REIFY_CALL`]): bind the
+        // call's type argument, run the call, unbind. The bind is a no-op for
+        // every callee that is not `reified`, which is why the parser can wrap
+        // every generic call without knowing which is which.
+        if name == REIFY_CALL && args.len() == 2 {
+            // `tagged<U>(x)` inside a `reified U` body passes U's OWN binding
+            // on, not the four characters `U`. The type argument is a literal
+            // everywhere else.
+            match reify_arg_name(&args[0]).filter(|n| self.cur_reified.contains(n)) {
+                Some(_) => self.b.emit(Op::Extended(KT_REIFIED, 0), line),
+                None => {
+                    self.compile_expr(sc, &args[0])?;
+                    0
+                }
+            };
+            self.b.emit(Op::Extended(KT_REIFY, 0), line);
+            let t = self.compile_expr(sc, &args[1])?;
+            self.b.emit(Op::Extended(KT_REIFY, 1), line);
+            return Ok(t);
+        }
         // The width-boxing intrinsic (see [`BOX_WIDTH`]).
         if name == BOX_WIDTH {
             if let Some(inner) = args.first() {

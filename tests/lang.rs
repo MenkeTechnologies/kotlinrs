@@ -2361,18 +2361,42 @@ fun main() {
 }
 
 #[test]
-fn a_reified_type_test_is_rejected_rather_than_answered() {
+fn a_plain_type_parameter_test_is_rejected_rather_than_answered() {
     // The coarse type system carries no type arguments, so `x is T` inside a
     // generic function has no answer it could give — and answering `false` (the
     // shape a name-based lookup falls into) would be silently wrong. It is a
     // compile error instead.
-    let err = prog_err(
-        "inline fun <reified T> isA(x: Any): Boolean = x is T\nfun main() { println(isA<Int>(5)) }",
-    );
+    //
+    // A `reified` T is the case that DOES have an answer, and this test used to
+    // assert that it did not: the type argument was unavailable at run time
+    // before the call site started binding it. See the test below, which pins
+    // what it answers now; this one keeps the diagnostic for the parameter that
+    // is still unanswerable.
+    let err =
+        prog_err("fun <T> isA(x: Any): Boolean = x is T\nfun main() { println(isA<Int>(5)) }");
     assert!(
         err.contains("type parameter `T`") && err.contains("reified"),
         "unexpected diagnostic: {err}"
     );
+}
+
+#[test]
+fn a_reified_type_parameter_is_available_at_run_time() {
+    // `reified` means the type argument survives into the body. It does here
+    // without an inliner: the call site BINDS the name and the body reads it
+    // back, so `T::class`, `x is T` and `x as T` all answer for whatever the
+    // call supplied. Both spellings are covered — a free function and an
+    // extension — because they take different paths to the call site.
+    let src = "inline fun <reified T> nameOf(): String = T::class.simpleName ?: \"?\"\n\
+               inline fun <reified T> Any.isA(): Boolean = this is T\n\
+               fun main() {\n\
+                   println(nameOf<Int>())\n\
+                   println(nameOf<String>())\n\
+                   println(5.isA<Int>())\n\
+                   println(5.isA<String>())\n\
+                   println(\"x\".isA<String>())\n\
+               }";
+    assert_eq!(prog(src), "Int\nString\ntrue\nfalse\ntrue\n");
 }
 
 // ── Secondary constructors, delegation, invocation ──

@@ -205,6 +205,11 @@ pub struct Param {
 #[derive(Debug, Clone)]
 pub struct FunDecl {
     pub name: String,
+    /// The `reified` type-parameter names this function declares. A call to it
+    /// binds the type argument at run time and the body reads it back — see
+    /// `crate::host::KT_REIFY`. Empty for every ordinary function, which is
+    /// what keeps the call path unchanged for one.
+    pub reified: Vec<String>,
     /// `fun Int.dbl(): Int` — the extension receiver as `(spelled type name,
     /// coarse type, user class)`. The spelled name is kept because that is what
     /// a call site matches against: `Int` and `Long` share a runtime
@@ -726,6 +731,11 @@ pub enum UnOp {
     Neg,
     Not,
 }
+
+/// The intrinsic a generic call is wrapped in so its type argument is bound
+/// while the callee runs — see `crate::host::KT_REIFY`. Not a name a Kotlin
+/// program can spell.
+pub const REIFY_CALL: &str = "__reify";
 
 /// The reserved member name `x::class` lowers to. `class` is a Kotlin keyword,
 /// so no program can spell a member of this name and the two cannot collide.

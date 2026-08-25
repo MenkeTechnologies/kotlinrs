@@ -68,6 +68,10 @@ pub struct Parser {
     /// positional against the CLASS's list, so `class Box<T> { fun <U> f(): T }`
     /// has to record `0` for `T` whichever position the union put it in.
     class_type_params: Vec<String>,
+    /// The `reified` type-parameter names of the `fun` whose body is being
+    /// parsed. A runtime test against one of these is legal — that is what
+    /// `reified` means — where a test against a plain type parameter is not.
+    reified_params: Vec<String>,
     /// Set while parsing a supertype's `by` delegate expression, where the `{`
     /// that follows opens the CLASS BODY rather than a trailing lambda —
     /// `class C(g: G) : G by g { override fun … }`. Kotlin resolves the same
@@ -136,6 +140,7 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
         last_type_param: None,
         type_params: Vec::new(),
         class_type_params: Vec::new(),
+        reified_params: Vec::new(),
         no_trailing_lambda: false,
         pending_classes: Vec::new(),
     };
@@ -350,6 +355,7 @@ fn expand_interface_delegation(prog: &mut Program) -> Result<(), String> {
                     line: m.line,
                 };
                 cd.methods.push(FunDecl {
+                    reified: Vec::new(),
                     name: m.name.clone(),
                     recv: None,
                     params: m.params.clone(),
@@ -448,6 +454,21 @@ fn is_modifier_word(w: &str) -> bool {
             | "infix"
             | "const"
     )
+}
+
+/// Wrap `call` so its explicit type argument is BOUND for the duration, which
+/// is what a `reified` callee reads. Every generic call is wrapped, not just a
+/// call to a reified function: the parser cannot know which the callee is, and
+/// a binding nothing reads costs two ops and is correctly nested either way.
+fn reify_wrap(targ: Option<String>, call: Expr, line: u32) -> Expr {
+    match targ {
+        Some(ty) => Expr::Call {
+            name: REIFY_CALL.to_string(),
+            args: vec![Expr::Str(vec![StrExpr::Text(ty)]), call],
+            line,
+        },
+        None => call,
+    }
 }
 
 impl Parser {
@@ -599,8 +620,10 @@ impl Parser {
         // replacing them: inside `class Box<T> { fun <U> f(a: T, b: U) }` both
         // `T` and `U` are type variables.
         let mut tps = self.type_params.clone();
-        tps.extend(self.type_params_decl());
+        let (declared, reified) = self.type_params_decl_reified();
+        tps.extend(declared);
         let outer_tps = std::mem::replace(&mut self.type_params, tps);
+        let outer_reified = std::mem::replace(&mut self.reified_params, reified.clone());
         // `fun Recv.name(…)` — an extension. The first identifier is the
         // receiver type only when a `.` follows it.
         let first = self.ident()?;
@@ -751,9 +774,11 @@ impl Parser {
             None => Type::Unit,
         };
         self.type_params = outer_tps;
+        self.reified_params = outer_reified;
         Ok(FunDecl {
             name,
             recv,
+            reified,
             params,
             ret,
             ret_class,
@@ -1135,6 +1160,7 @@ impl Parser {
         // reach it the way they reach a hand-written one.
         if is_data_object {
             methods.push(FunDecl {
+                reified: Vec::new(),
                 name: "toString".to_string(),
                 recv: None,
                 params: Vec::new(),
@@ -1412,6 +1438,7 @@ impl Parser {
         // `fun values() = arrayOf(E.RED, …)` — an ARRAY, and a fresh one per
         // call, which is what the JVM's generated `values()` returns.
         comp.methods.push(FunDecl {
+            reified: Vec::new(),
             name: "values".to_string(),
             recv: None,
             params: Vec::new(),
@@ -1469,6 +1496,7 @@ impl Parser {
             )],
         });
         comp.methods.push(FunDecl {
+            reified: Vec::new(),
             name: "valueOf".to_string(),
             recv: None,
             params: vec![Param {
@@ -1658,6 +1686,7 @@ impl Parser {
             ));
         }
         Ok(Some(FunDecl {
+            reified: Vec::new(),
             name,
             recv: None,
             params: Vec::new(),
@@ -1816,14 +1845,22 @@ impl Parser {
     /// their bare names here; the bound and the variance carry no meaning for a
     /// coarse type system.
     fn type_params_decl(&mut self) -> Vec<String> {
+        self.type_params_decl_reified().0
+    }
+
+    /// [`Parser::type_params_decl`], also answering which of the names carried
+    /// the `reified` modifier — the ones a body may test against at run time.
+    fn type_params_decl_reified(&mut self) -> (Vec<String>, Vec<String>) {
         let start = self.pos;
         if !self.at(&Tok::Lt) {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         self.skip_type_args();
         let mut names = Vec::new();
+        let mut reified = Vec::new();
         let mut depth = 0i32;
         let mut want = true;
+        let mut saw_reified = false;
         for i in start..self.pos {
             match &self.toks[i].tok {
                 Tok::Lt => {
@@ -1831,10 +1868,18 @@ impl Parser {
                     want = depth == 1;
                 }
                 Tok::Gt => depth -= 1,
-                Tok::Comma if depth == 1 => want = true,
+                Tok::Comma if depth == 1 => {
+                    want = true;
+                    saw_reified = false;
+                }
                 // A modifier or a bound is not the parameter's own name.
                 Tok::Ident(w) if want && depth == 1 => {
-                    if !matches!(w.as_str(), "reified" | "in" | "out") {
+                    if w == "reified" {
+                        saw_reified = true;
+                    } else if !matches!(w.as_str(), "in" | "out") {
+                        if saw_reified {
+                            reified.push(w.clone());
+                        }
                         names.push(w.clone());
                         want = false;
                     }
@@ -1842,7 +1887,7 @@ impl Parser {
                 _ => want = false,
             }
         }
-        names
+        (names, reified)
     }
 
     /// Consume a `<…>` type-argument list if one is present, discarding it.
@@ -2924,6 +2969,9 @@ impl Parser {
             let line = self.line();
             self.bump(); // `.`
             let name = self.ident()?;
+            // `x.f<T>()` — the same explicit type argument a free call takes,
+            // and the same reason to keep it: a `reified` callee reads it.
+            let targ = self.call_type_arg();
             let mut args = Vec::new();
             let mut is_call = false;
             if self.at(&Tok::LParen) {
@@ -2945,13 +2993,17 @@ impl Parser {
                 args.push(self.lambda()?);
             }
             if is_call {
-                e = Expr::MethodCall {
-                    recv: Box::new(e),
-                    name,
-                    args,
-                    safe,
+                e = reify_wrap(
+                    targ,
+                    Expr::MethodCall {
+                        recv: Box::new(e),
+                        name,
+                        args,
+                        safe,
+                        line,
+                    },
                     line,
-                };
+                );
             } else {
                 e = Expr::Member {
                     recv: Box::new(e),
@@ -3364,6 +3416,7 @@ impl Parser {
                 // comparison, since a type-argument list may only hold names and
                 // must be followed by `(`.
                 let targ = self.call_type_arg();
+                let targ_call = targ.clone();
                 if self.at(&Tok::LParen) {
                     self.bump();
                     let mut args = Vec::new();
@@ -3401,7 +3454,7 @@ impl Parser {
                             line,
                         });
                     }
-                    Ok(Expr::Call { name, args, line })
+                    Ok(reify_wrap(targ_call, Expr::Call { name, args, line }, line))
                 } else if self.at(&Tok::LBrace) && !self.no_trailing_lambda {
                     // Bare trailing-lambda call `run { … }` (no parenthesized
                     // args). `Ident {` is unambiguously a call in Kotlin's
@@ -3654,7 +3707,9 @@ impl Parser {
         if self.at(&Tok::Question) {
             self.bump();
         }
-        if self.type_params.contains(&ty) {
+        // A `reified` parameter IS testable at run time — that is what the
+        // modifier means — so only a plain one is rejected here.
+        if self.type_params.contains(&ty) && !self.reified_params.contains(&ty) {
             return Err(format!(
                 "a runtime test against the type parameter `{ty}` needs a reified \
                  type argument, which is not supported (line {})",
@@ -3718,6 +3773,7 @@ impl Parser {
                 StrPart::Expr(src) => {
                     let toks = Lexer::new(src).tokenize()?;
                     let mut sub = Parser {
+                        reified_params: Vec::new(),
                         type_params: Vec::new(),
                         class_type_params: Vec::new(),
                         toks,
