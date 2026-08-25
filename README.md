@@ -1470,6 +1470,23 @@ construction. 20 000 puts and reads went from 38.25 s to 0.15 s, and the shape
 holds out to 640 000 (0.56 s / 1.18 s / 2.52 s / 4.91 s per doubling from
 80 000).
 
+The round after that closed the `Int`/`Long` erasure the way the `Float` one had
+been closed, and the reason it had been left open — "boxing every `Long` would
+cost the common integer path" — was wrong. Nothing on that path passes through
+the boxing hook. Measured with both binaries frozen and the two arms
+interleaved, nine repetitions, minimum reported:
+
+| program | before | after |
+| --- | --- | --- |
+| 160 000 000 iterations of `Int` arithmetic | 0.11 s | 0.11 s |
+| 300 000 `Long`s appended to a `MutableList` | 0.39 s | 0.45 s |
+
+The native integer loop is unchanged to the digit; the cost is 15% and it lands
+where the box does, on a `Long` entering a position that keeps no type. Three
+other programs — a `MutableList<Int>` fill and walk, a map fill, a
+`StringBuilder` append loop — moved in BOTH directions between two runs at load
+30-60 and are reported as noise rather than as a result.
+
 The two collections that do NOT iterate in insertion order — `hashMapOf`/
 `hashSetOf` and `sortedMapOf`/`sortedSetOf` — stayed quadratic after that, and
 for a different reason: every mutation re-ranked all `n` keys to keep the stored
