@@ -950,3 +950,7 @@ class P(val a: Int)\ninline fun <reified T> castOr(x: Any, d: Any): Any = (x as?
 inline fun <reified T> tagged(x: Any): String = "${T::class.simpleName}:${x is T}"\ninline fun <reified U> outer(x: Any): String = tagged<Int>(x) + "/" + tagged<U>(x)\nfun main() { println(outer<String>("s")); println(outer<Int>(3)) }	Int:false/String:true\nInt:true/Int:true\n
 inline fun <reified T> boxName(): String = T::class.java.name\nfun main() { println(boxName<Int>()); println(boxName<String>()) }	java.lang.Integer\njava.lang.String\n
 class Holder { var v: String = "x"\n  operator fun getValue(t: Any?, p: Any?): String = v\n  operator fun setValue(t: Any?, p: Any?, x: String) { v = x } }\nfun main() { var s: String by Holder(); println(s); s = "y"; println(s) }	x\ny\n
+import kotlin.properties.Delegates\nfun main() { var n: Int by Delegates.observable(0) { _, old, new -> println("$old->$new") }; n = 1; n = 2; println(n) }	0->1\n1->2\n2\n
+import kotlin.properties.Delegates\nfun main() { var v: Int by Delegates.vetoable(0) { _, _, new -> new >= 0 }; v = 5; println(v); v = -1; println(v); v = 7; println(v) }	5\n5\n7\n
+import kotlin.properties.Delegates\nfun main() { var s: String by Delegates.observable("a") { _, o, n -> println("$o=>$n") }; s = "b"; s += "c"; println(s) }	a=>b\nb=>bc\nbc\n
+class Upper { var v: String = ""\n operator fun getValue(t: Any?, p: Any?): String = v.uppercase()\n operator fun setValue(t: Any?, p: Any?, x: String) { v = x } }\nfun main() { var s: String by Upper(); s = "hi"; println(s); println(s.length) }	HI\n2\n

@@ -254,25 +254,14 @@ what this table used to hold — `orEmpty`/`isNullOrEmpty`/`isNullOrBlank`,
 `IntRange(a, b)`, `iterator()`, `Result.success`/`failure`, `putAll`, `clear`,
 `::class` and `javaClass` — is implemented and pinned in the corpus.
 
-## Still unresolved: `sequence { yield(…) }` and a `reified` type parameter
+## `Delegates.observable` before the write, `vetoable` deciding it
 
-Both measured against kotlinc-jvm 2.4.10 and both loud, not silent.
-
-| program | kotlinrs | reference |
-| --- | --- | --- |
-| `sequence { yield(1); yield(2) }` | `unresolved reference: sequence` | a lazy `Sequence`; `.toList()` is `[1, 2]` |
-| `inline fun <reified T> f() = T::class.simpleName` | `unresolved reference: T` | the argument's name |
-
-`sequence` is the one that cannot be faked. Its block SUSPENDS at every `yield`,
-so an eager implementation that ran the block to completion and wrapped the
-results would answer correctly for a finite builder and HANG on
-`sequence { var i = 0; while (true) yield(i++) }` — which is the shape the
-laziness exists for. `generateSequence` is the finite-state half and does work.
-
-A `reified` parameter needs the body INLINED per call site with the type
-argument substituted, which is what `inline` means in Kotlin and what this
-frontend does not do; the parser now keeps a call's single type argument (that
-is what `enumValues<E>()` uses), so the missing half is the inlining.
+Both work. The one difference from the JVM that a program could observe is the
+`KProperty` a delegate is handed: this frontend passes `null` for it, having no
+reflection object to build, so a delegate that reads `property.name` gets a null
+receiver rather than the property's name. Every delegate that only reads and
+writes the value — which is what `observable`, `vetoable` and the
+`getValue`/`setValue` pair in the wild do — is unaffected.
 
 ## An identity hash is a small heap index
 

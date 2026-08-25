@@ -211,6 +211,11 @@ pub const KT_F32: u16 = 43;
 /// leaves nothing for a tag.
 pub const KT_BOX_F32: u16 = 45;
 
+/// `KT_OBSERVE`: build the delegate `kotlin.properties.Delegates.observable` /
+/// `vetoable` answers. Stack `[initial, handler]`; `arg` is `1` for the
+/// vetoable form, whose handler returns whether to accept the write.
+pub const KT_OBSERVE: u16 = 54;
+
 /// `KT_REIFY`: bind (`arg == 0`, taking the type name off the stack) or unbind
 /// (`arg == 1`) the type argument of the `reified` call being entered.
 ///
@@ -256,6 +261,18 @@ pub const KT_BOX_I64: u16 = 51;
 /// wrapped the results would be right for a finite builder and hang on the
 /// infinite one laziness exists for.
 pub const KT_YIELD: u16 = 48;
+
+/// `KT_DELEG_GET` / `KT_DELEG_SET`: read and write a delegate this frontend
+/// supplies rather than one a user class declares — currently the
+/// `Delegates.observable`/`vetoable` pair. Stack `[delegate]` and
+/// `[delegate, value]`.
+///
+/// BUILTINS and not extension ops, for the reason [`KT_ITER_SRC`] gives: the
+/// write runs the user's handler through a nested `vm.run()`, and an extension
+/// op takes the extension handler out of the VM for the duration of the call.
+pub const KT_DELEG_GET: u16 = 138;
+/// See [`KT_DELEG_GET`].
+pub const KT_DELEG_SET: u16 = 139;
 
 /// `KT_ITER_SRC`: normalize the value a `for (v in …)` header evaluated to into
 /// something the loop can index. Stack `[value]`; leaves it unchanged except
@@ -1250,6 +1267,14 @@ enum HeapObj {
         name_idx: u16,
         params: u8,
         captures: Vec<Value>,
+    },
+    /// The delegate `Delegates.observable`/`vetoable` answers: the value it
+    /// holds, the handler to run on a write, and whether that handler's answer
+    /// decides if the write happens. See [`KT_OBSERVE`].
+    Observed {
+        value: Value,
+        on: Value,
+        vetoable: bool,
     },
     /// A suspended `sequence { … }` block — see [`KT_YIELD`].
     ///
@@ -3640,6 +3665,15 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let v = vm.pop();
             vm.push(class_ref(&v, &hint, arg & 1 == 1, arg & 2 == 2));
         }
+        KT_OBSERVE => {
+            let on = vm.pop();
+            let value = vm.pop();
+            vm.push(alloc(HeapObj::Observed {
+                value,
+                on,
+                vetoable: arg == 1,
+            }));
+        }
         KT_REIFY if arg == 1 => {
             REIFIED.with(|r| {
                 r.borrow_mut().pop();
@@ -3783,6 +3817,8 @@ fn register_builtins(vm: &mut VM) {
     vm.register_builtin(KT_COMPARATOR, b_comparator);
     vm.register_builtin(KT_GENSEQ, b_genseq);
     vm.register_builtin(KT_ITER_SRC, b_iter_src);
+    vm.register_builtin(KT_DELEG_GET, b_deleg_get);
+    vm.register_builtin(KT_DELEG_SET, b_deleg_set);
     vm.register_builtin(KT_EXC_NEW, b_exc_new);
     vm.register_builtin(KT_EXC_THROW, b_exc_throw);
     vm.register_builtin(KT_EXC_PENDING, b_exc_pending);
@@ -5425,6 +5461,64 @@ fn coro_next(vm: &mut VM, handle: &Value) -> Result<Option<Value>, String> {
         return Err(e);
     }
     Ok(YIELDED.with(|y| y.borrow_mut().take()))
+}
+
+/// `KT_DELEG_GET` — see [`KT_DELEG_GET`].
+fn b_deleg_get(vm: &mut VM, _argc: u8) -> Value {
+    let d = vm.pop();
+    let _ = vm;
+    with_obj(&d, |o| match o {
+        HeapObj::Observed { value, .. } => value.clone(),
+        _ => Value::Undef,
+    })
+    .unwrap_or(Value::Undef)
+}
+
+/// `KT_DELEG_SET` — see [`KT_DELEG_GET`].
+///
+/// The handler takes `(property, old, new)`, and it runs BEFORE the store for
+/// the vetoable form and after it for the observable one — which is what
+/// Kotlin's own `ObservableProperty.beforeChange`/`afterChange` split is. The
+/// property argument is null, there being no `KProperty` to hand it.
+fn b_deleg_set(vm: &mut VM, _argc: u8) -> Value {
+    let new = vm.pop();
+    let d = vm.pop();
+    let Some((old, on, vetoable)) = with_obj(&d, |o| match o {
+        HeapObj::Observed {
+            value,
+            on,
+            vetoable,
+        } => Some((value.clone(), on.clone(), *vetoable)),
+        _ => None,
+    })
+    .flatten() else {
+        return Value::Undef;
+    };
+    let store = |vm: &mut VM, v: Value| {
+        let _ = vm;
+        with_obj_mut(&d, |o| {
+            if let HeapObj::Observed { value, .. } = o {
+                *value = v;
+            }
+        });
+    };
+    if vetoable {
+        // The handler decides, and the store only happens if it agrees.
+        let verdict = invoke_closure(vm, &on, &[Value::Undef, old, new.clone()]);
+        match verdict {
+            Ok(v) if truthy(&v) => store(vm, new),
+            Ok(_) => {}
+            Err(e) => {
+                fault(vm, e);
+            }
+        }
+        return Value::Undef;
+    }
+    store(vm, new.clone());
+    if let Err(e) = invoke_closure(vm, &on, &[Value::Undef, old, new]) {
+        fault(vm, e);
+    }
+    Value::Undef
 }
 
 /// `KT_ITER_SRC` — see [`KT_ITER_SRC`].
@@ -10210,6 +10304,7 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
         | HeapObj::Closure { .. }
         | HeapObj::Comparator(_)
         | HeapObj::Coro { .. }
+        | HeapObj::Observed { .. }
         | HeapObj::F32(_)
         | HeapObj::I64(_)
         | HeapObj::Gen { .. }
@@ -10869,6 +10964,7 @@ fn obj_hash(recv: &Value) -> Option<i32> {
         | HeapObj::Res { .. }
         | HeapObj::Iter { .. }
         | HeapObj::Coro { .. }
+        | HeapObj::Observed { .. }
         | HeapObj::Klass { .. } => None,
         // `java.lang.Float.hashCode()` is `floatToIntBits`, which is NOT the
         // `Double` fold of the same magnitude — `1.0f` hashes to `1065353216`
@@ -10948,6 +11044,7 @@ fn obj_label(recv: &Value) -> String {
         HeapObj::Iter { .. } => "Iterator".to_string(),
         HeapObj::Gen { .. } => "Sequence".to_string(),
         HeapObj::Coro { .. } => "SequenceScope".to_string(),
+        HeapObj::Observed { .. } => "ObservableProperty".to_string(),
         HeapObj::Grouping { .. } => "Grouping".to_string(),
         HeapObj::Range(r) => match (r.is_char, r.progression) {
             (true, true) => "CharProgression",
@@ -11088,6 +11185,15 @@ fn display_obj(id: u32) -> String {
             // A parked block is never a value a program holds — it is reached
             // only through the `Gen` that pulls from it — so this is a shape
             // for a diagnostic and not a rendering Kotlin has.
+            // A delegate is never a value a program holds — it is reached only
+            // through the property it backs — so this is a shape for a
+            // diagnostic and not a rendering Kotlin has.
+            HeapObj::Observed { vetoable, .. } => {
+                format!(
+                    "(delegate {})",
+                    if *vetoable { "vetoable" } else { "observable" }
+                )
+            }
             HeapObj::Coro { state, .. } => format!(
                 "(sequence block {})",
                 match state {

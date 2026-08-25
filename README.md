@@ -169,6 +169,17 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   are equal under it. `Char.MIN_VALUE`/`MAX_VALUE`
   bound the UTF-16 code unit, so the top is `￿` and not the highest code
   point.
+- **Lazy sequences** — `sequence { yield(…) }` is a real coroutine: the block
+  SUSPENDS at every `yield`, its frames and operand stack are parked off the VM
+  and put back on the next pull, so `sequence { while (true) yield(i++) }
+  .take(5)` terminates. `yieldAll`, `generateSequence`, and the `map`/`filter`/
+  `take`/`drop`/`takeWhile`/`dropWhile` pipeline over either source.
+- **Reified generics** — `inline fun <reified T>` with `T::class`, `x is T` and
+  `x as T`, including from inside a lambda in the body and with one reified
+  parameter passed on to another.
+- **Delegated properties** — `by lazy`, a user delegate declaring
+  `operator fun getValue`/`setValue` (on a class property or a local), and
+  `Delegates.observable`/`vetoable`.
 - **Class objects** — `x::class` and `Type::class` (a `KClass`, with
   `.simpleName`, `.qualifiedName` and `.java`) and `x.javaClass` (a
   `java.lang.Class`, with `.name` and `.simpleName`). A receiver whose STATIC

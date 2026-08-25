@@ -24,16 +24,16 @@ use crate::host::{
     COLL_COPY, COLL_DEFAULT_CAP, COLL_HASH, COLL_LITERAL, COLL_SORTED, KT_ARRAY, KT_ARRAY_INIT,
     KT_ARRAY_NEW, KT_AS, KT_BOX_F32, KT_BOX_I64, KT_BUILDER, KT_CHR_STRING, KT_CLASSOF,
     KT_CLASS_REF, KT_CLOSURE_CALL, KT_COLL_HOF, KT_COMPARATOR, KT_COMPARE_REG, KT_DBG_LINE,
-    KT_DDIV, KT_DISPLAY, KT_ENUM_REG, KT_EQUALS_REG, KT_EXC_ABORT, KT_EXC_CUT, KT_EXC_DEPTH,
-    KT_EXC_MATCH, KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW,
-    KT_EXC_UNSTASH, KT_EXTEND, KT_F32, KT_F32_ARITH, KT_F32_STR, KT_FFI_CALL, KT_FFI_COMPILE,
-    KT_GENSEQ, KT_GETFIELD, KT_HASH_REG, KT_IDENTITY, KT_IDIV, KT_IMOD, KT_INDEX_GET_VM,
-    KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_ITER_SRC, KT_JOIN,
-    KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO, KT_LIST_TAG, KT_MAKE_CLOSURE, KT_MAP_VM,
-    KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OPER_VM, KT_PAIR, KT_PRECOND,
-    KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_REIFIED, KT_REIFY, KT_RESULT_HOF,
-    KT_RUN_CATCHING, KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG,
-    KT_TO_STRING, KT_TYPE_REG, KT_YIELD,
+    KT_DDIV, KT_DELEG_GET, KT_DELEG_SET, KT_DISPLAY, KT_ENUM_REG, KT_EQUALS_REG, KT_EXC_ABORT,
+    KT_EXC_CUT, KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE,
+    KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND, KT_F32, KT_F32_ARITH, KT_F32_STR, KT_FFI_CALL,
+    KT_FFI_COMPILE, KT_GENSEQ, KT_GETFIELD, KT_HASH_REG, KT_IDENTITY, KT_IDIV, KT_IMOD,
+    KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE,
+    KT_ITER_SRC, KT_JOIN, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO, KT_LIST_TAG,
+    KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OBSERVE,
+    KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_REIFIED,
+    KT_REIFY, KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM,
+    KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG, KT_YIELD,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
@@ -108,6 +108,18 @@ fn reify_arg_name(e: &Expr) -> Option<String> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Whether `e` is a `Delegates.observable`/`vetoable` factory call — the
+/// delegate shapes this frontend supplies itself, which name no class.
+fn is_observable_delegate(e: &Expr) -> bool {
+    match e {
+        Expr::MethodCall { recv, name, .. } => {
+            matches!(name.as_str(), "observable" | "vetoable")
+                && matches!(&**recv, Expr::Var(v) if v == "Delegates")
+        }
+        _ => false,
     }
 }
 
@@ -2321,14 +2333,21 @@ impl Compiler {
                             .get(c)
                             .is_some_and(|m| m.methods.contains_key("getValue"))
                     });
-                    if dc.is_none() {
+                    // `Delegates.observable`/`vetoable` name no class — they are
+                    // stdlib FACTORY calls — so the delegate they answer is one
+                    // this frontend supplies and the accesses go through the
+                    // host ops rather than a subroutine.
+                    if dc.is_none() && is_observable_delegate(init) {
+                        None
+                    } else if dc.is_none() {
                         return Err(format!(
                             "local {name}: delegates to a value whose class is not a user \
                              class declaring `operator fun getValue`; only that form of \
                              `by` is supported (besides `by lazy`)"
                         ));
+                    } else {
+                        dc
                     }
-                    dc
                 } else {
                     class
                 };
@@ -2397,10 +2416,14 @@ impl Compiler {
                             r: Box::new(value.clone()),
                         },
                     };
-                    self.b.emit(Op::GetSlot(slot), 0);
-                    self.b.emit(Op::LoadUndef, 0);
-                    self.b.emit(Op::LoadUndef, 0);
                     let dc = sc.class_of(name);
+                    self.b.emit(Op::GetSlot(slot), 0);
+                    // A user delegate's `setValue` takes `(thisRef, property,
+                    // value)`; the host one takes the value alone.
+                    if dc.is_some() {
+                        self.b.emit(Op::LoadUndef, 0);
+                        self.b.emit(Op::LoadUndef, 0);
+                    }
                     self.compile_expr(sc, &full)?;
                     self.emit_delegate_set(dc)?;
                     return Ok(());
@@ -3770,6 +3793,16 @@ impl Compiler {
                 };
                 return self.compile_call(sc, "runCatching", &[block], line);
             }
+        }
+        // `Delegates.observable(initial) { … }` / `Delegates.vetoable(…)`.
+        // A stdlib factory on an object this frontend does not otherwise model,
+        // so the receiver is recognized by spelling and the call becomes the
+        // intrinsic that builds the delegate.
+        if matches!(name, "observable" | "vetoable")
+            && args.len() == 2
+            && self.qualifier(sc, recv).as_deref() == Some("Delegates")
+        {
+            return self.compile_call(sc, &format!("__{name}"), args, line);
         }
         // `x::class` / `Type::class` and `x.javaClass` — the two class-object
         // spellings. Both need the receiver's STATIC type, which is the only
@@ -5512,7 +5545,12 @@ impl Compiler {
     /// CLASS property already dispatches — the runtime member table has no
     /// entry for a user `getValue`.
     fn emit_delegate_get(&mut self, dc: Option<String>) -> Result<(), String> {
-        let dc = dc.ok_or_else(|| "delegate class is not known".to_string())?;
+        // No class means a delegate this frontend supplies — see
+        // [`crate::host::KT_DELEG_GET`] — which takes the delegate alone.
+        let Some(dc) = dc else {
+            self.b.emit(Op::CallBuiltin(KT_DELEG_GET, 1), 0);
+            return Ok(());
+        };
         self.b.emit(Op::LoadUndef, 0);
         self.b.emit(Op::LoadUndef, 0);
         let idx = self.b.add_name(&method_sub_name(&dc, "getValue"));
@@ -5524,7 +5562,11 @@ impl Compiler {
     /// nulls and the value already on the stack. Leaves nothing: a property
     /// write is a statement.
     fn emit_delegate_set(&mut self, dc: Option<String>) -> Result<(), String> {
-        let dc = dc.ok_or_else(|| "delegate class is not known".to_string())?;
+        let Some(dc) = dc else {
+            self.b.emit(Op::CallBuiltin(KT_DELEG_SET, 2), 0);
+            self.b.emit(Op::Pop, 0);
+            return Ok(());
+        };
         let idx = self.b.add_name(&method_sub_name(&dc, "setValue"));
         self.b.emit(Op::Call(idx, 4), 0);
         self.b.emit(Op::Pop, 0);
@@ -5871,6 +5913,16 @@ impl Compiler {
                     "requireNotNull" | "checkNotNull" => Type::Unknown,
                     _ => Type::Unit,
                 })
+            }
+            // `Delegates.observable(initial) { … }` / `vetoable`. Reached as a
+            // member of `Delegates`, which is rewritten to this free call by the
+            // qualifier arm in `compile_member`.
+            "__observable" | "__vetoable" if args.len() == 2 => {
+                self.compile_expr(sc, &args[0])?;
+                self.compile_expr(sc, &args[1])?;
+                let vetoable = u8::from(name == "__vetoable");
+                self.b.emit(Op::Extended(KT_OBSERVE, vetoable), line);
+                Ok(Type::Obj)
             }
             // `sequence { … }` — a lazy sequence whose block SUSPENDS at every
             // `yield`. The block is an ordinary closure here; what makes it a
