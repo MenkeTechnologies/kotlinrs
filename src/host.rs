@@ -7843,11 +7843,25 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         })),
         // `startsWith(prefix, startIndex)` tests at an OFFSET, not from 0 —
         // `"abc".startsWith("b", 1)` is true. `endsWith` has no such overload.
+        //
+        // An offset outside `0..=length - prefix.length` is FALSE, not clamped:
+        // `java.lang.String.startsWith` (the exact-case arm) opens with
+        // `if (toffset < 0 || toffset > length() - prefix.length()) return false`
+        // and `regionMatchesImpl` (the `ignoreCase` arm) tests the same bound.
+        // Measured on kotlinc 2.x: `"".startsWith("", 1)` is false while
+        // `"".startsWith("", 0)` is true, and `"abc".startsWith("a", -1)` is
+        // false with and without `ignoreCase`.
         (Value::Str(s), "startsWith") => {
             let ignore = ignore_case(args, 1);
             let hay = Folded::of(s, ignore);
-            let at = hay.index_at(index_arg(args, 1).unwrap_or(0).max(0) as usize);
             let pre = Folded::of(&arg_str(args, 0), ignore);
+            let start = index_arg(args, 1).unwrap_or(0);
+            let last = hay.len().checked_sub(pre.len());
+            let within = start >= 0 && last.is_some_and(|last| start as usize <= last);
+            if !within {
+                return Ok(Value::Bool(false));
+            }
+            let at = hay.index_at(start as usize);
             Ok(Value::Bool(hay.find(&pre, at) == Some(at)))
         }
         (Value::Str(s), "endsWith") => {

@@ -6112,3 +6112,35 @@ fn the_ordered_map_builders_and_to_map_conversions_resolve() {
         "{1=2, 3=1}\n"
     );
 }
+
+/// `startsWith(prefix, startIndex)` REFUSES an offset outside the string rather
+/// than clamping it into range.
+///
+/// `java.lang.String.startsWith` — the exact-case arm Kotlin delegates to —
+/// opens with `if (toffset < 0 || toffset > length() - prefix.length()) return
+/// false`, and `regionMatchesImpl`, the `ignoreCase` arm, tests the same bound.
+/// kotlinrs clamped the offset with `.max(0)` and never checked the upper end,
+/// so `"".startsWith("", 1)` answered true where Kotlin answers false — an
+/// empty prefix matched an empty string one character past its end. Found by
+/// `parity-fuzz` (seed 24334); every value below was measured on kotlinc.
+#[test]
+fn starts_with_refuses_an_offset_outside_the_string() {
+    // The offset is one past the last position an empty prefix can start at.
+    assert_eq!(stdout(r#"println("".startsWith("", 1))"#), "false\n");
+    assert_eq!(stdout(r#"println("".startsWith("", 0))"#), "true\n");
+    assert_eq!(stdout(r#"println("abc".startsWith("", 3))"#), "true\n");
+    assert_eq!(stdout(r#"println("abc".startsWith("", 4))"#), "false\n");
+    // A negative offset is false, not treated as 0 — which is what the clamp
+    // turned it into.
+    assert_eq!(stdout(r#"println("abc".startsWith("a", -1))"#), "false\n");
+    assert_eq!(stdout(r#"println("abc".startsWith("a", 0))"#), "true\n");
+    // A prefix longer than what is left cannot match at any offset.
+    assert_eq!(stdout(r#"println("abc".startsWith("abcd", 0))"#), "false\n");
+    assert_eq!(stdout(r#"println("abc".startsWith("bc", 2))"#), "false\n");
+    assert_eq!(stdout(r#"println("abc".startsWith("bc", 1))"#), "true\n");
+    // The `ignoreCase` arm carries the same bound, so a folded compare cannot
+    // reach a position the exact one refuses.
+    assert_eq!(stdout(r#"println("abc".startsWith("A", -1, true))"#), "false\n");
+    assert_eq!(stdout(r#"println("abc".startsWith("", 4, true))"#), "false\n");
+    assert_eq!(stdout(r#"println("abc".startsWith("A", 0, true))"#), "true\n");
+}
