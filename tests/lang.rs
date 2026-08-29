@@ -6140,7 +6140,16 @@ fn starts_with_refuses_an_offset_outside_the_string() {
     assert_eq!(stdout(r#"println("abc".startsWith("bc", 1))"#), "true\n");
     // The `ignoreCase` arm carries the same bound, so a folded compare cannot
     // reach a position the exact one refuses.
-    assert_eq!(stdout(r#"println("abc".startsWith("A", -1, true))"#), "false\n");
-    assert_eq!(stdout(r#"println("abc".startsWith("", 4, true))"#), "false\n");
-    assert_eq!(stdout(r#"println("abc".startsWith("A", 0, true))"#), "true\n");
+    assert_eq!(
+        stdout(r#"println("abc".startsWith("A", -1, true))"#),
+        "false\n"
+    );
+    assert_eq!(
+        stdout(r#"println("abc".startsWith("", 4, true))"#),
+        "false\n"
+    );
+    assert_eq!(
+        stdout(r#"println("abc".startsWith("A", 0, true))"#),
+        "true\n"
+    );
 }
