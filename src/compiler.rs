@@ -3273,7 +3273,12 @@ impl Compiler {
             // function's `reified` parameter: the type name is not a constant
             // here, it is whatever the CALL bound. See
             // [`crate::host::KT_REIFY`].
-            Expr::Is { value, ty, negated, nullable } if self.cur_reified.contains(ty) => {
+            Expr::Is {
+                value,
+                ty,
+                negated,
+                nullable,
+            } if self.cur_reified.contains(ty) => {
                 self.compile_erased(sc, value)?;
                 self.b.emit(Op::Extended(KT_REIFIED, 0), 0);
                 self.b.emit(Op::Extended(KT_IS, 0), 0);
@@ -3291,10 +3296,18 @@ impl Compiler {
             } if self.cur_reified.contains(ty) => {
                 self.compile_erased(sc, value)?;
                 self.b.emit(Op::Extended(KT_REIFIED, 0), 0);
-                self.b.emit(Op::Extended(KT_AS, u8::from(*safe) | (u8::from(*nullable) << 1)), 0);
+                self.b.emit(
+                    Op::Extended(KT_AS, u8::from(*safe) | (u8::from(*nullable) << 1)),
+                    0,
+                );
                 Ok(Type::Unknown)
             }
-            Expr::Is { value, ty, negated, nullable } => {
+            Expr::Is {
+                value,
+                ty,
+                negated,
+                nullable,
+            } => {
                 // The operand is BOXED when its static type is one the runtime
                 // cannot tell apart on its own, because that is exactly what
                 // `is Long` and `is Float` ask about. Without it `1L is Long`
@@ -3336,7 +3349,10 @@ impl Compiler {
                 }
                 let nidx = self.b.add_constant(Value::str(ty.clone()));
                 self.b.emit(Op::LoadConst(nidx), 0);
-                self.b.emit(Op::Extended(KT_AS, u8::from(*safe) | (u8::from(*nullable) << 1)), 0);
+                self.b.emit(
+                    Op::Extended(KT_AS, u8::from(*safe) | (u8::from(*nullable) << 1)),
+                    0,
+                );
                 Ok(cast_type(ty, *safe, *nullable))
             }
             Expr::IncDec {
@@ -6992,7 +7008,11 @@ impl Compiler {
                     self.b.emit(Op::LogNot, 0);
                 }
             }
-            WhenCond::Is { negated, ty, nullable } => {
+            WhenCond::Is {
+                negated,
+                ty,
+                nullable,
+            } => {
                 let (slot, _) = subj.ok_or("`is` condition requires a `when` subject")?;
                 self.b.emit(Op::GetSlot(slot), 0);
                 let nidx = self.b.add_constant(Value::str(ty.clone()));
