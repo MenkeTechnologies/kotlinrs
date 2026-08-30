@@ -2668,11 +2668,12 @@ impl Parser {
                 }
                 self.bump(); // is
                              // The type arguments are dropped: the check is by erased class.
-                let (ty, _) = self.is_type()?;
+                let (ty, _, nullable) = self.is_type()?;
                 l = Expr::Is {
                     value: Box::new(l),
                     ty,
                     negated,
+                    nullable,
                 };
                 continue;
             }
@@ -2840,12 +2841,13 @@ impl Parser {
             if safe {
                 self.bump();
             }
-            let (ty, type_args) = self.is_type()?;
+            let (ty, type_args, nullable) = self.is_type()?;
             e = Expr::As {
                 value: Box::new(e),
                 ty,
                 type_args,
                 safe,
+                nullable,
             };
         }
         Ok(e)
@@ -3688,8 +3690,12 @@ impl Parser {
                 }
                 Tok::Is => {
                     self.bump();
-                    let (ty, _) = self.is_type()?;
-                    return Ok(WhenCond::Is { negated: false, ty });
+                    let (ty, _, nullable) = self.is_type()?;
+                    return Ok(WhenCond::Is {
+                        negated: false,
+                        ty,
+                        nullable,
+                    });
                 }
                 // `!in` / `!is` — a `!` immediately followed by `in`/`is`.
                 Tok::Not if matches!(self.peek_at(1), Tok::In) => {
@@ -3700,8 +3706,12 @@ impl Parser {
                 Tok::Not if matches!(self.peek_at(1), Tok::Is) => {
                     self.bump();
                     self.bump();
-                    let (ty, _) = self.is_type()?;
-                    return Ok(WhenCond::Is { negated: true, ty });
+                    let (ty, _, nullable) = self.is_type()?;
+                    return Ok(WhenCond::Is {
+                        negated: true,
+                        ty,
+                        nullable,
+                    });
                 }
                 _ => {}
             }
@@ -3718,11 +3728,16 @@ impl Parser {
     /// type the cast produces, and that is what decides the width of
     /// `(x as Box<Int>).v * 2000000000`. They are answered alongside the name so
     /// each caller states which it is.
-    fn is_type(&mut self) -> Result<(String, Vec<TypeArg>), String> {
+    fn is_type(&mut self) -> Result<(String, Vec<TypeArg>, bool), String> {
         let ty = self.ident()?;
         let args = self.type_args_list();
+        // The `?` is part of the test, not decoration: `null is String?` is
+        // true where `null is String` is false, and `null as String?` is null
+        // where `null as String` throws. Reported rather than discarded.
+        let mut nullable = false;
         if self.at(&Tok::Question) {
             self.bump();
+            nullable = true;
         }
         // A `reified` parameter IS testable at run time — that is what the
         // modifier means — so only a plain one is rejected here.
@@ -3733,7 +3748,7 @@ impl Parser {
                 self.line()
             ));
         }
-        Ok((ty, args))
+        Ok((ty, args, nullable))
     }
 
     /// The range after `in`/`!in` in a `when` arm — `a..b`, `a until b`, or

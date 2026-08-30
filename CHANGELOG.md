@@ -559,3 +559,60 @@ VALUE prints. All in [BUGS.md](BUGS.md).
 `kotlinc-jvm 2.4.10 (JRE 21.0.12.1)` in this run; 0 rejected. The corpus floor
 moved 675 → 722. 5 new `tests/lang.rs` tests, 253 → 258. No test was deleted or
 weakened, and no audit or report script was touched.
+
+## Round 10 — nullability is part of a cast, not decoration on it
+
+### The bug
+
+`is_type()` consumed the `?` of a written type and discarded it, so `String?`
+and `String` reached the compiler as one string. Three answers followed from
+that single loss, two of them wrong values rather than refusals:
+
+| program | kotlinrs | reference |
+| --- | --- | --- |
+| `null as String?` | `ClassCastException` | `null` |
+| `null as String` | `ClassCastException` | `NullPointerException` |
+| `null is String?` | `false` | `true` |
+
+The comment on `KT_AS` asserted the opposite — that dropping the `?` left a null
+"passing a safe cast and failing an unsafe one exactly as the JVM's would" —
+which is true of `as?` and of nothing else.
+
+### The fix
+
+`is_type()` now reports the `?`, and `Expr::As`, `Expr::Is` and `WhenCond::Is`
+carry it. It reaches the runtime in each op's inline operand: `KT_IS` takes it
+as its only bit, `KT_AS` as bit 1 beside the existing `as?` bit 0. A null
+operand is then decided by the target's nullability rather than by its class —
+null for `as T?` and for `as? T`, and a `NullPointerException` naming the type
+for `as T`, which is the JVM's own wording and not the `ClassCastException` a
+wrong class still gets.
+
+`cast_type` had to learn it too. It already mapped `as? String` to
+`NullableString`; `as String?` produced a plain `String`, and a null under that
+static type prints as the empty string rather than as `null` — so the cast
+answered correctly and then rendered wrongly. Both spellings now produce the
+nullable type, which is what `println(null as String?)` needs.
+
+### Newly measured, recorded rather than fixed
+
+An infix CALL does not parse, though an `infix fun` DECLARATION does:
+`2 pw 10` is `expected RParen, found Ident("pw")` where the reference answers
+`1024`. In [BUGS.md](BUGS.md).
+
+One row of that table was stale and is gone: a local `data class` inside `fun
+main()` was recorded as `unexpected token Class (line 1)`, and both the
+single-line and the multi-line spelling now print `P(a=1)` as the reference
+does.
+
+### Provenance
+
+8 new records, minted by `scripts/capture-parity.sh` from
+`kotlinc-jvm 2.4.10 (JRE 26.0.2.1)`; 0 rejected. The corpus floor moved
+956 → 964. No test was deleted or weakened, and no audit or report script was
+touched.
+
+The JDK gate that had kept this frontend unmeasured was a mistake in the
+measurement, not a missing toolchain: `/usr/libexec/java_home` lists only the
+JVMs registered under JavaVirtualMachines, and Homebrew's openjdk 21, 25 and 26
+are not among them. `JAVA_HOME=/opt/homebrew/opt/openjdk` is enough.

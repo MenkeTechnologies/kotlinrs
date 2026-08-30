@@ -139,7 +139,7 @@ the next round starts from a measurement rather than a guess.
 | `"hello".replace(Regex("l+"), "L")` | `unresolved reference: Regex` | `heLo` |
 | `"a1b2".split(Regex("[0-9]"))` | `unresolved reference: Regex` | `[a, b, ]` |
 | `"a".toRegex()` | `unresolved reference: toRegex on String` | `a` |
-| `fun main() { data class P(val a: Int) ; println(P(1)) }` | `unexpected token Class (line 1)` | `P(a=1)` |
+| `infix fun Int.pw(n: Int) = …; 2 pw 10` | `expected RParen, found Ident("pw")` | `1024` |
 | `listOf(1, 2, 3).forEach lit@{ if (it == 2) return@lit }` | `a label must precede a loop (`for`/`while`/`do`), found LBrace` | (runs; the label names the lambda) |
 | `listOf("a", "B").sortedWith(String.CASE_INSENSITIVE_ORDER)` | `unresolved reference: String` | `[a, B]` |
 | `listOf(1, 2, 3).random(kotlin.random.Random(1))` | `unresolved reference: kotlin` | `1` |

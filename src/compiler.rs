@@ -3273,7 +3273,7 @@ impl Compiler {
             // function's `reified` parameter: the type name is not a constant
             // here, it is whatever the CALL bound. See
             // [`crate::host::KT_REIFY`].
-            Expr::Is { value, ty, negated } if self.cur_reified.contains(ty) => {
+            Expr::Is { value, ty, negated, nullable } if self.cur_reified.contains(ty) => {
                 self.compile_erased(sc, value)?;
                 self.b.emit(Op::Extended(KT_REIFIED, 0), 0);
                 self.b.emit(Op::Extended(KT_IS, 0), 0);
@@ -3283,14 +3283,18 @@ impl Compiler {
                 Ok(Type::Boolean)
             }
             Expr::As {
-                value, ty, safe, ..
+                value,
+                ty,
+                safe,
+                nullable,
+                ..
             } if self.cur_reified.contains(ty) => {
                 self.compile_erased(sc, value)?;
                 self.b.emit(Op::Extended(KT_REIFIED, 0), 0);
-                self.b.emit(Op::Extended(KT_AS, u8::from(*safe)), 0);
+                self.b.emit(Op::Extended(KT_AS, u8::from(*safe) | (u8::from(*nullable) << 1)), 0);
                 Ok(Type::Unknown)
             }
-            Expr::Is { value, ty, negated } => {
+            Expr::Is { value, ty, negated, nullable } => {
                 // The operand is BOXED when its static type is one the runtime
                 // cannot tell apart on its own, because that is exactly what
                 // `is Long` and `is Float` ask about. Without it `1L is Long`
@@ -3298,7 +3302,9 @@ impl Compiler {
                 self.compile_erased(sc, value)?;
                 let nidx = self.b.add_constant(Value::str(ty.clone()));
                 self.b.emit(Op::LoadConst(nidx), 0);
-                self.b.emit(Op::Extended(KT_IS, 0), 0);
+                // The operand says whether the tested type was written `T?`,
+                // which is the only thing that decides a null operand's answer.
+                self.b.emit(Op::Extended(KT_IS, u8::from(*nullable)), 0);
                 if *negated {
                     self.b.emit(Op::LogNot, 0);
                 }
@@ -3309,14 +3315,18 @@ impl Compiler {
             // width and `/` dispatch from here on. The runtime op only enforces
             // the check (throw for `as`, null for `as?`).
             Expr::As {
-                value, ty, safe, ..
+                value,
+                ty,
+                safe,
+                nullable,
+                ..
             } => {
                 // A cast to a type that keeps no width — `1L as Any` — is an
                 // erased position: the value leaves with the cast's static type
                 // and its own is gone. A cast that KEEPS the width (`x as Long`)
                 // needs no box, and taking one would put the native path behind
                 // a heap object.
-                match cast_type(ty, *safe) {
+                match cast_type(ty, *safe, *nullable) {
                     Type::Long | Type::Float => {
                         self.compile_expr(sc, value)?;
                     }
@@ -3326,8 +3336,8 @@ impl Compiler {
                 }
                 let nidx = self.b.add_constant(Value::str(ty.clone()));
                 self.b.emit(Op::LoadConst(nidx), 0);
-                self.b.emit(Op::Extended(KT_AS, u8::from(*safe)), 0);
-                Ok(cast_type(ty, *safe))
+                self.b.emit(Op::Extended(KT_AS, u8::from(*safe) | (u8::from(*nullable) << 1)), 0);
+                Ok(cast_type(ty, *safe, *nullable))
             }
             Expr::IncDec {
                 target,
@@ -6982,12 +6992,14 @@ impl Compiler {
                     self.b.emit(Op::LogNot, 0);
                 }
             }
-            WhenCond::Is { negated, ty } => {
+            WhenCond::Is { negated, ty, nullable } => {
                 let (slot, _) = subj.ok_or("`is` condition requires a `when` subject")?;
                 self.b.emit(Op::GetSlot(slot), 0);
                 let nidx = self.b.add_constant(Value::str(ty.clone()));
                 self.b.emit(Op::LoadConst(nidx), 0);
-                self.b.emit(Op::Extended(KT_IS, 0), 0);
+                // The operand says whether the tested type was written `T?`,
+                // which is the only thing that decides a null operand's answer.
+                self.b.emit(Op::Extended(KT_IS, u8::from(*nullable)), 0);
                 if *negated {
                     self.b.emit(Op::LogNot, 0);
                 }
@@ -7219,7 +7231,9 @@ impl Compiler {
             // A range and an array are heap objects; `in` is a predicate.
             Expr::Range { .. } | Expr::Step { .. } => Type::Obj,
             Expr::In { .. } | Expr::Is { .. } => Type::Boolean,
-            Expr::As { ty, safe, .. } => cast_type(ty, *safe),
+            Expr::As {
+                ty, safe, nullable, ..
+            } => cast_type(ty, *safe, *nullable),
             // `++`/`--` keep the target's type, so `d++` on a `Double` stays a
             // `Double` for display and `/` dispatch.
             Expr::IncDec { target, .. } => self.infer(sc, target),
@@ -8301,9 +8315,12 @@ fn join_ty(prev: Option<Type>, next: Type) -> Type {
 /// A failing `as?` yields null, so a safe cast to `String` is a *nullable*
 /// String — the distinction the display path needs to render the four
 /// characters `null` rather than the empty string.
-fn cast_type(ty: &str, safe: bool) -> Type {
+fn cast_type(ty: &str, safe: bool, nullable: bool) -> Type {
     match Type::from_name(ty) {
-        Type::String if safe => Type::NullableString,
+        // Both spellings can produce null — `as? String` on a mismatch and
+        // `as String?` on a null operand — and the static type has to say so,
+        // or `println` renders that null as the empty string a `String` prints.
+        Type::String if safe || nullable => Type::NullableString,
         Type::Unknown => Type::Obj,
         t => t,
     }

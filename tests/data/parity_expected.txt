@@ -954,3 +954,11 @@ import kotlin.properties.Delegates\nfun main() { var n: Int by Delegates.observa
 import kotlin.properties.Delegates\nfun main() { var v: Int by Delegates.vetoable(0) { _, _, new -> new >= 0 }; v = 5; println(v); v = -1; println(v); v = 7; println(v) }	5\n5\n7\n
 import kotlin.properties.Delegates\nfun main() { var s: String by Delegates.observable("a") { _, o, n -> println("$o=>$n") }; s = "b"; s += "c"; println(s) }	a=>b\nb=>bc\nbc\n
 class Upper { var v: String = ""\n operator fun getValue(t: Any?, p: Any?): String = v.uppercase()\n operator fun setValue(t: Any?, p: Any?, x: String) { v = x } }\nfun main() { var s: String by Upper(); s = "hi"; println(s); println(s.length) }	HI\n2\n
+fun main() {\n    val n: Any? = null\n    println(n as String?)\n    println(n as? String)\n    println(n is String)\n    println(n is String?)\n    println(n !is String?)\n}	null\nnull\nfalse\ntrue\nfalse\n
+fun main() {\n    println(null as String?)\n    println((null as String?)?.length ?: -1)\n}	null\n-1\n
+fun main() {\n    val n: Any? = null\n    try {\n        val s = n as String\n        println(s)\n    } catch (e: NullPointerException) {\n        println("NPE")\n    }\n}	NPE\n
+fun main() {\n    val v: Any = 5\n    try {\n        println(v as String)\n    } catch (e: ClassCastException) {\n        println("CCE")\n    }\n}	CCE\n
+fun main() {\n    val n: Any? = null\n    println(when (n) { is String? -> "s?" else -> "other" })\n    val m: Any? = "x"\n    println(when (m) { is String -> "s" else -> "other" })\n}	s?\ns\n
+fun main() {\n    data class P(val x: Int, val y: String)\n    val (a, b) = P(1, "one")\n    println("$a $b")\n    for ((n, s) in listOf(P(2, "two"), P(3, "three"))) println("$n=$s")\n    for ((k, v) in mapOf(1 to "a", 2 to "b")) println("$k->$v")\n}	1 one\n2=two\n3=three\n1->a\n2->b\n
+fun main() {\n    println(5.takeIf { it > 3 })\n    println(5.takeUnless { it > 3 })\n    println(listOf(1, 2, 3).let { it.sum() })\n    println(run { 40 + 2 })\n    println("z".also { }.length)\n}	5\nnull\n6\n42\n1\n
+fun main() {\n    val sb = StringBuilder().apply { append("p"); append("q") }\n    println(sb.toString())\n    val nn: String? = "x"\n    println(nn!!.length)\n}	pq\n1\n

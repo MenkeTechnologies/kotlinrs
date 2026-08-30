@@ -3421,9 +3421,17 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             vm.push(Value::str(s));
         }
         KT_IS => {
-            // Stack: [value, typeName]; typeName on top.
+            // Stack: [value, typeName]; typeName on top. `arg == 1` when the
+            // tested type was written `T?`.
             let ty = vm.pop().to_str();
             let v = vm.pop();
+            // Null matches a nullable type and nothing else: `null is String?`
+            // is true, `null is String` is false. `value_is_type` answers about
+            // the class alone and cannot make that distinction.
+            if matches!(v, Value::Undef) {
+                vm.push(Value::Bool(arg == 1));
+                return;
+            }
             vm.push(Value::Bool(value_is_type(&v, &ty)));
         }
         KT_LAZY_NEW => {
@@ -3433,13 +3441,25 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
         KT_AS => {
             let ty = vm.pop().to_str();
             let v = vm.pop();
-            // Kotlin's `null as T?` succeeds and `null as? T` is null; the
-            // parser drops the `?`, so a null value passes a safe cast and
-            // fails an unsafe one exactly as the JVM's would.
+            // Null is decided by the target's NULLABILITY, not by its class:
+            // `null as T?` is null, `null as? T` is null, and `null as T`
+            // throws — and it throws a NullPointerException, not the
+            // ClassCastException a wrong class gets.
+            if matches!(v, Value::Undef) {
+                let safe = arg & 1 == 1;
+                let nullable = arg & 2 == 2;
+                if safe || nullable {
+                    vm.push(Value::Undef);
+                } else {
+                    fault(vm, format!("java.lang.NullPointerException: null cannot be cast to non-null type {ty}"));
+                    vm.push(Value::Undef);
+                }
+                return;
+            }
             let matched = value_is_type(&v, &ty);
             if matched {
                 vm.push(v);
-            } else if arg == 1 {
+            } else if arg & 1 == 1 {
                 vm.push(Value::Undef);
             } else {
                 fault(vm, cast_failure(&v, &ty));

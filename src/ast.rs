@@ -704,7 +704,12 @@ pub enum WhenCond {
         kind: RangeKind,
     },
     /// `is Type` (or `!is …`) — subject-form runtime type check.
-    Is { negated: bool, ty: String },
+    Is {
+        negated: bool,
+        ty: String,
+        /// The arm wrote `is T?`, which a null subject matches.
+        nullable: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -880,6 +885,8 @@ pub enum Expr {
         value: Box<Expr>,
         ty: String,
         negated: bool,
+        /// The tested type was written `T?`, which a null value matches.
+        nullable: bool,
     },
     /// `value as Type` / `value as? Type` — a checked cast.
     ///
@@ -898,6 +905,10 @@ pub enum Expr {
         type_args: Vec<TypeArg>,
         /// `as?` — yield null instead of throwing on a mismatch.
         safe: bool,
+        /// The target was written `T?`. Nullability is not erased for a cast the
+        /// way the type arguments are: `null as T?` is null and `null as T`
+        /// throws, and only this tells the two apart.
+        nullable: bool,
     },
     /// `x++` / `x--` / `++x` / `--x`. The expression's value is the target's
     /// value *before* the update for the postfix forms and *after* it for the
