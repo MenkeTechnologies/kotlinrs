@@ -588,23 +588,19 @@ type this coarse system can name.
 
 The `inline` / `noinline` / `crossinline` / `tailrec` / `operator` / `infix` /
 `const` modifiers are accepted and discarded — each changes how the JVM compiles
-a declaration, not what it computes. A **reified** type test is the one case
-that cannot be erased quietly: `x is T` / `x as T` against a type parameter has
-no answer a coarse type system could give, and answering `false` (the shape a
-name-based lookup falls into) would be silently wrong — so it is a compile error.
+a declaration, not what it computes. A type test against a type parameter that is
+NOT `reified` is the one case that cannot be erased quietly: `x is T` / `x as T`
+has no answer a coarse type system could give, and answering `false` (the shape
+a name-based lookup falls into) would be silently wrong — so it is a compile
+error. A `reified` T does have an answer and is compiled: the call site binds
+the type argument and the body reads it back.
 
-Not yet (see roadmap): `sequence { … }` / `yield` (a generator needs a
-continuation this VM has no opcode for, so an infinite sequence cannot be
-modelled by evaluating eagerly), variance and bounds,
-`kotlin.properties.Delegates.observable` / `vetoable` (a property delegate that
-is not a constructor call has no class whose `getValue` could be resolved at
-compile time, and no host-side delegate object backs the stdlib factories yet),
-an explicit `: super(args)` from a secondary constructor (the primary
-constructor is the only thing that chains to the superclass here), calling a
-method on `this` from inside an `init` block (the instance is allocated after
-the initializers run, so there is no receiver yet — reading properties works),
-and the rest of the standard-library surface. Each fails loudly rather than
-answering wrong.
+Not yet (see roadmap): variance and bounds, an explicit `: super(args)` from a
+secondary constructor (the primary constructor is the only thing that chains to
+the superclass here), calling a method on `this` from inside an `init` block
+(the instance is allocated after the initializers run, so there is no receiver
+yet — reading properties works), and the rest of the standard-library surface.
+Each fails loudly rather than answering wrong.
 
 One limitation is a **representation** limit rather than a missing feature, and
 so is excluded from the fuzzer and the frozen corpus by design: every integer is
