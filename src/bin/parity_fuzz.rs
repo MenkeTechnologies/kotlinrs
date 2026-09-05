@@ -49,6 +49,20 @@
 //! `keys`/`entries` are `Set`s — three silent differences in display, hashing,
 //! and equality).
 //!
+//! The modes added most recently cover DECLARATION FORMS the earlier ones never
+//! reached, each of which a frontend can approximate with a nearby form that is
+//! right until it is not: `enum` (a constant is an object with an `ordinal` and
+//! a `Comparable` order, and its default `toString` is its NAME where a plain
+//! class's is an identity hash), `sealed` (`when` over a closed hierarchy needs
+//! no `else`, and each `is` arm SMART-CASTS its subject), `builder`
+//! (`StringBuilder` is mutated in place across statements, so a frontend that
+//! copies the receiver per `append` is right on one call and wrong on two),
+//! `label` (an unlabelled `break` leaves the inner loop and a labelled one the
+//! outer — ignoring the label prints the same lines, just more of them, which is
+//! why it survives eyeballing), and `fold` (`fold`/`reduce` differ in their seed
+//! and the `Right` pair in their direction, told apart only by a
+//! non-commutative operator; `sortedWith`'s `thenBy` diverges only on a tie).
+//!
 //! Scope + determinism invariants (mirroring the javars/scalars harnesses):
 //!   * Only constructs kotlinrs actually implements are emitted — an unsupported
 //!     construct would be a known gap, not a parity signal.
@@ -95,6 +109,25 @@
 //! The two axes that USED to be blind here are now gated: the oracle's JVM
 //! (both of them — see [`check_oracle_jvms`]) and the run step's locale and
 //! console charset (see [`ORACLE_JVM_PINS`]).
+//!
+//! The JVM gate is a REFUSAL, not a fix, and on a machine with a version
+//! manager installed it fired on every run: `JAVA_HOME` named whatever that
+//! manager last selected, both Kotlin launchers honour it, and the harness could
+//! not run at all. [`pin_oracle_java_home`] sets the variable to
+//! [`DEFAULT_ORACLE_JAVA_HOME`] — the same home `scripts/reverify-parity.sh`
+//! pins — before either launcher is asked anything, so a divergence found here
+//! and a corpus record re-minted there were measured on ONE JVM. Override it
+//! with `ORACLE_JAVA_HOME`. The banner names the home AND the JRE each launcher
+//! resolved under it, because those two lines are the only record of which
+//! toolchain a reported divergence is about.
+//!
+//! A reported case is reduced twice. [`minimize`] deletes probes until every
+//! remaining one is load-bearing; [`shrink`] then replaces one LITERAL at a time
+//! with a simpler one, keeping whatever the divergence survives. Without the
+//! second stage a one-probe reduction still carries whichever operands the
+//! generator drew, and separating the literals that matter from the ones that do
+//! not is left to the reader. `--shrink-budget N` caps its toolchain calls
+//! (default 40); `--no-shrink` leaves only the probe-level stage.
 //!
 //! Subprocess-only: this binary never links the kotlinrs library.
 //!
@@ -1611,6 +1644,11 @@ enum Mode {
     Equality,
     Operator,
     Generic,
+    Enum,
+    Sealed,
+    Builder,
+    Label,
+    Fold,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -1670,6 +1708,11 @@ const CONCRETE: &[Mode] = &[
     Mode::Equality,
     Mode::Operator,
     Mode::Generic,
+    Mode::Enum,
+    Mode::Sealed,
+    Mode::Builder,
+    Mode::Label,
+    Mode::Fold,
 ];
 
 /// The **operator conventions** on a collection receiver, plus the iteration
@@ -1995,6 +2038,271 @@ fn g_equality(r: &mut Rng, idx: usize) -> String {
     }
 }
 
+const ENUM_NAMES: &[&str] = &["\"RED\"", "\"GREEN\"", "\"BLUE\""];
+const PLAIN_NAMES: &[&str] = &["\"A\"", "\"B\"", "\"C\""];
+
+/// `enum class`: constant identity, `name`/`ordinal`/`entries`/`valueOf`, the
+/// `Comparable` order the ordinal induces, and `when` over an enum subject —
+/// the exhaustive form that takes no `else`.
+///
+/// Two enums, because their DEFAULT renderings differ and a frontend can get
+/// one from the other. `EPlain`'s `toString` is the constant name; `ECol`
+/// overrides it, so a frontend that hard-codes "an enum prints its name" is
+/// right on one and wrong on the other. Neither may fall back to the
+/// identity-hash form a plain class defaults to, which would be
+/// nondeterministic rather than merely wrong.
+fn g_enum(r: &mut Rng, idx: usize) -> String {
+    let n = pick(r, INTS);
+    match r.below(17) {
+        0 => p("ECol.RED".into()),
+        1 => p("EPlain.B".into()),
+        2 => p(format!("ECol.valueOf({}).w", pick(r, ENUM_NAMES))),
+        3 => p(format!("EPlain.valueOf({}).ordinal", pick(r, PLAIN_NAMES))),
+        4 => p("ECol.entries.size".into()),
+        5 => p("EPlain.entries.map { it.name }".into()),
+        6 => p("ECol.entries.joinToString(\",\") { it.hue() }".into()),
+        7 => p(format!("erank(ecolOf({n}))")),
+        8 => p(format!("ecolOf({n})")),
+        9 => p(format!("ecolOf({n}) == ECol.RED")),
+        10 => p(format!(
+            "EPlain.valueOf({}) < EPlain.valueOf({})",
+            pick(r, PLAIN_NAMES),
+            pick(r, PLAIN_NAMES)
+        )),
+        11 => p("EPlain.entries.sortedByDescending { it.ordinal }".into()),
+        12 => p("ECol.RED.name + ECol.RED.ordinal".into()),
+        13 => p(format!(
+            "when (ecolOf({n})) {{ ECol.RED -> \"r\"; ECol.GREEN -> \"g\"; ECol.BLUE -> \"b\" }}"
+        )),
+        14 => format!("val ev{idx} = EPlain.entries.toList(); println(ev{idx}.indexOf(EPlain.C))"),
+        15 => p("ECol.entries.sumOf { it.w }".into()),
+        _ => p(format!("listOf(ecolOf({n}), EPlain.A)")),
+    }
+}
+
+/// `sealed` hierarchies and the `when` that dispatches on them.
+///
+/// The point is the SMART CAST: after `is Sd.Rect` the subject is a `Sd.Rect`
+/// and `s.w` resolves, which a frontend that treats `is` as a pure predicate
+/// cannot do. `Sd.Empty` is an `object` arm — matched by identity, not by type
+/// — and it carries an explicit `toString` because the default for an object
+/// embeds an identity hash and would make the probe nondeterministic.
+fn g_sealed(r: &mut Rng, idx: usize) -> String {
+    let a = pick(r, RINTS);
+    let b = pick(r, RINTS);
+    let n = pick(r, INTS);
+    match r.below(21) {
+        0 => p(format!("sdArea(sdMk({n}))")),
+        1 => p(format!("sdMk({n})")),
+        2 => p(format!("sdMk({n}) is Sd.Rect")),
+        3 => format!(
+            "val sv{idx} = sdMk({n}); println(if (sv{idx} is Sd.Circ) sv{idx}.r else -1)"
+        ),
+        4 => p(format!("sdWhich({n}).tag()")),
+        5 => p(format!(
+            "when (val sq{idx} = sdWhich({n})) {{ is SdA -> sq{idx}.k; is SdB -> sq{idx}.s.length }}"
+        )),
+        6 => p(format!("Sd.Circ({a}) == Sd.Circ({b})")),
+        7 => p(format!("Sd.Rect({a}, {b}).copy(h = {})", pick(r, RINTS))),
+        8 => p("Sd.Empty".into()),
+        9 => p("listOf(sdMk(0), sdMk(1), sdMk(2))".into()),
+        10 => p(format!("sdArea(Sd.Rect({a}, {b})) + sdArea(Sd.Circ({a}))")),
+        11 => p(format!("sdMk({n}) == sdMk({n})")),
+        12 => p(format!(
+            "when (sdMk({n})) {{ is Sd.Circ -> \"c\"; is Sd.Rect -> \"r\"; Sd.Empty -> \"e\" }}"
+        )),
+        13 => format!("val sd{idx}: Sd = Sd.Rect({a}, {b}); println(sdArea(sd{idx}))"),
+        // The flat spelling of the same hierarchy — see `extra_declarations`.
+        14 => p(format!("tlArea(TlMk({n}))")),
+        15 => p(format!("TlMk({n})")),
+        16 => p(format!("TlMk({n}) is TlRect")),
+        17 => format!("val tv{idx} = TlMk({n}); println(if (tv{idx} is TlCirc) tv{idx}.r else -1)"),
+        18 => p(format!("TlRect({a}, {b}).copy(h = {})", pick(r, RINTS))),
+        19 => p(format!(
+            "when (TlMk({n})) {{ is TlCirc -> \"c\"; is TlRect -> \"r\"; TlEmpty -> \"e\" }}"
+        )),
+        _ => p("listOf(TlMk(0), TlMk(1), TlMk(2))".into()),
+    }
+}
+
+/// `StringBuilder` and `buildString`, plus the padding/repeat members that
+/// build a fixed-width field.
+///
+/// A builder is MUTATED IN PLACE, so every probe reads its answer off an object
+/// several statements later — a frontend that copies the receiver on each
+/// `append` is right on a single call and wrong here. `append` is also
+/// overloaded across `Int`/`Double`/`Char`/`Boolean`/`String`, and each spells
+/// its argument the way `toString` would, so the overload set doubles as a
+/// second reading of the display rules.
+fn g_builder(r: &mut Rng, idx: usize) -> String {
+    let s = pick(r, STRS);
+    let n = pick(r, INTS);
+    let d = pick(r, DBLS);
+    match r.below(16) {
+        0 => format!(
+            "val sb{idx} = StringBuilder(); sb{idx}.append({s}); sb{idx}.append({n}); \
+             println(sb{idx}.toString())"
+        ),
+        1 => format!(
+            "val sb{idx} = StringBuilder({s}); sb{idx}.append({d}); println(sb{idx}.toString())"
+        ),
+        2 => format!(
+            "val sb{idx} = StringBuilder({s}); sb{idx}.append('z'); sb{idx}.reverse(); \
+             println(sb{idx}.toString())"
+        ),
+        3 => format!("val sb{idx} = StringBuilder({s}); println(sb{idx}.length)"),
+        4 => format!(
+            "val sb{idx} = StringBuilder(\"abc\"); sb{idx}.insert(1, {n}); \
+             println(sb{idx}.toString())"
+        ),
+        5 => format!(
+            "val sb{idx} = StringBuilder(\"abcd\"); sb{idx}.deleteCharAt(2); \
+             println(sb{idx}.toString())"
+        ),
+        6 => format!(
+            "val sb{idx} = StringBuilder(); sb{idx}.append(true); sb{idx}.append({n}); \
+             println(sb{idx}.toString() + \"|\" + sb{idx}.length)"
+        ),
+        7 => p(format!(
+            "buildString {{ append({s}); append({n}); append('x') }}"
+        )),
+        8 => p(format!("buildString {{ appendLine({s}); append({n}) }}")),
+        9 => p(format!("{s}.repeat({})", pick(r, &["0", "1", "2", "3"]))),
+        10 => p(format!(
+            "\"{}\".padStart({}, '0')",
+            pick(r, &["7", "42", ""]),
+            pick(r, &["0", "1", "4"])
+        )),
+        11 => p(format!(
+            "\"{}\".padEnd({}, '.')",
+            pick(r, &["7", "ab", ""]),
+            pick(r, &["0", "2", "5"])
+        )),
+        12 => p(format!("{s}.trimStart() + \"|\" + {s}.trimEnd() + \"|\"")),
+        13 => format!(
+            "val sb{idx} = StringBuilder(\"hello\"); sb{idx}.setLength({}); \
+             println(sb{idx}.toString() + sb{idx}.length)",
+            pick(r, &["0", "2", "5"])
+        ),
+        14 => p(format!(
+            "buildString {{ for (q in 0..{}) append(q) }}",
+            pick(r, &["0", "2", "4"])
+        )),
+        _ => format!(
+            "val sb{idx} = StringBuilder({s}); sb{idx}.append({s}); \
+             println(sb{idx}.toString().length)"
+        ),
+    }
+}
+
+/// Labels: `break@`/`continue@` out of a NESTED loop, and `return@` out of a
+/// lambda.
+///
+/// An unlabelled `break` leaves the inner loop and a labelled one leaves the
+/// outer, so a frontend that ignores the label produces output that is not
+/// merely different but PLAUSIBLE — the same lines, more of them. A `return@`
+/// inside `forEach` is the same hazard one level up: it must end the iteration,
+/// not the enclosing function.
+fn g_label(r: &mut Rng, idx: usize) -> String {
+    let lim = pick(r, &["0", "1", "2", "4", "6"]);
+    let hi = pick(r, &["1", "2", "3"]);
+    match r.below(11) {
+        0 => format!(
+            "outer{idx}@ for (i in 0..{hi}) {{ for (j in 0..{hi}) {{ \
+             if (i * j > {lim}) break@outer{idx}; print(\"\" + i + j + \" \") }} }}; println()"
+        ),
+        1 => format!(
+            "outer{idx}@ for (i in 0..{hi}) {{ for (j in 0..{hi}) {{ \
+             if (i * j > {lim}) continue@outer{idx}; print(\"\" + i + j + \" \") }} }}; println()"
+        ),
+        2 => format!(
+            "for (i in 0..{hi}) {{ for (j in 0..{hi}) {{ \
+             if (i * j > {lim}) break; print(\"\" + i + j + \" \") }} }}; println()"
+        ),
+        3 => format!(
+            "listOf(1, 2, 3).forEach lit{idx}@ {{ if (it == 2) return@lit{idx}; print(it) }}; \
+             println()"
+        ),
+        4 => format!(
+            "listOf(1, 2, 3).forEach {{ if (it > {lim}) return@forEach; print(it) }}; println()"
+        ),
+        5 => format!(
+            "var t{idx} = 0; w{idx}@ while (t{idx} < {hi} + 3) {{ t{idx}++; \
+             if (t{idx} == {hi}) continue@w{idx}; print(t{idx}) }}; println()"
+        ),
+        6 => format!(
+            "var u{idx} = 0; d{idx}@ do {{ u{idx}++; if (u{idx} > {lim}) break@d{idx}; \
+             print(u{idx}) }} while (u{idx} < {hi} + 2); println()"
+        ),
+        7 => format!(
+            "println(run r{idx}@ {{ for (i in 0..{hi}) if (i == {lim}) return@r{idx} \"hit\" + i; \
+             \"none\" }})"
+        ),
+        8 => format!(
+            "println(listOf(1, 2, 3).map lm{idx}@ {{ if (it == {lim}) return@lm{idx} 0; it * 2 }})"
+        ),
+        9 => format!(
+            "a{idx}@ for (i in 0..{hi}) {{ b{idx}@ for (j in 0..{hi}) {{ \
+             if (j == {lim}) continue@b{idx}; if (i == {lim}) break@a{idx}; \
+             print(\"\" + i + j) }} }}; println()"
+        ),
+        _ => format!(
+            "println(listOf(1, 2, 3).sumOf s{idx}@ {{ if (it == {lim}) return@s{idx} 0; it }})"
+        ),
+    }
+}
+
+/// The fold family and comparator-driven ordering.
+///
+/// `fold`/`reduce` differ in their SEED and `foldRight`/`reduceRight` in their
+/// direction, so a non-commutative operator tells all four apart — which is why
+/// every probe here uses `-` or string append rather than `+` over numbers.
+/// `sortedWith` carries the comparator that `sorted` implies, and `thenBy` is
+/// where a frontend that returns the first comparator's answer diverges only on
+/// a tie.
+fn g_fold(r: &mut Rng, idx: usize) -> String {
+    let list = pick(
+        r,
+        &[
+            "listOf(1, 2, 3, 4)",
+            "listOf(5, 1, 4, 2)",
+            "listOf(-3, 7, 0, 2)",
+            "listOf(2)",
+            "listOf(10, 10, 3)",
+        ],
+    );
+    let seed = pick(r, &["0", "1", "-2", "100"]);
+    match r.below(18) {
+        0 => p(format!("{list}.reduce {{ a, b -> a - b }}")),
+        1 => p(format!("{list}.reduceRight {{ a, b -> a - b }}")),
+        2 => p(format!("{list}.fold({seed}) {{ a, b -> a - b }}")),
+        3 => p(format!("{list}.foldRight({seed}) {{ a, b -> a - b }}")),
+        4 => p(format!("{list}.runningFold({seed}) {{ a, b -> a + b }}")),
+        5 => p(format!("{list}.scan({seed}) {{ a, b -> a * 2 + b }}")),
+        6 => p(format!("{list}.runningReduce {{ a, b -> a - b }}")),
+        7 => p(format!("{list}.fold(\"s\") {{ a, b -> a + b }}")),
+        8 => p(format!("{list}.sortedWith(compareBy {{ it % 3 }})")),
+        9 => p(format!(
+            "{list}.sortedWith(compareByDescending<Int> {{ it % 3 }}.thenBy {{ it }})"
+        )),
+        10 => p(format!(
+            "{list}.sortedWith(compareBy<Int> {{ it % 2 }}.thenByDescending {{ it }})"
+        )),
+        11 => p(format!("{list}.zipWithNext()")),
+        12 => p(format!("{list}.zipWithNext {{ a, b -> a - b }}")),
+        13 => p(format!("{list}.sortedDescending()")),
+        14 => p(format!("{list}.maxByOrNull {{ it % 3 }}")),
+        15 => p(format!("{list}.minWithOrNull(compareBy {{ it % 3 }})")),
+        // The `With` pair is drawn as often as the `By` pair because WHICH of a
+        // tied run they answer is the observable part, and `it % 3` over lists
+        // that repeat a residue is what produces the ties. Kotlin keeps the
+        // FIRST — it replaces the incumbent only on a strict improvement — so a
+        // frontend that replaces on `<=` differs on exactly these lists.
+        16 => p(format!("{list}.maxWithOrNull(compareBy {{ it % 3 }})")),
+        _ => format!("val fs{idx} = {list}.sorted(); println(fs{idx}.binarySearch({seed}))"),
+    }
+}
+
 fn mode_name(m: Mode) -> &'static str {
     match m {
         Mode::All => "all",
@@ -2054,6 +2362,11 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Equality => "equality",
         Mode::Operator => "operator",
         Mode::Generic => "generic",
+        Mode::Enum => "enum",
+        Mode::Sealed => "sealed",
+        Mode::Builder => "builder",
+        Mode::Label => "label",
+        Mode::Fold => "fold",
     }
 }
 
@@ -2127,6 +2440,11 @@ fn gen_probe(r: &mut Rng, mode: Mode, idx: usize) -> String {
         Mode::Equality => g_equality(r, idx),
         Mode::Operator => g_operator(r),
         Mode::Generic => g_generic(r, idx),
+        Mode::Enum => g_enum(r, idx),
+        Mode::Sealed => g_sealed(r, idx),
+        Mode::Builder => g_builder(r, idx),
+        Mode::Label => g_label(r, idx),
+        Mode::Fold => g_fold(r, idx),
         Mode::All => unreachable!("resolved above"),
     }
 }
@@ -2156,6 +2474,86 @@ fn gen_probes(seed: u64, mode: Mode, n: usize) -> Vec<String> {
 fn extra_declarations(probes: &[String]) -> String {
     let mut out = String::new();
     let named = |m: &str| probes.iter().any(|p| p.contains(m));
+    // ── enum: two enums whose DEFAULT rendering differs ──
+    //
+    // Both blocks go out together whenever either enum is named, because a
+    // single probe can draw a constant from one and a helper that returns the
+    // other (`listOf(ecolOf(n), EPlain.A)`), and `minimize` can reduce a batch
+    // to exactly that probe. Keying each block on its own type would then emit
+    // a program `kotlinc` rejects, which is scored as "the oracle would not
+    // answer" rather than as a divergence — the reduction disappears.
+    if named("ECol") || named("EPlain") || named("ecolOf(") || named("erank(") {
+        out.push_str(
+            "enum class ECol(val w: Int) {\n\
+             \x20   RED(3), GREEN(5), BLUE(7);\n\
+             \x20   fun hue(): String = name.lowercase() + w\n\
+             \x20   override fun toString(): String = \"ECol<\" + name + \":\" + w + \">\"\n\
+             }\n\
+             enum class EPlain { A, B, C }\n\
+             fun ecolOf(i: Int): ECol = ECol.entries[((i % 3) + 3) % 3]\n\
+             fun erank(c: ECol): String = when (c) {\n\
+             \x20   ECol.RED -> \"r\"\n\
+             \x20   ECol.GREEN -> \"g\"\n\
+             \x20   ECol.BLUE -> \"b\"\n\
+             }\n",
+        );
+    }
+    // ── sealed: a class hierarchy and an interface one ──
+    //
+    // `Sd.Empty` overrides `toString`; the default for an `object` is
+    // `Sd$Empty@<identity hash>`, which no two runs agree on.
+    if named("Sd.") || named("sdArea(") || named("sdMk(") {
+        out.push_str(
+            "sealed class Sd {\n\
+             \x20   data class Circ(val r: Int) : Sd()\n\
+             \x20   data class Rect(val w: Int, val h: Int) : Sd()\n\
+             \x20   object Empty : Sd() { override fun toString(): String = \"Empty\" }\n\
+             }\n\
+             fun sdArea(s: Sd): Int = when (s) {\n\
+             \x20   is Sd.Circ -> 3 * s.r * s.r\n\
+             \x20   is Sd.Rect -> s.w * s.h\n\
+             \x20   Sd.Empty -> 0\n\
+             }\n\
+             fun sdMk(i: Int): Sd = when (((i % 3) + 3) % 3) {\n\
+             \x20   0 -> Sd.Circ(i)\n\
+             \x20   1 -> Sd.Rect(i, i + 1)\n\
+             \x20   else -> Sd.Empty\n\
+             }\n",
+        );
+    }
+    // The TOP-LEVEL spelling of the same hierarchy. Kotlin allows a sealed
+    // type's subclasses either nested in its body or beside it in the same
+    // file, and the two are one construct to the language and two to a parser.
+    // Generating only the nested idiom means a frontend that rejects nesting
+    // reports one finding and stops, hiding whether the `when`/smart-cast
+    // behaviour it wraps is right — so the flat spelling is drawn as well and
+    // keeps that half under comparison.
+    if named("TlMk(") || named("tlArea(") || named("TlCirc") || named("TlRect") {
+        out.push_str(
+            "sealed class Tl\n\
+             data class TlCirc(val r: Int) : Tl()\n\
+             data class TlRect(val w: Int, val h: Int) : Tl()\n\
+             object TlEmpty : Tl() { override fun toString(): String = \"TlEmpty\" }\n\
+             fun tlArea(s: Tl): Int = when (s) {\n\
+             \x20   is TlCirc -> 3 * s.r * s.r\n\
+             \x20   is TlRect -> s.w * s.h\n\
+             \x20   TlEmpty -> 0\n\
+             }\n\
+             fun TlMk(i: Int): Tl = when (((i % 3) + 3) % 3) {\n\
+             \x20   0 -> TlCirc(i)\n\
+             \x20   1 -> TlRect(i, i + 1)\n\
+             \x20   else -> TlEmpty\n\
+             }\n",
+        );
+    }
+    if named("sdWhich(") || named("SdA") || named("SdB") {
+        out.push_str(
+            "sealed interface SdI { fun tag(): String }\n\
+             class SdA(val k: Int) : SdI { override fun tag(): String = \"A\" + k }\n\
+             class SdB(val s: String) : SdI { override fun tag(): String = \"B\" + s }\n\
+             fun sdWhich(i: Int): SdI = if (i % 2 == 0) SdA(i) else SdB(\"x\" + i)\n",
+        );
+    }
     // The three equality families — see `g_equality`.
     if named("EqPlain(") {
         out.push_str("class EqPlain(val a: Int)\n");
@@ -2681,11 +3079,41 @@ fn build_program(probes: &[String]) -> String {
     s
 }
 
+#[derive(Clone)]
 struct RunOut {
     stdout: Vec<u8>,
     ok: bool,
     /// How far this side got. See [`Stage`].
     stage: Stage,
+}
+
+/// Toolchain invocations actually spent, counted rather than estimated.
+///
+/// The oracle is where all of this harness's wall time goes — a `kotlinc` on a
+/// forty-probe program is seconds, and everything else is microseconds — so
+/// this counter, not a stopwatch, is the honest measure of what the reduction
+/// stages cost. It is also machine-load independent, which a stopwatch on a
+/// shared box is not.
+static ORACLE_RUNS: AtomicU64 = AtomicU64::new(0);
+static ORACLE_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Memo of oracle answers keyed on the exact program text.
+///
+/// The reduction stages ask about the SAME program repeatedly. [`shrink`]
+/// restarts its outer sweep whenever a substitution lands, and every candidate
+/// it had already rejected for an untouched probe is regenerated and re-run
+/// identically; [`minimize`]'s halving sweep replays subsets the same way; and
+/// `main` re-runs the winning reduction one final time to print it. Every one
+/// of those repeats was a fresh `kotlinc`. The program text is the whole input
+/// to a run — the toolchain, the JVM and the pins are fixed for the process —
+/// so a repeat's answer is already known.
+///
+/// Not cleared between seeds: two seeds that reduce to the same probe reduce to
+/// the same program, and that is exactly the case worth not paying for twice.
+fn oracle_memo() -> &'static std::sync::Mutex<std::collections::HashMap<String, RunOut>> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, RunOut>>> =
+        std::sync::OnceLock::new();
+    MEMO.get_or_init(Default::default)
 }
 
 /// How far a side got before it stopped.
@@ -2793,6 +3221,33 @@ fn run_ours(ours: &Path, src: &str, timeout: Duration) -> RunOut {
 /// divergence report would name the JDK rather than this frontend.
 const ORACLE_JVM_FLOOR: u32 = 21;
 
+/// The JVM this harness runs the oracle on unless `ORACLE_JAVA_HOME` overrides
+/// it — the same home `scripts/reverify-parity.sh` pins, so a divergence found
+/// here and a corpus record re-minted there were measured on ONE JVM.
+///
+/// A DEFAULT, not a discovery, because the ambient `JAVA_HOME` on a machine
+/// with a version manager installed points at whatever that manager last
+/// selected — a JDK 17 here — and `kotlinc`/`kotlin` are launcher scripts that
+/// honour it. Inheriting that silently downgrades both halves of the oracle
+/// below [`ORACLE_JVM_FLOOR`]; [`check_oracle_jvms`] would then abort the run
+/// naming the JRE but not the `JAVA_HOME` that chose it, which is the one fact
+/// needed to fix it. Overriding here makes the harness run at all, and the
+/// banner says which home it used.
+const DEFAULT_ORACLE_JAVA_HOME: &str = "/opt/homebrew/opt/openjdk@21";
+
+/// Point both launchers at one JVM and hand back the home that was used.
+///
+/// `kotlinc -version` reports the JRE it resolved, so the floor check that
+/// follows still MEASURES the outcome rather than trusting this to have taken.
+fn pin_oracle_java_home() -> String {
+    let home = std::env::var("ORACLE_JAVA_HOME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| DEFAULT_ORACLE_JAVA_HOME.to_string());
+    std::env::set_var("JAVA_HOME", &home);
+    home
+}
+
 /// The properties that pin the run step's locale and console charset, the same
 /// set `scripts/capture-parity.sh` freezes the corpus under.
 ///
@@ -2820,26 +3275,39 @@ fn jre_feature(banner: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
-/// The JVM a launcher resolved for ITSELF, measured rather than inferred.
-///
-/// There are two JVMs in the oracle and `JAVA_HOME` is only *expected* to steer
-/// both: a `const val` is folded into the class file under the COMPILER's
-/// `Double.toString` while an identical literal read at run time renders under
-/// the RUNTIME's, so the same source compiled and run across 17/21 gives four
-/// distinct answer pairs. Each launcher is therefore asked separately.
-fn launcher_jre(tool: &Path) -> Option<u32> {
-    let out = Command::new(tool).arg("-version").output().ok()?;
-    let banner =
-        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
-    jre_feature(&banner)
+/// The whole `-version` banner, so the report names the COMPILER version and
+/// not only the JVM under it. Two kotlinc releases disagree about plenty that
+/// has nothing to do with the JDK.
+fn launcher_banner(tool: &Path) -> String {
+    match Command::new(tool).arg("-version").output() {
+        Ok(out) => {
+            let s = String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr);
+            s.lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        }
+        Err(e) => format!("<{e}>"),
+    }
 }
 
-/// Refuse an oracle older than [`ORACLE_JVM_FLOOR`] on either side.
-fn check_oracle_jvms(kotlinc: &Path, kotlin: &Path) {
+/// Refuse an oracle older than [`ORACLE_JVM_FLOOR`] on either side, and SAY
+/// what was resolved either way.
+///
+/// The `JAVA_HOME` is named in both the accepting and the rejecting report
+/// because it is the input that decides the answer: a run that silently spoke
+/// JDK 17 and one that spoke 21 print identical divergence lists otherwise, and
+/// every double in them differs.
+fn check_oracle_jvms(kotlinc: &Path, kotlin: &Path, java_home: &str) {
+    eprintln!("parity-fuzz: JAVA_HOME={java_home}");
     for (label, tool) in [("kotlinc", kotlinc), ("kotlin", kotlin)] {
-        match launcher_jre(tool) {
+        let banner = launcher_banner(tool);
+        match jre_feature(&banner) {
             Some(v) if v >= ORACLE_JVM_FLOOR => {
-                eprintln!("parity-fuzz: {label} runs on JRE {v}");
+                eprintln!("parity-fuzz: {label} = JRE {v}  ({banner})");
             }
             other => {
                 let seen = other.map_or("unknown".to_string(), |v| v.to_string());
@@ -2847,7 +3315,11 @@ fn check_oracle_jvms(kotlinc: &Path, kotlin: &Path) {
                     "parity-fuzz: {label} runs on JRE {seen}; the oracle needs \
                      {ORACLE_JVM_FLOOR} or newer"
                 );
-                eprintln!("parity-fuzz: export JAVA_HOME=/path/to/jdk{ORACLE_JVM_FLOOR}+");
+                eprintln!("parity-fuzz: banner: {banner}");
+                eprintln!(
+                    "parity-fuzz: JAVA_HOME={java_home} chose it; set \
+                     ORACLE_JAVA_HOME=/path/to/jdk{ORACLE_JVM_FLOOR}+"
+                );
                 std::process::exit(2);
             }
         }
@@ -2858,6 +3330,19 @@ fn check_oracle_jvms(kotlinc: &Path, kotlin: &Path) {
 /// generated `TKt` class. A compile failure reports `Stage::Rejected`, which is
 /// a different defect from a program that compiled and then aborted.
 fn run_oracle(kotlinc: &Path, kotlin: &Path, src: &str, timeout: Duration) -> RunOut {
+    if let Some(hit) = oracle_memo().lock().ok().and_then(|m| m.get(src).cloned()) {
+        ORACLE_HITS.fetch_add(1, Ordering::Relaxed);
+        return hit;
+    }
+    let out = run_oracle_uncached(kotlinc, kotlin, src, timeout);
+    if let Ok(mut m) = oracle_memo().lock() {
+        m.insert(src.to_string(), out.clone());
+    }
+    out
+}
+
+fn run_oracle_uncached(kotlinc: &Path, kotlin: &Path, src: &str, timeout: Duration) -> RunOut {
+    ORACLE_RUNS.fetch_add(1, Ordering::Relaxed);
     let dir = workdir();
     let path = dir.join("T.kt");
     let out = dir.join("out");
@@ -2947,6 +3432,143 @@ fn minimize(probes: &[String], t: &Tools, timeout: Duration) -> Vec<String> {
     cur
 }
 
+/// Is the byte before `i` part of an identifier?
+///
+/// The digits in `gm3`, `boom7` and `p87` are NAME material, not literals: the
+/// generator suffixes every declared name with its probe index, and rewriting
+/// one occurrence of such a digit renames a variable at its use but not at its
+/// declaration. Only a digit run that starts fresh is a literal.
+fn preceded_by_ident(b: &[u8], i: usize) -> bool {
+    i > 0 && ((b[i - 1] as char).is_ascii_alphanumeric() || b[i - 1] == b'_')
+}
+
+/// Every one-literal simplification of `probe`, each a whole candidate probe.
+///
+/// Pure, so the span-finding is testable without a toolchain: the interesting
+/// part is what it declines to touch — digits inside a string, digits inside an
+/// identifier, and the exponent of a scientific literal.
+fn shrink_candidates(probe: &str) -> Vec<String> {
+    let b = probe.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i] as char;
+        if c == '"' {
+            let start = i;
+            let mut j = i + 1;
+            while j < b.len() {
+                if b[j] == b'\\' {
+                    j += 2;
+                    continue;
+                }
+                if b[j] == b'"' {
+                    j += 1;
+                    break;
+                }
+                j += 1;
+            }
+            // A template (`"a${x}b"`) is skipped whole: dropping its text would
+            // also drop the interpolation that is the point of the probe.
+            if !probe[start..j].contains('$') {
+                for repl in ["\"a\"", "\"\""] {
+                    if &probe[start..j] != repl {
+                        out.push(format!("{}{repl}{}", &probe[..start], &probe[j..]));
+                    }
+                }
+            }
+            i = j;
+            continue;
+        }
+        if c.is_ascii_digit() {
+            let fresh = !preceded_by_ident(b, i);
+            let mut j = i;
+            let mut dbl = false;
+            while j < b.len() && (b[j] as char).is_ascii_digit() {
+                j += 1;
+            }
+            if j + 1 < b.len() && b[j] == b'.' && (b[j + 1] as char).is_ascii_digit() {
+                dbl = true;
+                j += 1;
+                while j < b.len() && (b[j] as char).is_ascii_digit() {
+                    j += 1;
+                }
+            }
+            if j < b.len() && (b[j] == b'e' || b[j] == b'E') {
+                let mut k = j + 1;
+                if k < b.len() && (b[k] == b'+' || b[k] == b'-') {
+                    k += 1;
+                }
+                if k < b.len() && (b[k] as char).is_ascii_digit() {
+                    dbl = true;
+                    while k < b.len() && (b[k] as char).is_ascii_digit() {
+                        k += 1;
+                    }
+                    j = k;
+                }
+            }
+            let mut suffixed = false;
+            if j < b.len() && (b[j] == b'L' || b[j] == b'f' || b[j] == b'F') {
+                suffixed = true;
+                j += 1;
+            }
+            if fresh {
+                let cur = &probe[i..j];
+                let repls: &[&str] = match () {
+                    _ if cur.ends_with('L') => &["1L"],
+                    _ if suffixed => &[],
+                    _ if dbl => &["1.0"],
+                    _ => &["1", "0"],
+                };
+                for repl in repls {
+                    if cur != *repl {
+                        out.push(format!("{}{repl}{}", &probe[..i], &probe[j..]));
+                    }
+                }
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Literal-level shrinking — the stage after [`minimize`]'s probe-level one.
+///
+/// `minimize` can only DELETE probes, so it stops at one and that one still
+/// carries every literal the generator drew. Most of them are irrelevant to the
+/// divergence, and nothing in the report says which, so the reader re-derives
+/// the minimal case by hand. This substitutes a simpler literal for one span at
+/// a time and keeps whatever the divergence survives.
+///
+/// Each candidate is re-run through BOTH sides, so a substitution that happens
+/// to make the frontend agree is REJECTED rather than quietly narrowing the
+/// finding into a different one. `budget` caps the toolchain invocations,
+/// because every trial pays a full `kotlinc` compile.
+fn shrink(probes: &[String], t: &Tools, timeout: Duration, mut budget: usize) -> Vec<String> {
+    let mut cur = probes.to_vec();
+    let mut improved = true;
+    while improved && budget > 0 {
+        improved = false;
+        for k in 0..cur.len() {
+            for cand in shrink_candidates(&cur[k]) {
+                if budget == 0 {
+                    break;
+                }
+                budget -= 1;
+                let mut trial = cur.clone();
+                trial[k] = cand;
+                if diverges(&trial, t, timeout) {
+                    cur = trial;
+                    improved = true;
+                    break;
+                }
+            }
+        }
+    }
+    cur
+}
+
 fn ours_bin() -> PathBuf {
     if let Ok(p) = std::env::var("KOTLINRS_BIN") {
         return PathBuf::from(p);
@@ -2962,13 +3584,23 @@ fn ours_bin() -> PathBuf {
 }
 
 /// Find a reference tool on PATH, skipping our own binary of the same name.
+///
+/// The hit is CANONICALIZED before it is returned, for two reasons. A `PATH`
+/// entry may be relative (`.`, `./bin`), and a relative oracle resolves against
+/// whatever directory a later step happens to be in — [`run_oracle`] sets
+/// `current_dir` to a fresh scratch directory, where such a path names nothing.
+/// And the banner this program prints is the record of WHICH toolchain a
+/// divergence was measured against, so it has to name a real absolute file
+/// rather than the `PATH` fragment that found it.
 fn on_path(name: &str, skip: &Path) -> Option<PathBuf> {
     let skip = skip.canonicalize().ok();
     let path = std::env::var("PATH").ok()?;
     for dir in path.split(':') {
         let cand = Path::new(dir).join(name);
-        if cand.exists() && cand.canonicalize().ok() != skip {
-            return Some(cand);
+        if let Ok(real) = cand.canonicalize() {
+            if Some(&real) != skip.as_ref() {
+                return Some(real);
+            }
         }
     }
     None
@@ -2985,6 +3617,9 @@ struct Args {
     /// Print the generated program instead of running it — the only way to
     /// see what a BARREN seed actually handed the reference toolchain.
     dump: bool,
+    /// Toolchain invocations [`shrink`] may spend per divergence. 0 turns the
+    /// literal-level stage off and leaves [`minimize`]'s probe-level one.
+    shrink_budget: usize,
 }
 
 fn parse_args() -> Args {
@@ -2997,6 +3632,7 @@ fn parse_args() -> Args {
         timeout: Duration::from_secs(300),
         verbose: false,
         dump: false,
+        shrink_budget: 40,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -3012,6 +3648,8 @@ fn parse_args() -> Args {
             "--seed" => a.seed = take(&mut i).parse().ok(),
             "--once" => a.once = true,
             "--dump" => a.dump = true,
+            "--shrink-budget" => a.shrink_budget = take(&mut i).parse().unwrap_or(a.shrink_budget),
+            "--no-shrink" => a.shrink_budget = 0,
             "--verbose" | "-v" => a.verbose = true,
             "--timeout" => a.timeout = Duration::from_secs(take(&mut i).parse().unwrap_or(300)),
             "--mode" => {
@@ -3048,6 +3686,10 @@ fn parse_args() -> Args {
 
 fn main() {
     let args = parse_args();
+    // BEFORE either launcher is asked anything: both read `JAVA_HOME`, so the
+    // pin has to be in place for the version banners to describe the JVM the
+    // probes will actually run on.
+    let java_home = pin_oracle_java_home();
     let ours = ours_bin();
     if !ours.exists() {
         eprintln!("parity-fuzz: {} not built (cargo build)", ours.display());
@@ -3076,7 +3718,15 @@ fn main() {
         }
     };
 
-    check_oracle_jvms(&kotlinc, &kotlin);
+    // `--dump` prints the generated program and runs NEITHER side, so the two
+    // `-version` launches the gate costs buy nothing — and each is a full JVM
+    // start, which on a loaded machine is the dominant cost of a dump. Skipping
+    // it turns generating a batch of programs from minutes into milliseconds.
+    // The gate still runs on every path that actually consults the oracle,
+    // which is the only path whose answers a JVM can be wrong about.
+    if !args.dump {
+        check_oracle_jvms(&kotlinc, &kotlin, &java_home);
+    }
 
     let t = Tools {
         ours,
@@ -3139,7 +3789,12 @@ fn main() {
         }
         probes_compared += probes.len();
         failures += 1;
-        let minimal = minimize(&probes, &t, args.timeout);
+        let minimal = shrink(
+            &minimize(&probes, &t, args.timeout),
+            &t,
+            args.timeout,
+            args.shrink_budget,
+        );
         let src = build_program(&minimal);
         let a = run_oracle(&t.kotlinc, &t.kotlin, &src, args.timeout);
         let b = run_ours(&t.ours, &src, args.timeout);
@@ -3156,6 +3811,11 @@ fn main() {
          {probes_compared} compared, {failures} divergence(s), \
          {barren} barren ({rejected} rejected by kotlinc, {aborted} aborted at run time)"
     );
+    eprintln!(
+        "parity-fuzz: {} oracle toolchain run(s), {} served from the memo",
+        ORACLE_RUNS.load(Ordering::Relaxed),
+        ORACLE_HITS.load(Ordering::Relaxed)
+    );
     // A barren program is a hole in the measurement, not a pass, so it fails the
     // run just as a divergence does.
     if failures > 0 || barren > 0 {
@@ -3166,6 +3826,87 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shrinker must not rewrite a digit that is NAME material.
+    ///
+    /// `gm3` is a variable the same probe declares and reads; rewriting one
+    /// occurrence of its `3` renames the use and not the declaration, and the
+    /// candidate no longer compiles — which `diverges` scores as "the oracle
+    /// rejected it", i.e. not a divergence, so the bad candidate is dropped
+    /// rather than reported. That is the harmless failure. The harmful one is a
+    /// candidate that still compiles and means something else.
+    #[test]
+    fn shrink_leaves_identifier_digits_alone() {
+        let cands = shrink_candidates("val gm3 = GBox(7); println(gm3.v)");
+        assert!(
+            cands
+                .iter()
+                .all(|c| c.contains("gm3") && c.contains("gm3.v")),
+            "identifier digits were rewritten: {cands:?}"
+        );
+        // The one literal in it IS offered, both ways.
+        assert!(cands.iter().any(|c| c.contains("GBox(1)")), "{cands:?}");
+        assert!(cands.iter().any(|c| c.contains("GBox(0)")), "{cands:?}");
+    }
+
+    /// Digits inside a string are text, not literals, and a template's text is
+    /// not touched at all — dropping it would drop the `${}` the probe exists
+    /// to exercise.
+    #[test]
+    fn shrink_leaves_string_contents_alone() {
+        let cands = shrink_candidates("println(\"a7b\" + 42)");
+        assert!(
+            cands
+                .iter()
+                .all(|c| c.contains("\"a7b\"") || c.contains("\"a\"") || c.contains("\"\"")),
+            "{cands:?}"
+        );
+        assert!(
+            cands.contains(&"println(\"a7b\" + 1)".to_string()),
+            "{cands:?}"
+        );
+
+        let tmpl = shrink_candidates("println(\"v=${9 + 1}\")");
+        assert!(
+            tmpl.iter().all(|c| c.starts_with("println(\"v=$")),
+            "a template's text was rewritten: {tmpl:?}"
+        );
+    }
+
+    /// A scientific literal is ONE span. Splitting `1.0e-7` at the `e` would
+    /// offer `1.0e-1`, a different magnitude that reads as a successful shrink,
+    /// and `1.0` + a dangling `e-7`, which does not compile.
+    #[test]
+    fn shrink_treats_a_scientific_literal_as_one_span() {
+        let cands = shrink_candidates("println(1.0e-7 + 2.5)");
+        assert!(
+            cands.contains(&"println(1.0 + 2.5)".to_string()),
+            "{cands:?}"
+        );
+        assert!(
+            cands.iter().all(|c| !c.contains("e-1")),
+            "the exponent was shrunk on its own: {cands:?}"
+        );
+        // A `Long` shrinks to a `Long`: dropping the suffix changes the WIDTH,
+        // which is the very thing several modes are probing.
+        let l = shrink_candidates("println(9999999999L * 2)");
+        assert!(l.contains(&"println(1L * 2)".to_string()), "{l:?}");
+        assert!(l.iter().all(|c| !c.contains("println(1 *")), "{l:?}");
+    }
+
+    /// Every candidate is exactly one span different from the input, so a
+    /// shrink step that is accepted is attributable to a single literal.
+    #[test]
+    fn shrink_changes_one_span_at_a_time() {
+        for c in shrink_candidates("println(7 / 2 + 3.5)") {
+            assert_ne!(c, "println(7 / 2 + 3.5)");
+            let diffs = ["7", "2", "3.5"]
+                .iter()
+                .filter(|lit| !c.contains(*lit))
+                .count();
+            assert!(diffs <= 1, "candidate {c:?} moved more than one literal");
+        }
+    }
 
     /// The three ways the oracle can fail to answer are three different
     /// defects, and a single `barren` count spells them the same. A program

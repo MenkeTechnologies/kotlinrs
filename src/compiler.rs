@@ -7648,8 +7648,10 @@ impl Compiler {
                     Type::Unknown,
                 ),
             ],
-            // `sortedWith(comparator)`'s lambda compares two elements.
-            "sortedWith" => vec![(elem, inner), (elem, inner)],
+            // `sortedWith(comparator)`'s lambda compares two elements, and so do
+            // `maxWithOrNull`/`minWithOrNull`'s — all three take a COMPARATOR
+            // rather than a selector.
+            "sortedWith" | "maxWithOrNull" | "minWithOrNull" => vec![(elem, inner), (elem, inner)],
             // These hand the lambda a GROUP of the receiver's elements, so the
             // group's ELEMENT type is the receiver's element type.
             "chunked" | "windowed" => vec![(Type::Obj, elem)],
@@ -8834,6 +8836,8 @@ fn is_coll_hof(name: &str) -> bool {
             | "filterKeys"
             | "filterValues"
             | "sortedWith"
+            | "maxWithOrNull"
+            | "minWithOrNull"
             | "distinctBy"
             | "firstNotNullOf"
             | "firstNotNullOfOrNull"

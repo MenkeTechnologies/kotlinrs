@@ -382,6 +382,12 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `takeLast`/`dropLast`, `slice` — collapse to the empty and singleton classes
   at 0 and 1 elements, so `listOf(1, 2).take(1)` faults as a `SingletonList`
   while `listOf(1, 2).filter { true }` faults as an `ArrayList`.
+- **`List.binarySearch(element)`** over a receiver the caller sorted. The MISS
+  answer is not `-1`: Kotlin (and `java.util.Collections`) answer
+  `-(insertionPoint) - 1`, so a miss is negative AND says where the element
+  would go — `listOf(1, 3).binarySearch(2)` is `-2`. Which index a duplicate run
+  answers is whatever the halving lands on, unspecified by the contract, so the
+  same halving runs here rather than a scan.
 - **`Set`** — `setOf`/`mutableSetOf` build a `LinkedHashSet`, so iteration and
   display follow *insertion* order (`setOf(3, 1, 2, 3)` prints `[3, 1, 2]`) while
   equality ignores it (`setOf(1, 2) == setOf(2, 1)`). `MutableSet.add` answers
@@ -422,6 +428,9 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `.partition`, `.takeWhile`/`.dropWhile`, `.firstOrNull`/`.lastOrNull`,
   `.forEach`, `.fold`/`.reduce`, `.any`/`.all`/`.none`/`.count`, `.sumOf`,
   `.maxBy`/`.minBy` and `.maxByOrNull`/`.minByOrNull`,
+   `.maxWithOrNull`/`.minWithOrNull` — their COMPARATOR twins, which keep
+   the FIRST of a tied run because Kotlin replaces the incumbent only on a
+   strict improvement,
   `.sortedBy`/`.sortedByDescending`,
   `.associate`/`.associateBy`/`.associateWith`, `.groupBy`,
   `.first`/`.last`/`.find`/`.findLast`/`.single` and their `…OrNull` forms,
@@ -516,7 +525,12 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   A loop body may be a block or a single statement;
   `break`/`continue`, including labeled `outer@ for (…)` with
   `break@outer` / `continue@outer`, and the local `return@label` out of a
-  lambda. Blocks are lexically scoped: bindings
+   lambda — whose DECLARATION side is the label on the lambda itself
+   (`list.forEach lit@ { … return@lit … }`, `run r@ { … }`, and the standalone
+   `val f = lit@ { … }`). The label needs no lowering of its own: every lambda
+   body is its own VM frame, so a local return IS a frame return; what it needed
+   was to PARSE, and until it did the parser ended the statement at the label and
+   then reported that a label must precede a loop. Blocks are lexically scoped: bindings
   declared in a nested block (and the `for` variable) drop at the block's end;
   shadowing is restored. A `when` over a `sealed` hierarchy's `is` arms needs no
   `else` — the arms cover every subtype, so the fallthrough is unreachable.
@@ -836,6 +850,38 @@ fusevm::VM  ──►  three-tier Cranelift JIT (linear · block · tracing)
   every capture. kotlinrs targets the current wording throughout; it is the only
   self-consistent choice, since no single JDK ever paired JDK 17's index
   messages with JDK 19's `Double.toString`.
+- **All three harness entry points pin the same JVM, and none of them inherit
+  one.** Refusing an ambient `JAVA_HOME` below the floor is a correct guard and
+  a useless default: on a machine with a JVM version manager installed the
+  variable names whatever that manager last selected, so `capture-parity.sh` and
+  `parity-fuzz` aborted on every run and said only which JRE they had found, not
+  which `JAVA_HOME` had chosen it. Both now set the variable themselves — to
+  `CAPTURE_JAVA_HOME` / `ORACLE_JAVA_HOME` if given, else to the same JDK 21 home
+  `reverify-parity.sh` already pinned — before either Kotlin launcher is asked
+  anything, and each prints the home alongside the JRE **and full `-version`
+  banner** it measured for the compile step and the run step separately. A
+  divergence report and a re-minted corpus record are then about one toolchain,
+  and the report names it. `parity-fuzz` also canonicalizes the oracle it found
+  on `PATH`, so the banner records an absolute file rather than the `PATH`
+  fragment that located it.
+- **One JDK-17 contamination has a signature, and CI now greps for it.** JDK 21
+  reworded the `String`/`StringBuilder` index faults, so a frozen expectation
+  containing `index 9, length 3` cannot have come from any JVM the corpus is
+  allowed to be captured on. `tests/parity.rs` fails on that wording with no
+  toolchain installed. The `Double.toString` half has no such signature — both
+  dialects are ordinary decimal strings — so only `reverify-parity.sh` separates
+  them, and it must be run when a pin is in doubt.
+- **A reported divergence is reduced twice.** Probe-level delta debugging can
+  only delete probes; the one it stops at still carries whichever operands the
+  generator drew, which leaves separating the literals that matter from the ones
+  that do not to the reader. `parity-fuzz` follows it with a literal-level stage
+  that substitutes a simpler value for one span at a time and keeps whatever the
+  divergence survives — re-running BOTH sides each time, so a substitution that
+  happens to make the frontend agree is rejected rather than quietly narrowing
+  the finding into a different one. It leaves identifier digits, string
+  contents, `Long` suffixes and scientific exponents alone, each of which
+  changes the program's meaning rather than its size. `--shrink-budget N` caps
+  its toolchain calls; `--no-shrink` turns it off.
 - **A record may not name a class loader.** The oracle's run step is `kotlin
   -classpath out TKt`, and that launcher loads the program through a
   `URLClassLoader` of its own — so a `ClassCastException` over a user class

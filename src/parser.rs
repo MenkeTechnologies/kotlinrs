@@ -2170,7 +2170,14 @@ impl Parser {
     fn stmt(&mut self) -> Result<Stmt, String> {
         let line = self.line();
         // A loop label: `outer@ for (…)` / `outer@ while (…)`.
-        if matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::At) {
+        //
+        // A label followed by `{` is NOT one: it is a labelled lambda literal
+        // (`lit@ { … }`), an expression, so it falls through to the expression
+        // arm below rather than being rejected here for not being a loop.
+        if matches!(self.peek(), Tok::Ident(_))
+            && matches!(self.peek_at(1), Tok::At)
+            && !matches!(self.peek_at(2), Tok::LBrace)
+        {
             let label = self.ident()?;
             self.eat(&Tok::At)?;
             let kind = match self.peek() {
@@ -2953,8 +2960,8 @@ impl Parser {
                     }
                 }
                 self.eat(&Tok::RParen)?;
-                if self.at(&Tok::LBrace) && !self.no_trailing_lambda {
-                    args.push(self.lambda()?);
+                if self.at_lambda() {
+                    args.push(self.labeled_lambda()?);
                 }
                 e = Expr::Invoke {
                     target: Box::new(e),
@@ -3007,9 +3014,9 @@ impl Parser {
                 self.eat(&Tok::RParen)?;
             }
             // Trailing-lambda syntax: `list.map { … }` / `list.map(sel) { … }`.
-            if self.at(&Tok::LBrace) && !self.no_trailing_lambda {
+            if self.at_lambda() {
                 is_call = true;
-                args.push(self.lambda()?);
+                args.push(self.labeled_lambda()?);
             }
             if is_call {
                 e = reify_wrap(
@@ -3059,6 +3066,42 @@ impl Parser {
     /// [`StmtKind::Destructure`], the same node `val (k, v) = e` produces. The
     /// synthetic name is unspellable in Kotlin source, so it cannot shadow or be
     /// captured by anything the program wrote.
+    /// Does a lambda literal begin here — with or without a LABEL?
+    ///
+    /// `list.forEach lit@ { … }` names the lambda so a `return@lit` inside it
+    /// can say which one it leaves. Every call site that accepts a trailing
+    /// lambda accepts the labelled spelling too, so all of them ask this rather
+    /// than testing for `{` directly.
+    fn at_lambda(&self) -> bool {
+        if self.no_trailing_lambda {
+            return false;
+        }
+        self.at(&Tok::LBrace)
+            || (matches!(self.peek(), Tok::Ident(_))
+                && matches!(self.peek_at(1), Tok::At)
+                && matches!(self.peek_at(2), Tok::LBrace))
+    }
+
+    /// A lambda literal, consuming an optional `NAME@` label first.
+    ///
+    /// The label needs no lowering: every lambda body here compiles to its own
+    /// VM frame, so a `return@lit` IS a frame return, and [`Parser::stmt`]
+    /// already consumes and drops the label on the `return` side. What was
+    /// missing was the DECLARATION side. Without it the parser ended the
+    /// expression statement before the label, met `lit@ {` as a fresh statement,
+    /// and reported that a label must precede a loop — a message about a
+    /// construct the program did not contain.
+    fn labeled_lambda(&mut self) -> Result<Expr, String> {
+        if matches!(self.peek(), Tok::Ident(_))
+            && matches!(self.peek_at(1), Tok::At)
+            && matches!(self.peek_at(2), Tok::LBrace)
+        {
+            self.ident()?;
+            self.eat(&Tok::At)?;
+        }
+        self.lambda()
+    }
+
     fn lambda(&mut self) -> Result<Expr, String> {
         let lam_line = self.line();
         self.eat(&Tok::LBrace)?;
@@ -3392,6 +3435,16 @@ impl Parser {
             // `f({ … })`). Trailing-lambda braces are consumed by `postfix` /
             // `primary`'s call arms before reaching here.
             Tok::LBrace => self.lambda(),
+            // A LABELLED lambda literal in expression position: `lit@ { … }`,
+            // where the label names this lambda for a `return@lit` inside it.
+            // The trailing-lambda arms in `postfix`/`primary` consume the
+            // labelled spelling too, so what reaches here is the standalone one
+            // (`val f = lit@ { … }`, `g(lit@ { … })`).
+            Tok::Ident(_)
+                if matches!(self.peek_at(1), Tok::At) && matches!(self.peek_at(2), Tok::LBrace) =>
+            {
+                self.labeled_lambda()
+            }
             Tok::LParen => {
                 self.bump();
                 let e = self.expr()?;
@@ -3449,8 +3502,8 @@ impl Parser {
                     }
                     self.eat(&Tok::RParen)?;
                     // Trailing-lambda syntax on a free call: `apply(x) { … }`.
-                    if self.at(&Tok::LBrace) && !self.no_trailing_lambda {
-                        args.push(self.lambda()?);
+                    if self.at_lambda() {
+                        args.push(self.labeled_lambda()?);
                     }
                     // `enumValues<E>()` / `enumValueOf<E>(s)` are the two calls
                     // whose TYPE ARGUMENT is the whole meaning — they are
@@ -3474,11 +3527,11 @@ impl Parser {
                         });
                     }
                     Ok(reify_wrap(targ_call, Expr::Call { name, args, line }, line))
-                } else if self.at(&Tok::LBrace) && !self.no_trailing_lambda {
+                } else if self.at_lambda() {
                     // Bare trailing-lambda call `run { … }` (no parenthesized
                     // args). `Ident {` is unambiguously a call in Kotlin's
                     // expression grammar — there are no anonymous block statements.
-                    let lam = self.lambda()?;
+                    let lam = self.labeled_lambda()?;
                     Ok(Expr::Call {
                         name,
                         args: vec![lam],

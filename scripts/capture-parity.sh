@@ -74,14 +74,22 @@ for tool in $kotlinc $kotlin; do
     [[ -x $tool ]] || { print -u2 "capture-parity: $tool is not executable"; exit 2 }
 done
 
-# An explicit JVM beats an inherited one; an inherited one beats none.
-if [[ -n ${CAPTURE_JAVA_HOME:-} ]]; then
-    export JAVA_HOME=$CAPTURE_JAVA_HOME
-fi
-java=${JAVA_HOME:+$JAVA_HOME/bin/java}
-java=${java:-$(command -v java)}
+# AN EXPLICIT JVM, OR A PINNED DEFAULT — never the inherited one.
+#
+# `JAVA_HOME` on a machine with a version manager installed names whatever that
+# manager last selected, and both launchers below honour it, so an inherited
+# value silently decides the dialect every record is minted in. Defaulting to
+# the same home `reverify-parity.sh` pins means a record minted here and the
+# same record re-minted there were measured on ONE JVM; without it the two
+# scripts can disagree about a corpus neither of them is wrong about.
+#
+# (Inheriting was not unsafe — the floor check below rejects a JDK under 21 —
+# but it made the script unrunnable on exactly the machines that need it, and
+# an aborted capture teaches nothing about which JVM to pass.)
+export JAVA_HOME=${CAPTURE_JAVA_HOME:-/opt/homebrew/opt/openjdk@21}
+java=$JAVA_HOME/bin/java
 [[ -x $java ]] || {
-    print -u2 "capture-parity: no java (set CAPTURE_JAVA_HOME=/path/to/jdk21+)"
+    print -u2 "capture-parity: no java at $java (set CAPTURE_JAVA_HOME=/path/to/jdk21+)"
     exit 2
 }
 # `java -version` writes to stderr and spells the feature release first.
@@ -101,7 +109,9 @@ if [[ -z $cver ]] || (( cver < 21 )); then
     print -u2 "capture-parity: set CAPTURE_JAVA_HOME to a JDK 21+ home"
     exit 2
 fi
-print -u2 "capture-parity: oracle $kver"
+print -u2 "capture-parity: JAVA_HOME=$JAVA_HOME"
+print -u2 "capture-parity: run JVM     = $java (JDK $jver)"
+print -u2 "capture-parity: compile JVM = $kver"
 
 # THE LOCALE IS PART OF THE ORACLE TOO. `String.format`'s `%f`/`%e`/`%,d` take
 # their decimal separator and grouping from `Locale.getDefault()`, so the same

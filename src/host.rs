@@ -6863,6 +6863,34 @@ fn coll_hof(
                 None => invoke_closure(vm, clo, &[Value::Int(i)]),
             }
         }
+        // `maxWithOrNull`/`minWithOrNull` are the COMPARATOR twins of
+        // `maxByOrNull`/`minByOrNull`: they take a two-element comparison rather
+        // than a per-element selector, so they reach `compare_with` (which
+        // understands both a two-argument lambda and a `compareBy` chain) where
+        // the `By` pair reaches `value_cmp` on a selector's result.
+        //
+        // WHICH extremum, when several compare equal, is observable. Kotlin
+        // replaces the incumbent only on a STRICT improvement — `if
+        // (comparator.compare(max, e) < 0) max = e` — so the FIRST of a tied run
+        // wins on both sides. Replacing on `<=` would answer the last, which is
+        // a different element whenever the comparator is coarser than equality
+        // (`compareBy { it % 3 }` over `[10, 10, 3]`, say).
+        "maxWithOrNull" | "minWithOrNull" => {
+            let want_greater = name == "maxWithOrNull";
+            let mut best: Option<Value> = None;
+            for it in items {
+                match &best {
+                    None => best = Some(it),
+                    Some(cur) => {
+                        let c = compare_with(vm, clo, &cur.clone(), &it)?;
+                        if (want_greater && c < 0) || (!want_greater && c > 0) {
+                            best = Some(it);
+                        }
+                    }
+                }
+            }
+            extremum_or(best, name)
+        }
         // `sortedWith(comparator)` / `sortedBy`-with-a-comparator: the closure
         // answers a negative/zero/positive `Int` for a pair of elements.
         "sortedWith" => {
@@ -9972,6 +10000,42 @@ fn sequence_member(
                     .map(|p| p as i64)
                     .unwrap_or(-1),
             )
+        }
+        // `binarySearch(element)` over a list the caller has already sorted.
+        //
+        // THE MISS ANSWER IS NOT -1. Kotlin (and `java.util.Collections`) answer
+        // `-(insertionPoint) - 1`, so a miss is always negative AND says where
+        // the element would go — `listOf(1, 3).binarySearch(2)` is `-2`, not
+        // `-1`. Returning `-1` for every miss would agree with the oracle only
+        // when the insertion point happens to be 0.
+        //
+        // Which index a DUPLICATE run answers is unspecified in the contract and
+        // is whatever the halving lands on, so this runs the same halving rather
+        // than scanning: a linear search would answer the first of a tied run,
+        // which is a different index the oracle does not produce.
+        //
+        // An unsorted receiver is undefined behaviour on both sides — the
+        // stdlib does not check either — so no error is raised for one.
+        "binarySearch" => {
+            let Some(needle) = args.first().cloned() else {
+                return Some(Err("binarySearch: an element is required".to_string()));
+            };
+            let mut lo: i64 = 0;
+            let mut hi: i64 = items.len() as i64 - 1;
+            let mut found: Option<i64> = None;
+            while lo <= hi {
+                let mid = (lo + hi) / 2;
+                let c = value_cmp(&items[mid as usize], &needle);
+                match c {
+                    std::cmp::Ordering::Less => lo = mid + 1,
+                    std::cmp::Ordering::Greater => hi = mid - 1,
+                    std::cmp::Ordering::Equal => {
+                        found = Some(mid);
+                        break;
+                    }
+                }
+            }
+            Value::Int(found.unwrap_or(-(lo + 1)))
         }
         "sum" => sum_values(items),
         // An empty average is NaN in Kotlin, not an error.

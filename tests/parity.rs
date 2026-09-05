@@ -96,7 +96,58 @@ fn fnv1a(s: &str) -> u64 {
 /// fewer records than this is reporting on a TRUNCATED file rather than on the
 /// frontend — and `n > 0` would have called that a pass. Raise it with the
 /// corpus; never lower it to accommodate a deletion.
-const CORPUS_FLOOR: usize = 722;
+const CORPUS_FLOOR: usize = 969;
+
+/// No record may speak a pre-JDK-21 dialect.
+///
+/// The corpus is minted against a JDK 21+ oracle, but that is enforced by
+/// `scripts/capture-parity.sh` at CAPTURE time — nothing re-checks a line once
+/// it is in the file, and a record captured before the gate existed keeps
+/// whatever JDK the shell of the day exported. One such contamination has a
+/// SYNTACTIC signature and is therefore catchable here without a toolchain:
+/// JDK 21 moved the `String`/`StringBuilder` index faults onto `Preconditions`,
+/// turning `index 9, length 3` into `Index 9 out of bounds for length 3`. The
+/// old wording is unreachable from every JVM this corpus is allowed to be
+/// captured on, so a record carrying it was captured on JDK 20 or older and is
+/// pinning that JVM rather than the language. (That is not hypothetical: record
+/// 499 was exactly this, captured under a shell exporting a JDK 17.)
+///
+/// THE OTHER JDK-17 CONTAMINATION IS NOT CATCHABLE HERE. `Double.toString`
+/// switched to the shortest-round-trip algorithm in JDK 19, so `1.0e23` renders
+/// `9.999999999999999E22` on 17 and `1.0E23` from 19 on — both are ordinary
+/// decimal strings with no signature to grep for. Only re-minting the record
+/// against a live JDK 21+ oracle separates them, which is
+/// `scripts/reverify-parity.sh`'s job and a developer step, not a CI one.
+#[test]
+fn no_record_speaks_a_pre_jdk21_dialect() {
+    let data = include_str!("data/parity_expected.txt");
+    let mut bad = Vec::new();
+    for (i, line) in data.lines().enumerate() {
+        let Some((_, expected)) = line.split_once('\t') else {
+            continue;
+        };
+        // `index <digits>, length` — the lowercase spelling is the pre-21 one;
+        // the JDK 21 replacement capitalises it and reads `out of bounds for`.
+        let mut rest = expected;
+        while let Some(at) = rest.find("index ") {
+            let tail = &rest[at + "index ".len()..];
+            let digits = tail.chars().take_while(char::is_ascii_digit).count();
+            if digits > 0 && tail[digits..].starts_with(", length") {
+                bad.push(format!("line {}: {:?}", i + 1, expected));
+                break;
+            }
+            rest = &rest[at + "index ".len()..];
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "{} record(s) froze the pre-JDK-21 index-fault wording, so they were \
+         captured on JDK 20 or older and pin that JVM rather than Kotlin. \
+         Re-capture them with scripts/capture-parity.sh on a JDK 21+ home:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
+}
 
 #[test]
 fn frozen_corpus_matches_reference_kotlin() {
