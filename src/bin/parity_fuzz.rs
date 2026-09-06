@@ -1649,6 +1649,13 @@ enum Mode {
     Builder,
     Label,
     Fold,
+    StrOps,
+    NumConv,
+    Seq,
+    Destr,
+    NullColl,
+    MapOps,
+    Contract,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -1713,6 +1720,13 @@ const CONCRETE: &[Mode] = &[
     Mode::Builder,
     Mode::Label,
     Mode::Fold,
+    Mode::StrOps,
+    Mode::NumConv,
+    Mode::Seq,
+    Mode::Destr,
+    Mode::NullColl,
+    Mode::MapOps,
+    Mode::Contract,
 ];
 
 /// The **operator conventions** on a collection receiver, plus the iteration
@@ -2303,6 +2317,364 @@ fn g_fold(r: &mut Rng, idx: usize) -> String {
     }
 }
 
+/// String operations over the whole `String` member surface no earlier mode
+/// reached: the slicing family (`substring`/`take`/`drop`/`substringBefore`),
+/// the search family, the padding and trimming family, and `split`/`chunked`/
+/// `windowed`, which answer LISTS and so put the container rendering under
+/// comparison at the same time.
+///
+/// Every probe draws its indices from a pool that includes out-of-range values,
+/// because the FAULT is as observable as the answer: `substring` and `[]` raise
+/// with JDK-21 wording that a frontend has to reproduce verbatim.
+fn g_strops(r: &mut Rng, idx: usize) -> String {
+    let s = pick(
+        r,
+        &[
+            "\"Hello, World\"",
+            "\"aabbaa\"",
+            "\"\"",
+            "\" pad \"",
+            "\"a,b,,c\"",
+            "\"MiXeD\"",
+        ],
+    );
+    let i = pick(r, &["0", "1", "3", "5", "20"]);
+    let j = pick(r, &["0", "2", "4", "11"]);
+    let ch = pick(r, &["'a'", "'.'", "'X'"]);
+    let sub = pick(r, &["\"a\"", "\",\"", "\"l\"", "\"zz\"", "\"\""]);
+    match r.below(26) {
+        0 => format!("println(runCatching {{ {s}.substring({i}) }}.getOrNull())"),
+        1 => format!("println(runCatching {{ {s}.substring({j}, {i}) }}.getOrNull())"),
+        2 => p(format!("{s}.take({i})")),
+        3 => p(format!("{s}.drop({i})")),
+        4 => p(format!("{s}.takeLast({i})")),
+        5 => p(format!("{s}.dropLast({i})")),
+        6 => p(format!("{s}.split({sub})")),
+        7 => p(format!("{s}.split({sub}).size")),
+        8 => p(format!("{s}.replace({sub}, \"-\")")),
+        9 => p(format!("{s}.replaceFirst({sub}, \"-\")")),
+        10 => p(format!("{s}.indexOf({sub})")),
+        11 => p(format!("{s}.lastIndexOf({sub})")),
+        12 => p(format!("{s}.indexOf({sub}, {i})")),
+        13 => p(format!("{s}.padStart({i}, {ch})")),
+        14 => p(format!("{s}.padEnd({i}, {ch})")),
+        15 => format!("println(\"[\" + {s}.trim() + \"]\")"),
+        16 => format!("println(\"[\" + {s}.trimStart() + \"|\" + {s}.trimEnd() + \"]\")"),
+        17 => p(format!("{s}.repeat({j})")),
+        18 => p(format!("{s}.reversed()")),
+        19 => p(format!("{s}.substringBefore({sub})")),
+        20 => p(format!("{s}.substringAfter({sub})")),
+        21 => p(format!("{s}.substringAfterLast({sub})")),
+        22 => p(format!("{s}.startsWith({sub})")),
+        23 => p(format!("{s}.chunked({j} + 1)")),
+        24 => p(format!("{s}.windowed({j} + 1, {i} + 1)")),
+        _ => format!("val so{idx} = {s}; println(so{idx}.commonPrefixWith(\"Hello\"))"),
+    }
+}
+
+/// Numeric conversion and clamping. The parse family answers a VALUE or throws
+/// (`toInt`) or answers null (`toIntOrNull`), and the two disagree on exactly
+/// the inputs that overflow rather than the ones that are not numbers, so both
+/// spellings are drawn against a pool that contains each kind. `toString(radix)`
+/// and `toInt(radix)` are the inverse pair, and a negative operand is where a
+/// frontend that formats the magnitude and prepends a sign agrees while one
+/// that reinterprets the bits does not.
+fn g_numconv(r: &mut Rng, idx: usize) -> String {
+    let text = pick(
+        r,
+        &[
+            "\"42\"",
+            "\"-7\"",
+            "\"x\"",
+            "\"\"",
+            "\" 5\"",
+            "\"9999999999\"",
+            "\"0\"",
+        ],
+    );
+    // The negative literals are PARENTHESIZED because unary minus binds looser
+    // than a member call: `-255.toString(16)` is `-(255.toString(16))`, which is
+    // `unresolved reference 'unaryMinus'` on a `String` and cost this mode three
+    // of six programs to a kotlinc rejection. Where it does compile it is worse
+    // than a rejection, because it silently probes the wrong expression —
+    // `-3.7.coerceIn(0.0, 1.0)` is `-1.0` and `(-3.7).coerceIn(0.0, 1.0)` is
+    // `0.0`, and both sides of the comparison agree on the wrong one.
+    let n = pick(r, &["255", "(-255)", "0", "1", "2147483647"]);
+    let d = pick(r, &["3.7", "(-3.7)", "0.5", "(-0.5)", "2.5", "1e18"]);
+    let radix = pick(r, &["2", "8", "16", "36"]);
+    let lo = pick(r, &["0", "1", "-5"]);
+    let hi = pick(r, &["3", "5", "100"]);
+    match r.below(20) {
+        0 => format!("println(runCatching {{ {text}.toInt() }}.getOrNull())"),
+        1 => p(format!("{text}.toIntOrNull()")),
+        2 => p(format!("{text}.toLongOrNull()")),
+        3 => p(format!("{text}.toDoubleOrNull()")),
+        4 => format!("println(runCatching {{ {text}.trim().toLong() }}.getOrNull())"),
+        5 => p(format!("{text}.toIntOrNull(16)")),
+        6 => p(format!("{n}.toString({radix})")),
+        7 => p(format!("{n}.toLong().toString({radix})")),
+        8 => format!("println(runCatching {{ \"ff\".toInt({radix}) }}.getOrNull())"),
+        9 => p(format!("{n}.coerceIn({lo}, {hi})")),
+        10 => p(format!("{n}.coerceAtLeast({hi})")),
+        11 => p(format!("{n}.coerceAtMost({lo})")),
+        12 => p(format!("{d}.coerceIn(0.0, 1.0)")),
+        13 => p(format!("{d}.toInt()")),
+        14 => p(format!("{d}.toLong()")),
+        15 => p(format!("{n}.toByte()")),
+        16 => p(format!("{n}.toShort()")),
+        17 => p(format!("{n}.toDouble() / 2")),
+        18 => p(format!("{n}.toChar().code")),
+        _ => format!("val nc{idx} = {d}; println(nc{idx}.toFloat().toDouble() == nc{idx})"),
+    }
+}
+
+/// Sequences. A `Sequence` is LAZY where a `List` is eager, so the two differ in
+/// what they evaluate rather than in what they answer — which means a frontend
+/// that lowers `asSequence()` to the identity passes every probe that only
+/// checks the result. `generateSequence` with a null-returning step is the one
+/// that separates them: it has no length until the step says so, and an eager
+/// lowering does not terminate.
+fn g_seq(r: &mut Rng, idx: usize) -> String {
+    let list = pick(
+        r,
+        &[
+            "listOf(4, 1, 4, 9, 2)",
+            "listOf(1)",
+            "emptyList<Int>()",
+            "(1..6).toList()",
+            "listOf(-2, 0, 3)",
+        ],
+    );
+    let k = pick(r, &["0", "1", "2", "4", "9"]);
+    match r.below(20) {
+        0 => p(format!("{list}.asSequence().map {{ it * 2 }}.toList()")),
+        1 => p(format!("{list}.asSequence().filter {{ it > 1 }}.toList()")),
+        2 => p(format!("{list}.asSequence().take({k}).toList()")),
+        3 => p(format!("{list}.asSequence().drop({k}).toList()")),
+        4 => p(format!(
+            "{list}.asSequence().takeWhile {{ it > 0 }}.toList()"
+        )),
+        5 => p(format!(
+            "{list}.asSequence().dropWhile {{ it > 0 }}.toList()"
+        )),
+        6 => p(format!(
+            "generateSequence(1) {{ it * 3 }}.take({k}).toList()"
+        )),
+        7 => format!(
+            "println(generateSequence(1) {{ if (it < {k} * 4) it + 3 else null }}.toList())"
+        ),
+        8 => p(format!("{list}.asSequence().distinct().toList()")),
+        9 => p(format!("{list}.asSequence().sorted().toList()")),
+        10 => p(format!(
+            "{list}.asSequence().mapIndexed {{ i, v -> i * v }}.sum()"
+        )),
+        11 => p(format!(
+            "{list}.asSequence().flatMap {{ listOf(it, -it) }}.take({k}).toList()"
+        )),
+        12 => p(format!(
+            "{list}.asSequence().withIndex().map {{ it.index }}.toList()"
+        )),
+        13 => p(format!("{list}.asSequence().firstOrNull {{ it > {k} }}")),
+        14 => p(format!("{list}.asSequence().count {{ it % 2 == 0 }}")),
+        15 => p(format!(
+            "{list}.asSequence().fold(0) {{ a, b -> a * 2 + b }}"
+        )),
+        16 => p(format!("{list}.asSequence().joinToString(\"|\")")),
+        17 => p(format!("{list}.windowed({k} + 1)")),
+        18 => p(format!("{list}.chunked({k} + 1)")),
+        // The lazy/eager difference made observable: the step runs only for the
+        // elements taken, so the counter says how far the sequence was pulled.
+        _ => format!(
+            "var sq{idx} = 0; \
+             val r{idx} = generateSequence(1) {{ sq{idx}++; it + 1 }}.take({k}).toList(); \
+             println(\"\" + r{idx} + sq{idx})"
+        ),
+    }
+}
+
+/// Destructuring, in every position Kotlin allows one: a `val` declaration, a
+/// `for` header, and a lambda parameter list. What a destructuring binds is
+/// `componentN()`, so a `data class`, a `Pair`, a `Triple`, a `Map.Entry` and a
+/// `List` all destructure and each answers from a different place — the `List`
+/// form through the stdlib's five `componentN` extensions, which is why an index
+/// beyond five is not written here.
+fn g_destr(r: &mut Rng, idx: usize) -> String {
+    let a = pick(r, &["1", "-3", "0"]);
+    let b = pick(r, &["2", "7", "-1"]);
+    match r.below(16) {
+        0 => format!("val (a{idx}, b{idx}) = {a} to \"s\"; println(\"\" + a{idx} + b{idx})"),
+        1 => format!(
+            "val (a{idx}, b{idx}, c{idx}) = Triple({a}, {b}, {a} + {b}); \
+             println(a{idx} + b{idx} + c{idx})"
+        ),
+        2 => format!(
+            "val (a{idx}, b{idx}, c{idx}) = DP3({a}, \"k\", {b}.toDouble()); \
+             println(\"\" + a{idx} + b{idx} + c{idx})"
+        ),
+        3 => p(format!("DP3({a}, \"k\", 1.5).component2()")),
+        4 => p(format!("DP3({a}, \"k\", 1.5).component3()")),
+        5 => format!(
+            "for ((i{idx}, v{idx}) in listOf(\"a\", \"b\").withIndex()) \
+             print(\"\" + i{idx} + v{idx}); println()"
+        ),
+        6 => format!(
+            "for ((k{idx}, v{idx}) in mapOf({a} to \"x\", {b} to \"y\")) \
+             print(\"\" + k{idx} + v{idx}); println()"
+        ),
+        7 => p(format!(
+            "listOf({a} to {b}, {b} to {a}).map {{ (l, r) -> l * r }}"
+        )),
+        8 => p(format!("listOf({a} to {b}, {b} to {a}).unzip()")),
+        9 => p(format!(
+            "listOf({a}, {b}, 3).zip(listOf(\"p\", \"q\")) {{ m, n -> \"\" + m + n }}"
+        )),
+        10 => format!("val (a{idx}, b{idx}) = listOf({a}, {b}); println(a{idx} - b{idx})"),
+        11 => format!("val (_, b{idx}) = {a} to {b}; println(b{idx})"),
+        12 => p(format!("DP3({a}, \"z\", 0.5).copy(b = \"w\")")),
+        13 => format!(
+            "val e{idx} = mapOf(\"k\" to {a}).entries.first(); \
+             println(\"\" + e{idx}.key + e{idx}.value)"
+        ),
+        14 => p(format!(
+            "listOf(DP3({a}, \"a\", 0.0), DP3({b}, \"b\", 1.0)).map {{ (n, s, _) -> \"\" + n + s }}"
+        )),
+        _ => format!(
+            "val (a{idx}, b{idx}, c{idx}) = listOf({a}, {b}, {a} + {b}); \
+             println(a{idx} * b{idx} - c{idx})"
+        ),
+    }
+}
+
+/// The nullable-collection surface. Each of these answers for a container that
+/// MAY hold null, and the family splits three ways: `filterNotNull` drops them,
+/// `getOrNull`/`firstOrNull` answer null instead of throwing, and
+/// `isNullOrEmpty`/`orEmpty` are extensions on a NULLABLE RECEIVER — the one
+/// shape a frontend that dispatches on the runtime value cannot reach at all,
+/// because the receiver is not there to dispatch on.
+fn g_nullcoll(r: &mut Rng, idx: usize) -> String {
+    let list = pick(
+        r,
+        &[
+            "listOf(1, null, 3, null)",
+            "listOf<Int?>(null)",
+            "listOf<Int?>()",
+            "listOf<Int?>(5, 5)",
+        ],
+    );
+    let k = pick(r, &["0", "1", "4"]);
+    match r.below(18) {
+        0 => p(format!("{list}.filterNotNull()")),
+        1 => p(format!("{list}.mapNotNull {{ it }}")),
+        2 => p(format!("{list}.count {{ it == null }}")),
+        3 => p(format!("{list}.firstOrNull {{ it != null }}")),
+        4 => p(format!("{list}.indexOfFirst {{ it == null }}")),
+        5 => p(format!("{list}.getOrNull({k})")),
+        6 => p(format!("{list}.getOrElse({k}) {{ 99 }}")),
+        7 => p(format!("{list}.sumOf {{ it ?: 0 }}")),
+        8 => p(format!("{list}.joinToString()")),
+        9 => p(format!("{list}.singleOrNull()")),
+        10 => p(format!("{list}.lastOrNull()")),
+        11 => p(format!("{list}.ifEmpty {{ listOf(0) }}")),
+        12 => p(format!("{list}.filterNotNull().maxOrNull()")),
+        13 => format!("val ns{idx}: String? = null; println(ns{idx}.isNullOrEmpty())"),
+        14 => format!("val ns{idx}: String? = null; println(\"[\" + ns{idx}.orEmpty() + \"]\")"),
+        15 => format!("val ns{idx}: String? = null; println(ns{idx}?.length ?: -{k} - 1)"),
+        16 => format!("val ns{idx}: String? = \"v\"; println(ns{idx}?.let {{ it + \"!\" }})"),
+        _ => p(format!("listOfNotNull(1, null, {k})")),
+    }
+}
+
+/// The mutable-`Map` surface. The write members are where the observable answer
+/// is easiest to get wrong, because the three that look alike return three
+/// different things: `put` and `putIfAbsent` answer the PREVIOUS value,
+/// `getOrPut` answers the value that ends up stored, and `remove(key)` answers
+/// the removed value while `remove(key, value)` answers a `Boolean`. Every
+/// mutation runs inside one `run { … }` so the map it builds is local to the
+/// probe and a reduction cannot change what an earlier probe left behind.
+fn g_mapops(r: &mut Rng, idx: usize) -> String {
+    let init = pick(
+        r,
+        &[
+            "mutableMapOf(1 to \"a\", 2 to \"b\")",
+            "mutableMapOf<Int, String>()",
+            "mutableMapOf(1 to \"a\", 1 to \"z\")",
+        ],
+    );
+    let k = pick(r, &["1", "2", "9"]);
+    let m = pick(
+        r,
+        &[
+            "mapOf(1 to 2, 3 to 4)",
+            "mapOf<Int, Int>()",
+            "mapOf(1 to 1)",
+        ],
+    );
+    let mk = |body: &str| format!("println(run {{ val m{idx} = {init}; {body} }})");
+    match r.below(22) {
+        0 => mk(&format!("m{idx}.getOrPut({k}) {{ \"c\" }}")),
+        1 => mk(&format!("m{idx}.put({k}, \"B\")")),
+        2 => mk(&format!("m{idx}.putIfAbsent({k}, \"B\")")),
+        3 => mk(&format!("m{idx}.remove({k})")),
+        4 => mk(&format!("m{idx}.remove({k}, \"a\")")),
+        5 => mk(&format!("m{idx}.remove({k}); m{idx}")),
+        6 => mk(&format!("m{idx}.keys")),
+        7 => mk(&format!("m{idx}.values")),
+        8 => mk(&format!("m{idx}.containsKey({k})")),
+        9 => mk(&format!("m{idx}.containsValue(\"a\")")),
+        10 => mk(&format!("m{idx}.getOrDefault({k}, \"d\")")),
+        11 => format!("println(runCatching {{ {init}.getValue({k}) }}.exceptionOrNull()?.message)"),
+        12 => mk(&format!(
+            "m{idx}.entries.map {{ it.key.toString() + it.value }}"
+        )),
+        13 => mk(&format!("m{idx}.clear(); \"\" + m{idx} + m{idx}.isEmpty()")),
+        14 => p(format!("{m}.filterKeys {{ it > 1 }}")),
+        15 => p(format!("{m}.filterValues {{ it % 2 == 0 }}")),
+        16 => p(format!("{m}.mapValues {{ it.value * 10 }}")),
+        17 => p(format!("{m}.mapKeys {{ it.key * 10 }}")),
+        18 => p(format!("{m}.toList()")),
+        19 => p(format!("{m} + mapOf(5 to 6)")),
+        20 => p(format!("{m} - {k}")),
+        _ => p(format!("{m}.maxByOrNull {{ it.key }}")),
+    }
+}
+
+/// The standard-library CONTRACT functions and the faults they raise. Each
+/// answers `Unit` when it holds and throws when it does not, so the observable
+/// half is the exception: its CLASS decides which `catch` arm runs, and its
+/// MESSAGE is the string the toolchain generates when the call site supplies no
+/// lambda (`Failed requirement.`, `Check failed.`) — wording no frontend can
+/// guess. Both spellings are drawn, with and without the message lambda.
+fn g_contract(r: &mut Rng, idx: usize) -> String {
+    let cond = pick(r, &["1 > 2", "1 < 2", "\"a\".isEmpty()"]);
+    let msg = pick(r, &["\"need more\"", "\"m\" + 3", "\"\""]);
+    let caught = |body: &str| {
+        format!("println(runCatching {{ {body} }}.exceptionOrNull()?.let {{ it.toString() }})")
+    };
+    match r.below(16) {
+        0 => caught(&format!("require({cond}) {{ {msg} }}")),
+        1 => caught(&format!("require({cond})")),
+        2 => caught(&format!("check({cond}) {{ {msg} }}")),
+        3 => caught(&format!("check({cond})")),
+        4 => caught(&format!("error({msg})")),
+        5 => caught(&format!("requireNotNull(if ({cond}) 5 else null)")),
+        6 => caught(&format!(
+            "checkNotNull(if ({cond}) 5 else null) {{ {msg} }}"
+        )),
+        7 => caught(&format!("listOf(1)[if ({cond}) 0 else 5]")),
+        8 => caught(&format!("\"ab\"[if ({cond}) 0 else 9]")),
+        9 => caught(&format!("mapOf(1 to 2).getValue(if ({cond}) 1 else 9)")),
+        10 => caught("emptyList<Int>().first()"),
+        11 => caught(&format!("(if ({cond}) \"7\" else \"x\").toInt()")),
+        12 => caught(&format!("if ({cond}) 1 else 1 / 0")),
+        13 => format!("println(requireNotNull(if ({cond}) 5 else 6))"),
+        14 => format!("println(runCatching {{ require({cond}) {{ {msg} }} }}.isFailure)"),
+        _ => format!(
+            "val ct{idx} = runCatching {{ check({cond}) }}; \
+             println(\"\" + ct{idx}.isSuccess + ct{idx}.exceptionOrNull()?.message)"
+        ),
+    }
+}
+
 fn mode_name(m: Mode) -> &'static str {
     match m {
         Mode::All => "all",
@@ -2367,6 +2739,13 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Builder => "builder",
         Mode::Label => "label",
         Mode::Fold => "fold",
+        Mode::StrOps => "strops",
+        Mode::NumConv => "numconv",
+        Mode::Seq => "seq",
+        Mode::Destr => "destr",
+        Mode::NullColl => "nullcoll",
+        Mode::MapOps => "mapops",
+        Mode::Contract => "contract",
     }
 }
 
@@ -2445,6 +2824,13 @@ fn gen_probe(r: &mut Rng, mode: Mode, idx: usize) -> String {
         Mode::Builder => g_builder(r, idx),
         Mode::Label => g_label(r, idx),
         Mode::Fold => g_fold(r, idx),
+        Mode::StrOps => g_strops(r, idx),
+        Mode::NumConv => g_numconv(r, idx),
+        Mode::Seq => g_seq(r, idx),
+        Mode::Destr => g_destr(r, idx),
+        Mode::NullColl => g_nullcoll(r, idx),
+        Mode::MapOps => g_mapops(r, idx),
+        Mode::Contract => g_contract(r, idx),
         Mode::All => unreachable!("resolved above"),
     }
 }
@@ -2553,6 +2939,12 @@ fn extra_declarations(probes: &[String]) -> String {
              class SdB(val s: String) : SdI { override fun tag(): String = \"B\" + s }\n\
              fun sdWhich(i: Int): SdI = if (i % 2 == 0) SdA(i) else SdB(\"x\" + i)\n",
         );
+    }
+    // The three-component `data class` the `destr` probes destructure. Three
+    // components because that is the first arity past `Pair`, and the three
+    // types differ so a probe that binds them out of order shows it.
+    if named("DP3(") {
+        out.push_str("data class DP3(val a: Int, val b: String, val c: Double)\n");
     }
     // The three equality families — see `g_equality`.
     if named("EqPlain(") {
