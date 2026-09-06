@@ -145,6 +145,14 @@ pub struct Program {
     /// a compile error — so the compiler gates those names on this list rather
     /// than treating them as always-available builtins.
     pub imports: Vec<ImportDecl>,
+    /// The hoisted names of the classes declared inside another class's BODY —
+    /// `sealed class Sd { data class Circ… }` records `"Sd$Circ"`. A nested
+    /// class is an ordinary top-level entry of `classes` by the time the
+    /// compiler sees it; what this list adds is the two ALTERNATE SPELLINGS
+    /// that reach it, which nothing else can reconstruct: the qualified
+    /// `Sd.Circ` a program writes outside the owner, and the bare `Circ` it
+    /// writes inside. See `crate::compiler`'s `class_alias`.
+    pub nested: Vec<String>,
 }
 
 /// One `import` line: the dotted path (a star import keeps its trailing `.*`)
@@ -405,6 +413,52 @@ pub struct CtorDelegation {
 /// The synthetic top-level name a class's `companion object` is hoisted under.
 pub fn companion_name(owner: &str) -> String {
     format!("{owner}$Companion")
+}
+
+/// The hoisted name of a class declared inside `owner`'s body. This is the
+/// JVM's own binary name, which the reference toolchain prints verbatim for
+/// the identity and throwable `toString` forms (`Sd$Plain@1b6d`,
+/// `Outer$Boom: bad`) — see `crate::parser`'s `class_decl_mods`.
+pub fn nested_class_name(owner: &str, nested: &str) -> String {
+    format!("{owner}${nested}")
+}
+
+/// The alternate spellings that reach a nested class, mapped onto its hoisted
+/// name (see [`Program::nested`]). Two exist, and they are needed in different
+/// places.
+///
+/// The QUALIFIED spelling is how a program outside the owner writes it —
+/// `Sd.Circ` for the hoisted `Sd$Circ` — and it is unambiguous by
+/// construction, because a declared class name can hold neither `.` nor `$`.
+///
+/// The BARE spelling is how the owner's own body writes it (`Circ`), and it is
+/// registered only when nothing else answers to that name: a top-level class of
+/// the same name keeps it, and two nested classes sharing a simple name cancel
+/// each other, since neither the alias nor the reader could then say which was
+/// meant. That is narrower than Kotlin, which resolves a bare name by the
+/// enclosing declaration; the qualified spelling always reaches either one.
+pub fn class_aliases(
+    declared: &[String],
+    nested: &[String],
+) -> std::collections::HashMap<String, String> {
+    use std::collections::HashMap;
+    let mut alias: HashMap<String, String> = HashMap::new();
+    let mut bare: HashMap<&str, Option<&String>> = HashMap::new();
+    for n in nested {
+        alias.insert(n.replace('$', "."), n.clone());
+        let simple = n.rsplit('$').next().unwrap_or(n);
+        bare.entry(simple)
+            .and_modify(|slot| *slot = None)
+            .or_insert(Some(n));
+    }
+    for (simple, owner) in bare {
+        if let Some(n) = owner {
+            if !declared.iter().any(|d| d == simple) {
+                alias.insert(simple.to_string(), n.clone());
+            }
+        }
+    }
+    alias
 }
 
 /// A property declared in a class or `object` body: `var c = 0`, `val n: Int = f()`.

@@ -705,6 +705,13 @@ pub struct Compiler {
     extensions: HashMap<(String, String), FnSig>,
     /// class/object name → metadata, filled before lowering.
     classes: HashMap<String, ClassMeta>,
+    /// An alternate spelling of a NESTED class's name → the hoisted name it
+    /// stands for: `"Sd.Circ"` and (when unambiguous) `"Circ"` both → `"Sd$Circ"`.
+    /// Empty for a program that nests nothing. Built by [`class_aliases`]; every
+    /// name that reaches [`Compiler::classes`] goes through
+    /// [`Compiler::class_meta`] or [`Compiler::canon_class`] so both spellings
+    /// land on one entry.
+    class_alias: HashMap<String, String>,
     /// Top-level `val`/`var` properties by name. They live in chunk globals, so
     /// every function sees them; a local of the same name shadows one, which is
     /// why the slot lookup always runs first.
@@ -1479,6 +1486,12 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
 
     let classes = build_class_meta(program)?;
     let method_index = build_method_index(program, &classes);
+    let class_alias = if program.nested.is_empty() {
+        HashMap::new()
+    } else {
+        let declared: Vec<String> = classes.keys().cloned().collect();
+        class_aliases(&declared, &program.nested)
+    };
 
     let main = program
         .funs
@@ -1493,6 +1506,7 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
         fun_sig,
         extensions,
         classes,
+        class_alias,
         globals,
         method_index,
         cur_class: None,
@@ -3109,8 +3123,14 @@ impl Compiler {
                     return Ok(p.ty);
                 }
                 // A bare reference to an `object` singleton loads its global.
-                if self.classes.get(name).is_some_and(|m| m.is_object) {
-                    let g = self.b.add_name(name);
+                // A nested one is reached through its hoisted name, which is
+                // what the global is keyed by.
+                if let Some(obj) = self
+                    .class_meta(name)
+                    .filter(|m| m.is_object)
+                    .map(|m| m.name.clone())
+                {
+                    let g = self.b.add_name(&obj);
                     self.b.emit(Op::GetVar(g), 0);
                     return Ok(Type::Obj);
                 }
@@ -3174,6 +3194,22 @@ impl Compiler {
                 safe,
                 line,
             } => self.compile_member(sc, recv, name, &[], *safe, *line),
+            // `Sd.Circ(2)` — a CONSTRUCTION of a class declared inside `Sd`'s
+            // body. Rewritten here rather than in `compile_member`, because
+            // only the node shape says whether the name was CALLED: a bare
+            // `Reg.Kind` is a qualifier for the member behind it (`Reg.Kind.A`)
+            // and must not construct anything.
+            Expr::MethodCall {
+                recv,
+                name,
+                args,
+                line,
+                ..
+            } if self.nests() && self.nested_ctor(recv, name).is_some() => {
+                let target = self.nested_ctor(recv, name).expect("guarded above");
+                let (args, line) = (args.clone(), *line);
+                self.compile_call(sc, &target, &args, line)
+            }
             Expr::MethodCall {
                 recv,
                 name,
@@ -3313,7 +3349,7 @@ impl Compiler {
                 // `is Long` and `is Float` ask about. Without it `1L is Long`
                 // reaches a bare `Value::Int` and answers for an `Int`.
                 self.compile_erased(sc, value)?;
-                let nidx = self.b.add_constant(Value::str(ty.clone()));
+                let nidx = self.b.add_constant(Value::str(self.canon_class(ty)));
                 self.b.emit(Op::LoadConst(nidx), 0);
                 // The operand says whether the tested type was written `T?`,
                 // which is the only thing that decides a null operand's answer.
@@ -3347,7 +3383,7 @@ impl Compiler {
                         self.compile_erased(sc, value)?;
                     }
                 }
-                let nidx = self.b.add_constant(Value::str(ty.clone()));
+                let nidx = self.b.add_constant(Value::str(self.canon_class(ty)));
                 self.b.emit(Op::LoadConst(nidx), 0);
                 self.b.emit(
                     Op::Extended(KT_AS, u8::from(*safe) | (u8::from(*nullable) << 1)),
@@ -3449,7 +3485,7 @@ impl Compiler {
         let mut arm_ty: Option<Type> = None;
         let mut handled = Vec::new();
         for arm in &t.catches {
-            let tidx = self.b.add_constant(Value::str(arm.ty.clone()));
+            let tidx = self.b.add_constant(Value::str(self.canon_class(&arm.ty)));
             self.b.emit(Op::LoadConst(tidx), 0);
             self.b.emit(Op::CallBuiltin(KT_EXC_MATCH, 1), 0);
             let next_arm = self.b.emit(Op::JumpIfFalse(0), 0);
@@ -3991,12 +4027,30 @@ impl Compiler {
                 },
             }
         }
+        // `Owner.Nested` where the name pair reaches a class declared inside
+        // `Owner`'s body. With arguments it is a CONSTRUCTION (`Sd.Circ(2)`);
+        // without them it is a reference to a nested `object` (`Sd.Empty`), and
+        // both are compiled as the top-level forms the hoist made them. This
+        // runs BEFORE the companion rewrite below, which would otherwise
+        // swallow the access whenever the owner happens to declare a companion.
+        // `Sd.Empty` — a reference to an `object` declared inside `Sd`'s body,
+        // which is the singleton the hoist made a top-level one. The
+        // CONSTRUCTION form is rewritten in `compile_expr`, where the node
+        // shape still says whether the name was called.
+        if self.nests() && args.is_empty() {
+            if let Some(meta) = self.nested_class(recv, name).filter(|m| m.is_object) {
+                let target = meta.name.clone();
+                return self.compile_expr(sc, &Expr::Var(target));
+            }
+        }
         // `Owner.member` where `Owner` names a class with a `companion object`:
         // the companion singleton is the real receiver. A rewrite rather than a
         // dedicated path, so property reads and method calls both reach it
-        // through what a named `object` already uses.
-        if let Expr::Var(cls) = recv {
-            if let Some(comp) = self.companion_of(cls) {
+        // through what a named `object` already uses. The owner is resolved as
+        // a type QUALIFIER, so a nested class reaches its own companion through
+        // the same rule (`Reg.Kind.valueOf(…)`).
+        if let Some(cls) = self.class_qualifier(recv) {
+            if let Some(comp) = self.companion_of(&cls) {
                 return self.compile_member(sc, &Expr::Var(comp), name, args, false, line);
             }
         }
@@ -6175,7 +6229,7 @@ impl Compiler {
             }
             _ => {
                 // A constructor call `Class(args)`.
-                if let Some(meta) = self.classes.get(name).cloned() {
+                if let Some(meta) = self.class_meta(name).cloned() {
                     return self.compile_construct(sc, &meta, args, line);
                 }
                 // A free user function.
@@ -6440,6 +6494,89 @@ impl Compiler {
     /// The hoisted singleton name of `cls`'s `companion object`, if it declared
     /// one. `cls` must name a class rather than a value — a local of the same
     /// name shadows the type, exactly as in Kotlin.
+    /// The metadata for the class `name` spells, following a nested class's
+    /// alternate spellings (`Sd.Circ` / `Circ` → `Sd$Circ`). Every lookup that
+    /// starts from a name a PROGRAM wrote goes through here; a lookup that
+    /// starts from a name the frontend itself minted (an MRO entry, a parent, a
+    /// `ClassMeta::name`) is already canonical and reads `classes` directly.
+    /// Whether this program declares any nested class at all. Every
+    /// nested-class rewrite is gated on it, so a program without one pays a
+    /// single `is_empty` for the whole feature.
+    fn nests(&self) -> bool {
+        !self.class_alias.is_empty()
+    }
+
+    fn class_meta(&self, name: &str) -> Option<&ClassMeta> {
+        if let Some(m) = self.classes.get(name) {
+            return Some(m);
+        }
+        // A bare nested name resolves against the ENCLOSING declaration first,
+        // which is Kotlin's own rule and the only thing that separates two
+        // owners nesting the same simple name: inside `O2`, `D` is `O2$D` even
+        // where `O$D` also exists. The walk strips one `$` at a time, so a
+        // method of `A$B` sees `A$B`'s nested classes and then `A`'s, and a
+        // companion (`A$Companion`) sees `A`'s.
+        if let Some(cur) = &self.cur_class {
+            let mut owner = cur.as_str();
+            loop {
+                if let Some(m) = self.classes.get(&nested_class_name(owner, name)) {
+                    return Some(m);
+                }
+                match owner.rfind('$') {
+                    Some(cut) => owner = &owner[..cut],
+                    None => break,
+                }
+            }
+        }
+        self.classes.get(self.class_alias.get(name)?)
+    }
+
+    /// The canonical spelling of a written type name — unchanged unless it
+    /// names a nested class. Used wherever a type name becomes a RUNTIME
+    /// string (`is`, `as`, a `catch` arm), because the registry those match
+    /// against is keyed by the hoisted name.
+    fn canon_class(&self, name: &str) -> String {
+        if self.classes.contains_key(name) {
+            return name.to_string();
+        }
+        match self.class_alias.get(name) {
+            Some(canon) => canon.clone(),
+            None => name.to_string(),
+        }
+    }
+
+    /// `outer.name` read as a NESTED class reference — the hoisted name, when
+    /// `outer` is a class and `outer$name` is one of the classes declared
+    /// inside it. This is what makes `Sd.Circ(2)` a construction and `Sd.Empty`
+    /// a singleton read; both spellings arrive as a member access on a bare
+    /// name, which is otherwise a companion lookup.
+    fn nested_class(&self, outer: &Expr, name: &str) -> Option<&ClassMeta> {
+        self.classes
+            .get(&nested_class_name(&self.class_qualifier(outer)?, name))
+    }
+
+    /// The hoisted name `outer.name(…)` constructs, when the pair reaches a
+    /// nested class that CAN be constructed. An `object` is excluded: it is a
+    /// singleton read, never a call.
+    fn nested_ctor(&self, outer: &Expr, name: &str) -> Option<String> {
+        self.nested_class(outer, name)
+            .filter(|m| !m.is_object)
+            .map(|m| m.name.clone())
+    }
+
+    /// The canonical class name an expression denotes when it is read as a TYPE
+    /// QUALIFIER rather than a value — `Sd` in `Sd.Circ`, and `A.B` in
+    /// `A.B.C`, which arrives as a member access of its own.
+    fn class_qualifier(&self, e: &Expr) -> Option<String> {
+        match e {
+            Expr::Var(n) => self.class_meta(n).map(|m| m.name.clone()),
+            Expr::Member { recv, name, .. } => {
+                self.nested_class(recv, name).map(|m| m.name.clone())
+            }
+            _ => None,
+        }
+    }
+
     fn companion_of(&self, cls: &str) -> Option<String> {
         let comp = companion_name(cls);
         (self.classes.contains_key(cls) && self.classes.contains_key(&comp)).then_some(comp)
@@ -7015,7 +7152,7 @@ impl Compiler {
             } => {
                 let (slot, _) = subj.ok_or("`is` condition requires a `when` subject")?;
                 self.b.emit(Op::GetSlot(slot), 0);
-                let nidx = self.b.add_constant(Value::str(ty.clone()));
+                let nidx = self.b.add_constant(Value::str(self.canon_class(ty)));
                 self.b.emit(Op::LoadConst(nidx), 0);
                 // The operand says whether the tested type was written `T?`,
                 // which is the only thing that decides a null operand's answer.
@@ -7082,6 +7219,21 @@ impl Compiler {
 
     fn infer(&self, sc: &Scope, e: &Expr) -> Type {
         match e {
+            // `Sd.Circ(2)` / `Sd.Empty` — a nested class reached by its
+            // qualified spelling, which `compile_member` rewrites to the
+            // top-level construction or singleton read the hoist made of it.
+            // Inference has to agree, or the value would be compared and
+            // displayed as an untyped one.
+            Expr::MethodCall { recv, name, .. }
+                if self.nests() && self.nested_ctor(recv, name).is_some() =>
+            {
+                Type::Obj
+            }
+            Expr::Member { recv, name, .. }
+                if self.nests() && self.nested_class(recv, name).is_some_and(|m| m.is_object) =>
+            {
+                Type::Obj
+            }
             Expr::Super { .. } => Type::Unknown,
             // The result of invoking a function value. The declared return type
             // of a `(Int) -> Int` is not tracked through the value, so this is
@@ -7212,7 +7364,7 @@ impl Compiler {
                 // `with(x) { … }` / `run { … }` evaluate to their block, whose
                 // type the frontend does not track.
                 "with" | "run" => Type::Unknown,
-                _ if self.classes.contains_key(name) => Type::Obj, // constructor
+                _ if self.class_meta(name).is_some() => Type::Obj, // constructor
                 // A math call keeps its `Int` overload for integral arguments —
                 // this is what makes `abs(-7) / 2` truncate rather than divide.
                 _ if self.resolve_math_fn(name).is_some() => {
@@ -8071,6 +8223,26 @@ impl Compiler {
 
     fn infer_class(&self, sc: &Scope, e: &Expr) -> Option<String> {
         match e {
+            // The class half of the nested-class rewrite `infer` mirrors above.
+            Expr::MethodCall { recv, name, .. } if self.nests() => {
+                match self.nested_ctor(recv, name) {
+                    Some(canon) => Some(canon),
+                    None => self.infer_class_plain(sc, e),
+                }
+            }
+            Expr::Member { recv, name, .. } if self.nests() => {
+                match self.nested_class(recv, name).filter(|m| m.is_object) {
+                    Some(meta) => Some(meta.name.clone()),
+                    None => self.infer_class_plain(sc, e),
+                }
+            }
+            _ => self.infer_class_plain(sc, e),
+        }
+    }
+
+    /// not claim.
+    fn infer_class_plain(&self, sc: &Scope, e: &Expr) -> Option<String> {
+        match e {
             Expr::Var(n) => {
                 if n == "this" {
                     return self.cur_class.clone().or_else(|| sc.class_of(n));
@@ -8088,8 +8260,8 @@ impl Compiler {
                     return Some(c);
                 }
                 // An `object` singleton referenced by name.
-                if self.classes.get(n).is_some_and(|m| m.is_object) {
-                    return Some(n.clone());
+                if let Some(obj) = self.class_meta(n).filter(|m| m.is_object) {
+                    return Some(obj.name.clone());
                 }
                 // A class name in receiver position IS its companion object, and
                 // `compile_member` rewrites the node that way. Inference has to
@@ -8102,8 +8274,8 @@ impl Compiler {
                 None
             }
             Expr::Call { name, .. } => {
-                if self.classes.contains_key(name) {
-                    return Some(name.clone()); // constructor
+                if let Some(meta) = self.class_meta(name) {
+                    return Some(meta.name.clone()); // constructor
                 }
                 match name.as_str() {
                     "listOf" | "mutableListOf" | "arrayListOf" | "emptyList" | "ArrayList" => {

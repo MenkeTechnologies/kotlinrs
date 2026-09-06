@@ -11188,7 +11188,13 @@ fn display_obj(id: u32) -> String {
                             .map(|(n, v)| format!("{n}={}", kotlin_string(v)))
                             .collect::<Vec<_>>()
                             .join(", ");
-                        format!("{class}({body})")
+                        // The SIMPLE name: Kotlin's generated `toString` calls
+                        // the class `Circ(r=2)` even when it is nested, where
+                        // the identity and throwable forms below print the
+                        // binary name the frontend carries (`Sd$Circ`). Measured
+                        // against the reference toolchain, which prints
+                        // `Circ(r=2)` and `Sd$Plain@1b6d` for the same pair.
+                        format!("{}({body})", simple_of(class))
                     })
                     .unwrap_or_default()
                 } else if is_enum_class(class) {

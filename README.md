@@ -338,6 +338,25 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `entries` are `Set`s, so their hash sums and their equality ignores order;
   `values` is a plain `Collection`, whose `equals`/`hashCode` the JVM leaves as
   identity.
+- **Nested declarations** — a `class`, `data class`, `object`, `interface`,
+  `enum class` or `value class` written inside another class's body, which is
+  how the sealed idiom is spelled:
+  `sealed class Sd { data class Circ(val r: Int) : Sd(); object Empty : Sd() }`.
+  A nested declaration has no outer-instance reference, so it is hoisted to the
+  top level under the JVM's own binary name, `Owner$Nested` — the name the
+  reference toolchain prints for the identity and throwable forms
+  (`Sd$Empty@1b6d`, `Outer$Boom: bad`), while a `data class`'s generated
+  `toString` names it simply (`Circ(r=2)`). Nesting deeper qualifies again
+  (`A.B.C`). The name is reached by both spellings Kotlin allows: qualified
+  from outside the owner (`Sd.Circ(2)`, `is Sd.Circ`, `catch (e: Outer.Boom)`,
+  `val x: A.B.C`) and bare from inside it, where the lookup walks outward from
+  the enclosing declaration — so two owners nesting the same simple name each
+  see their own, exactly as in Kotlin. An `inner class` is REFUSED rather than
+  hoisted: it keeps a reference to the enclosing instance, which a top-level
+  class has nowhere to store, and answering for the wrong receiver would be
+  worse than not compiling. A bare name written OUTSIDE every owner also
+  resolves when exactly one nested class answers to it, which is wider than
+  Kotlin — the qualified spelling is the one that always means what it says.
 - **`object`** — singleton declarations with `val`/`var` properties and methods,
   built once and reachable by name (`Counter.inc()`). An `object` may
   declare supertypes (`object Registry : Greeter`), which its own methods and

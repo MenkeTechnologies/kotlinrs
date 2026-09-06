@@ -6153,3 +6153,121 @@ fn starts_with_refuses_an_offset_outside_the_string() {
         "true\n"
     );
 }
+
+// ── nested class declarations ────────────────────────────────────────────────
+// A class declared inside another class's body is hoisted to the top level
+// under the JVM's own binary name, `Owner$Nested`. The parity corpus pins the
+// observable output of the shapes against the reference toolchain; what is
+// pinned here is the NAME MACHINERY those records cannot separate — which
+// spelling reaches the class, which one it prints under, and the cases the
+// hoist deliberately refuses.
+
+#[test]
+fn a_nested_class_prints_its_simple_name_from_data_and_its_binary_name_otherwise() {
+    // The two forms disagree on the JVM and the split is not cosmetic: the
+    // generated `toString` of a data class names the class simply, while the
+    // identity and throwable forms name it as the class loader does.
+    assert_eq!(
+        stdout("class O { data class D(val v: Int); class P }; println(O.D(1)); println(O.P().toString().substringBefore(\"@\"))"),
+        "D(v=1)\nO$P\n"
+    );
+    assert_eq!(
+        stdout(
+            "class O { class Boom(m: String) : RuntimeException(m) }\n\
+             try { throw O.Boom(\"bad\") } catch (e: O.Boom) { println(e) }"
+        ),
+        "O$Boom: bad\n"
+    );
+}
+
+#[test]
+fn a_nested_class_is_reached_by_both_its_qualified_and_its_bare_spelling() {
+    // Qualified from outside the owner, bare from inside it — and the two must
+    // land on ONE class, or `is` would answer false for a value the other
+    // spelling built.
+    assert_eq!(
+        stdout(
+            "class O {\n\
+               data class D(val v: Int)\n\
+               companion object { fun make(v: Int) = D(v) }\n\
+             }\n\
+             val d = O.make(3)\n\
+             println(d)\n\
+             println(d is O.D)\n\
+             println(O.D(3) == d)"
+        ),
+        "D(v=3)\ntrue\ntrue\n"
+    );
+}
+
+#[test]
+fn a_bare_nested_name_two_owners_share_resolves_by_the_enclosing_class() {
+    // Two owners nesting the same simple name is legal Kotlin, and inside each
+    // owner the bare name means THAT owner's. The program-wide alias cannot
+    // decide it; only the enclosing declaration can, so the bare lookup walks
+    // outward from the class being lowered before consulting the alias.
+    assert_eq!(
+        stdout(
+            "class A {\n\
+               data class Dup(val v: Int)\n\
+               companion object { fun make() = Dup(1) }\n\
+             }\n\
+             class B {\n\
+               data class Dup(val v: Int, val w: Int)\n\
+               companion object { fun make() = Dup(2, 3) }\n\
+             }\n\
+             println(A.make())\n\
+             println(B.make())\n\
+             println(A.make() is A.Dup)\n\
+             println(B.make() is B.Dup)"
+        ),
+        "Dup(v=1)\nDup(v=2, w=3)\ntrue\ntrue\n"
+    );
+    // From outside either owner the bare name says nothing, and the qualified
+    // spelling is the only one that does.
+    let out = eval("class A { class Dup }; class B { class Dup }; println(Dup())");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("unresolved reference"), "stderr was: {err}");
+}
+
+#[test]
+fn a_nested_class_name_is_only_a_qualifier_until_it_is_called() {
+    // `Reg.Kind` names a type; `Reg.Kind.A` reads a member THROUGH it. Reading
+    // the qualifier must not construct anything, which is the bug the enum form
+    // exposes first because its constants live on a companion.
+    assert_eq!(
+        stdout(
+            "class Reg { enum class Kind { A, B }; object Cfg { val n = 4 } }\n\
+             println(Reg.Kind.A)\n\
+             println(Reg.Kind.valueOf(\"B\").ordinal)\n\
+             println(Reg.Cfg.n)\n\
+             println(Reg.Kind.values().size)"
+        ),
+        "A\n1\n4\n2\n"
+    );
+}
+
+#[test]
+fn an_inner_class_is_refused_rather_than_hoisted() {
+    // `inner` is the one nested form the hoist cannot reproduce: it carries a
+    // reference to the enclosing INSTANCE, which a top-level class has nowhere
+    // to keep. Accepting it silently would answer for the wrong receiver.
+    let out = eval("class O { val v = 1; inner class I { fun get() = v } }; println(1)");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("enclosing instance"), "stderr was: {err}");
+}
+
+#[test]
+fn nesting_deeper_than_one_level_keeps_qualifying() {
+    assert_eq!(
+        stdout(
+            "class A { class B { data class C(val k: Int) } }\n\
+             val c: A.B.C = A.B.C(7)\n\
+             println(c)\n\
+             println(c is A.B.C)"
+        ),
+        "C(k=7)\ntrue\n"
+    );
+}

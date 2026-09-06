@@ -86,6 +86,10 @@ pub struct Parser {
     /// A LOCAL class — one declared inside a function body — queues here too,
     /// for the same reason and through the same drain.
     pending_classes: Vec<ClassDecl>,
+    /// The hoisted names of the nested classes seen so far, in declaration
+    /// order — published as [`Program::nested`], which is what reconstructs the
+    /// qualified and bare spellings that reach them.
+    nested_names: Vec<String>,
 }
 
 /// Whether a postfix `(` may apply to this expression as an invocation.
@@ -126,6 +130,11 @@ struct Mods {
     abstract_: bool,
     override_: bool,
     sealed: bool,
+    /// `inner class` — a nested class carrying a reference to the enclosing
+    /// INSTANCE. Accepted and discarded everywhere it cannot change a result;
+    /// a nested declaration rejects it, because there the outer reference is
+    /// exactly what the hoist cannot reproduce.
+    inner: bool,
 }
 
 /// Parse a full program: top-level `fun`, `class`/`data class`, `interface`, and
@@ -143,6 +152,7 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
         reified_params: Vec::new(),
         no_trailing_lambda: false,
         pending_classes: Vec::new(),
+        nested_names: Vec::new(),
     };
     let mut prog = Program::default();
     while !p.at(&Tok::Eof) {
@@ -169,7 +179,7 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
                 }
                 prog.funs.push(f);
             } else {
-                prog.classes.push(p.class_decl_mods(mods, None)?);
+                prog.classes.push(p.class_decl_mods(mods, None, None)?);
             }
             continue;
         }
@@ -221,6 +231,7 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
     // top-level classes; they are appended before the companion hoist so that
     // an entry-body subclass carrying its own companion is hoisted too.
     prog.classes.append(&mut p.pending_classes);
+    prog.nested = std::mem::take(&mut p.nested_names);
     // Hoist each `companion object` to the top level. From here on it is an
     // ordinary singleton, and only the owner→companion NAME relation (which
     // `companion_name` reconstructs) is needed to resolve `Owner.member`.
@@ -230,6 +241,50 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
         .filter_map(|cd| cd.companion.take().map(|c| *c))
         .collect();
     prog.classes.extend(hoisted);
+    // A supertype may name a NESTED class — `class Sub : Sd.Circ()`, or a
+    // sibling written bare inside the owner. Rewriting the list here, rather
+    // than in the compiler, keeps `build_class_meta`'s supertype resolution
+    // (and everything it feeds: the MRO, inherited members, the runtime
+    // supertype registry) reading one canonical spelling.
+    if !prog.nested.is_empty() {
+        let declared: Vec<String> = prog.classes.iter().map(|cd| cd.name.clone()).collect();
+        let alias = class_aliases(&declared, &prog.nested);
+        let known: std::collections::HashSet<&str> = declared.iter().map(|s| s.as_str()).collect();
+        // A supertype written bare inside the owner names the SIBLING of that
+        // name before it names anything else — the same enclosing-first rule
+        // `crate::compiler`'s `class_meta` applies to a reference, and the only
+        // one that separates two owners nesting the same simple name.
+        let resolve = |scope: &str, name: &str| -> Option<String> {
+            if known.contains(name) {
+                return None;
+            }
+            let mut owner = scope;
+            loop {
+                let qualified = nested_class_name(owner, name);
+                if known.contains(qualified.as_str()) {
+                    return Some(qualified);
+                }
+                match owner.rfind('$') {
+                    Some(cut) => owner = &owner[..cut],
+                    None => break,
+                }
+            }
+            alias.get(name).cloned()
+        };
+        for cd in &mut prog.classes {
+            let scope = cd.name.clone();
+            for p in &mut cd.parents {
+                if let Some(canon) = resolve(&scope, p) {
+                    *p = canon;
+                }
+            }
+            for (iface, _) in &mut cd.delegates {
+                if let Some(canon) = resolve(&scope, iface) {
+                    *iface = canon;
+                }
+            }
+        }
+    }
     expand_interface_delegation(&mut prog)?;
     Ok(prog)
 }
@@ -589,13 +644,42 @@ impl Parser {
                 "abstract" => m.abstract_ = true,
                 "override" => m.override_ = true,
                 "sealed" => m.sealed = true,
-                "final" | "public" | "private" | "internal" | "protected" | "inner" | "inline"
+                "inner" => m.inner = true,
+                "final" | "public" | "private" | "internal" | "protected" | "inline"
                 | "noinline" | "crossinline" | "tailrec" | "operator" | "infix" | "const" => {}
                 _ => break,
             }
             self.bump();
         }
         m
+    }
+
+    /// A type NAME, which may be qualified: `Int`, `Sd.Circ`,
+    /// `java.lang.RuntimeException`. The segments are joined with `.` and left
+    /// for the compiler to resolve — it is the only side that knows which
+    /// classes exist, and a nested class is reached by the same spelling as a
+    /// package-qualified one. A `.` not followed by an identifier is left
+    /// alone, so nothing that used to parse stops parsing.
+    fn qualified_ident(&mut self) -> Result<String, String> {
+        let mut name = self.ident()?;
+        while self.at(&Tok::Dot) && matches!(self.peek_at(1), Tok::Ident(_)) {
+            self.bump();
+            name.push('.');
+            name.push_str(&self.ident()?);
+        }
+        Ok(name)
+    }
+
+    /// True when the parser is positioned on the head of a CLASS-shaped
+    /// declaration — the forms `parse_program` dispatches on at the top level,
+    /// which are exactly the forms a class body may nest.
+    fn at_class_kw(&self) -> bool {
+        match self.peek() {
+            Tok::Class | Tok::Data | Tok::Object => true,
+            Tok::Ident(w) if w == "interface" => true,
+            Tok::Ident(w) if w == "value" || w == "enum" => matches!(self.peek_at(1), Tok::Class),
+            _ => false,
+        }
     }
 
     /// True when the parser is positioned on a declaration keyword — `fun`,
@@ -797,16 +881,26 @@ impl Parser {
     /// `interface I { ... }`, with the modifiers already consumed by
     /// [`Parser::modifiers`].
     fn class_decl(&mut self) -> Result<ClassDecl, String> {
-        self.class_decl_mods(Mods::default(), None)
+        self.class_decl_mods(Mods::default(), None, None)
     }
 
     /// `companion_of` names the enclosing class when this is a `companion
     /// object`: the declaration is then an `object` whose name is synthesized
     /// from the owner, because the companion may be written without one.
+    ///
+    /// `nested_in` names the enclosing class when this declaration sits inside
+    /// another class's BODY. A nested class has no outer-instance reference, so
+    /// it is an ordinary top-level class wearing a qualified name — and the
+    /// name it wears is the JVM's own binary one, `Owner$Nested`, which is what
+    /// the reference toolchain prints for the identity and throwable
+    /// `toString` forms (`Sd$Plain@1b6d`, `Outer$Boom: bad`). `$` cannot appear
+    /// in a Kotlin identifier, so the qualified name can never collide with a
+    /// declared one, and nesting deeper simply prefixes again (`A$B$C`).
     fn class_decl_mods(
         &mut self,
         mods: Mods,
         companion_of: Option<&str>,
+        nested_in: Option<&str>,
     ) -> Result<ClassDecl, String> {
         let line = self.line();
         // `value class Uid(val v: Int)` — a class with one property that the
@@ -863,7 +957,13 @@ impl Parser {
                 }
                 companion_name(owner)
             }
-            None => self.ident()?,
+            None => {
+                let simple = self.ident()?;
+                match nested_in {
+                    Some(owner) => nested_class_name(owner, &simple),
+                    None => simple,
+                }
+            }
         };
         // A generic class keeps only its head name; the coarse type system
         // carries no type variables. The parameter NAMES are still recorded, so
@@ -977,7 +1077,7 @@ impl Parser {
         if self.at(&Tok::Colon) {
             self.bump();
             loop {
-                let pname = self.ident()?;
+                let pname = self.qualified_ident()?;
                 // A generic supertype (`Box<Int>`) keeps its head name AND its
                 // written arguments: a subclass declares no type parameters of
                 // its own, so this is the only place the inherited `T`-typed
@@ -1054,9 +1154,11 @@ impl Parser {
                             "class {name}: only one companion object is allowed"
                         ));
                     }
-                    companion = Some(Box::new(
-                        self.class_decl_mods(Mods::default(), Some(&name))?,
-                    ));
+                    companion = Some(Box::new(self.class_decl_mods(
+                        Mods::default(),
+                        Some(&name),
+                        None,
+                    )?));
                     continue;
                 }
                 // `init { … }` — an initializer block. A soft keyword, so it is
@@ -1094,6 +1196,24 @@ impl Parser {
                     continue;
                 }
                 let mods = self.modifiers();
+                // A NESTED declaration — `sealed class Sd { data class Circ… }`,
+                // the canonical sealed idiom. A nested class is not a member: it
+                // has no outer-instance reference and its own body is an
+                // ordinary class body, so it is hoisted to the top level under
+                // the qualified name `Owner$Nested` and resolved from there.
+                // The forms accepted are exactly the top-level ones.
+                if self.at_class_kw() {
+                    if mods.inner {
+                        return Err(format!(
+                            "class {name}: an `inner` class keeps a reference to the enclosing \
+                             instance, which a nested declaration here does not carry"
+                        ));
+                    }
+                    let nested = self.class_decl_mods(mods, None, Some(&name))?;
+                    self.nested_names.push(nested.name.clone());
+                    self.pending_classes.push(nested);
+                    continue;
+                }
                 match self.peek() {
                     Tok::Fun => methods.push(self.fun_decl_mods(mods)?),
                     // A body property: `val n = expr` / `var c: Int = expr`, in a
@@ -2105,7 +2225,7 @@ impl Parser {
             self.last_type_param = None;
             return Ok(TypeArg::plain(Type::Unknown, Some("Function".to_string())));
         }
-        let name = self.ident()?;
+        let name = self.qualified_ident()?;
         let args = self.type_args_list();
         let nullable = if self.at(&Tok::Question) {
             self.bump(); // nullable marker `T?`
@@ -2625,9 +2745,17 @@ impl Parser {
         {
             return false;
         }
-        // Step over the type's own decorations (`is List<*> ->`, `is String? ->`)
-        // so the `->` that marks an arm is still found behind them.
+        // Step over the type's own decorations (`is List<*> ->`,
+        // `is String? ->`, `is Sd.Circ ->`) so the `->` that marks an arm is
+        // still found behind them.
         let mut i = off + 2;
+        // A qualified name — a nested class, `is Sd.Circ`. Without this the
+        // scan stops at the `.` and misses the `->`, so the arm header is read
+        // as an `is` operator continuing the PREVIOUS arm's body and the `->`
+        // is then unexpected.
+        while matches!(self.peek_at(i), Tok::Dot) && matches!(self.peek_at(i + 1), Tok::Ident(_)) {
+            i += 2;
+        }
         if matches!(self.peek_at(i), Tok::Lt) {
             let mut depth = 0;
             loop {
@@ -3639,9 +3767,11 @@ impl Parser {
             self.eat(&Tok::LParen)?;
             let name = self.ident()?;
             self.eat(&Tok::Colon)?;
-            // The caught type is a plain name; a nullable/generic spelling is not
-            // valid on a `catch` parameter in Kotlin, so no `type_ref` here.
-            let ty = self.ident()?;
+            // The caught type is a bare name, possibly qualified
+            // (`catch (e: Outer.Boom)`, `catch (e: java.io.IOException)`); a
+            // nullable or generic spelling is not valid on a `catch` parameter
+            // in Kotlin, so no `type_ref` here.
+            let ty = self.qualified_ident()?;
             self.eat(&Tok::RParen)?;
             let cbody = self.block()?;
             catches.push(CatchArm {
@@ -3782,7 +3912,7 @@ impl Parser {
     /// `(x as Box<Int>).v * 2000000000`. They are answered alongside the name so
     /// each caller states which it is.
     fn is_type(&mut self) -> Result<(String, Vec<TypeArg>, bool), String> {
-        let ty = self.ident()?;
+        let ty = self.qualified_ident()?;
         let args = self.type_args_list();
         // The `?` is part of the test, not decoration: `null is String?` is
         // true where `null is String` is false, and `null as String?` is null
@@ -3870,6 +4000,7 @@ impl Parser {
                         // A string template holds an expression, which can
                         // never declare a class.
                         pending_classes: Vec::new(),
+                        nested_names: Vec::new(),
                     };
                     let e = sub.expr()?;
                     out.push(StrExpr::Expr(Box::new(e)));
