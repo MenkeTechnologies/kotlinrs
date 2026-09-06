@@ -1399,6 +1399,16 @@ enum HeapObj {
         /// A traversal instantiates its own coroutine from this, which is also
         /// what keeps two pipelines built from one sequence independent.
         block: Option<Value>,
+        /// The LIST this pipeline pulls from, for `asSequence()` — the third
+        /// source, and the only finite one. It is kept whole and re-read from
+        /// the front on every traversal, exactly as `block` is re-entered,
+        /// because a `Sequence` over a list is re-iterable.
+        ///
+        /// Materializing it instead was not a laziness OPTIMIZATION to skip:
+        /// `listOf(1, 0).asSequence().map { 10 / it }.take(1).toList()` is
+        /// `[10]` in Kotlin, because the second element is never mapped, and
+        /// an eager pipeline divides by zero and reports a fault instead.
+        items: Option<Vec<Value>>,
         /// The next element to yield, or `None` once the step answered `null`.
         seed: Option<Value>,
         /// `(T) -> T?` — the step. Answering Kotlin `null` ends the sequence.
@@ -3675,6 +3685,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let body = vm.pop();
             vm.push(alloc(HeapObj::Gen {
                 block: Some(body),
+                items: None,
                 seed: None,
                 step: Value::Undef,
                 stages: Vec::new(),
@@ -5029,7 +5040,23 @@ fn b_join(vm: &mut VM, argc: u8) -> Value {
     };
     let recv = vm.pop();
     ensure_ordered_deep(vm, &recv);
-    let items = sequence_items(&recv);
+    // A LAZY sequence holds a pipeline rather than elements, so it has to be
+    // PULLED here. [`sequence_items`] answers the empty vector for one, and
+    // this op is reached instead of the ordinary member dispatch only in a
+    // program that overrides `toString()` — so `asSequence().joinToString(…)`
+    // answered the empty string in exactly those programs and the right one
+    // everywhere else, which is why it took a whole-program fuzz probe to see.
+    let items = if gen_parts(&recv).is_some() {
+        match gen_pull(vm, &recv, None) {
+            Ok(items) => items,
+            Err(e) => {
+                fault(vm, e);
+                return Value::Undef;
+            }
+        }
+    } else {
+        sequence_items(&recv)
+    };
     let body: Vec<String> = items.iter().map(|x| display_vm(vm, x)).collect();
     Value::str(body.join(&sep))
 }
@@ -5101,6 +5128,27 @@ fn join_to_string(
         });
     }
     format!("{prefix}{}{postfix}", body.join(&sep))
+}
+
+/// As [`sequence_items`], but a LAZY sequence is pulled rather than read as
+/// empty.
+///
+/// [`sequence_items`] reads a materialized container, and a `Sequence` holds a
+/// pipeline instead of elements, so it answers the empty vector for one. That
+/// is silently wrong wherever the value came from user code rather than from a
+/// literal — `listOf(1, 2).asSequence().flatMap { listOf(it).asSequence() }`
+/// spliced nothing — and it only became reachable when `asSequence` started
+/// answering a real lazy pipeline instead of a tagged copy of the list.
+///
+/// A pull can raise (a stage's lambda runs Kotlin code), which is why this
+/// needs the VM and a `Result` where [`sequence_items`] needs neither. Callers
+/// that hold a VM should prefer this one; the plain form remains correct for a
+/// value that cannot be a sequence.
+fn iterable_items(vm: &mut VM, v: &Value) -> Result<Vec<Value>, String> {
+    if gen_parts(v).is_some() {
+        return gen_pull(vm, v, None);
+    }
+    Ok(sequence_items(v))
 }
 
 fn sequence_items(v: &Value) -> Vec<Value> {
@@ -5218,18 +5266,32 @@ fn gen_parts(v: &Value) -> Option<GenParts> {
     with_obj(v, |o| match o {
         HeapObj::Gen {
             block,
+            items,
             seed,
             step,
             stages,
-        } => Some((block.clone(), seed.clone(), step.clone(), stages.clone())),
+        } => Some((
+            block.clone(),
+            items.clone(),
+            seed.clone(),
+            step.clone(),
+            stages.clone(),
+        )),
         _ => None,
     })
     .flatten()
 }
 
-/// What a lazy sequence is made of: its `sequence { … }` block (or `None` for
-/// the seed/step form), its current seed, its step, and its pipeline.
-type GenParts = (Option<Value>, Option<Value>, Value, Vec<Stage>);
+/// What a lazy sequence is made of: its SOURCE — a `sequence { … }` block, a
+/// list, or the seed/step pair, exactly one of which is present — and its
+/// pipeline.
+type GenParts = (
+    Option<Value>,
+    Option<Vec<Value>>,
+    Option<Value>,
+    Value,
+    Vec<Stage>,
+);
 
 /// A new lazy sequence: `gen` with `stage` appended.
 ///
@@ -5237,12 +5299,13 @@ type GenParts = (Option<Value>, Option<Value>, Value, Vec<Stage>);
 /// carries per-pull state — two pipelines built from one base must not see each
 /// other's progress.
 fn gen_with(vm: &mut VM, gen: &Value, stage: Stage) -> Result<Value, String> {
-    let (block, seed, step, mut stages) =
+    let (block, items, seed, step, mut stages) =
         gen_parts(gen).ok_or_else(|| format!("unresolved reference on {}", obj_label(gen)))?;
     let _ = vm;
     stages.push(stage);
     Ok(alloc(HeapObj::Gen {
         block,
+        items,
         seed,
         step,
         stages,
@@ -5257,7 +5320,26 @@ fn gen_with(vm: &mut VM, gen: &Value, stage: Stage) -> Result<Value, String> {
 /// That is exactly the contract Kotlin gives: an unbounded pipeline with a
 /// non-short-circuiting terminal does not finish.
 fn gen_pull(vm: &mut VM, gen: &Value, want: Option<usize>) -> Result<Vec<Value>, String> {
-    let (block, mut seed, step, mut stages) =
+    gen_drive(vm, gen, want, &mut |_, _| Ok(true))
+}
+
+/// Pull a lazy pipeline, handing every element that survives the stages to
+/// `on` — which answers `false` to stop the traversal there. [`gen_pull`] is
+/// this with a count budget and no early stop.
+///
+/// The point of the callback is that a SEARCH (`first { … }`, `any { … }`) has
+/// to decide element by element without knowing the index in advance. Asking
+/// for one more element each round instead restarts the pipeline from its seed
+/// every time, so the step ran a quadratic number of times: `first { it > 3 }`
+/// over `generateSequence(1) { it + 1 }` called the step ten times where the
+/// reference toolchain calls it three.
+fn gen_drive(
+    vm: &mut VM,
+    gen: &Value,
+    want: Option<usize>,
+    on: &mut dyn FnMut(&mut VM, &Value) -> Result<bool, String>,
+) -> Result<Vec<Value>, String> {
+    let (block, items, seed, step, mut stages) =
         gen_parts(gen).ok_or_else(|| format!("unresolved reference on {}", obj_label(gen)))?;
     // THIS traversal's coroutine, entered from the block afresh — see the
     // `block` field on [`HeapObj::Gen`] for why it is not shared. A coroutine
@@ -5273,15 +5355,56 @@ fn gen_pull(vm: &mut VM, gen: &Value, want: Option<usize>) -> Result<Vec<Value>,
             state: CoroState::Fresh,
         })
     });
-    if let Some(c) = &coro {
-        seed = coro_next(vm, c)?;
-    }
+    // Where a LIST source has got to. Local to the traversal, so two pipelines
+    // built from one `asSequence()` are independent — the same reason the
+    // `sequence { … }` block instantiates its own coroutine above.
+    let mut at = 0usize;
+    // The FIRST element, already in hand: the `generateSequence` seed, or the
+    // block's first yield. Every later one is pulled at the top of the loop,
+    // on demand.
+    let mut primed = match (&coro, &items) {
+        (Some(c), _) => coro_next(vm, c)?,
+        (None, Some(_)) => None,
+        (None, None) => seed,
+    };
+    // The element the source yielded last — the step's argument.
+    let mut prev: Option<Value> = None;
     let mut out: Vec<Value> = Vec::new();
     let mut pulled = 0usize;
-    'source: while let Some(cur) = seed.clone() {
+    'source: loop {
         if want.is_some_and(|n| out.len() >= n) {
             break;
         }
+        // The source is advanced HERE, when the next element is actually
+        // wanted, rather than after the previous one was taken. That ordering
+        // is observable: Kotlin's `generateSequence(1) { … }.take(1)` never
+        // runs the step at all, because the seed alone satisfies the `take`,
+        // and advancing eagerly ran it twice.
+        let cur = match primed.take() {
+            Some(v) => v,
+            None => match (&coro, &items) {
+                (Some(c), _) => match coro_next(vm, c)? {
+                    Some(v) => v,
+                    None => break,
+                },
+                (None, Some(list)) => match list.get(at) {
+                    Some(v) => {
+                        at += 1;
+                        v.clone()
+                    }
+                    None => break,
+                },
+                (None, None) => {
+                    let Some(p) = prev.clone() else { break };
+                    let next = invoke_closure(vm, &step, std::slice::from_ref(&p))?;
+                    if matches!(next, Value::Undef) {
+                        break;
+                    }
+                    next
+                }
+            },
+        };
+        prev = Some(cur.clone());
         pulled += 1;
         if pulled > GEN_PULL_CAP {
             return Err(format!(
@@ -5289,16 +5412,11 @@ fn gen_pull(vm: &mut VM, gen: &Value, want: Option<usize>) -> Result<Vec<Value>,
                  elements without a `take`, `takeWhile` or a step returning null"
             ));
         }
-        // Advance the source BEFORE the stages run: a stage may end the
-        // sequence, and the next seed is a property of the source alone.
-        seed = match &coro {
-            Some(c) => coro_next(vm, c)?,
-            None => {
-                let next = invoke_closure(vm, &step, std::slice::from_ref(&cur))?;
-                (!matches!(next, Value::Undef)).then_some(next)
-            }
-        };
 
+        // Whether a `take` budget ran out on THIS element. Nothing further can
+        // pass that stage, so the traversal ends without asking the source for
+        // another — which is the second half of why `take(1)` runs no step.
+        let mut spent = false;
         let mut v = cur;
         for stage in stages.iter_mut() {
             match stage.clone() {
@@ -5326,6 +5444,7 @@ fn gen_pull(vm: &mut VM, gen: &Value, want: Option<usize>) -> Result<Vec<Value>,
                         break 'source;
                     }
                     *stage = Stage::Take(n - 1);
+                    spent = spent || n == 1;
                 }
                 Stage::Drop(n) => {
                     if n > 0 {
@@ -5335,7 +5454,11 @@ fn gen_pull(vm: &mut VM, gen: &Value, want: Option<usize>) -> Result<Vec<Value>,
                 }
             }
         }
+        let more = on(vm, &v)?;
         out.push(v);
+        if spent || !more {
+            break;
+        }
     }
     Ok(out)
 }
@@ -5564,6 +5687,7 @@ fn b_genseq(vm: &mut VM, _argc: u8) -> Value {
     let seed = (!matches!(seed, Value::Undef)).then_some(seed);
     alloc(HeapObj::Gen {
         block: None,
+        items: None,
         seed,
         step,
         stages: Vec::new(),
@@ -6082,25 +6206,23 @@ fn coll_hof(
             // sequence — as they do on Kotlin's.
             "first" | "firstOrNull" | "find" | "any" | "indexOfFirst" => {
                 let mut at = 0i64;
-                loop {
-                    let batch = gen_pull(vm, recv, Some(at as usize + 1))?;
-                    let Some(v) = batch.get(at as usize) else {
-                        return Ok(match name {
-                            "any" => Value::Bool(false),
-                            "indexOfFirst" => Value::Int(-1),
-                            "first" => return Err(kind.no_match(name)),
-                            _ => Value::Undef,
-                        });
-                    };
+                let mut hit: Option<(i64, Value)> = None;
+                gen_drive(vm, recv, None, &mut |vm, v| {
                     if truthy(&invoke_closure(vm, clo, std::slice::from_ref(v))?) {
-                        return Ok(match name {
-                            "any" => Value::Bool(true),
-                            "indexOfFirst" => Value::Int(at),
-                            _ => v.clone(),
-                        });
+                        hit = Some((at, v.clone()));
+                        return Ok(false);
                     }
                     at += 1;
-                }
+                    Ok(true)
+                })?;
+                return Ok(match (name, hit) {
+                    ("any", h) => Value::Bool(h.is_some()),
+                    ("indexOfFirst", Some((i, _))) => Value::Int(i),
+                    ("indexOfFirst", None) => Value::Int(-1),
+                    ("first", None) => return Err(kind.no_match(name)),
+                    (_, Some((_, v))) => v,
+                    (_, None) => Value::Undef,
+                });
             }
             _ => {
                 // Tagged: materializing a lazy sequence must not switch its diagnostics
@@ -6328,7 +6450,7 @@ fn coll_hof(
             let mut out = Vec::new();
             for (i, it) in items.into_iter().enumerate() {
                 let sub = invoke_closure(vm, clo, &[Value::Int(i as i64), it])?;
-                out.extend(sequence_items(&sub));
+                out.extend(iterable_items(vm, &sub)?);
             }
             Ok(alloc(HeapObj::List(out)))
         }
@@ -6562,7 +6684,7 @@ fn coll_hof(
             let mut out = Vec::new();
             for it in items {
                 let sub = invoke_closure(vm, clo, &[it])?;
-                out.extend(sequence_items(&sub));
+                out.extend(iterable_items(vm, &sub)?);
             }
             Ok(alloc(HeapObj::List(out)))
         }
@@ -8937,6 +9059,27 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             }
             // `asSequence` on a sequence is the identity.
             "asSequence" => return Ok(recv.clone()),
+            // The no-lambda prefix reads. Each needs a BOUNDED prefix, so each
+            // asks for exactly that many elements rather than materializing the
+            // pipeline — which on an endless one is the difference between an
+            // answer and the pull-cap fault, and on a finite one between
+            // `[10]` and a division by zero.
+            "first" | "firstOrNull" | "elementAt" | "elementAtOrNull" | "getOrNull"
+                if !name.starts_with("first") || args.is_empty() =>
+            {
+                let at = if name.starts_with("first") {
+                    0
+                } else {
+                    args.first().map(|v| v.to_int()).unwrap_or(0)
+                };
+                if at < 0 {
+                    let items = tag_sequence(alloc(HeapObj::List(Vec::new())));
+                    return obj_method(vm, &items, name, args);
+                }
+                let prefix = gen_pull(vm, recv, Some(at as usize + 1))?;
+                let items = tag_sequence(alloc(HeapObj::List(prefix)));
+                return obj_method(vm, &items, name, args);
+            }
             _ => {
                 // Tagged: materializing a lazy sequence must not switch its diagnostics
                 // onto the `List` wording — see [`SEQ_VIEW`].
@@ -9199,16 +9342,41 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         "remove" => {
             let v = args.first().cloned().unwrap_or(Value::Undef);
             let at = key_position(vm, recv, &v);
+            // A MAP and a COLLECTION answer differently, and the difference is
+            // not cosmetic: `MutableMap.remove(key)` is declared `V?` and
+            // answers the PREVIOUS VALUE (null when the key was absent), where
+            // `MutableCollection.remove(element)` is declared `Boolean`. The
+            // two-argument `remove(key, value)` is the conditional form and is
+            // `Boolean` on a map too — it removes only when the mapping is the
+            // one named, so a key held under a different value survives.
+            let is_map = with_obj(recv, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false);
+            if is_map && args.len() < 2 {
+                let prev = with_obj_mut(recv, |o| match o {
+                    HeapObj::Map(entries) => at.map(|i| entries.remove(i).1),
+                    _ => None,
+                })
+                .flatten();
+                return Ok(prev.unwrap_or(Value::Undef));
+            }
+            let matched = at.filter(|i| {
+                args.len() < 2
+                    || with_obj(recv, |o| match o {
+                        HeapObj::Map(entries) => {
+                            entries.get(*i).is_some_and(|(_, v)| value_eq(v, &args[1]))
+                        }
+                        _ => true,
+                    })
+                    .unwrap_or(true)
+            });
             let removed = with_obj_mut(recv, |o| match o {
-                HeapObj::List(items) | HeapObj::Set(items) => Some(match at {
+                HeapObj::List(items) | HeapObj::Set(items) => Some(match matched {
                     Some(i) => {
                         items.remove(i);
                         true
                     }
                     None => false,
                 }),
-                // `MutableMap.remove(key)` answers the previous value, or null.
-                HeapObj::Map(entries) => Some(match at {
+                HeapObj::Map(entries) => Some(match matched {
                     Some(i) => {
                         entries.remove(i);
                         true
@@ -9405,11 +9573,31 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             invalidate_key_index(recv);
             return Ok(Value::Undef);
         }
-        "put" => {
-            // Map.put(k, v) → previous value or null.
+        // `put(k, v)` replaces unconditionally; `putIfAbsent(k, v)` writes only
+        // when the key is absent. Both answer the PREVIOUS value or null, so
+        // `putIfAbsent` returning non-null is exactly "the write did not
+        // happen" — which is what distinguishes it from `getOrPut`, whose
+        // answer is the value that ends up stored either way.
+        "put" | "putIfAbsent" => {
             let k = args.first().cloned().unwrap_or(Value::Undef);
             let v = args.get(1).cloned().unwrap_or(Value::Undef);
             let at = key_position(vm, recv, &k);
+            if name == "putIfAbsent" {
+                if let Some(i) = at {
+                    let prev = with_obj(recv, |o| match o {
+                        HeapObj::Map(entries) => entries.get(i).map(|(_, v)| v.clone()),
+                        _ => None,
+                    })
+                    .flatten();
+                    if let Some(prev) = prev {
+                        // A key mapped to NULL counts as absent, which is what
+                        // `Map.putIfAbsent` is specified to do.
+                        if !matches!(prev, Value::Undef) {
+                            return Ok(prev);
+                        }
+                    }
+                }
+            }
             let prev = with_obj_mut(recv, |o| match o {
                 HeapObj::Map(entries) => match at.and_then(|i| entries.get_mut(i)) {
                     Some(slot) => Some(std::mem::replace(&mut slot.1, v)),
@@ -9504,6 +9692,38 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     // `equals`/`hashCode` and so cannot run under the heap borrow that block
     // holds.
     let is_map = with_obj(recv, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false);
+    // `containsValue` scans the VALUES, so it is not a key lookup at all — but
+    // it shares this block because comparing values uses the same container
+    // equality, which may re-enter the VM for a user `equals`.
+    if is_map && name == "containsValue" {
+        let want = args.first().cloned().unwrap_or(Value::Undef);
+        let values = with_obj(recv, |o| match o {
+            HeapObj::Map(entries) => Some(entries.iter().map(|(_, v)| v.clone()).collect()),
+            _ => None,
+        })
+        .flatten()
+        .unwrap_or_else(Vec::new);
+        return Ok(Value::Bool(values.iter().any(|v| value_eq(v, &want))));
+    }
+    // `getValue(key)` is the THROWING read: where `get` answers null for an
+    // absent key, this raises, and the message names the key. A key mapped to
+    // null is present, so the test is the key's position rather than the value
+    // that came back — the same distinction `getOrDefault` makes.
+    if is_map && name == "getValue" {
+        let k = args.first().cloned().unwrap_or(Value::Undef);
+        return match key_position(vm, recv, &k) {
+            Some(i) => Ok(with_obj(recv, |o| match o {
+                HeapObj::Map(entries) => entries.get(i).map(|(_, v)| v.clone()),
+                _ => None,
+            })
+            .flatten()
+            .unwrap_or(Value::Undef)),
+            None => Err(format!(
+                "java.util.NoSuchElementException: Key {} is missing in the map.",
+                kotlin_string(&k)
+            )),
+        };
+    }
     if is_map && matches!(name, "containsKey" | "get") {
         let k = args.first().cloned().unwrap_or(Value::Undef);
         let at = key_position(vm, recv, &k);
@@ -10079,13 +10299,20 @@ fn sequence_member(
         "flatten" => {
             let mut out = Vec::new();
             for it in items {
-                out.extend(sequence_items(it));
+                match iterable_items(vm, it) {
+                    Ok(sub) => out.extend(sub),
+                    Err(e) => return Some(Err(e)),
+                }
             }
             return Some(Ok(alloc(HeapObj::List(out))));
         }
         // `zip(other)` pairs element-wise and stops at the shorter sequence.
         "zip" => {
-            let other = args.first().map(sequence_items).unwrap_or_default();
+            let other = match args.first().map(|a| iterable_items(vm, a)) {
+                Some(Ok(items)) => items,
+                Some(Err(e)) => return Some(Err(e)),
+                None => Vec::new(),
+            };
             let out: Vec<Value> = items
                 .iter()
                 .zip(other)
@@ -10128,9 +10355,20 @@ fn sequence_member(
         "toMutableList" | "toTypedArray" | "asList" | "asIterable" => {
             return Some(Ok(alloc(HeapObj::List(items.to_vec()))))
         }
-        // Same eager representation, but tagged: its empty/exhausted
-        // diagnostics are the `Sequence` ones, not the `List` ones.
-        "asSequence" => return Some(Ok(tag_sequence(alloc(HeapObj::List(items.to_vec()))))),
+        // A LAZY pipeline over the elements, not a tagged copy of them: the
+        // laziness is observable, and not only as how often a lambda runs.
+        // `listOf(1, 0).asSequence().map { 10 / it }.take(1).toList()` is
+        // `[10]` in Kotlin — the second element is never mapped — where an
+        // eager `map` divides by zero and reports a fault instead.
+        "asSequence" => {
+            return Some(Ok(alloc(HeapObj::Gen {
+                block: None,
+                items: Some(items.to_vec()),
+                seed: None,
+                step: Value::Undef,
+                stages: Vec::new(),
+            })))
+        }
         // `withIndex()` pairs each element with its position. Kotlin's element
         // type is the data class `IndexedValue`, whose `index`/`value` are read
         // as ordinary properties and which prints as

@@ -1460,6 +1460,89 @@ fn math_functions_need_the_kotlin_math_import() {
 }
 
 #[test]
+fn an_aliased_math_import_moves_the_name_even_under_a_star_import() {
+    // A star import is not a floor an alias sits on top of. `as` MOVES the
+    // name, and it wins over the star, so a file holding both
+    // `import kotlin.math.*` and `import kotlin.math.abs as A` can call `A` and
+    // cannot call `abs` — measured against the reference toolchain, which
+    // answers `unresolved reference 'abs'` for exactly that pair of lines.
+    //
+    // The rule is a property of the IMPORT and not of what was imported, so it
+    // is checked on all three kinds the star opens: a function, a constant, and
+    // an extension member on a numeric receiver.
+    for (decl, gone, alias, want) in [
+        ("abs as A", "abs(-3)", "A(-3)", "3\n"),
+        ("PI as Tau", "PI", "Tau", "3.141592653589793\n"),
+        ("roundToInt as rti", "3.7.roundToInt()", "3.7.rti()", "4\n"),
+    ] {
+        let src = format!("import kotlin.math.*\nimport kotlin.math.{decl}\nfun main() ");
+        let err = prog_err(&format!("{src}{{ println({gone}) }}"));
+        let bare = gone.split(['(', '.']).next().unwrap_or(gone);
+        let named = if bare == "3" { "roundToInt" } else { bare };
+        assert!(
+            err.contains(&format!("unresolved reference: {named}")),
+            "star + `{decl}` must hide `{gone}`; stderr was: {err}"
+        );
+        // The alias itself resolves, and the star still opens every name the
+        // alias did not rename — `max` is untouched by an alias on `abs`.
+        assert_eq!(prog(&format!("{src}{{ println({alias}) }}")), want);
+        assert_eq!(prog(&format!("{src}{{ println(max(1, 2)) }}")), "2\n");
+    }
+    // An explicit import of the original spelling puts it back on its own
+    // account, so the two lines together leave BOTH spellings callable.
+    assert_eq!(
+        prog(
+            "import kotlin.math.abs\nimport kotlin.math.abs as A\n\
+             fun main() { println(\"\" + abs(-3) + A(-4)) }"
+        ),
+        "34\n"
+    );
+}
+
+#[test]
+fn the_kotlin_math_extension_members_are_gated_on_the_import() {
+    // `roundToInt`, `pow`, `absoluteValue` and `sign` are EXTENSIONS declared in
+    // `kotlin.math`, not members of the numeric types, so a call with no import
+    // line is an unresolved reference exactly as a bare `abs` is — the
+    // reference toolchain answers `unresolved reference 'roundToInt'` for
+    // `3.7.roundToInt()` in a file with no imports.
+    for (name, call, want) in [
+        ("roundToInt", "3.7.roundToInt()", "4\n"),
+        ("roundToLong", "3.7.roundToLong()", "4\n"),
+        ("pow", "2.0.pow(3.0)", "8.0\n"),
+        ("absoluteValue", "(-5).absoluteValue", "5\n"),
+        ("sign", "(-5).sign", "-1\n"),
+    ] {
+        let err = prog_err(&format!("fun main() {{ println({call}) }}"));
+        assert!(
+            err.contains(&format!("unresolved reference: {name}")),
+            "`{call}` must need the import; stderr was: {err}"
+        );
+        assert_eq!(
+            prog(&format!(
+                "import kotlin.math.*\nfun main() {{ println({call}) }}"
+            )),
+            want
+        );
+        assert_eq!(
+            prog(&format!(
+                "import kotlin.math.{name}\nfun main() {{ println({call}) }}"
+            )),
+            want
+        );
+    }
+    // The RECEIVER is what makes the name an extension, so a method of one's
+    // own that happens to share a spelling is untouched by the gate.
+    assert_eq!(
+        prog("class K { fun pow(n: Int) = n * 2 }\nfun main() { println(K().pow(3)) }"),
+        "6\n"
+    );
+    // `mod` is a `kotlin` package member, not a `kotlin.math` extension, so it
+    // needs no import at all.
+    assert_eq!(prog("fun main() { println((-5).mod(3)) }"), "1\n");
+}
+
+#[test]
 fn math_functions_keep_their_int_and_double_overloads() {
     let src = "\
 import kotlin.math.*
@@ -4588,7 +4671,14 @@ fn math_round_is_the_jdk_algorithm_and_not_floor_of_x_plus_half() {
     // `floor(x + 0.5)` is the documentation, not the implementation. The
     // addition itself rounds `0.49999999999999994` up to `1.0`, so the floor
     // form answers 1 where every JVM since the JDK 8 fix answers 0.
-    let p = |e: &str| prog(&format!("fun main() {{ println({e}) }}"));
+    // `roundToInt` and `roundToLong` are `kotlin.math` EXTENSIONS on `Double`,
+    // not members of it, so the import is part of the program: without it the
+    // reference toolchain answers `unresolved reference 'roundToInt'`.
+    let p = |e: &str| {
+        prog(&format!(
+            "import kotlin.math.roundToInt\nfun main() {{ println({e}) }}"
+        ))
+    };
     assert_eq!(p("Math.round(0.49999999999999994)"), "0\n");
     assert_eq!(p("0.49999999999999994.roundToInt()"), "0\n");
     assert_eq!(p("Math.round(0.5)"), "1\n");
@@ -4607,7 +4697,7 @@ fn math_round_is_the_jdk_algorithm_and_not_floor_of_x_plus_half() {
     for m in ["roundToInt", "roundToLong"] {
         assert_eq!(
             prog(&format!(
-                "fun main() {{ try {{ println(Double.NaN.{m}()) }} \
+                "import kotlin.math.{m}\nfun main() {{ try {{ println(Double.NaN.{m}()) }} \
                  catch (e: Throwable) {{ println(e) }} }}"
             )),
             "java.lang.IllegalArgumentException: Cannot round NaN value.\n",
@@ -4708,7 +4798,15 @@ fn parse_double_follows_javas_grammar_and_not_rusts() {
 fn floor_division_and_sign_follow_the_divisor_not_the_dividend() {
     // `/` and `%` truncate toward zero; `floorDiv`/`floorMod`/`mod` round
     // toward negative infinity, which flips the remainder's sign.
-    let p = |e: &str| prog(&format!("fun main() {{ println({e}) }}"));
+    //
+    // `Int.sign` is an EXTENSION in `kotlin.math`, not a member of `Int`, so
+    // the import is part of the program rather than decoration: without it the
+    // reference toolchain answers `unresolved reference 'sign'`.
+    let p = |e: &str| {
+        prog(&format!(
+            "import kotlin.math.sign\nfun main() {{ println({e}) }}"
+        ))
+    };
     assert_eq!(p("-7 / 2"), "-3\n");
     assert_eq!(p("-7 % 2"), "-1\n");
     assert_eq!(p("Math.floorDiv(-7, 2)"), "-4\n");
@@ -5158,6 +5256,97 @@ fn a_null_argument_renders_as_null_under_every_conversion_but_b() {
     assert_eq!(
         prog(src),
         "[null]\n[null]\n[null]\n[null]\n[null]\n[ null]\n[null  ]\n"
+    );
+}
+
+#[test]
+fn a_lazy_sequence_is_evaluated_element_by_element_and_only_as_far_as_asked() {
+    // `asSequence()` answers a LAZY pipeline, and the laziness is observable in
+    // what gets EVALUATED rather than only in what comes back. A `map` over a
+    // list whose second element would divide by zero is an answer when a
+    // `take(1)` stops before reaching it, and a fault when the pipeline is
+    // eager.
+    assert_eq!(
+        prog("fun main() { println(listOf(1, 0).asSequence().map { 10 / it }.take(1).toList()) }"),
+        "[10]\n"
+    );
+    // The STEP of a `generateSequence` runs only when the next element is
+    // actually wanted, so the seed alone satisfies a `take(1)` and the step
+    // never runs; `first { … }` stops at the match rather than restarting the
+    // pipeline once per index.
+    let counted = |pipeline: &str| {
+        prog(&format!(
+            "fun main() {{\n    var c = 0\n    val r = generateSequence(1) {{ c++; it + 1 }}{pipeline}\n    println(\"\" + r + c)\n}}"
+        ))
+    };
+    assert_eq!(counted(".take(1).toList()"), "[1]0\n");
+    assert_eq!(counted(".first { it > 3 }"), "43\n");
+    // A bounded prefix read off an ENDLESS sequence terminates, where
+    // materializing the pipeline would hit the pull cap.
+    assert_eq!(
+        prog("fun main() { println(generateSequence(1) { it + 1 }.elementAt(4)) }"),
+        "5\n"
+    );
+    // A sequence is RE-ITERABLE: two traversals of one pipeline each start from
+    // the front rather than sharing progress.
+    assert_eq!(
+        prog(
+            "fun main() {\n    val s = listOf(1, 2, 3).asSequence().map { it * 2 }\n\
+             \x20   println(\"\" + s.toList() + s.toList())\n}"
+        ),
+        "[2, 4, 6][2, 4, 6]\n"
+    );
+}
+
+#[test]
+fn a_lazy_sequence_is_pulled_by_the_members_that_splice_or_render_one() {
+    // Every member that reads a container's ELEMENTS has to pull a lazy
+    // sequence rather than read it as empty. Each of these answered an empty
+    // result when `asSequence` began returning a real pipeline, and each is
+    // reached by a different path, so one fix for one of them proves nothing
+    // about the others.
+    //
+    // `joinToString` is the one that hid: a program declaring a `toString()`
+    // override lowers it to a DIFFERENT op than every other program does, so it
+    // answered the empty string in exactly those programs. The `object` below
+    // is what selects that lowering and is load-bearing, not decoration.
+    assert_eq!(
+        prog(
+            "object O { override fun toString(): String = \"O\" }\n\
+             fun main() { println(listOf(1, 2, 3).asSequence().joinToString(\"|\")) }"
+        ),
+        "1|2|3\n"
+    );
+    assert_eq!(
+        prog(
+            "object O { override fun toString(): String = \"O\" }\n\
+             fun main() { println(generateSequence(1) { it + 1 }.take(3).joinToString(\"-\")) }"
+        ),
+        "1-2-3\n"
+    );
+    // `flatMap`/`flatMapIndexed` splice the elements of whatever the lambda
+    // answered, and `zip` reads the elements of its ARGUMENT — a sequence in
+    // any of those three positions has to be pulled.
+    assert_eq!(
+        prog(
+            "fun main() { println(listOf(1, 2).asSequence()\
+             .flatMap { listOf(it, -it).asSequence() }.toList()) }"
+        ),
+        "[1, -1, 2, -2]\n"
+    );
+    assert_eq!(
+        prog(
+            "fun main() { println(listOf(5, 6)\
+             .flatMapIndexed { i, v -> listOf(i, v).asSequence().toList() }) }"
+        ),
+        "[0, 5, 1, 6]\n"
+    );
+    assert_eq!(
+        prog(
+            "fun main() { println(listOf(1, 2, 3).asSequence()\
+             .zip(listOf(\"a\", \"b\").asSequence()).toList()) }"
+        ),
+        "[(1, a), (2, b)]\n"
     );
 }
 

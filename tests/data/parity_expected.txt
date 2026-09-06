@@ -971,3 +971,24 @@ sealed class Sd {\n    data class Circ(val r: Int) : Sd()\n    data class Rect(v
 sealed class Node {\n    data class Leaf(val v: Int) : Node()\n    data class Pair2(val l: Node, val r: Node) : Node()\n    companion object {\n        fun of(v: Int): Node = Leaf(v)\n    }\n}\nfun sum(n: Node): Int = when (n) {\n    is Node.Leaf -> n.v\n    is Node.Pair2 -> sum(n.l) + sum(n.r)\n}\nfun main() {\n    println(sum(Node.Pair2(Node.of(4), Node.Leaf(6))))\n    println(Node.Pair2(Node.Leaf(1), Node.Leaf(2)))\n    println(Node.of(9))\n}	10\nPair2(l=Leaf(v=1), r=Leaf(v=2))\nLeaf(v=9)\n
 class Reg {\n    class Sq(val s: Int) { fun area() = s * s }\n    enum class Kind { A, B }\n    object Cfg { val n = 4 }\n    class Deep { data class Leaf(val k: Int) }\n}\nfun main() {\n    println(Reg.Sq(5).area())\n    println(Reg.Sq(5) is Reg.Sq)\n    println(Reg.Kind.A)\n    println(Reg.Kind.valueOf("B").ordinal)\n    println(Reg.Cfg.n)\n    println(Reg.Deep.Leaf(9))\n    val l: Reg.Deep.Leaf = Reg.Deep.Leaf(2)\n    println(l.k)\n}	25\ntrue\nA\n1\n4\nLeaf(k=9)\n2\n
 class Outer {\n    class Boom(m: String) : RuntimeException(m)\n}\nfun main() {\n    try {\n        throw Outer.Boom("bad")\n    } catch (e: Outer.Boom) {\n        println(e.message)\n        println(e)\n    }\n    println(runCatching { throw Outer.Boom("x") }.isFailure)\n}	bad\nOuter$Boom: bad\ntrue\n
+fun main() { println(listOf(1, 0).asSequence().map { 10 / it }.take(1).toList()) }	[10]\n
+fun main() { var c = 0\n    val r = generateSequence(1) { c++; it + 1 }.take(1).toList()\n    println("" + r + c) }	[1]0\n
+fun main() { var c = 0\n    val r = generateSequence(1) { c++; it + 1 }.first { it > 3 }\n    println("" + r + c) }	43\n
+fun main() { println(generateSequence(1) { it + 1 }.elementAt(4)) }	5\n
+fun main() { val s = listOf(1, 2, 3).asSequence().map { it * 2 }\n    println("" + s.toList() + s.toList()) }	[2, 4, 6][2, 4, 6]\n
+fun main() { println(listOf(3, 1, 2).asSequence().sorted().take(2).toList()) }	[1, 2]\n
+fun main() { println(generateSequence(1) { it * 2 }.firstOrNull { it > 10 }) }	16\n
+fun main() { val m = mutableMapOf(1 to "a")\n    println("" + m.remove(1, "z") + m) }	false{1=a}\n
+fun main() { val m = mutableMapOf(1 to "a")\n    println("" + m.remove(1, "a") + m) }	true{}\n
+fun main() { val m = mutableMapOf(1 to "a")\n    println("" + m.remove(1) + m.remove(9) + m) }	anull{}\n
+fun main() { val m = mutableMapOf(1 to "a")\n    println("" + m.putIfAbsent(1, "z") + m.putIfAbsent(2, "b") + m) }	anull{1=a, 2=b}\n
+fun main() { val m = mutableMapOf<Int, String?>(1 to null)\n    println("" + m.putIfAbsent(1, "z") + m) }	null{1=z}\n
+fun main() { val m = mapOf(1 to "a")\n    println("" + m.containsValue("a") + m.containsValue("z")) }	truefalse\n
+fun main() { println(mapOf(1 to "a").getValue(1)) }	a\n
+fun main() { println(runCatching { mapOf(1 to "a").getValue(9) }.exceptionOrNull()) }	java.util.NoSuchElementException: Key 9 is missing in the map.\n
+fun main() { println(runCatching { mapOf("k" to 1).getValue("zz") }.exceptionOrNull()) }	java.util.NoSuchElementException: Key zz is missing in the map.\n
+import kotlin.math.*\nimport kotlin.math.abs as A\nfun main() { println("" + A(-3) + max(1, 2)) }	32\n
+import kotlin.math.roundToInt as rti\nfun main() { println(3.7.rti()) }	4\n
+import kotlin.math.abs\nimport kotlin.math.abs as A\nfun main() { println("" + abs(-3) + A(-4)) }	34\n
+import kotlin.math.*\nfun main() { println("" + 3.7.roundToInt() + 2.0.pow(3.0) + (-5).absoluteValue + (-5).sign) }	48.05-1\n
+fun main() { println((-5).mod(3)) }	1\n
