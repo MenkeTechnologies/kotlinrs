@@ -616,3 +616,127 @@ The JDK gate that had kept this frontend unmeasured was a mistake in the
 measurement, not a missing toolchain: `/usr/libexec/java_home` lists only the
 JVMs registered under JavaVirtualMachines, and Homebrew's openjdk 21, 25 and 26
 are not among them. `JAVA_HOME=/opt/homebrew/opt/openjdk` is enough.
+
+## Round 11 — a sequence that is lazy is a sequence that must be pulled
+
+### The oracle
+
+`kotlinc-jvm 2.4.10 (JRE 21.0.12.1)`, with `JAVA_HOME` pinned to
+`/opt/homebrew/opt/openjdk@21`. The pin is not optional: unset, the launchers
+resolve through `/usr/libexec/java_home`, which on this machine registers only
+Corretto 17 and 11, and the ambient `JAVA_HOME` is Corretto 17. `1.0e23`
+printing `9.999999999999999E22` is the tell for a pre-19 JVM; under the pin it
+prints `1.0E23`.
+
+### `asSequence()` became lazy, and the laziness is observable
+
+A `Sequence` was represented as a `List` with a tag, which answers correctly for
+every terminal that only inspects the result and wrongly for every one that can
+observe HOW MUCH was evaluated:
+
+| program | before | reference |
+| --- | --- | --- |
+| `listOf(1, 0).asSequence().map { 10 / it }.take(1).toList()` | `ArithmeticException: / by zero` | `[10]` |
+| `generateSequence(1) { c++; it + 1 }.take(1)`, then `c` | `2` | `0` |
+| `generateSequence(1) { c++; it + 1 }.first { it > 3 }`, then `c` | `10` | `3` |
+| `generateSequence(1) { it + 1 }.elementAt(4)` | pull-cap `IllegalStateException` | `5` |
+
+The source is now one of three — a `sequence { … }` block, a list, or the
+seed/step pair — and the source is advanced when the next element is WANTED
+rather than after the previous one was taken, which is what makes `take(1)` run
+no step at all. A search (`first`/`any`/`indexOfFirst`) drives the pipeline with
+a callback instead of asking for one more element per round, which had restarted
+the pipeline from its seed each time and so ran the step a quadratic number of
+times.
+
+### The members that read a container's elements had to learn to pull one
+
+Making `asSequence` answer a real pipeline broke every path that read elements
+out of a materialized container. `sequence_items` answers the empty vector for a
+lazy sequence, so each of these silently produced nothing:
+
+| program | before | reference |
+| --- | --- | --- |
+| `listOf(1, 2).asSequence().flatMap { listOf(it, -it).asSequence() }.toList()` | `[]` | `[1, -1, 2, -2]` |
+| `listOf(1, 2, 3).asSequence().zip(listOf("a", "b").asSequence()).toList()` | `[]` | `[(1, a), (2, b)]` |
+| `listOf(1, 2, 3).asSequence().joinToString("|")` — in a program declaring a `toString()` override | `` | `1|2|3` |
+
+The last one is the reason a whole-program differential harness earns its keep.
+`joinToString` lowers to a different op in a program that overrides `toString()`
+than in one that does not, so it answered the empty string in exactly those
+programs and the right answer in every isolated probe. It survived every
+targeted test written for the sequence work and fell to one 2700-probe fuzz run.
+
+### `kotlin.math` is an import, and an alias MOVES a name
+
+`roundToInt`, `roundToLong`, `pow`, `absoluteValue` and `sign` are extensions
+declared in `kotlin.math`, not members of the numeric types, so a call with no
+import line is an unresolved reference exactly as a bare `abs` is. `Int.mod` is
+a `kotlin` package member and needs no import.
+
+An aliased import moves the spelling rather than adding one, and it wins over a
+star import of the same package — which holds for all three kinds the star
+opens:
+
+| program | before | reference |
+| --- | --- | --- |
+| `import kotlin.math.roundToInt as rti` + `3.7.rti()` | `unresolved reference: rti` | `4` |
+| `import kotlin.math.*` + `import kotlin.math.abs as A` + `abs(-3)` | `3` | `unresolved reference 'abs'` |
+| `import kotlin.math.*` + `import kotlin.math.PI as Tau` + `PI` | `3.141592653589793` | `unresolved reference 'PI'` |
+
+An explicit import of the original spelling alongside the alias puts it back, so
+`import kotlin.math.abs` and `import kotlin.math.abs as A` together leave both
+callable.
+
+### `Map` write members answer three different things
+
+`put` and `putIfAbsent` answer the PREVIOUS value; `remove(key)` answers the
+removed value while `remove(key, value)` answers a `Boolean` and removes only
+when the mapping is the one named; `getValue` throws where `get` answers null.
+A key mapped to null counts as absent for `putIfAbsent`. `containsValue` scans
+the values. All measured; all previously wrong or unresolved.
+
+### The frontend, profiled for the first time
+
+Both earlier rounds on this frontend delivered harness-side wins only. Lowering
+itself is now measured, `--dump-bytecode` isolating lex+parse+compile, minimum of
+110 interleaved runs against a baseline built from the previous commit, with an
+A/A control:
+
+| program | baseline | after | A/A control |
+| --- | --- | --- | --- |
+| 1600 probes, one accumulating scope | 416.28ms | 82.27ms | 132.60ms |
+| 800 probes, one accumulating scope | 77.13ms | 50.71ms | 0.51ms |
+| 200 probes, one accumulating scope | 27.71ms | 28.44ms | 1.20ms |
+| 1600 probes, each in its own `run { … }` | 125.41ms | 128.49ms | 3.84ms |
+| 800 probes, each in its own `run { … }` | 69.65ms | 70.61ms | 0.86ms |
+
+A lambda captured its whole visible scope, so a function holding n bindings and
+n lambdas was quadratic. Filtering the captures to the names the body mentions
+removes that — but the filter walks the body, which is pure overhead when the
+scope was small enough to copy for nothing, and it cost about 12% on the
+`run { … }` shape where every scope stays tiny. Both answers are correct, so the
+choice is made on scope size: above `CAPTURE_SCAN_FLOOR` bindings the captures
+are filtered, below it they are taken whole. The two bottom rows are the
+control that the gate works; the 200-probe row is where the quadratic has not
+yet bitten and nothing should move.
+
+### Provenance
+
+21 new records, minted by `scripts/capture-parity.sh` from
+`kotlinc-jvm 2.4.10 (JRE 21.0.12.1)`; 0 rejected. The corpus floor moved
+973 → 994. Seven fuzz modes were added — `strops`, `numconv`, `seq`, `destr`,
+`nullcoll`, `mapops`, `contract` — and one of them shipped a generator bug that
+cost half its probes: `-255.toString(16)` parses as `-(255.toString(16))`, which
+kotlinc rejects, so its negative literals are now parenthesized. No test was
+deleted or weakened, and no audit or report script was touched.
+
+### Newly measured, recorded rather than fixed
+
+A local `fun` does not capture the enclosing frame: `val k = 5; fun h(x: Int) =
+x + k` inside `main` is `unresolved reference: k` where the reference answers
+`6`. Local functions lower to top-level subroutines reached by a direct call,
+which have no upvalue mechanism, so the fix is a closure-conversion pass with a
+transitive fixpoint — a local `fun` calling another inherits its captures, and a
+lambda calling one inherits them too. Not attempted here rather than attempted
+badly.
