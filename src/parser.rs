@@ -574,16 +574,33 @@ impl Parser {
         }
         &Tok::Eof
     }
-    fn bump(&mut self) -> Tok {
-        let t = self.toks[self.pos].tok.clone();
+    /// Step past the current token, WITHOUT copying it.
+    ///
+    /// This is what almost every consumption site wants — a keyword, a
+    /// delimiter, a punctuation mark, recognised by [`Parser::at`] and then
+    /// discarded. [`Parser::bump`] hands back an owned [`Tok`], and for the two
+    /// variants that carry a heap payload (`Ident`'s `String`, `Str`'s parts)
+    /// that is a clone plus a matching drop per token consumed, for a value
+    /// thrown away on the next line.
+    ///
+    /// The token stream is left INTACT rather than moved out of, because the
+    /// parser backtracks: several forms try one reading, restore `self.pos` and
+    /// try another, and a consumed token has to still be there the second time.
+    fn advance(&mut self) {
         if self.pos + 1 < self.toks.len() {
             self.pos += 1;
         }
+    }
+    /// Step past the current token and hand it back by value. Only for the few
+    /// sites that read the payload out of it; use [`Parser::advance`] otherwise.
+    fn bump(&mut self) -> Tok {
+        let t = self.toks[self.pos].tok.clone();
+        self.advance();
         t
     }
     fn eat(&mut self, t: &Tok) -> Result<(), String> {
         if self.at(t) {
-            self.bump();
+            self.advance();
             Ok(())
         } else {
             Err(format!(
@@ -596,7 +613,7 @@ impl Parser {
     }
     fn ident(&mut self) -> Result<String, String> {
         if let Some(s) = soft_keyword(self.peek()) {
-            self.bump();
+            self.advance();
             return Ok(s.to_string());
         }
         match self.bump() {
@@ -611,9 +628,9 @@ impl Parser {
     fn dotted_path(&mut self) -> Result<ImportDecl, String> {
         let mut path = self.ident()?;
         while self.at(&Tok::Dot) {
-            self.bump();
+            self.advance();
             if self.at(&Tok::Star) {
-                self.bump();
+                self.advance();
                 path.push_str(".*");
                 return Ok(ImportDecl { path, alias: None });
             }
@@ -621,7 +638,7 @@ impl Parser {
             path.push_str(&self.ident()?);
         }
         let alias = if matches!(self.peek(), Tok::Ident(a) if a == "as") {
-            self.bump();
+            self.advance();
             Some(self.ident()?)
         } else {
             None
@@ -649,7 +666,7 @@ impl Parser {
                 | "noinline" | "crossinline" | "tailrec" | "operator" | "infix" | "const" => {}
                 _ => break,
             }
-            self.bump();
+            self.advance();
         }
         m
     }
@@ -663,7 +680,7 @@ impl Parser {
     fn qualified_ident(&mut self) -> Result<String, String> {
         let mut name = self.ident()?;
         while self.at(&Tok::Dot) && matches!(self.peek_at(1), Tok::Ident(_)) {
-            self.bump();
+            self.advance();
             name.push('.');
             name.push_str(&self.ident()?);
         }
@@ -713,7 +730,7 @@ impl Parser {
         let first = self.ident()?;
         let mut recv = None;
         let name = if self.at(&Tok::Dot) {
-            self.bump();
+            self.advance();
             let (ty, class) = (Type::from_name(&first), None);
             let class = if ty == Type::Unknown {
                 Some(first.clone())
@@ -750,17 +767,17 @@ impl Parser {
                 match self.peek() {
                     Tok::Ident(w) if w == "vararg" => {
                         is_vararg = true;
-                        self.bump();
+                        self.advance();
                     }
                     Tok::Ident(w) if w == "crossinline" || w == "noinline" => {
-                        self.bump();
+                        self.advance();
                     }
                     _ => break,
                 }
             }
             let pname = self.ident()?;
             let ann = if self.at(&Tok::Colon) {
-                self.bump();
+                self.advance();
                 self.type_ref()?
             } else {
                 self.last_type_param = None;
@@ -780,7 +797,7 @@ impl Parser {
             });
             // A default value, `fun f(a: Int, b: Int = 10)`.
             let default = if self.at(&Tok::Assign) {
-                self.bump();
+                self.advance();
                 Some(self.expr()?)
             } else {
                 None
@@ -803,14 +820,14 @@ impl Parser {
                 type_param_of: None,
             });
             if self.at(&Tok::Comma) {
-                self.bump();
+                self.advance();
             } else {
                 break;
             }
         }
         self.eat(&Tok::RParen)?;
         let (ret_annot, ret_class, ret_type_args, ret_tp) = if self.at(&Tok::Colon) {
-            self.bump();
+            self.advance();
             let t = self.type_ref()?;
             (Some(t.ty), t.class, t.args, self.last_type_param.take())
         } else {
@@ -842,7 +859,7 @@ impl Parser {
         let (body, is_expr_body) = if bodyless {
             (Vec::new(), false)
         } else if self.at(&Tok::Assign) {
-            self.bump();
+            self.advance();
             let e = self.expr()?;
             (vec![Stmt::new(line, StmtKind::Return(Some(e)))], true)
         } else {
@@ -911,10 +928,10 @@ impl Parser {
         let is_value = matches!(self.peek(), Tok::Ident(w) if w == "value")
             && matches!(self.peek_at(1), Tok::Class);
         if is_value {
-            self.bump();
+            self.advance();
         }
         let mut is_data = if self.at(&Tok::Data) {
-            self.bump();
+            self.advance();
             true
         } else {
             is_value
@@ -934,14 +951,14 @@ impl Parser {
         let is_enum = matches!(self.peek(), Tok::Ident(w) if w == "enum")
             && matches!(self.peek_at(1), Tok::Class);
         if is_enum {
-            self.bump();
+            self.advance();
         }
         let is_interface = matches!(self.peek(), Tok::Ident(w) if w == "interface");
         let is_object = if is_interface {
-            self.bump();
+            self.advance();
             false
         } else if self.at(&Tok::Object) {
-            self.bump();
+            self.advance();
             true
         } else {
             self.eat(&Tok::Class)?;
@@ -953,7 +970,7 @@ impl Parser {
             // so either way the declaration is hoisted under the owner's name.
             Some(owner) => {
                 if matches!(self.peek(), Tok::Ident(_)) {
-                    self.bump();
+                    self.advance();
                 }
                 companion_name(owner)
             }
@@ -978,7 +995,7 @@ impl Parser {
         let mut params = Vec::new();
         let has_primary = !is_object && !is_interface && self.at(&Tok::LParen);
         if has_primary {
-            self.bump();
+            self.advance();
             while !self.at(&Tok::RParen) {
                 // A constructor property carries modifiers like any other:
                 // `class Base(override val name: String)` is how a class
@@ -987,11 +1004,11 @@ impl Parser {
                 self.modifiers();
                 let kind = match self.peek() {
                     Tok::Val => {
-                        self.bump();
+                        self.advance();
                         PropKind::Val
                     }
                     Tok::Var => {
-                        self.bump();
+                        self.advance();
                         PropKind::Var
                     }
                     _ => PropKind::None,
@@ -1012,7 +1029,7 @@ impl Parser {
                         .position(|p| p.as_str() == r.as_str())
                 });
                 let default = if self.at(&Tok::Assign) {
-                    self.bump();
+                    self.advance();
                     Some(self.expr()?)
                 } else {
                     None
@@ -1027,7 +1044,7 @@ impl Parser {
                     type_args,
                 });
                 if self.at(&Tok::Comma) {
-                    self.bump();
+                    self.advance();
                 } else {
                     break;
                 }
@@ -1075,7 +1092,7 @@ impl Parser {
         let mut super_args = Vec::new();
         let mut delegates: Vec<(String, Expr)> = Vec::new();
         if self.at(&Tok::Colon) {
-            self.bump();
+            self.advance();
             loop {
                 let pname = self.qualified_ident()?;
                 // A generic supertype (`Box<Int>`) keeps its head name AND its
@@ -1091,11 +1108,11 @@ impl Parser {
                             self.line()
                         ));
                     }
-                    self.bump();
+                    self.advance();
                     while !self.at(&Tok::RParen) {
                         super_args.push(self.expr()?);
                         if self.at(&Tok::Comma) {
-                            self.bump();
+                            self.advance();
                         } else {
                             break;
                         }
@@ -1106,7 +1123,7 @@ impl Parser {
                 // the class does not itself declare is forwarded to the value
                 // of `expr`.
                 if matches!(self.peek(), Tok::Ident(w) if w == "by") {
-                    self.bump();
+                    self.advance();
                     self.no_trailing_lambda = true;
                     let d = self.expr();
                     self.no_trailing_lambda = false;
@@ -1115,7 +1132,7 @@ impl Parser {
                 parents.push(pname);
                 parent_args.push(pargs);
                 if self.at(&Tok::Comma) {
-                    self.bump();
+                    self.advance();
                 } else {
                     break;
                 }
@@ -1131,7 +1148,7 @@ impl Parser {
         let mut abstract_props: Vec<CtorProp> = Vec::new();
         let mut entries: Vec<EnumEntry> = Vec::new();
         if self.at(&Tok::LBrace) {
-            self.bump();
+            self.advance();
             // An enum body opens with its constants, comma-separated, and the
             // members (if any) follow a `;`. The constants come first in the
             // grammar, so they are consumed before the member loop rather than
@@ -1141,14 +1158,14 @@ impl Parser {
             }
             while !self.at(&Tok::RBrace) && !self.at(&Tok::Eof) {
                 if self.at(&Tok::Semi) {
-                    self.bump();
+                    self.advance();
                     continue;
                 }
                 // `companion object [Name] { … }` — one per class.
                 if matches!(self.peek(), Tok::Ident(w) if w == "companion")
                     && matches!(self.peek_at(1), Tok::Object)
                 {
-                    self.bump();
+                    self.advance();
                     if companion.is_some() {
                         return Err(format!(
                             "class {name}: only one companion object is allowed"
@@ -1173,9 +1190,9 @@ impl Parser {
                              interfaces have none"
                         ));
                     }
-                    self.bump(); // `init`
-                                 // The shared block rule, so an `init` body accepts `;`
-                                 // separators and everything else a `fun` body does.
+                    self.advance(); // `init`
+                                    // The shared block rule, so an `init` body accepts `;`
+                                    // separators and everything else a `fun` body does.
                     let body = self.block()?;
                     inits.push(InitBlock {
                         after_props: obj_props.len(),
@@ -1339,11 +1356,11 @@ impl Parser {
             let name = self.ident()?;
             let mut args = Vec::new();
             if self.at(&Tok::LParen) {
-                self.bump();
+                self.advance();
                 while !self.at(&Tok::RParen) {
                     args.push(self.expr()?);
                     if self.at(&Tok::Comma) {
-                        self.bump();
+                        self.advance();
                     } else {
                         break;
                     }
@@ -1355,11 +1372,11 @@ impl Parser {
             // there too, but one would need storage on the subclass, and
             // rejecting is better than dropping it silently.
             let body = if self.at(&Tok::LBrace) {
-                self.bump();
+                self.advance();
                 let mut ms = Vec::new();
                 while !self.at(&Tok::RBrace) && !self.at(&Tok::Eof) {
                     if self.at(&Tok::Semi) {
-                        self.bump();
+                        self.advance();
                         continue;
                     }
                     let mods = self.modifiers();
@@ -1384,13 +1401,13 @@ impl Parser {
                 line,
             });
             if self.at(&Tok::Comma) {
-                self.bump();
+                self.advance();
             } else {
                 break;
             }
         }
         if self.at(&Tok::Semi) {
-            self.bump();
+            self.advance();
         }
         Ok(entries)
     }
@@ -1659,7 +1676,7 @@ impl Parser {
     /// the body is optional — `constructor(x: Int) : this(x, 0)` is complete.
     fn secondary_ctor(&mut self) -> Result<SecondaryCtor, String> {
         let line = self.line();
-        self.bump(); // `constructor`
+        self.advance(); // `constructor`
         self.eat(&Tok::LParen)?;
         let mut params = Vec::new();
         while !self.at(&Tok::RParen) {
@@ -1679,7 +1696,7 @@ impl Parser {
                     .position(|p| p.as_str() == r.as_str())
             });
             let default = if self.at(&Tok::Assign) {
-                self.bump();
+                self.advance();
                 Some(self.expr()?)
             } else {
                 None
@@ -1694,14 +1711,14 @@ impl Parser {
                 type_param_of,
             });
             if self.at(&Tok::Comma) {
-                self.bump();
+                self.advance();
             } else {
                 break;
             }
         }
         self.eat(&Tok::RParen)?;
         let deleg = if self.at(&Tok::Colon) {
-            self.bump();
+            self.advance();
             let kw = self.ident()?;
             let is_super = match kw.as_str() {
                 "super" => true,
@@ -1718,7 +1735,7 @@ impl Parser {
             while !self.at(&Tok::RParen) {
                 args.push(self.expr()?);
                 if self.at(&Tok::Comma) {
-                    self.bump();
+                    self.advance();
                 } else {
                     break;
                 }
@@ -1759,13 +1776,13 @@ impl Parser {
     fn accessor_prop(&mut self, mods: Mods) -> Result<Option<FunDecl>, String> {
         let start = self.pos;
         let line = self.line();
-        self.bump(); // `val` / `var`
+        self.advance(); // `val` / `var`
         let parsed = (|| -> Result<Option<(String, TypeArg)>, String> {
             let name = self.ident()?;
             if !self.at(&Tok::Colon) {
                 return Ok(None);
             }
-            self.bump();
+            self.advance();
             Ok(Some((name, self.type_ref()?)))
         })();
         // The type variable the annotation named, read while it is still fresh
@@ -1786,11 +1803,11 @@ impl Parser {
             self.pos = start;
             return Ok(None);
         }
-        self.bump(); // `get`
+        self.advance(); // `get`
         self.eat(&Tok::LParen)?;
         self.eat(&Tok::RParen)?;
         let body = if self.at(&Tok::Assign) {
-            self.bump();
+            self.advance();
             let e = self.expr()?;
             vec![Stmt::new(line, StmtKind::Return(Some(e)))]
         } else {
@@ -1849,7 +1866,7 @@ impl Parser {
             if !self.at(&Tok::Colon) {
                 return Ok(None);
             }
-            self.bump();
+            self.advance();
             Ok(Some((name, self.type_ref()?)))
         })();
         // `=` (an initializer), `by` (a delegate) and `get`/`set` (an accessor)
@@ -1887,7 +1904,7 @@ impl Parser {
             class,
             args: type_args,
         } = if self.at(&Tok::Colon) {
-            self.bump();
+            self.advance();
             self.type_ref()?
         } else {
             self.last_type_param = None;
@@ -1908,14 +1925,14 @@ impl Parser {
         // `by lazy { … }`. `by` is a soft keyword, so it only means delegation
         // in this position.
         if matches!(self.peek(), Tok::Ident(w) if w == "by") {
-            self.bump();
+            self.advance();
             // `by lazy { … }` has its own lowering (a cell forced on first
             // read); every other delegate goes through the general
             // `getValue`/`setValue` operator protocol.
             if matches!(self.peek(), Tok::Ident(w) if w == "lazy")
                 && matches!(self.peek_at(1), Tok::LBrace)
             {
-                self.bump();
+                self.advance();
                 if mutable {
                     return Err(format!("property {name}: `by lazy` requires `val`"));
                 }
@@ -2019,16 +2036,16 @@ impl Parser {
     /// none of them changes what the annotated declaration computes.
     fn skip_annotations(&mut self) {
         while self.at(&Tok::At) {
-            self.bump();
+            self.advance();
             if matches!(self.peek(), Tok::Ident(_)) {
-                self.bump();
+                self.advance();
             }
             // A use-site target (`@file:JvmName("…")`) writes the target, a
             // colon, then the annotation itself.
             if self.at(&Tok::Colon) {
-                self.bump();
+                self.advance();
                 if matches!(self.peek(), Tok::Ident(_)) {
-                    self.bump();
+                    self.advance();
                 }
             }
             if self.at(&Tok::LParen) {
@@ -2101,7 +2118,7 @@ impl Parser {
         let params_at = self.fn_param_types.len();
         let rets_at = self.fn_ret_types.len();
         let parsed = (|| -> Result<Vec<TypeArg>, String> {
-            self.bump(); // `<`
+            self.advance(); // `<`
             let mut out = Vec::new();
             loop {
                 // `in`/`out` variance is a use-site modifier on the argument,
@@ -2109,20 +2126,20 @@ impl Parser {
                 while matches!(self.peek(), Tok::Ident(w) if w == "in" || w == "out")
                     || self.at(&Tok::In)
                 {
-                    self.bump();
+                    self.advance();
                 }
                 if self.at(&Tok::Star) {
-                    self.bump(); // `List<*>` — a star projection names no type
+                    self.advance(); // `List<*>` — a star projection names no type
                     out.push(TypeArg::unknown());
                 } else {
                     out.push(self.type_ref()?);
                 }
                 match self.peek() {
                     Tok::Comma => {
-                        self.bump();
+                        self.advance();
                     }
                     Tok::Gt => {
-                        self.bump();
+                        self.advance();
                         return Ok(out);
                     }
                     other => return Err(format!("unexpected {other:?} in type arguments")),
@@ -2158,16 +2175,16 @@ impl Parser {
         // rather than by backtracking, because the parameter-list scan below
         // has the `fn_param_types` side channel it cannot cleanly undo.
         if self.at(&Tok::LParen) && !matches!(self.tok_after_parens(), Tok::Arrow) {
-            self.bump();
+            self.advance();
             let inner = self.type_ref()?;
             self.eat(&Tok::RParen)?;
             if self.at(&Tok::Question) {
-                self.bump(); // nullable parenthesized type `((Int) -> Int)?`
+                self.advance(); // nullable parenthesized type `((Int) -> Int)?`
             }
             return Ok(inner);
         }
         if self.at(&Tok::LParen) {
-            self.bump();
+            self.advance();
             // Record the parameter types as the list goes by. A parameter is
             // typed only when it is ONE plain identifier (`Int`, `String`); a
             // generic, nullable, or nested function type widens to `Unknown`,
@@ -2184,7 +2201,7 @@ impl Parser {
                         if any || !words.is_empty() {
                             params.push(fn_param_ty(&words, plain));
                         }
-                        self.bump();
+                        self.advance();
                         break;
                     }
                     Tok::Comma if depth == 1 => {
@@ -2192,7 +2209,7 @@ impl Parser {
                         words.clear();
                         plain = true;
                         any = true;
-                        self.bump();
+                        self.advance();
                     }
                     Tok::Eof => return Err("unterminated function type".into()),
                     _ => {
@@ -2206,7 +2223,7 @@ impl Parser {
                             _ if depth == 1 => plain = false,
                             _ => {}
                         }
-                        self.bump();
+                        self.advance();
                     }
                 }
             }
@@ -2218,7 +2235,7 @@ impl Parser {
             let ret = self.type_ref()?;
             self.fn_ret_types.push(ret.ty);
             if self.at(&Tok::Question) {
-                self.bump(); // nullable function type `((Int) -> Int)?`
+                self.advance(); // nullable function type `((Int) -> Int)?`
             }
             // The annotation is a function type, NOT the type variable its
             // result may have mentioned — clear what the recursive call left.
@@ -2228,7 +2245,7 @@ impl Parser {
         let name = self.qualified_ident()?;
         let args = self.type_args_list();
         let nullable = if self.at(&Tok::Question) {
-            self.bump(); // nullable marker `T?`
+            self.advance(); // nullable marker `T?`
             true
         } else {
             false
@@ -2276,7 +2293,7 @@ impl Parser {
         let mut stmts = Vec::new();
         while !self.at(&Tok::RBrace) && !self.at(&Tok::Eof) {
             if self.at(&Tok::Semi) {
-                self.bump();
+                self.advance();
                 continue;
             }
             stmts.push(self.stmt()?);
@@ -2345,7 +2362,7 @@ impl Parser {
                 StmtKind::Empty
             }
             Tok::Return => {
-                self.bump();
+                self.advance();
                 // `return@label` — a LOCAL return from the lambda (or `fun`)
                 // carrying that label. Every lambda body here compiles to its
                 // own VM frame, so a local return IS a frame return and the
@@ -2353,7 +2370,7 @@ impl Parser {
                 // dropped. (Kotlin's non-local `return` from an inline
                 // function's lambda is a different construct and is unaffected.)
                 if self.at(&Tok::At) {
-                    self.bump();
+                    self.advance();
                     self.ident()?;
                 }
                 // A `return` with no expression (Unit) — the next token starts a
@@ -2370,11 +2387,11 @@ impl Parser {
             Tok::If => StmtKind::If(self.if_expr()?),
             Tok::When => StmtKind::When(self.when_expr()?),
             Tok::Break => {
-                self.bump();
+                self.advance();
                 StmtKind::Break(self.opt_label()?)
             }
             Tok::Continue => {
-                self.bump();
+                self.advance();
                 StmtKind::Continue(self.opt_label()?)
             }
             _ => self.assign_or_expr()?,
@@ -2385,7 +2402,7 @@ impl Parser {
     /// An optional `@label` after `break`/`continue`.
     fn opt_label(&mut self) -> Result<Option<String>, String> {
         if self.at(&Tok::At) {
-            self.bump();
+            self.advance();
             Ok(Some(self.ident()?))
         } else {
             Ok(None)
@@ -2396,12 +2413,12 @@ impl Parser {
         let mutable = matches!(self.bump(), Tok::Var);
         // Destructuring: `val (a, b, …) = expr`.
         if self.at(&Tok::LParen) {
-            self.bump();
+            self.advance();
             let mut names = Vec::new();
             while !self.at(&Tok::RParen) {
                 names.push(self.ident()?);
                 if self.at(&Tok::Comma) {
-                    self.bump();
+                    self.advance();
                 } else {
                     break;
                 }
@@ -2413,7 +2430,7 @@ impl Parser {
         }
         let name = self.ident()?;
         let (ty, class, type_args, fn_params, fn_ret) = if self.at(&Tok::Colon) {
-            self.bump();
+            self.advance();
             let before = self.fn_param_types.len();
             let ret_before = self.fn_ret_types.len();
             let t = self.type_ref()?;
@@ -2432,7 +2449,7 @@ impl Parser {
         // `getValue`/`setValue` delegate protocol needs a property to hand the
         // delegate, and a local has none.
         if matches!(self.peek(), Tok::Ident(w) if w == "by") {
-            self.bump();
+            self.advance();
             // The general delegate protocol: anything but `lazy` after `by` is
             // an expression producing a delegate, whose `getValue`/`setValue`
             // every read and write of the binding goes through. `lazy` keeps
@@ -2455,7 +2472,7 @@ impl Parser {
                     delegated: true,
                 });
             }
-            self.bump();
+            self.advance();
             if mutable {
                 return Err(format!("local {name}: `by lazy` requires `val`"));
             }
@@ -2533,11 +2550,11 @@ impl Parser {
         // collide with a name the loop body writes.
         let mut parts = Vec::new();
         let var = if self.at(&Tok::LParen) {
-            self.bump();
+            self.advance();
             while !self.at(&Tok::RParen) {
                 parts.push(self.ident()?);
                 if self.at(&Tok::Comma) {
-                    self.bump();
+                    self.advance();
                 } else {
                     break;
                 }
@@ -2616,7 +2633,7 @@ impl Parser {
         let Some(binop) = op else {
             return Ok(StmtKind::Expr(lhs));
         };
-        self.bump(); // the assign token
+        self.advance(); // the assign token
         let value = self.expr()?;
         self.assign_to(lhs, binop, value)
     }
@@ -2665,7 +2682,7 @@ impl Parser {
     fn or_expr(&mut self) -> Result<Expr, String> {
         let mut l = self.and_expr()?;
         while self.at(&Tok::OrOr) {
-            self.bump();
+            self.advance();
             let r = self.and_expr()?;
             l = Expr::Binary {
                 op: BinOp::Or,
@@ -2679,7 +2696,7 @@ impl Parser {
     fn and_expr(&mut self) -> Result<Expr, String> {
         let mut l = self.eq_expr()?;
         while self.at(&Tok::AndAnd) {
-            self.bump();
+            self.advance();
             let r = self.eq_expr()?;
             l = Expr::Binary {
                 op: BinOp::And,
@@ -2700,7 +2717,7 @@ impl Parser {
                 Tok::NotEqEq => BinOp::RefNe,
                 _ => break,
             };
-            self.bump();
+            self.advance();
             let r = self.cmp_expr()?;
             l = Expr::Binary {
                 op,
@@ -2721,7 +2738,7 @@ impl Parser {
                 Tok::Ge => BinOp::Ge,
                 _ => break,
             };
-            self.bump();
+            self.advance();
             let r = self.in_expr()?;
             l = Expr::Binary {
                 op,
@@ -2799,10 +2816,10 @@ impl Parser {
             if self.at(&Tok::Is) || (self.at(&Tok::Not) && matches!(self.peek_at(1), Tok::Is)) {
                 let negated = self.at(&Tok::Not);
                 if negated {
-                    self.bump();
+                    self.advance();
                 }
-                self.bump(); // is
-                             // The type arguments are dropped: the check is by erased class.
+                self.advance(); // is
+                                // The type arguments are dropped: the check is by erased class.
                 let (ty, _, nullable) = self.is_type()?;
                 l = Expr::Is {
                     value: Box::new(l),
@@ -2813,11 +2830,11 @@ impl Parser {
                 continue;
             }
             let negated = if self.at(&Tok::In) {
-                self.bump();
+                self.advance();
                 false
             } else if self.at(&Tok::Not) && matches!(self.peek_at(1), Tok::In) {
-                self.bump();
-                self.bump();
+                self.advance();
+                self.advance();
                 true
             } else {
                 break;
@@ -2839,8 +2856,8 @@ impl Parser {
     fn elvis_expr(&mut self) -> Result<Expr, String> {
         let l = self.infix_expr()?;
         if self.at(&Tok::Question) && matches!(self.peek_at(1), Tok::Colon) {
-            self.bump(); // ?
-            self.bump(); // :
+            self.advance(); // ?
+            self.advance(); // :
             let r = self.elvis_expr()?;
             Ok(Expr::Elvis {
                 left: Box::new(l),
@@ -2883,7 +2900,7 @@ impl Parser {
                 Tok::Until => Some(RangeKind::Until),
                 Tok::DownTo => Some(RangeKind::DownTo),
                 Tok::Step => {
-                    self.bump();
+                    self.advance();
                     let by = self.range_expr()?;
                     l = Expr::Step {
                         recv: Box::new(l),
@@ -2893,7 +2910,7 @@ impl Parser {
                 }
                 _ => break,
             };
-            self.bump();
+            self.advance();
             let r = self.range_expr()?;
             l = match kind {
                 None => Expr::Pair {
@@ -2915,7 +2932,7 @@ impl Parser {
     fn range_expr(&mut self) -> Result<Expr, String> {
         let mut l = self.additive()?;
         while self.at(&Tok::DotDot) {
-            self.bump();
+            self.advance();
             let r = self.additive()?;
             l = Expr::Range {
                 start: Box::new(l),
@@ -2934,7 +2951,7 @@ impl Parser {
                 Tok::Minus => BinOp::Sub,
                 _ => break,
             };
-            self.bump();
+            self.advance();
             let r = self.multiplicative()?;
             l = Expr::Binary {
                 op,
@@ -2954,7 +2971,7 @@ impl Parser {
                 Tok::Percent => BinOp::Mod,
                 _ => break,
             };
-            self.bump();
+            self.advance();
             let r = self.as_expr()?;
             l = Expr::Binary {
                 op,
@@ -2971,10 +2988,10 @@ impl Parser {
     fn as_expr(&mut self) -> Result<Expr, String> {
         let mut e = self.unary()?;
         while matches!(self.peek(), Tok::Ident(w) if w == "as") {
-            self.bump();
+            self.advance();
             let safe = self.at(&Tok::Question);
             if safe {
-                self.bump();
+                self.advance();
             }
             let (ty, type_args, nullable) = self.is_type()?;
             e = Expr::As {
@@ -2991,14 +3008,14 @@ impl Parser {
     fn unary(&mut self) -> Result<Expr, String> {
         match self.peek() {
             Tok::Minus => {
-                self.bump();
+                self.advance();
                 Ok(Expr::Unary {
                     op: UnOp::Neg,
                     expr: Box::new(self.unary()?),
                 })
             }
             Tok::Not => {
-                self.bump();
+                self.advance();
                 Ok(Expr::Unary {
                     op: UnOp::Not,
                     expr: Box::new(self.unary()?),
@@ -3007,7 +3024,7 @@ impl Parser {
             // Prefix `++x` / `--x` — the value is the target AFTER the update.
             Tok::PlusPlus | Tok::MinusMinus => {
                 let inc = matches!(self.peek(), Tok::PlusPlus);
-                self.bump();
+                self.advance();
                 Ok(Expr::IncDec {
                     target: Box::new(self.unary()?),
                     inc,
@@ -3027,8 +3044,8 @@ impl Parser {
             // Not-null assertion `expr!!` — two consecutive `!` tokens (`!=`
             // lexes as a single `NotEq`, so this only fires on a literal `!!`).
             if self.at(&Tok::Not) && matches!(self.peek_at(1), Tok::Not) {
-                self.bump();
-                self.bump();
+                self.advance();
+                self.advance();
                 e = Expr::NotNull(Box::new(e));
                 continue;
             }
@@ -3039,14 +3056,14 @@ impl Parser {
             // records which expression was written.
             if self.at(&Tok::ColonColon) {
                 let line = self.line();
-                self.bump();
+                self.advance();
                 // `x::class` / `Type::class` — a class REFERENCE, not a member
                 // one. `class` is a keyword, so it can never be the name of a
                 // member and the two spellings cannot collide; it lowers as a
                 // member read of that reserved name, which is where the
                 // compiler's receiver machinery already lives.
                 if self.at(&Tok::Class) {
-                    self.bump();
+                    self.advance();
                     e = Expr::Member {
                         recv: Box::new(e),
                         name: CLASS_REF.to_string(),
@@ -3057,7 +3074,7 @@ impl Parser {
                 }
                 let name = match self.peek().clone() {
                     Tok::Ident(n) => {
-                        self.bump();
+                        self.advance();
                         n
                     }
                     other => return Err(format!("expected a name after `::`, found {other:?}")),
@@ -3077,12 +3094,12 @@ impl Parser {
             // `f()` stays a separate statement, exactly as Kotlin parses it.
             if self.at(&Tok::LParen) && self.glued_to_prev() && invocable(&e) {
                 let line = self.line();
-                self.bump();
+                self.advance();
                 let mut args = Vec::new();
                 while !self.at(&Tok::RParen) {
                     args.push(self.call_arg()?);
                     if self.at(&Tok::Comma) {
-                        self.bump();
+                        self.advance();
                     } else {
                         break;
                     }
@@ -3101,7 +3118,7 @@ impl Parser {
             // Indexed access `recv[index]` (chainable: `m[k][i]`).
             if self.at(&Tok::LBracket) {
                 let line = self.line();
-                self.bump();
+                self.advance();
                 let index = self.expr()?;
                 self.eat(&Tok::RBracket)?;
                 e = Expr::Index {
@@ -3115,13 +3132,13 @@ impl Parser {
             let safe = if self.at(&Tok::Dot) {
                 false
             } else if self.at(&Tok::Question) && matches!(self.peek_at(1), Tok::Dot) {
-                self.bump(); // `?`
+                self.advance(); // `?`
                 true
             } else {
                 break;
             };
             let line = self.line();
-            self.bump(); // `.`
+            self.advance(); // `.`
             let name = self.ident()?;
             // `x.f<T>()` — the same explicit type argument a free call takes,
             // and the same reason to keep it: a `reified` callee reads it.
@@ -3130,11 +3147,11 @@ impl Parser {
             let mut is_call = false;
             if self.at(&Tok::LParen) {
                 is_call = true;
-                self.bump();
+                self.advance();
                 while !self.at(&Tok::RParen) {
                     args.push(self.call_arg()?);
                     if self.at(&Tok::Comma) {
-                        self.bump();
+                        self.advance();
                     } else {
                         break;
                     }
@@ -3172,7 +3189,7 @@ impl Parser {
         // expression position (`println(i++)`) as well as as a statement.
         if matches!(self.peek(), Tok::PlusPlus | Tok::MinusMinus) {
             let inc = matches!(self.peek(), Tok::PlusPlus);
-            self.bump();
+            self.advance();
             e = Expr::IncDec {
                 target: Box::new(e),
                 inc,
@@ -3249,13 +3266,13 @@ impl Parser {
                 // `{ (a + b).toString() }`, fails one of the checks below or the
                 // `->` test after the loop, and rolls back.
                 if self.at(&Tok::LParen) {
-                    self.bump();
+                    self.advance();
                     let mut names: Vec<String> = Vec::new();
                     loop {
                         match self.peek() {
                             Tok::Ident(n) => {
                                 let n = n.clone();
-                                self.bump();
+                                self.advance();
                                 names.push(n);
                             }
                             _ => {
@@ -3268,14 +3285,14 @@ impl Parser {
                         // is bound through `componentN`, whose result type the
                         // compiler infers from the receiver.
                         if self.at(&Tok::Colon) {
-                            self.bump();
+                            self.advance();
                             if self.skip_lambda_param_type().is_none() {
                                 ok = false;
                                 break;
                             }
                         }
                         if self.at(&Tok::Comma) {
-                            self.bump();
+                            self.advance();
                         } else {
                             break;
                         }
@@ -3284,12 +3301,12 @@ impl Parser {
                         ok = false;
                         break;
                     }
-                    self.bump(); // `)`
+                    self.advance(); // `)`
                     let synth = format!("<destructured{}>", tmp.len());
                     dtmp.push((synth.clone(), names));
                     tmp.push((synth, Type::Unknown));
                     if self.at(&Tok::Comma) {
-                        self.bump();
+                        self.advance();
                         continue;
                     }
                     break;
@@ -3297,7 +3314,7 @@ impl Parser {
                 let pname = match self.peek() {
                     Tok::Ident(n) => {
                         let n = n.clone();
-                        self.bump();
+                        self.advance();
                         n
                     }
                     _ => {
@@ -3312,7 +3329,7 @@ impl Parser {
                 // the `{ … }` was a body, not a parameter list.
                 let mut pty = Type::Unknown;
                 if self.at(&Tok::Colon) {
-                    self.bump();
+                    self.advance();
                     match self.skip_lambda_param_type() {
                         Some(t) => pty = t,
                         None => {
@@ -3323,25 +3340,25 @@ impl Parser {
                 }
                 tmp.push((pname, pty));
                 if self.at(&Tok::Comma) {
-                    self.bump();
+                    self.advance();
                 } else {
                     break;
                 }
             }
             if ok && self.at(&Tok::Arrow) {
-                self.bump();
+                self.advance();
                 params = tmp;
                 destructures = dtmp;
             } else {
                 self.pos = save;
             }
         } else if self.at(&Tok::Arrow) {
-            self.bump(); // `{ -> … }` — explicitly no parameters
+            self.advance(); // `{ -> … }` — explicitly no parameters
         }
         let mut body = Vec::new();
         while !self.at(&Tok::RBrace) && !self.at(&Tok::Eof) {
             if self.at(&Tok::Semi) {
-                self.bump();
+                self.advance();
                 continue;
             }
             body.push(self.stmt()?);
@@ -3396,22 +3413,22 @@ impl Parser {
                 Tok::Lt | Tok::LParen | Tok::LBracket => {
                     depth += 1;
                     ty = Type::Unknown;
-                    self.bump();
+                    self.advance();
                 }
                 Tok::Gt | Tok::RParen | Tok::RBracket => {
                     depth -= 1;
-                    self.bump();
+                    self.advance();
                 }
                 Tok::RBrace | Tok::Eof => return None,
                 Tok::Ident(_) if depth == 0 && !consumed_simple => {
                     consumed_simple = true;
-                    self.bump();
+                    self.advance();
                 }
                 _ => {
                     // A second token at depth 0 (`Int?`, `a.B`, …) is not a plain
                     // simple type — fall back to `Unknown`.
                     ty = Type::Unknown;
-                    self.bump();
+                    self.advance();
                 }
             }
         }
@@ -3444,7 +3461,7 @@ impl Parser {
             return;
         }
         let save = self.pos;
-        self.bump(); // `<`
+        self.advance(); // `<`
         let mut depth = 1i32;
         // A function type argument (`listOf<(Int) -> Int>()`) puts parens and an
         // `->` inside the list. They are tracked separately so the `>` that ends
@@ -3454,7 +3471,7 @@ impl Parser {
             match self.peek() {
                 Tok::LParen => {
                     paren += 1;
-                    self.bump();
+                    self.advance();
                 }
                 Tok::RParen => {
                     paren -= 1;
@@ -3462,24 +3479,24 @@ impl Parser {
                         self.pos = save;
                         return;
                     }
-                    self.bump();
+                    self.advance();
                 }
                 Tok::Arrow => {
-                    self.bump();
+                    self.advance();
                 }
                 Tok::Lt => {
                     depth += 1;
-                    self.bump();
+                    self.advance();
                 }
                 Tok::Gt if paren == 0 => {
                     depth -= 1;
-                    self.bump();
+                    self.advance();
                     if depth == 0 {
                         break;
                     }
                 }
                 Tok::Ident(_) | Tok::Comma | Tok::Dot | Tok::Question => {
-                    self.bump();
+                    self.advance();
                 }
                 // Not a type-argument list after all.
                 _ => {
@@ -3505,10 +3522,10 @@ impl Parser {
             // (`Type::name`, `expr::name`) are postfix and are handled in
             // `postfix`.
             Tok::ColonColon => {
-                self.bump();
+                self.advance();
                 match self.peek().clone() {
                     Tok::Ident(n) => {
-                        self.bump();
+                        self.advance();
                         Ok(Expr::FunRef {
                             recv: None,
                             name: n,
@@ -3519,35 +3536,35 @@ impl Parser {
                 }
             }
             Tok::Int(n) => {
-                self.bump();
+                self.advance();
                 Ok(Expr::Int(n))
             }
             Tok::Long(n) => {
-                self.bump();
+                self.advance();
                 Ok(Expr::Long(n))
             }
             Tok::Float(f) => {
-                self.bump();
+                self.advance();
                 Ok(Expr::Float(f))
             }
             Tok::Float32(f) => {
-                self.bump();
+                self.advance();
                 Ok(Expr::Float32(f))
             }
             Tok::Bool(b) => {
-                self.bump();
+                self.advance();
                 Ok(Expr::Bool(b))
             }
             Tok::Char(c) => {
-                self.bump();
+                self.advance();
                 Ok(Expr::Char(c))
             }
             Tok::Null => {
-                self.bump();
+                self.advance();
                 Ok(Expr::Null)
             }
             Tok::Str(parts) => {
-                self.bump();
+                self.advance();
                 Ok(Expr::Str(self.str_parts(&parts)?))
             }
             Tok::If => Ok(Expr::If(self.if_expr()?)),
@@ -3556,7 +3573,7 @@ impl Parser {
             // `throw e` — an expression (Kotlin types it `Nothing`), so it is
             // usable as a statement and on the right of `?:`.
             Tok::Throw => {
-                self.bump();
+                self.advance();
                 Ok(Expr::Throw(Box::new(self.expr()?)))
             }
             // A brace in expression position is a lambda literal (`val f = { … }`,
@@ -3574,7 +3591,7 @@ impl Parser {
                 self.labeled_lambda()
             }
             Tok::LParen => {
-                self.bump();
+                self.advance();
                 let e = self.expr()?;
                 self.eat(&Tok::RParen)?;
                 Ok(e)
@@ -3585,7 +3602,7 @@ impl Parser {
             // and a `data class` declaration is taken by the top-level parser.
             ref t if soft_keyword(t).is_some() => {
                 let name = soft_keyword(t).unwrap().to_string();
-                self.bump();
+                self.advance();
                 if self.at(&Tok::LParen) {
                     self.primary_call(name, line)
                 } else {
@@ -3593,13 +3610,13 @@ impl Parser {
                 }
             }
             Tok::Ident(name) if name == "super" => {
-                self.bump();
+                self.advance();
                 // `super<Base>.m()` — the supertype qualifier that disambiguates
                 // when more than one supertype implements `m`. Not consumed by
                 // `skip_call_type_args`, which only takes a type-argument list
                 // followed by `(`; this one is followed by `.`.
                 let qualifier = if self.at(&Tok::Lt) {
-                    self.bump();
+                    self.advance();
                     let n = self.ident()?;
                     self.eat(&Tok::Gt)?;
                     Some(n)
@@ -3609,7 +3626,7 @@ impl Parser {
                 Ok(Expr::Super { qualifier })
             }
             Tok::Ident(name) => {
-                self.bump();
+                self.advance();
                 // Explicit type arguments on a call — `listOf<Int>()`,
                 // `emptyMap<String, Int>()`. Consumed and ignored (typing here is
                 // coarse); the speculative scan below is what keeps `a < b` a
@@ -3618,12 +3635,12 @@ impl Parser {
                 let targ = self.call_type_arg();
                 let targ_call = targ.clone();
                 if self.at(&Tok::LParen) {
-                    self.bump();
+                    self.advance();
                     let mut args = Vec::new();
                     while !self.at(&Tok::RParen) {
                         args.push(self.call_arg()?);
                         if self.at(&Tok::Comma) {
-                            self.bump();
+                            self.advance();
                         } else {
                             break;
                         }
@@ -3689,8 +3706,8 @@ impl Parser {
         };
         if let Some(soft) = soft {
             if matches!(self.peek_at(1), Tok::Assign) {
-                self.bump(); // the soft keyword
-                self.bump(); // `=`
+                self.advance(); // the soft keyword
+                self.advance(); // `=`
                 return Ok(Expr::Named {
                     name: soft.to_string(),
                     value: Box::new(self.expr()?),
@@ -3699,7 +3716,7 @@ impl Parser {
         }
         if matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Assign) {
             let name = self.ident()?;
-            self.bump(); // `=`
+            self.advance(); // `=`
             return Ok(Expr::Named {
                 name,
                 value: Box::new(self.expr()?),
@@ -3716,7 +3733,7 @@ impl Parser {
         while !self.at(&Tok::RParen) {
             args.push(self.call_arg()?);
             if self.at(&Tok::Comma) {
-                self.bump();
+                self.advance();
             } else {
                 break;
             }
@@ -3736,7 +3753,7 @@ impl Parser {
         self.eat(&Tok::RParen)?;
         let then = self.branch_body()?;
         let els = if self.at(&Tok::Else) {
-            self.bump();
+            self.advance();
             if self.at(&Tok::If) {
                 // `else if` chains as an else-branch holding a single if-stmt.
                 let l = self.line();
@@ -3763,7 +3780,7 @@ impl Parser {
         let body = self.block()?;
         let mut catches = Vec::new();
         while self.at(&Tok::Catch) {
-            self.bump();
+            self.advance();
             self.eat(&Tok::LParen)?;
             let name = self.ident()?;
             self.eat(&Tok::Colon)?;
@@ -3784,7 +3801,7 @@ impl Parser {
         // “a try needs one or the other” rule, even though it lowers to nothing.
         let mut saw_finally = false;
         let finally_body = if self.at(&Tok::Finally) {
-            self.bump();
+            self.advance();
             saw_finally = true;
             self.block()?
         } else {
@@ -3813,12 +3830,12 @@ impl Parser {
         // plain form is the same thing without the name.
         let mut binding = None;
         let subject = if self.at(&Tok::LParen) {
-            self.bump();
+            self.advance();
             if self.at(&Tok::Val) {
-                self.bump();
+                self.advance();
                 binding = Some(self.ident()?);
                 if self.at(&Tok::Colon) {
-                    self.bump();
+                    self.advance();
                     self.type_name()?;
                 }
                 self.eat(&Tok::Assign)?;
@@ -3834,16 +3851,16 @@ impl Parser {
         let mut arms = Vec::new();
         while !self.at(&Tok::RBrace) && !self.at(&Tok::Eof) {
             if self.at(&Tok::Semi) {
-                self.bump();
+                self.advance();
                 continue;
             }
             let guard = if self.at(&Tok::Else) {
-                self.bump();
+                self.advance();
                 WhenGuard::Else
             } else {
                 let mut conds = vec![self.when_cond(has_subject)?];
                 while self.at(&Tok::Comma) {
-                    self.bump();
+                    self.advance();
                     conds.push(self.when_cond(has_subject)?);
                 }
                 WhenGuard::Conds(conds)
@@ -3868,11 +3885,11 @@ impl Parser {
         if has_subject {
             match self.peek() {
                 Tok::In => {
-                    self.bump();
+                    self.advance();
                     return self.when_range(false);
                 }
                 Tok::Is => {
-                    self.bump();
+                    self.advance();
                     let (ty, _, nullable) = self.is_type()?;
                     return Ok(WhenCond::Is {
                         negated: false,
@@ -3882,13 +3899,13 @@ impl Parser {
                 }
                 // `!in` / `!is` — a `!` immediately followed by `in`/`is`.
                 Tok::Not if matches!(self.peek_at(1), Tok::In) => {
-                    self.bump();
-                    self.bump();
+                    self.advance();
+                    self.advance();
                     return self.when_range(true);
                 }
                 Tok::Not if matches!(self.peek_at(1), Tok::Is) => {
-                    self.bump();
-                    self.bump();
+                    self.advance();
+                    self.advance();
                     let (ty, _, nullable) = self.is_type()?;
                     return Ok(WhenCond::Is {
                         negated: true,
@@ -3919,7 +3936,7 @@ impl Parser {
         // where `null as String` throws. Reported rather than discarded.
         let mut nullable = false;
         if self.at(&Tok::Question) {
-            self.bump();
+            self.advance();
             nullable = true;
         }
         // A `reified` parameter IS testable at run time — that is what the
@@ -3940,15 +3957,15 @@ impl Parser {
         let start = self.range_bound()?;
         let (kind, end) = match self.peek() {
             Tok::DotDot => {
-                self.bump();
+                self.advance();
                 (RangeKind::Inclusive, self.range_bound()?)
             }
             Tok::Until => {
-                self.bump();
+                self.advance();
                 (RangeKind::Until, self.range_bound()?)
             }
             Tok::DownTo => {
-                self.bump();
+                self.advance();
                 (RangeKind::DownTo, self.range_bound()?)
             }
             other => {

@@ -1563,6 +1563,20 @@ pub fn compile_debug(program: &Program) -> Result<Chunk, String> {
 /// Compile a program to a runnable chunk, optionally instrumented with debug
 /// line markers. Requires a `fun main`.
 pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
+    compile_catchable(program, debug).map(|(chunk, _)| chunk)
+}
+
+/// [`compile_with`], also handing back whether the program CATCHES — the answer
+/// [`uses_exceptions`] gives, which the runtime needs in order to decide whether
+/// a runtime fault may be delivered to a handler.
+///
+/// It comes back from here because the compiler already had to compute it (only
+/// a catching program gets the per-statement unwind checks), and it is a full
+/// walk of every function, method and property initializer in the program.
+/// Asking for it again after compiling — which the runtime and the debug
+/// adapter both did — walked the whole AST a second time for an answer that was
+/// already in hand.
+pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool), String> {
     // Extensions live in their own table keyed by `(receiver type, name)`: they
     // are NOT callable as free functions, and two receivers may each declare one
     // of the same name.
@@ -1789,7 +1803,8 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
 
     let end = c.b.current_pos();
     c.b.patch_jump(end_jump, end);
-    Ok(c.b.build())
+    let catchable = c.has_try;
+    Ok((c.b.build(), catchable))
 }
 
 impl Compiler {

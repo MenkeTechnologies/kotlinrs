@@ -289,11 +289,12 @@ fn run_debug(src: &str) -> Result<(), String> {
     use fusevm::VMResult;
     let prepared = crate::rust_ffi::desugar(&crate::prepare_source(src));
     let program = crate::parser::parse_program(&prepared)?;
-    let chunk = crate::compiler::compile_debug(&program)?;
+    let (chunk, catchable) = crate::compiler::compile_catchable(&program, true)?;
     let _ = crate::host::take_error();
     // Same contract as the normal run: a JVM-throwable fault is catchable only
-    // in a program whose bytecode carries the unwind checks.
-    crate::host::set_catchable(crate::compiler::uses_exceptions(&program));
+    // in a program whose bytecode carries the unwind checks. The flag rides back
+    // out of the compile that already computed it.
+    crate::host::set_catchable(catchable);
     let mut vm = VM::new(chunk);
     crate::host::install_debug(&mut vm);
     match vm.run() {
