@@ -2444,6 +2444,58 @@ fun main() {
 }
 
 #[test]
+fn a_local_fun_closes_over_the_enclosing_frame_without_losing_recursion() {
+    // The captures ride as synthesized trailing parameters, so the body reaches
+    // them at fixed slots and a self-call passes them straight on. Every line
+    // below was measured against kotlinc 2.4.10 on JDK 21 before it was frozen
+    // here; the shapes that motivate each one:
+    //
+    //   * `a` calls `b`, so `a` has to carry `b`'s capture even though it never
+    //     spells it — captures compose along the call graph.
+    //   * `shadow` has a parameter named `k`, and still owes `b` the OUTER `k`.
+    //     A capture the parameter list shadows is bound under a key no Kotlin
+    //     identifier can spell, so both reach the right binding.
+    //   * `bump` ASSIGNS to a captured `var`, which is what forces the enclosing
+    //     `c` into a heap cell — by-value capture would have counted a copy.
+    //   * `inner` reads a field, which needs both the captured `this` and the
+    //     declaring method's class context.
+    //   * the `forEach` block and `f` both call outward into a local `fun`, so
+    //     the lambda has to hold captures for names it never mentions.
+    let src = "\
+class P(val n: Int) {
+    fun go(): Int {
+        fun inner(m: Int) = n * m
+        return inner(2)
+    }
+}
+fun main() {
+    val k = 5
+    fun h(x: Int) = x + k
+    println(h(1))
+    fun b(x: Int) = x + k
+    fun a(y: Int) = b(y) * 2
+    println(a(1))
+    println(listOf(1, 2, 3).map { b(it) })
+    var c = 0
+    fun bump() { c += 1 }
+    bump(); bump(); bump()
+    println(c)
+    fun fact(n: Int): Int = if (n <= 1) k else n * fact(n - 1)
+    println(fact(4))
+    fun shadow(k: Int): Int = b(0) + k
+    println(shadow(100))
+    println(P(21).go())
+    listOf(7).forEach { e ->
+        fun show(t: String) = \"$t:$e:$k\"
+        println(show(\"v\"))
+    }
+    val f = { z: Int -> b(z) + 1 }
+    println(f(2))
+}";
+    assert_eq!(prog(src), "6\n12\n[6, 7, 8]\n3\n120\n105\n42\nv:7:5\n8\n");
+}
+
+#[test]
 fn a_plain_type_parameter_test_is_rejected_rather_than_answered() {
     // The coarse type system carries no type arguments, so `x is T` inside a
     // generic function has no answer it could give — and answering `false` (the

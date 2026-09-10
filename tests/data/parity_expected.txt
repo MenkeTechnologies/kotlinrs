@@ -992,3 +992,18 @@ import kotlin.math.roundToInt as rti\nfun main() { println(3.7.rti()) }	4\n
 import kotlin.math.abs\nimport kotlin.math.abs as A\nfun main() { println("" + abs(-3) + A(-4)) }	34\n
 import kotlin.math.*\nfun main() { println("" + 3.7.roundToInt() + 2.0.pow(3.0) + (-5).absoluteValue + (-5).sign) }	48.05-1\n
 fun main() { println((-5).mod(3)) }	1\n
+fun main() {\n    val k = 5\n    fun h(x: Int) = x + k\n    println(h(1))\n}	6\n
+fun main() {\n    val k = 5\n    fun b(x: Int) = x + k\n    fun a(y: Int) = b(y) * 2\n    println(a(1))\n}	12\n
+fun main() {\n    val k = 5\n    fun b(x: Int) = x + k\n    println(listOf(1, 2, 3).map { b(it) })\n}	[6, 7, 8]\n
+fun main() {\n    var c = 0\n    fun bump() { c += 1 }\n    bump()\n    bump()\n    bump()\n    println(c)\n}	3\n
+fun main() {\n    val base = 10\n    fun fact(n: Int): Int = if (n <= 1) base else n * fact(n - 1)\n    println(fact(4))\n}	240\n
+fun main() {\n    val k = 5\n    fun b() = k\n    fun a(k: Int): Int = b() + k\n    println(a(100))\n}	105\n
+class P(val n: Int) {\n    fun go(): Int {\n        fun inner() = n * 2\n        return inner()\n    }\n}\nfun main() { println(P(21).go()) }	42\n
+fun main() {\n    val xs = listOf(1, 2, 3)\n    xs.forEach { e ->\n        fun show(t: String) = "$t:$e:${xs.size}"\n        println(show("v"))\n    }\n}	v:1:3\nv:2:3\nv:3:3\n
+fun main() {\n    val p = 3\n    fun outer(x: Int): Int {\n        fun inner(y: Int) = y + p\n        return inner(x)\n    }\n    println(outer(4))\n}	7\n
+fun main() {\n    val k = 7\n    fun b(x: Int) = x + k\n    val f = { z: Int -> b(z) + 1 }\n    println(f(2))\n}	10\n
+fun main() {\n    var total = 0\n    val step = 3\n    fun add(n: Int) { total += n * step }\n    for (i in 1..4) add(i)\n    println(total)\n}	30\n
+fun main() {\n    val names = mutableListOf<String>()\n    fun note(s: String) { names.add(s.uppercase()) }\n    note("a")\n    note("b")\n    println(names)\n}	[A, B]\n
+fun main() {\n    val d = 2.5\n    fun scale(v: Double): Double = v * d\n    println(scale(4.0))\n}	10.0\n
+fun main() {\n    val k = 4L\n    fun wide(n: Long): Long = n * k\n    println(wide(3_000_000_000L))\n}	12000000000\n
+fun main() {\n    val sep = "-"\n    fun join(a: String, b: String = "z"): String = a + sep + b\n    println(join("x") + join("x", "y"))\n}	x-zx-y\n

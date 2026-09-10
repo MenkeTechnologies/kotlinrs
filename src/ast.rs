@@ -690,9 +690,16 @@ pub enum StmtKind {
     /// It is emitted as an ordinary subroutine rather than as a closure value,
     /// which is what lets it call ITSELF: a closure captures by value at
     /// creation time, so a recursive local lambda would capture an
-    /// uninitialized slot. The consequence is that it cannot close over the
-    /// enclosing frame's locals — naming one is an unresolved reference, which
-    /// is a loud failure rather than a wrong answer.
+    /// uninitialized slot.
+    ///
+    /// The enclosing frame's locals it names still reach it, as SYNTHESIZED
+    /// TRAILING PARAMETERS appended to its declared ones and pushed by every
+    /// call site. That keeps recursion working — inside the body a capture is
+    /// an ordinary parameter at a known slot, so the recursive call passes it
+    /// on — and it composes transitively, since a local `fun` that calls
+    /// another is the one that has to supply the callee's captures. A captured
+    /// `var` the body ASSIGNS to is boxed in the enclosing frame first, so the
+    /// write lands where the declaring frame can see it.
     LocalFun(FunDecl),
     /// An expression evaluated for effect (e.g. a `println(...)` call).
     Expr(Expr),

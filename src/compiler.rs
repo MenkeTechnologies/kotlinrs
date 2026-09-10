@@ -37,7 +37,7 @@ use crate::host::{
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// The stdlib supertypes a class may declare that contribute NOTHING to
 /// dispatch: every member they declare is abstract, so the class supplies its
@@ -828,6 +828,12 @@ pub struct Compiler {
     /// local declaration cannot leak into another function's name resolution;
     /// it shadows a top-level function of the same name while in scope.
     local_sigs: HashMap<String, FnSig>,
+    /// The enclosing-frame bindings each of those local `fun`s closes over, in
+    /// the order the call site pushes them. Saved and restored alongside
+    /// `local_funs`, and consulted TRANSITIVELY: a local `fun` that calls
+    /// another inherits the callee's captures, since it is the one that has to
+    /// supply them.
+    local_caps: HashMap<String, Vec<LocalCap>>,
     /// Monotonic id for the mangled local-`fun` sub names.
     local_funs_seen: u32,
     /// The names a lambda somewhere in the CURRENT frame's body assigns to. A
@@ -961,6 +967,15 @@ struct PendingLocalFun {
     decl: FunDecl,
     local_funs: HashMap<String, String>,
     local_sigs: HashMap<String, FnSig>,
+    /// The enclosing-frame bindings this body names, bound as trailing
+    /// parameters. See [`LocalCap`].
+    caps: Vec<LocalCap>,
+    local_caps: HashMap<String, Vec<LocalCap>>,
+    /// The user class whose members were in implicit scope at the declaration.
+    /// A local `fun` inside a method captures `this`, so it can reach fields the
+    /// same way the method does — but only if it also inherits the class context
+    /// that lowers a bare field name to a read through `this`.
+    class_ctx: Option<String>,
 }
 
 /// A lambda body queued for emission as a subroutine. `params` already has the
@@ -987,6 +1002,9 @@ struct PendingLambda {
     /// after the frame that declared those names finished lowering.
     local_funs: HashMap<String, String>,
     local_sigs: HashMap<String, FnSig>,
+    /// The capture lists of those local `fun`s, so a call to one from inside
+    /// this lambda pushes the same bindings an outer call would.
+    local_caps: HashMap<String, Vec<LocalCap>>,
     /// The `reified` type-parameter names in scope at the literal. A lambda
     /// inside a `reified` body sees them — Kotlin inlines the lambda into that
     /// body, so `xs.firstOrNull { it is T }` is a test against the CALL's type
@@ -1007,6 +1025,49 @@ struct Captured {
     class: Option<String>,
     elem: Type,
     boxed: bool,
+}
+
+/// One enclosing-frame binding a local `fun` closes over, passed as a
+/// SYNTHESIZED TRAILING PARAMETER rather than as a closure upvalue.
+///
+/// A local `fun` is emitted as an ordinary subroutine so that it can call
+/// itself (a closure captures by value at creation, so a self-reference would
+/// read an uninitialized slot). Appending its free variables to its parameter
+/// list keeps that property — inside the body a capture is an ordinary
+/// parameter at a known slot, so the recursive call passes it on exactly as the
+/// outer call did — while giving the body the enclosing locals it names.
+///
+/// No slot travels here, unlike [`Captured`]: the call site resolves each
+/// capture BY NAME in whatever scope the call is written in, which is what
+/// makes a call from inside another local `fun` (whose captures are its own
+/// parameters) push the same binding the outer call pushed.
+#[derive(Clone)]
+struct LocalCap {
+    /// The name as the source spells it.
+    name: String,
+    ty: Type,
+    class: Option<String>,
+    elem: Type,
+    boxed: bool,
+}
+
+/// The scope key a captured `name` is bound under inside a local `fun` whose
+/// own parameters shadow it.
+///
+/// `$` is not legal in a Kotlin identifier, so this key can only ever be
+/// reached through a synthesized capture — which is the point. In
+/// `fun a(k: Int) { b() }` where `b` captures an OUTER `k`, `a` receives that
+/// outer `k` under this key, so the push for `b` finds the enclosing binding
+/// while `a`'s own body still reads its parameter for a bare `k`.
+fn cap_key(name: &str) -> String {
+    format!("{name}$cap")
+}
+
+/// Push `cap`'s current value, resolving it by name in `sc`.
+///
+/// The shadow key wins when it is bound, for the reason [`cap_key`] gives.
+fn cap_slot(sc: &Scope, cap: &LocalCap) -> Option<u16> {
+    sc.slot(&cap_key(&cap.name)).or_else(|| sc.slot(&cap.name))
 }
 
 /// Backpatch bookkeeping for one enclosing loop. `break`/`continue` emit a
@@ -1582,6 +1643,7 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
         pending_local_funs: Vec::new(),
         local_funs: HashMap::new(),
         local_sigs: HashMap::new(),
+        local_caps: HashMap::new(),
         local_funs_seen: 0,
         boxed_vars: HashSet::new(),
         lambda_hint: None,
@@ -1715,9 +1777,11 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
             Some(pf) => {
                 c.local_funs = pf.local_funs;
                 c.local_sigs = pf.local_sigs;
-                c.compile_fun(&pf.decl, None)?;
+                c.local_caps = pf.local_caps;
+                c.compile_fun_captured(&pf.decl, None, &pf.caps, pf.class_ctx.as_deref())?;
                 c.local_funs.clear();
                 c.local_sigs.clear();
+                c.local_caps.clear();
             }
             None => break,
         }
@@ -2114,6 +2178,68 @@ impl Compiler {
     /// Lower a free function (`class` = `None`) or a class method (`class` =
     /// `Some(name)`, adding an implicit `this` in slot 0).
     fn compile_fun(&mut self, f: &FunDecl, class: Option<&str>) -> Result<(), String> {
+        self.compile_fun_captured(f, class, &[], None)
+    }
+
+    /// The enclosing-frame bindings a local `fun` has to be handed, computed at
+    /// its declaration — which is exactly where Kotlin's own scoping says its
+    /// free names resolve.
+    ///
+    /// Two sources, and they are filtered differently:
+    ///
+    /// * The names the body itself MENTIONS (see [`mentioned_names`], the same
+    ///   over-approximation a lambda's captures use), minus the ones the
+    ///   function's own parameters bind — a parameter is not a free variable.
+    /// * The captures of every local `fun` the body names, which this one is
+    ///   the caller of and therefore has to supply. These are NOT filtered by
+    ///   the parameter list: `fun a(k: Int) { b() }` where `b` closes over an
+    ///   outer `k` still has to carry that outer `k`, and it rides under the
+    ///   shadow key ([`cap_key`]) so `a`'s own `k` is untouched.
+    ///
+    /// The callee's captures are already transitively closed when this runs,
+    /// because a local `fun` is only visible after its declaration — so one
+    /// pass reaches a fixpoint.
+    fn local_fun_caps(&self, sc: &Scope, lf: &FunDecl) -> Vec<LocalCap> {
+        let mentioned = mentioned_names(&lf.body);
+        let mut wanted: BTreeSet<&str> = BTreeSet::new();
+        for n in &mentioned {
+            if !lf.params.iter().any(|p| p.name == *n) && sc.map.contains_key(n.as_str()) {
+                wanted.insert(n.as_str());
+            }
+            for c in self.local_caps.get(n).into_iter().flatten() {
+                if sc.map.contains_key(c.name.as_str()) {
+                    wanted.insert(c.name.as_str());
+                }
+            }
+        }
+        // Ordered by name: the push order at every call site and the bind order
+        // in the body read the SAME list, but a hash set's iteration order is
+        // not stable across runs and the two must agree for every lowering of
+        // one program.
+        wanted
+            .into_iter()
+            .filter_map(|n| sc.map.get_key_value(n))
+            .map(|(n, b)| LocalCap {
+                name: n.clone(),
+                ty: b.ty,
+                class: b.class.clone(),
+                elem: b.elem,
+                boxed: b.boxed,
+            })
+            .collect()
+    }
+
+    /// [`Compiler::compile_fun`] for a queued local `fun`: `caps` are the
+    /// enclosing-frame bindings its body names, bound as trailing parameters
+    /// after the declared ones (see [`LocalCap`]), and `class_ctx` is the user
+    /// class whose members were in implicit scope where it was declared.
+    fn compile_fun_captured(
+        &mut self,
+        f: &FunDecl,
+        class: Option<&str>,
+        caps: &[LocalCap],
+        class_ctx: Option<&str>,
+    ) -> Result<(), String> {
         let entry = self.b.current_pos();
         let sub_name = match (class, &f.recv) {
             (Some(cls), _) => method_sub_name(cls, &f.name),
@@ -2147,6 +2273,23 @@ impl Compiler {
                 sc.set_type_args(&p.name, p.type_args.clone());
             }
         }
+        // Then the synthesized captures, which the call site pushed after the
+        // real arguments. A capture whose name one of the declared parameters
+        // already spells is bound under the shadow key instead, so the
+        // parameter keeps the bare name (see [`cap_key`]).
+        for c in caps {
+            let shadowed = f.params.iter().any(|p| p.name == c.name);
+            let key = if shadowed {
+                cap_key(&c.name)
+            } else {
+                c.name.clone()
+            };
+            sc.declare_full(&key, c.ty, c.boxed, c.class.clone(), c.elem);
+            if c.boxed {
+                sc.box_binding(&key);
+            }
+            nslots += 1;
+        }
         // Bind args (stack top = last arg) into slots, deepest last.
         for i in (0..nslots).rev() {
             self.b.emit(Op::SetSlot(i as u16), f.line);
@@ -2160,6 +2303,13 @@ impl Compiler {
                 .and_then(|(_, _, c)| c.clone())
                 .filter(|c| self.classes.contains_key(c))
         });
+        // A local `fun` declares no receiver, so the line above leaves it with
+        // no class context — but it captured the enclosing method's `this`, and
+        // a bare field name only lowers to a read through `this` when the
+        // owning class is known here.
+        if let Some(cc) = class_ctx {
+            self.cur_class = Some(cc.to_string());
+        }
         // The frame is its own unwind boundary: an exception with no handler
         // inside it leaves the frame, and the caller's check resumes the walk.
         // A `return` likewise belongs to this frame, so an enclosing `try`'s
@@ -2174,6 +2324,7 @@ impl Compiler {
         // what the drain loop installs before calling here.
         let outer_locals = self.local_funs.clone();
         let outer_local_sigs = self.local_sigs.clone();
+        let outer_local_caps = self.local_caps.clone();
         let outer_ret = self.cur_ret.replace(f.ret);
         let outer_reified = std::mem::replace(&mut self.cur_reified, f.reified.clone());
         let res: Result<(), String> = (|| {
@@ -2186,6 +2337,7 @@ impl Compiler {
         self.cur_reified = outer_reified;
         self.local_funs = outer_locals;
         self.local_sigs = outer_local_sigs;
+        self.local_caps = outer_local_caps;
         self.boxed_vars = outer_boxed;
         self.cur_class = None;
         self.finally_returns = outer_returns;
@@ -2304,17 +2456,22 @@ impl Compiler {
                         lf.name
                     ));
                 }
+                let caps = self.local_fun_caps(sc, lf);
                 let id = self.local_funs_seen;
                 self.local_funs_seen += 1;
                 let sub = format!("{}$local${id}", lf.name);
                 self.local_funs.insert(lf.name.clone(), sub.clone());
                 self.local_sigs.insert(lf.name.clone(), FnSig::of(lf));
+                self.local_caps.insert(lf.name.clone(), caps.clone());
                 let mut decl = lf.clone();
                 decl.name = sub;
                 self.pending_local_funs.push(PendingLocalFun {
                     decl,
                     local_funs: self.local_funs.clone(),
                     local_sigs: self.local_sigs.clone(),
+                    caps,
+                    local_caps: self.local_caps.clone(),
+                    class_ctx: self.cur_class.clone(),
                 });
             }
             StmtKind::Let {
@@ -4906,7 +5063,7 @@ impl Compiler {
         // the lambda's own parameters shadow. Captures use slots after the params
         // in the body; the push order here matches the body prologue's pop order.
         let caps: Vec<Captured> = if sc.map.len() > CAPTURE_SCAN_FLOOR {
-            sc.visible_mentioned(&mentioned_names(body))
+            sc.visible_mentioned(&self.lambda_mentioned(body))
         } else {
             sc.visible()
         }
@@ -4940,6 +5097,7 @@ impl Compiler {
             recv_class,
             local_funs: self.local_funs.clone(),
             local_sigs: self.local_sigs.clone(),
+            local_caps: self.local_caps.clone(),
             reified: self.cur_reified.clone(),
         });
         self.b.emit(Op::LoadInt(name_idx as i64), 0);
@@ -5106,6 +5264,29 @@ impl Compiler {
         self.compile_expr(sc, &lam(n.unwrap_or(0), body))
     }
 
+    /// [`mentioned_names`] widened by the captures of every local `fun` the
+    /// body calls.
+    ///
+    /// A lambda that calls a local `fun` is the one that has to push that
+    /// function's captures, so it must hold them itself — even though it never
+    /// spells them. Only the filtered path needs this: below
+    /// [`CAPTURE_SCAN_FLOOR`] the whole visible scope is taken and they are
+    /// already in it.
+    fn lambda_mentioned(&self, body: &[Stmt]) -> HashSet<String> {
+        let mut out = mentioned_names(body);
+        let extra: Vec<String> = out
+            .iter()
+            .filter_map(|n| self.local_caps.get(n))
+            .flatten()
+            // Both spellings: the binding is under the bare name in the frame
+            // that declared it, and under the shadow key in a local `fun` that
+            // received it as a capture (see [`cap_key`]).
+            .flat_map(|c| [c.name.clone(), cap_key(&c.name)])
+            .collect();
+        out.extend(extra);
+        out
+    }
+
     fn compile_lambda_body(&mut self, pl: PendingLambda) -> Result<(), String> {
         let entry = self.b.current_pos();
         self.b.add_sub_entry(pl.name_idx, entry);
@@ -5137,6 +5318,7 @@ impl Compiler {
         self.cur_class = pl.class.clone();
         let outer_locals = std::mem::replace(&mut self.local_funs, pl.local_funs.clone());
         let outer_local_sigs = std::mem::replace(&mut self.local_sigs, pl.local_sigs.clone());
+        let outer_local_caps = std::mem::replace(&mut self.local_caps, pl.local_caps.clone());
         let outer_boxed = std::mem::replace(&mut self.boxed_vars, lambda_writes(&pl.body));
         // A lambda declares no return type, so a `return@label` inside one is
         // handing its value to the same erased position the fallthrough result
@@ -5156,6 +5338,7 @@ impl Compiler {
         let res = self.compile_block_value(&mut sc, &pl.body);
         self.local_funs = outer_locals;
         self.local_sigs = outer_local_sigs;
+        self.local_caps = outer_local_caps;
         self.boxed_vars = outer_boxed;
         self.cur_class = saved;
         self.finally_returns = outer_returns;
@@ -6346,10 +6529,24 @@ impl Compiler {
                     let full = self.expand_args(&format!("function {name}"), &sig.params, args)?;
                     self.compile_call_args(sc, &sig.params, &full)?;
                     // A local `fun` shadows a top-level one of the same name and
-                    // lives under its mangled sub.
+                    // lives under its mangled sub. Its captures follow the real
+                    // arguments as synthesized trailing ones (see [`LocalCap`]),
+                    // resolved by name HERE so a call from inside another local
+                    // `fun` — where they are that function's own parameters —
+                    // passes on the same bindings.
                     let sub = self.local_funs.get(name).cloned();
+                    let caps = self.local_caps.get(name).cloned().unwrap_or_default();
+                    for c in &caps {
+                        match cap_slot(sc, c) {
+                            Some(slot) => self.b.emit(Op::GetSlot(slot), line),
+                            None => {
+                                return Err(format!("unresolved reference: {}", c.name));
+                            }
+                        };
+                    }
                     let idx = self.b.add_name(sub.as_deref().unwrap_or(name));
-                    self.b.emit(Op::Call(idx, sig.arity as u8), line);
+                    self.b
+                        .emit(Op::Call(idx, (sig.arity + caps.len()) as u8), line);
                     return Ok(self.call_ret(sc, &sig, args));
                 }
                 // A TOP-LEVEL property holding a first-class function value:
@@ -8783,12 +8980,15 @@ fn mentioned_names(body: &[Stmt]) -> HashSet<String> {
     out.into_inner()
 }
 
-/// Every name a lambda ANYWHERE inside `body` assigns to.
+/// Every name a lambda or a local `fun` ANYWHERE inside `body` assigns to.
 ///
-/// A `var` of the enclosing frame named here has to be boxed: a closure copies
-/// its captures by value, so a plain slot write inside the lambda would update
-/// the copy and leave the original untouched — a wrong answer rather than a
-/// loud one. Over-approximating (a name that turns out to be the lambda's own
+/// A `var` of the enclosing frame named here has to be boxed: both constructs
+/// receive their captures BY VALUE — a lambda as closure upvalues, a local
+/// `fun` as synthesized trailing parameters (see [`LocalCap`]) — so a plain
+/// slot write inside one would update the copy and leave the original
+/// untouched, a wrong answer rather than a loud one. Boxing makes the two share
+/// one heap cell, which is what `var c = 0; fun bump() { c += 1 }` needs to
+/// count. Over-approximating (a name that turns out to be the callee's own
 /// local, or a `val`) costs one heap cell and nothing else.
 fn lambda_writes(body: &[Stmt]) -> HashSet<String> {
     let out = RefCell::new(HashSet::new());
@@ -8800,17 +9000,26 @@ fn lambda_writes(body: &[Stmt]) -> HashSet<String> {
         }
         false
     };
+    let collect = |body: &[Stmt]| {
+        stmt_any(body, &|k| {
+            if let StmtKind::Assign { name, .. } = k {
+                out.borrow_mut().insert(name.clone());
+            }
+            false
+        });
+        // `x++` / `--x` are writes too, and reach their target through an
+        // expression rather than an `Assign`.
+        body_any(body, &note);
+    };
     body_any(body, &|e| {
         if let Expr::Lambda { body, .. } = e {
-            stmt_any(body, &|k| {
-                if let StmtKind::Assign { name, .. } = k {
-                    out.borrow_mut().insert(name.clone());
-                }
-                false
-            });
-            // `x++` / `--x` are writes too, and reach their target through an
-            // expression rather than an `Assign`.
-            body_any(body, &note);
+            collect(body);
+        }
+        false
+    });
+    stmt_any(body, &|k| {
+        if let StmtKind::LocalFun(lf) = k {
+            collect(&lf.body);
         }
         false
     });

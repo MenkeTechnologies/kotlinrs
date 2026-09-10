@@ -96,7 +96,7 @@ fn fnv1a(s: &str) -> u64 {
 /// fewer records than this is reporting on a TRUNCATED file rather than on the
 /// frontend — and `n > 0` would have called that a pass. Raise it with the
 /// corpus; never lower it to accommodate a deletion.
-const CORPUS_FLOOR: usize = 994;
+const CORPUS_FLOOR: usize = 1009;
 
 /// No record may speak a pre-JDK-21 dialect.
 ///
