@@ -4026,12 +4026,11 @@ impl Compiler {
         // handful of calls naming a `kotlin.math` extension can be affected by.
         let ext = self.math_ext_target(name);
         let alias_rt;
-        let name = if ext.is_none() && !is_math_ext(name) {
-            name
-        } else if !matches!(
-            self.infer(sc, recv),
-            Type::Int | Type::Long | Type::Double | Type::Float
-        ) {
+        let name = if (ext.is_none() && !is_math_ext(name))
+            || !matches!(
+                self.infer(sc, recv),
+                Type::Int | Type::Long | Type::Double | Type::Float
+            ) {
             name
         } else {
             match ext {
