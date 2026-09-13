@@ -492,8 +492,14 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   **recurse** (a closure captures by value at creation, so a self-reference would
   read an uninitialized slot). It takes defaults, shadows a top-level function of
   its name for the rest of the enclosing body, and is callable from a lambda
-  there. It cannot close over the enclosing frame's locals — naming one is an
-  unresolved reference, not a wrong answer.
+  there. It also **closes over the enclosing frame**: the locals its body names
+  ride as synthesized trailing parameters appended to its declared ones, which is
+  what keeps recursion working — inside the body a capture is an ordinary
+  parameter at a fixed slot, so the self-call passes it straight on. Captures
+  compose along the call graph (a local `fun` calling another supplies the
+  callee's), a parameter may spell a captured name without colliding with it, a
+  captured `var` the body *assigns* to is boxed exactly as a lambda's write is,
+  and a local `fun` inside a method reads the enclosing instance's fields.
 - **`Pair` / `Triple`** — the constructor spellings beside `a to b`, with the
   `data class` behaviour Kotlin gives them: `(a, b)` / `(a, b, c)` display,
   structural equality, the `31`-fold `hashCode`, `first`/`second`/`third`, and

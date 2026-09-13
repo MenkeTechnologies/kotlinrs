@@ -1459,9 +1459,19 @@ fn g_result(r: &mut Rng, _idx: usize) -> String {
 /// subroutine rather than a closure value, which is what lets it recurse; the
 /// probes exercise the recursion, the defaults it still gets, and the shadowing
 /// of a top-level function of the same name.
+///
+/// The second half of the table is the CAPTURING half, and it exists because
+/// the first half could not fail the way local functions actually failed. Every
+/// one of the original eight shapes passes all its data through parameters, so
+/// none of them names an enclosing local — and the frontend answered
+/// `unresolved reference` to exactly that, which a 2,700-probe round therefore
+/// never reached. A generator that cannot spell the bug is not coverage of it.
+/// These shapes read an enclosing `val`, write an enclosing `var`, reach one
+/// through a second local `fun`, through a lambda, and through a parameter that
+/// shadows the captured name.
 fn g_localfn(r: &mut Rng, _idx: usize) -> String {
     let n = pick(r, STEPS);
-    match r.below(8) {
+    match r.below(16) {
         0 => p(format!("withLocal({n})")),
         1 => p(format!("localFact({n})")),
         2 => p(format!("localFib({n})")),
@@ -1469,7 +1479,15 @@ fn g_localfn(r: &mut Rng, _idx: usize) -> String {
         4 => p("localDefaultBare()".to_string()),
         5 => p(format!("localShadow({n})")),
         6 => p(format!("localInLambda({n})")),
-        _ => p(format!("localNested({n})")),
+        7 => p(format!("localNested({n})")),
+        8 => p(format!("capRead({n})")),
+        9 => p(format!("capWrite({n})")),
+        10 => p(format!("capChain({n})")),
+        11 => p(format!("capLambda({n})")),
+        12 => p(format!("capRecur({n})")),
+        13 => p(format!("capShadowParam({n})")),
+        14 => p(format!("capDeep({n})")),
+        _ => p(format!("CapHolder({n}).via()")),
     }
 }
 
@@ -3307,6 +3325,97 @@ fn extra_declarations(probes: &[String]) -> String {
              \x20       return inner(x) * 2\n\
              \x20   }\n\
              \x20   return outer(n)\n\
+             }\n",
+        );
+    }
+    // The capturing helpers. Each NAMES an enclosing binding from inside the
+    // local `fun`, which is the whole point of them.
+    if named("capRead(") {
+        out.push_str(
+            "fun capRead(n: Int): Int {\n\
+             \x20   val bias = 7\n\
+             \x20   fun add(x: Int): Int = x + bias\n\
+             \x20   return add(n)\n\
+             }\n",
+        );
+    }
+    if named("capWrite(") {
+        // The write has to reach the DECLARING frame, so `total` is boxed.
+        out.push_str(
+            "fun capWrite(n: Int): Int {\n\
+             \x20   var total = 0\n\
+             \x20   val step = 3\n\
+             \x20   fun accum(x: Int) { total += x * step }\n\
+             \x20   for (i in 1..n) accum(i)\n\
+             \x20   return total\n\
+             }\n",
+        );
+    }
+    if named("capChain(") {
+        // `mid` never spells `bias`; it owes it to `base`, which does.
+        out.push_str(
+            "fun capChain(n: Int): Int {\n\
+             \x20   val bias = 4\n\
+             \x20   fun base(x: Int): Int = x + bias\n\
+             \x20   fun mid(x: Int): Int = base(x) * 2\n\
+             \x20   fun top(x: Int): Int = mid(x) - 1\n\
+             \x20   return top(n)\n\
+             }\n",
+        );
+    }
+    if named("capLambda(") {
+        out.push_str(
+            "fun capLambda(n: Int): Int {\n\
+             \x20   val bias = 5\n\
+             \x20   fun add(x: Int): Int = x + bias\n\
+             \x20   return listOf(n, n + 1).map { add(it) }.sum()\n\
+             }\n",
+        );
+    }
+    if named("capRecur(") {
+        // A self-call has to pass the capture on, or the recursion loses it.
+        out.push_str(
+            "fun capRecur(n: Int): Int {\n\
+             \x20   val floorV = 2\n\
+             \x20   fun down(k: Int): Int = if (k <= 0) floorV else down(k - 1) + floorV\n\
+             \x20   return down(n)\n\
+             }\n",
+        );
+    }
+    if named("capShadowParam(") {
+        // `inner` has a parameter spelling the captured name, and still owes
+        // `outerCap` the ENCLOSING one.
+        out.push_str(
+            "fun capShadowParam(n: Int): Int {\n\
+             \x20   val v = 6\n\
+             \x20   fun outerCap(): Int = v\n\
+             \x20   fun inner(v: Int): Int = outerCap() * 10 + v\n\
+             \x20   return inner(n % 10)\n\
+             }\n",
+        );
+    }
+    if named("capDeep(") {
+        out.push_str(
+            "fun capDeep(n: Int): Int {\n\
+             \x20   val a = 2\n\
+             \x20   fun outer(x: Int): Int {\n\
+             \x20       val b = 3\n\
+             \x20       fun inner(y: Int): Int = y * a + b\n\
+             \x20       return inner(x)\n\
+             \x20   }\n\
+             \x20   return outer(n)\n\
+             }\n",
+        );
+    }
+    if named("CapHolder(") {
+        // A local `fun` inside a METHOD reads a field, which needs the captured
+        // `this` and the declaring class's context together.
+        out.push_str(
+            "class CapHolder(val k: Int) {\n\
+             \x20   fun via(): Int {\n\
+             \x20       fun scaled(m: Int): Int = k * m\n\
+             \x20       return scaled(3)\n\
+             \x20   }\n\
              }\n",
         );
     }

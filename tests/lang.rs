@@ -2447,8 +2447,9 @@ fun main() {
 fn a_local_fun_closes_over_the_enclosing_frame_without_losing_recursion() {
     // The captures ride as synthesized trailing parameters, so the body reaches
     // them at fixed slots and a self-call passes them straight on. Every line
-    // below was measured against kotlinc 2.4.10 on JDK 21 before it was frozen
-    // here; the shapes that motivate each one:
+    // below was measured against kotlinc 2.4.10 and again against 2.4.20, both on
+    // JDK 21.0.12.1, before it was frozen here; the shapes that motivate each
+    // one:
     //
     //   * `a` calls `b`, so `a` has to carry `b`'s capture even though it never
     //     spells it — captures compose along the call graph.
