@@ -3745,6 +3745,11 @@ impl Parser {
     /// expression. Kotlin has no assignment *expression*, so an identifier
     /// followed by `=` inside an argument list can only be the named form.
     fn call_arg(&mut self) -> Result<Expr, String> {
+        // `*arr` — the spread operator, legal only here.
+        if self.at(&Tok::Star) {
+            self.advance();
+            return Ok(Expr::Spread(Box::new(self.expr()?)));
+        }
         // `step`, `until` and `downTo` are Kotlin SOFT keywords: they are infix
         // functions, not reserved words, so each is also a legal parameter name
         // — and `windowed(size = 2, step = 2)` spells one. The lexer gives them

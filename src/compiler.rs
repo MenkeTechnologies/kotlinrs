@@ -3307,6 +3307,12 @@ impl Compiler {
             Expr::Named { name, .. } => Err(format!(
                 "named argument `{name}` is not supported for this callee"
             )),
+            // A spread is expanded by the call that holds it (see
+            // [`spread_concat`]); reaching here means that call takes no
+            // `vararg`, which Kotlin rejects too.
+            Expr::Spread(_) => {
+                Err("the spread operator `*` needs a `vararg` parameter to pass into".to_string())
+            }
             Expr::Int(n) => {
                 self.b.emit(Op::LoadInt(*n), 0);
                 Ok(Type::Int)
@@ -4076,6 +4082,16 @@ impl Compiler {
         safe: bool,
         line: u32,
     ) -> Result<Type, String> {
+        // `fmt.format(*args)` — the arguments packed into one array, which the
+        // host's `format*` member spreads back into the formatter.
+        if name == "format" && args.iter().any(|a| matches!(a, Expr::Spread(_))) {
+            self.compile_expr(sc, recv)?;
+            self.compile_expr(sc, &spread_concat(Type::Unknown, args))?;
+            let nidx = self.b.add_constant(Value::str("format*"));
+            self.b.emit(Op::LoadConst(nidx), line);
+            self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 1), line);
+            return Ok(Type::String);
+        }
         // `Int.floorDiv(Int)` can leave the `Int` range — `Int.MIN_VALUE
         // .floorDiv(-1)` overflows back to `Int.MIN_VALUE` — and the host
         // divides in 64 bits with no receiver width to narrow by, so a
@@ -6129,6 +6145,29 @@ impl Compiler {
         args: &[Expr],
         line: u32,
     ) -> Result<Type, String> {
+        // A spread into a stdlib factory — `listOf(*xs, 3)`, `arrayOf(*a)` — packs
+        // its arguments the way a user `vararg` call does and converts the array
+        // to what the factory returns. A user declaration of the name wins.
+        if args.iter().any(|a| matches!(a, Expr::Spread(_)))
+            && self.class_meta(name).is_none()
+            && !self.local_sigs.contains_key(name)
+            && !self.fun_sig.contains_key(name)
+        {
+            if let Some((elem, conv)) = spread_factory(name) {
+                let packed = spread_concat(elem, args);
+                let e = match conv {
+                    Some(m) => Expr::MethodCall {
+                        recv: Box::new(packed),
+                        name: m.to_string(),
+                        args: Vec::new(),
+                        safe: false,
+                        line,
+                    },
+                    None => packed,
+                };
+                return self.compile_expr(sc, &e);
+            }
+        }
         // `__rust_compile("<base64>", line)` — the desugar target of a
         // `rust { ... }` block. Compile the base64 body string and hand it to the
         // FFI-compile extension op; the call evaluates to Unit.
@@ -6888,10 +6927,10 @@ impl Compiler {
                 (Some(a), Some(_), _) if rest.is_empty() => out.push(a.clone()),
                 (Some(a), Some(elem), _) => {
                     rest.insert(0, a.clone());
-                    out.push(vararg_array(elem, &rest));
+                    out.push(spread_concat(elem, &rest));
                 }
                 (Some(a), None, _) => out.push(a.clone()),
-                (None, Some(elem), _) => out.push(vararg_array(elem, &rest)),
+                (None, Some(elem), _) => out.push(spread_concat(elem, &rest)),
                 (None, _, Some(d)) => out.push(d.clone()),
                 (None, None, None) => {
                     return Err(format!("{callee} has no argument for `{}`", p.name))
@@ -7771,6 +7810,7 @@ impl Compiler {
             Expr::Invoke { .. } => Type::Unknown,
             // A named argument types as the value it carries.
             Expr::Named { value, .. } => self.infer(sc, value),
+            Expr::Spread(inner) => self.infer(sc, inner),
             Expr::Int(_) => Type::Int,
             Expr::Long(_) => Type::Long,
             Expr::Float(_) => Type::Double,
@@ -9362,6 +9402,58 @@ fn array_literal_desc(name: &str) -> &'static str {
 /// The array literal a `vararg` parameter's collected arguments pack into. The
 /// builder is chosen from the declared ELEMENT type so a `vararg xs: Int` binds
 /// an `IntArray`, as Kotlin's does.
+/// Pack a `vararg` argument list into its array, expanding every spread
+/// (`*arr`) in place: `f(1, *xs, 9)` passes `[1] + xs + [9]`. The runs of plain
+/// arguments become array literals of the element type and the pieces are
+/// joined with the array `plus` operator, starting from an EMPTY array — which
+/// is also what makes `f(*xs)` pass a COPY of `xs`, as Kotlin does, so the
+/// callee writing its `vararg` array cannot reach the caller's.
+fn spread_concat(elem: Type, items: &[Expr]) -> Expr {
+    if !items.iter().any(|a| matches!(a, Expr::Spread(_))) {
+        return vararg_array(elem, items);
+    }
+    let mut acc = vararg_array(elem, &[]);
+    let mut run: Vec<Expr> = Vec::new();
+    let join = |acc: Expr, part: Expr| Expr::Binary {
+        op: BinOp::Add,
+        l: Box::new(acc),
+        r: Box::new(part),
+    };
+    for it in items {
+        match it {
+            Expr::Spread(e) => {
+                if !run.is_empty() {
+                    acc = join(acc, vararg_array(elem, &std::mem::take(&mut run)));
+                }
+                acc = join(acc, (**e).clone());
+            }
+            other => run.push(other.clone()),
+        }
+    }
+    if !run.is_empty() {
+        acc = join(acc, vararg_array(elem, &run));
+    }
+    acc
+}
+
+/// The element type a stdlib vararg factory packs, and the conversion that
+/// turns the packed array into what the factory returns — `None` for a factory
+/// that IS the array. Only these reach [`spread_concat`] from a plain call.
+fn spread_factory(name: &str) -> Option<(Type, Option<&'static str>)> {
+    Some(match name {
+        "listOf" => (Type::Unknown, Some("toList")),
+        "mutableListOf" | "arrayListOf" => (Type::Unknown, Some("toMutableList")),
+        "setOf" | "linkedSetOf" => (Type::Unknown, Some("toSet")),
+        "mutableSetOf" => (Type::Unknown, Some("toMutableSet")),
+        "arrayOf" => (Type::Unknown, None),
+        "intArrayOf" => (Type::Int, None),
+        "doubleArrayOf" => (Type::Double, None),
+        "booleanArrayOf" => (Type::Boolean, None),
+        "charArrayOf" => (Type::Char, None),
+        _ => return None,
+    })
+}
+
 fn vararg_array(elem: Type, items: &[Expr]) -> Expr {
     let name = match elem {
         Type::Int | Type::Long => "intArrayOf",
@@ -10073,6 +10165,7 @@ fn expr_any(e: &Expr, f: &dyn Fn(&Expr) -> bool) -> bool {
             expr_any(recv, f) || args.iter().any(|a| expr_any(a, f))
         }
         Expr::Named { value, .. } => expr_any(value, f),
+        Expr::Spread(inner) => expr_any(inner, f),
         Expr::As { value, .. } => expr_any(value, f),
         Expr::Unary { expr, .. } => expr_any(expr, f),
         Expr::Binary { l, r, .. } => expr_any(l, f) || expr_any(r, f),

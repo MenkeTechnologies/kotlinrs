@@ -8673,6 +8673,13 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         }
         // `String.format(args…)` — the receiver is the format string.
         (Value::Str(s), "format") => format_string(s, args).map(Value::str),
+        // `fmt.format(*args)` — the compiler packs a spread argument list into one
+        // array (see `spread_concat`) and names the member `format*`, whose
+        // single argument is that array's elements.
+        (Value::Str(s), "format*") => {
+            let items = args.first().map(sequence_items).unwrap_or_default();
+            format_string(s, &items).map(Value::str)
+        }
         // Numeric parses. The `…OrNull` forms answer null where the plain ones
         // throw, which is the only difference between the pairs.
         // Both take an optional RADIX (`"ff".toInt(16)`). Dropping it would not

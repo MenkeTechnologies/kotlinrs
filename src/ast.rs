@@ -892,6 +892,11 @@ pub enum Expr {
         safe: bool,
         line: u32,
     },
+    /// A spread call argument, `f(*arr)` — the array's elements passed as
+    /// that many arguments to a `vararg` parameter (or to the stdlib
+    /// factories and `format`, whose parameter is one). It is meaningful only
+    /// in an argument list; anywhere else the compiler rejects it.
+    Spread(Box<Expr>),
     /// A named call argument, `f(count = 3)`. Kotlin has no assignment
     /// *expression*, so `name = value` inside an argument list is unambiguously
     /// this; the compiler binds it to the callee's parameter of that name and

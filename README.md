@@ -502,7 +502,12 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   constructors and extensions alike. Defaults are evaluated at the CALL site, so
   one may not name another parameter of the same callee; that form is rejected
   rather than silently misbound. A `vararg` binds an array of its declared
-  element type and is supported as the last parameter.
+  element type and is supported as the last parameter. The spread operator
+  passes an array's elements as that many arguments — `total(1, *xs, 9)`, and
+  into the stdlib factories and `format` (`listOf(*xs, 3)`, `arrayOf(*a)`,
+  `fmt.format(*args)`) — always as a COPY, so a callee writing its `vararg`
+  array cannot reach the caller's. A positional argument may follow named ones
+  that sit in their own positions (`f(a = 1, 2)`), as Kotlin allows since 1.4.
 - **Local functions** — a `fun` declared inside another function's body. It
   lowers to a real subroutine rather than a closure value, which is what lets it
   **recurse** (a closure captures by value at creation, so a self-reference would
