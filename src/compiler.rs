@@ -3445,6 +3445,26 @@ impl Compiler {
                 let (args, line) = (args.clone(), *line);
                 self.compile_call(sc, &target, &args, line)
             }
+            // `b.onClick()` — a CALL, with no arguments, of a property holding a
+            // function. `compile_member` reads a zero-argument member as the
+            // property itself (right for `b.onClick`), which yielded the closure
+            // unevaluated here; the one-or-more-argument spelling was already a
+            // field read followed by an invocation.
+            Expr::MethodCall {
+                recv,
+                name,
+                args,
+                safe: false,
+                line,
+            } if args.is_empty() && self.is_fn_prop(sc, recv, name) => {
+                let target = Expr::Member {
+                    recv: recv.clone(),
+                    name: name.clone(),
+                    safe: false,
+                    line: *line,
+                };
+                self.compile_invoke(sc, &target, &[], *line)
+            }
             Expr::MethodCall {
                 recv,
                 name,
@@ -8644,6 +8664,18 @@ impl Compiler {
         self.b.emit(Op::LoadConst(n), 0);
         self.b.emit(Op::CallBuiltin(KT_OPER_VM, 3), 0);
         Ok(())
+    }
+
+    /// Whether `recv.name` is a property of function type on a user class that
+    /// declares no method of that name — so `recv.name()` invokes the value.
+    fn is_fn_prop(&self, sc: &Scope, recv: &Expr, name: &str) -> bool {
+        self.infer_class(sc, recv)
+            .and_then(|c| self.classes.get(&c))
+            .is_some_and(|m| {
+                !m.methods.contains_key(name)
+                    && m.prop(name)
+                        .is_some_and(|p| p.class.as_deref() == Some("Function"))
+            })
     }
 
     fn infer_class(&self, sc: &Scope, e: &Expr) -> Option<String> {

@@ -1017,4 +1017,6 @@ fun main() {\n    val m = mutableListOf(3, 1, 2); for (i in 0 until m.lastIndex)
 fun main() {\n    println(listOf(1, 2, 3).joinToString(separator = "") { (it * 2).toString() }); println(listOf(1, 2).joinToString(prefix = "<", postfix = ">") { "x$it" }); println(listOf(1, 2, 3).joinToString(limit = 2, truncated = "~") { "$it!" })\n}	246\n<x1, x2>\n1!, 2!, ~\n
 fun apply(times: Int = 1, prefix: String = "", f: (Int) -> String) = (1..times).joinToString(prefix) { f(it) }\nfun main() { println(apply(times = 3) { "n$it" }); println(apply(prefix = ";", times = 2) { it.toString() }); println(apply { "z" }) }	n1n2n3\n1;2\nz\n
 fun main() {\n    println(listOf(1, 2, 3, 4).windowed(size = 2, step = 2) { it.sum() })\n}	[3, 7]\n
+class Btn(val label: String = "ok", val onClick: () -> String)\nfun main() { println(Btn { "hi" }.onClick()); println(Btn(label = "x") { "y" }.label) }	hi\nx\n
 fun twice(f: () -> Int) = f() + f()\nfun both(a: Int, f: (Int) -> Int = { it }) = f(a)\nfun main() { println(twice { 2 }); println(both(3)); println(both(3) { it * 5 }); println(both(a = 4) { it + 1 }) }	4\n3\n15\n5\n
+class Task(val name: String, var action: () -> Unit = {}) { val cb: () -> Int = { 42 } }\nfun main() { val t = Task("a") { println("run") }; t.action(); t.action = { println("changed") }; t.action(); println(t.cb()); println(Task("b").name) }	run\nchanged\n42\nb\n
