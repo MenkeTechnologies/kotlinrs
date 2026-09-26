@@ -8821,6 +8821,12 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
             "floorMod",
             &[recv.clone(), args.first().cloned().unwrap_or(Value::Int(0))],
         ),
+        // `Int.floorDiv(Int)` — the quotient rounded toward NEGATIVE infinity,
+        // `mod`'s partner: `(-7).floorDiv(2)` is -4 where `-7 / 2` is -3.
+        (Value::Int(_), "floorDiv") => math_call(
+            "floorDiv",
+            &[recv.clone(), args.first().cloned().unwrap_or(Value::Int(0))],
+        ),
         (Value::Int(_) | Value::Float(_), "absoluteValue") => {
             if is_int(recv) {
                 Ok(Value::Int(recv.to_int().wrapping_abs()))

@@ -4024,6 +4024,24 @@ impl Compiler {
         safe: bool,
         line: u32,
     ) -> Result<Type, String> {
+        // `Int.floorDiv(Int)` can leave the `Int` range — `Int.MIN_VALUE
+        // .floorDiv(-1)` overflows back to `Int.MIN_VALUE` — and the host
+        // divides in 64 bits with no receiver width to narrow by, so a
+        // statically-`Int` call is narrowed here, as `Int` arithmetic is.
+        if !safe
+            && name == "floorDiv"
+            && args.len() == 1
+            && self.infer(sc, recv) == Type::Int
+            && self.infer(sc, &args[0]) == Type::Int
+        {
+            self.compile_expr(sc, recv)?;
+            self.compile_expr(sc, &args[0])?;
+            let nidx = self.b.add_constant(Value::str(name.to_string()));
+            self.b.emit(Op::LoadConst(nidx), line);
+            self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 1), line);
+            self.emit_wrap32();
+            return Ok(Type::Int);
+        }
         // A `kotlin.math` EXTENSION member on a numeric receiver is gated on
         // the import, exactly as a bare `abs` is: `3.7.roundToInt()` in a file
         // with no import line is `unresolved reference 'roundToInt'` in the

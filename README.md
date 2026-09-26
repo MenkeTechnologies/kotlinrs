@@ -240,7 +240,8 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   an index past `Int.MAX_VALUE` are `IllegalFormatArgumentIndexException`, and
   `<` on `%n`/`%%` is `IllegalFormatFlagsException`. Numerically,
   `.coerceIn()`/`.coerceAtLeast()`/`.coerceAtMost()`, `.pow()`,
-  `.absoluteValue`, `.roundToInt()`, the IEEE classifiers
+  `.absoluteValue`, `.roundToInt()`, `.mod()`/`.floorDiv()` (which round toward negative
+  infinity, narrowed to `Int` for an `Int` receiver), the IEEE classifiers
   `.isNaN()`/`.isInfinite()`/`.isFinite()`, and the unsigned 32-bit renderers
   `Integer.toBinaryString`/`toHexString`/`toOctalString` — which differ from
   `toString(radix)` only for a negative value (`Integer.toHexString(-1)` is
