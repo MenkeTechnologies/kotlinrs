@@ -1876,7 +1876,7 @@ impl Parser {
         Ok(Some(FunDecl {
             reified: Vec::new(),
             name,
-            recv: recv,
+            recv,
             params: Vec::new(),
             ret: annot.ty,
             ret_class: annot.class,
