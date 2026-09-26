@@ -740,3 +740,53 @@ which have no upvalue mechanism, so the fix is a closure-conversion pass with a
 transitive fixpoint — a local `fun` calling another inherits its captures, and a
 lambda calling one inherits them too. Not attempted here rather than attempted
 badly.
+
+## Round 12 — three answers that were wrong, and the spellings that stopped a program
+
+### The oracle
+
+`kotlinc-jvm 2.4.20` on **JRE 25.0.4.1** (`CAPTURE_JAVA_HOME` set to the
+Microsoft 25 build) for both the compile and the run step, through
+`scripts/capture-parity.sh`. Every record below was captured there and replays
+byte-identically; the corpus went from 1009 to 1035 records, 0 rejected. No test
+was deleted or weakened, and no audit or report script was touched.
+
+### Wrong answers
+
+| program | before | reference and now |
+| --- | --- | --- |
+| `fun <T : Comparable<T>> ge(a: T, b: T) = a >= b; ge(V(1), V(3))` | `true` | `false` |
+| `maxOf("q", "r")` through a `String` function | `0.0` | `r` |
+| `maxOf(V(1), V(3))` on a user `Comparable` | `V(n=1)` | `V(n=3)` |
+| `listOf(0) + listOf(1) + listOf(2)` | `0.0` | `[0, 1, 2]` |
+| `listOf("a") + "b" + "c"` | `(obj:10)c` | `[a, b, c]` |
+| `V(1) + V(2) + V(3)` with `operator fun plus` | `0.0` | `V(x=6)` |
+| `b.onClick()` on `class Btn(val onClick: () -> String)` | `(lambda arity=1)` | the lambda's result |
+
+The ordering operators on two operands whose static types pick no native
+compare lowered to the coercing numeric ops, which read two strings as `0 >= 0`;
+they now reach `compareTo` at run time through `KT_COMPARE_VM`, and `maxOf`/
+`minOf` over non-numeric arguments go through `KT_EXTREMUM_VM`. Both are
+builtins because a user `compareTo` re-enters the VM, which an extension op
+cannot host. The operator chains were an inference gap: the result of an
+operator on a heap receiver typed as a number, so the next operator in the chain
+was a native add; it now types as a heap object, or as the declaring class's
+method result, and an unannotated expression-bodied function returning a
+constructor call carries that class.
+
+### Spellings that stopped the program
+
+Each was an `unresolved reference` or a parse error before this round:
+identifiers of any script (`val café`) and backquoted names; `%2$s` and `%<s`
+in `format`; `xs.indices` and `xs.lastIndex`; a trailing lambda after named
+arguments, and one that binds the last parameter over defaulted ones
+(`f { … }` against `fun f(n: Int = 1, g: (Int) -> String)`); `val size get() =
+…` and extension properties; `Int.floorDiv`; `List(n) { … }`/`MutableList(n)
+{ … }`; a positional argument after named ones in their own positions; the
+spread operator into a `vararg`, a stdlib factory, or `format`; and a
+throwable's `cause`, through `(message, cause)`, `(cause)` and `.cause`.
+
+### Recorded in Round 11, since closed
+
+A local `fun` capturing an enclosing `val` (`val k = 5; fun h(x: Int) = x + k`)
+now answers `6`; the fix landed as `77ba084947` after Round 11 was written.

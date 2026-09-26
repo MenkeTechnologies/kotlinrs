@@ -786,6 +786,13 @@ const CORPUS: &[Entry] = &[
         "print(\"a\"); print(\"b\")   // ab",
     ),
     (
+        "List",
+        "Builtin Functions",
+        "List(size: Int, init: (Int) -> T): List<T>\nMutableList(size: Int, init: (Int) -> T): MutableList<T>",
+        "An `ArrayList` of `size` elements, each the lambda applied to its index. A negative size is `IllegalArgumentException: Illegal Capacity: -1`, as `ArrayList`'s is.",
+        "println(List(3) { it * 2 })   // [0, 2, 4]",
+    ),
+    (
         "listOf",
         "Builtin Functions",
         "listOf(vararg elements: T): List<T>",
@@ -1049,14 +1056,14 @@ const CORPUS: &[Entry] = &[
         "maxOf",
         "Math",
         "maxOf(a: T, b: T): T",
-        "Larger of two values. It lives in the auto-imported `kotlin` package, so unlike `max` it needs no import; it dispatches to the same implementation.",
+        "Larger of its arguments. It lives in the auto-imported `kotlin` package, so unlike `max` it needs no import. Numbers take the numeric overloads (`max`'s implementation); anything else is the `Comparable<T>` overload, which answers an ARGUMENT by `compareTo` — a user `Comparable` by its own body — with the earlier argument winning a tie.",
         "println(maxOf(2, 9))   // 9",
     ),
     (
         "minOf",
         "Math",
         "minOf(a: T, b: T): T",
-        "Smaller of two values, auto-imported like `maxOf` and sharing `min`'s implementation.",
+        "Smaller of its arguments, auto-imported like `maxOf`: `min`'s implementation for numbers, `compareTo` for anything else.",
         "println(minOf(2, 9))   // 2",
     ),
     (
@@ -1455,6 +1462,20 @@ const CORPUS: &[Entry] = &[
         "println('A'.toString() + \"!\")   // A!",
     ),
     // ── Sequence Members ──
+    (
+        "indices",
+        "Sequence Members",
+        "indices: IntRange",
+        "The valid indices, `0..size - 1` — on a `List`, `Set`, array and `String` (not on a range or a lazy sequence, which Kotlin does not give one). Empty for an empty receiver.",
+        "for (i in listOf(\"a\", \"b\").indices) print(i)   // 01",
+    ),
+    (
+        "lastIndex",
+        "Sequence Members",
+        "lastIndex: Int",
+        "`size - 1` on a `List`, an array and a `String` (counted in UTF-16 units), so -1 when empty.",
+        "println(listOf(1, 2, 3).lastIndex)   // 2",
+    ),
     (
         "size",
         "Sequence Members",
@@ -1873,6 +1894,13 @@ const CORPUS: &[Entry] = &[
     ),
     // ── Numeric Members ──
     (
+        "floorDiv",
+        "Numeric Members",
+        "Int.floorDiv(other: Int): Int\nLong.floorDiv(other: Long): Long",
+        "Division rounded toward NEGATIVE infinity, `mod`'s partner: `(-7).floorDiv(2)` is -4 where `-7 / 2` is -3. A zero divisor is `ArithmeticException: / by zero`, and an `Int` receiver's result wraps at 32 bits.",
+        "println((-7).floorDiv(2))   // -4",
+    ),
+    (
         "plus",
         "Numeric Members",
         "Int.plus(other: Int): Int\nDouble.plus(other: Double): Double",
@@ -1982,7 +2010,7 @@ const CORPUS: &[Entry] = &[
         "copy",
         "Universal & Generated Members",
         "copy(vararg overrides: Any): T",
-        "A data class's generated clone-with-overrides. The arguments are **positional**, overriding the leading properties in declaration order — kotlinrs has no named arguments, so `p.copy(y = 9)` is not available; `p.copy(9)` overrides the first property. It calls the primary constructor, so a data class under a superclass re-runs its `: Super(args)` header.",
+        "A data class's generated clone-with-overrides. The arguments are **positional**, overriding the leading properties in declaration order — a named argument overrides that property instead, so `p.copy(y = 9)` keeps `x` and `p.copy(9)` overrides the first property. It calls the primary constructor, so a data class under a superclass re-runs its `: Super(args)` header.",
         "data class Pt(val x: Int, val y: Int)\nfun main() { println(Pt(1, 2).copy(9)) }   // Pt(x=9, y=2)",
     ),
     (
@@ -1991,6 +2019,13 @@ const CORPUS: &[Entry] = &[
         "Throwable.message: String?",
         "The message a throwable was constructed with, or `null` when it was constructed without one.",
         "try { 1 / 0 } catch (e: Exception) { println(e.message) }   // / by zero",
+    ),
+    (
+        "cause",
+        "Universal & Generated Members",
+        "Throwable.cause: Throwable?",
+        "The throwable this one was constructed with — `Exception(message, cause)`, `RuntimeException(cause)`, or a subclass's supertype call passing one — or `null`. The `(cause)` constructor takes its message from the cause's `toString()`.",
+        "val e = RuntimeException(\"outer\", IllegalStateException(\"inner\"))\nprintln(e.cause)   // java.lang.IllegalStateException: inner",
     ),
     // ── Higher-Order Collection Functions ──
     (
@@ -2343,8 +2378,15 @@ const CORPUS: &[Entry] = &[
         "by",
         "Keywords & Declarations",
         "val name: T by lazy { … }",
-        "Property delegation, on a top-level property, a class property or a local `val`. Only `by lazy` is supported: the block runs at the FIRST read and its value is cached, so an initializer with an effect fires at use rather than at startup. `lazy` requires `val`; any other delegate is a compile error.",
+        "Property delegation, on a top-level property, a class property or a local `val`. With `by lazy` the block runs at the FIRST read and its value is cached, so an initializer with an effect fires at use rather than at startup; `lazy` requires `val`. Any other delegate is a user class declaring `operator fun getValue` (and `setValue` for a `var`), which every read and write goes through.",
         "val z: Int by lazy { println(\"forcing\"); 42 }\nfun main() { println(\"before\"); println(z); println(z) }",
+    ),
+    (
+        "*",
+        "Operators",
+        "f(*array)",
+        "The spread operator: an array's elements passed as that many arguments to a `vararg` parameter, a stdlib factory (`listOf`, `arrayOf`, …) or `format`, mixed freely with plain arguments. The callee always receives a copy.",
+        "fun sum(vararg xs: Int) = xs.sum()\nprintln(sum(1, *intArrayOf(2, 3)))   // 6",
     ),
     (
         "as",
