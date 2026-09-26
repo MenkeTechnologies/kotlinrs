@@ -6543,6 +6543,19 @@ impl Compiler {
                 }
                 Ok(Type::Obj)
             }
+            // `List(n) { … }` / `MutableList(n) { … }` — the stdlib's
+            // `MutableList(size, init)`, an `ArrayList` filled with the lambda
+            // applied to each index. It shares the array initializer's loop; the
+            // `List` descriptor makes the host build a list and fault a negative
+            // size the way `ArrayList(-1)` does.
+            "List" | "MutableList" if args.len() == 2 && self.class_meta(name).is_none() => {
+                self.compile_expr(sc, &args[0])?;
+                let didx = self.b.add_constant(Value::str("List"));
+                self.b.emit(Op::LoadConst(didx), line);
+                self.compile_expr(sc, &args[1])?;
+                self.b.emit(Op::CallBuiltin(KT_ARRAY_INIT, 0), line);
+                Ok(Type::Obj)
+            }
             // A built-in throwable constructor: `RuntimeException("boom")`,
             // `IllegalStateException()`. Only reached when no user class or local
             // shadows the name (the constructor/user-function arms run first).

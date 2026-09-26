@@ -428,6 +428,9 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   *reachable* element), aggregated (`(1..3).sum()`), mapped/filtered, and
   iterated. `x in r` / `x !in r` is step-aligned membership; `in` also works over
   a `List`, a `Map`'s keys, and a `String`'s substrings.
+  `List(n) { … }` and `MutableList(n) { … }` build the same way an array
+  initializer does, into an `ArrayList`; a negative size is
+  `IllegalArgumentException: Illegal Capacity: -1`.
 - **Arrays** — `arrayOf`/`intArrayOf`/`longArrayOf`/`doubleArrayOf`/
   `floatArrayOf`/`booleanArrayOf`/`charArrayOf`, the
   zero-filled `IntArray(n)`/`DoubleArray(n)`/`BooleanArray(n)`, and the

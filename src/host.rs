@@ -2763,6 +2763,16 @@ fn b_array_init(vm: &mut VM, _argc: u8) -> Value {
     let clo = vm.pop();
     let desc = vm.pop().to_str();
     let n = vm.pop().to_int();
+    // `List(n) { … }` rides the same loop (see the compiler's `List` arm); its
+    // negative size is `ArrayList`'s capacity fault, not an array's.
+    let is_list = desc == "List";
+    if n < 0 && is_list {
+        fault(
+            vm,
+            format!("java.lang.IllegalArgumentException: Illegal Capacity: {n}"),
+        );
+        return Value::Undef;
+    }
     if n < 0 {
         fault(vm, negative_array_size(n));
         return Value::Undef;
@@ -2776,6 +2786,9 @@ fn b_array_init(vm: &mut VM, _argc: u8) -> Value {
                 return Value::Undef;
             }
         }
+    }
+    if is_list {
+        return alloc(HeapObj::List(items));
     }
     let desc = if desc.is_empty() {
         array_desc(&items)
