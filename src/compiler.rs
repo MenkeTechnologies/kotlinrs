@@ -6870,9 +6870,10 @@ impl Compiler {
         if let Some(v) = vararg_at {
             let split = head
                 .iter()
-                .position(|a| matches!(a, Expr::Named { .. }))
-                .unwrap_or(head.len())
-                .max(v);
+                .enumerate()
+                .skip(v)
+                .find(|(_, a)| matches!(a, Expr::Named { .. }))
+                .map_or(head.len(), |(i, _)| i);
             if split > v {
                 rest = head.drain(v..split).collect();
             }
@@ -9384,6 +9385,10 @@ fn bind_args<'a>(
 ) -> Result<Vec<Option<&'a Expr>>, String> {
     let mut slots: Vec<Option<&Expr>> = vec![None; params.len()];
     let mut seen_named = false;
+    // Since Kotlin 1.4 a positional argument may follow named ones as long as
+    // every named argument before it sits in its own position — `f(a = 1, 2)`
+    // against `fun f(a: Int, b: Int)`. Once one does not, positions are lost.
+    let mut in_place = true;
     for (i, a) in args.iter().enumerate() {
         let Expr::Named { name, value } = a else {
             // A TRAILING lambda — written after the parentheses — binds the LAST
@@ -9400,7 +9405,7 @@ fn bind_args<'a>(
                 }
                 continue;
             }
-            if seen_named {
+            if seen_named && !in_place {
                 return Err(format!(
                     "{callee}: a positional argument cannot follow a named one"
                 ));
@@ -9424,6 +9429,9 @@ fn bind_args<'a>(
             .ok_or_else(|| format!("{callee} has no parameter named `{name}`"))?;
         if slots[at].is_some() {
             return Err(format!("{callee}: argument for `{name}` given twice"));
+        }
+        if at != i {
+            in_place = false;
         }
         slots[at] = Some(value);
     }
