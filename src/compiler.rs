@@ -25,15 +25,16 @@ use crate::host::{
     KT_ARRAY_NEW, KT_AS, KT_BOX_F32, KT_BOX_I64, KT_BUILDER, KT_CHR_STRING, KT_CLASSOF,
     KT_CLASS_REF, KT_CLOSURE_CALL, KT_COLL_HOF, KT_COMPARATOR, KT_COMPARE_REG, KT_COMPARE_VM,
     KT_DBG_LINE, KT_DDIV, KT_DELEG_GET, KT_DELEG_SET, KT_DISPLAY, KT_ENUM_REG, KT_EQUALS_REG,
-    KT_EXC_ABORT, KT_EXC_CUT, KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH,
-    KT_EXC_TAKE, KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND, KT_EXTREMUM_VM, KT_F32, KT_F32_ARITH,
-    KT_F32_STR, KT_FFI_CALL, KT_FFI_COMPILE, KT_GENSEQ, KT_GETFIELD, KT_HASH_REG, KT_IDENTITY,
-    KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET,
-    KT_ITER_SIZE, KT_ITER_SRC, KT_JOIN, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO, KT_LIST_TAG,
-    KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OBSERVE,
-    KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_REIFIED,
-    KT_REIFY, KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM,
-    KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG, KT_YIELD,
+    KT_EXC_ABORT, KT_EXC_CAUSE_SET, KT_EXC_CUT, KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW,
+    KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND,
+    KT_EXTREMUM_VM, KT_F32, KT_F32_ARITH, KT_F32_STR, KT_FFI_CALL, KT_FFI_COMPILE, KT_GENSEQ,
+    KT_GETFIELD, KT_HASH_REG, KT_IDENTITY, KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM,
+    KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_ITER_SRC, KT_JOIN, KT_LAZY_GET,
+    KT_LAZY_NEW, KT_LIST, KT_LIST_RO, KT_LIST_TAG, KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH,
+    KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OBSERVE, KT_OPER_VM, KT_PAIR, KT_PRECOND,
+    KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_REIFIED, KT_REIFY, KT_RESULT_HOF,
+    KT_RUN_CATCHING, KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG,
+    KT_TO_STRING, KT_TYPE_REG, KT_YIELD,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
@@ -756,6 +757,25 @@ fn method_sub_name(class: &str, method: &str) -> String {
 /// appear in a Kotlin identifier, so the name can never collide with a method.
 fn ctor_sub_name(class: &str) -> String {
     format!("{class}#$init")
+}
+
+/// The built-in throwables that declare the `(message, cause)` and `(cause)`
+/// constructors — read off `javap -public` on the JDK; `ArithmeticException`,
+/// `NullPointerException`, `NumberFormatException`, `ClassCastException` and the
+/// index faults declare only `()` and `(message)`.
+fn takes_cause(name: &str) -> bool {
+    matches!(
+        name,
+        "Throwable"
+            | "Exception"
+            | "Error"
+            | "RuntimeException"
+            | "IllegalArgumentException"
+            | "IllegalStateException"
+            | "UnsupportedOperationException"
+            | "ConcurrentModificationException"
+            | "NoSuchElementException"
+    )
 }
 
 /// The mangled sub name for a class's Nth secondary constructor
@@ -2014,10 +2034,15 @@ impl Compiler {
             .throwable_base
             .as_ref()
             .is_some_and(|t| meta.parents.iter().any(|p| p == t));
+        // The first super argument is evaluated ONCE: it is the message, and —
+        // when it is a throwable, `RuntimeException(cause)` — the cause as well.
+        let first_arg = sc.temp();
         if direct_throwable {
             match meta.super_args.first() {
                 Some(a) => {
                     let t = self.compile_expr(&mut sc, a)?;
+                    self.b.emit(Op::SetSlot(first_arg), cd.line);
+                    self.b.emit(Op::GetSlot(first_arg), cd.line);
                     self.emit_display(t);
                 }
                 // `class E : Exception()` — `E().message` is Kotlin `null`.
@@ -2039,6 +2064,22 @@ impl Compiler {
             Op::Extended(KT_NEW, n)
         };
         self.b.emit(op, cd.line);
+        // `Exception(message, cause)` / `RuntimeException(cause)` in the
+        // supertype call: the cause is recorded on the finished instance.
+        if direct_throwable {
+            match meta.super_args.as_slice() {
+                [_, cause] => {
+                    self.compile_expr(&mut sc, cause)?;
+                }
+                [_] => {
+                    self.b.emit(Op::GetSlot(first_arg), cd.line);
+                }
+                _ => {
+                    self.b.emit(Op::LoadUndef, cd.line);
+                }
+            }
+            self.b.emit(Op::CallBuiltin(KT_EXC_CAUSE_SET, 2), cd.line);
+        }
         self.b.emit(Op::ReturnValue, cd.line);
         Ok(())
     }
@@ -6650,21 +6691,41 @@ impl Compiler {
             // A built-in throwable constructor: `RuntimeException("boom")`,
             // `IllegalStateException()`. Only reached when no user class or local
             // shadows the name (the constructor/user-function arms run first).
-            _ if self.is_throwable_ctor(name) && args.len() <= 1 => {
+            // The `(message, cause)` and `(cause)` constructors exist on the
+            // throwables [`takes_cause`] lists; see [`crate::host::KT_EXC_NEW`]
+            // for the three forms the builtin takes.
+            _ if self.is_throwable_ctor(name)
+                && (args.len() <= 1 || (args.len() == 2 && takes_cause(name))) =>
+            {
                 let fqn = crate::host::throwable_fqn(name).unwrap();
                 let fidx = self.b.add_constant(Value::str(fqn));
                 self.b.emit(Op::LoadConst(fidx), line);
-                match args.first() {
-                    Some(a) => {
+                let form = match args {
+                    [m, cause] => {
+                        let t = self.compile_expr(sc, m)?;
+                        self.emit_display(t);
+                        self.compile_expr(sc, cause)?;
+                        1
+                    }
+                    // A statically-`String` argument is the message. Anything
+                    // else may be a throwable, which makes it the cause, so the
+                    // host decides on the value.
+                    [a] if self.infer(sc, a).is_str() => {
                         let t = self.compile_expr(sc, a)?;
                         self.emit_display(t);
+                        0
+                    }
+                    [a] => {
+                        self.compile_expr(sc, a)?;
+                        2
                     }
                     // No message: `Throwable.message` is null.
-                    None => {
+                    _ => {
                         self.b.emit(Op::LoadUndef, line);
+                        0
                     }
-                }
-                self.b.emit(Op::CallBuiltin(KT_EXC_NEW, 0), line);
+                };
+                self.b.emit(Op::CallBuiltin(KT_EXC_NEW, form), line);
                 Ok(Type::Obj)
             }
             // `kotlin.math` — resolvable only under `import kotlin.math.…`, which

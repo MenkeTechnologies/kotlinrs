@@ -502,7 +502,18 @@ pub const KT_EXTREMUM_VM: u16 = 141;
 
 /// Builtin id for constructing a throwable (`RuntimeException("boom")`). Stack:
 /// `[fqnStr, message]` with the message on top (`Undef` for the no-arg form).
+///
+/// `argc` selects the form: 0 is `(message)`, 1 is `(message, cause)` with the
+/// cause on top, and 2 is the one-argument call whose argument the compiler
+/// could not type — a throwable there is the `(cause)` constructor, whose message
+/// is the cause's `toString()`, and anything else is the message.
 pub const KT_EXC_NEW: u16 = 110;
+
+/// Record the cause a throwable SUBCLASS passed its built-in supertype
+/// (`class AppEx(m: String, c: Throwable?) : Exception(m, c)`). Stack:
+/// `[exc, cause]`; pushes `exc`. A cause that is not a throwable (the
+/// `Exception(message)` form reaching here) records nothing.
+pub const KT_EXC_CAUSE_SET: u16 = 142;
 /// Builtin id for `throw e`: pops the throwable and makes it the in-flight
 /// exception. Returns `Undef` (a `throw` expression's value is never observed).
 pub const KT_EXC_THROW: u16 = 111;
@@ -581,6 +592,12 @@ thread_local! {
     /// user class extending a built-in throwable, and the `Class: message`
     /// display form such a class inherits.
     static TYPES: RefCell<std::collections::HashMap<String, Vec<String>>> =
+        RefCell::new(std::collections::HashMap::new());
+
+    /// Throwable handle → its `cause`, for the throwables constructed with one.
+    /// A side table rather than a field of [`HeapObj::Exc`] because a subclass
+    /// instance carries its cause too, and every other throwable has none.
+    static CAUSES: RefCell<std::collections::HashMap<u32, Value>> =
         RefCell::new(std::collections::HashMap::new());
 
     /// Class tag → the name-pool index of its `toString()` subroutine, as
@@ -1626,6 +1643,7 @@ fn difference_modulo(a: i64, b: i64, c: i64) -> i64 {
 /// no residual objects (handles are per-run identities).
 fn reset_heap() {
     HEAP.with(|h| h.borrow_mut().clear());
+    CAUSES.with(|c| c.borrow_mut().clear());
     COLL_ORDER.with(|c| c.borrow_mut().clear());
     COLL_UNORDERED.with(|d| d.borrow_mut().clear());
     COLL_LITERAL_TAG.with(|t| t.borrow_mut().clear());
@@ -2091,14 +2109,51 @@ fn throwable_str(v: &Value) -> String {
 }
 
 /// `KT_EXC_NEW` — see [`KT_EXC_NEW`].
-fn b_exc_new(vm: &mut VM, _argc: u8) -> Value {
+fn b_exc_new(vm: &mut VM, argc: u8) -> Value {
+    let cause = if argc == 1 { vm.pop() } else { Value::Undef };
     let msg = vm.pop();
     let class = vm.pop().to_str();
+    // The untyped one-argument form: a throwable is the `(cause)` constructor.
+    let (msg, cause) = if argc == 2 && is_throwable(&msg) {
+        (Value::str(kotlin_string(&msg)), msg)
+    } else {
+        (msg, cause)
+    };
     let msg = match msg {
         Value::Undef => None,
         other => Some(kotlin_string(&other)),
     };
-    new_throwable(&class, msg.as_deref())
+    let exc = new_throwable(&class, msg.as_deref());
+    set_cause(&exc, cause);
+    exc
+}
+
+/// `KT_EXC_CAUSE_SET` — see [`KT_EXC_CAUSE_SET`].
+fn b_exc_cause_set(vm: &mut VM, _argc: u8) -> Value {
+    let cause = vm.pop();
+    let exc = vm.pop();
+    if is_throwable(&cause) {
+        set_cause(&exc, cause);
+    }
+    exc
+}
+
+/// Whether `v` is a throwable: a built-in one, or an instance of a class
+/// extending one (which carries the synthetic `message` field).
+fn is_throwable(v: &Value) -> bool {
+    with_obj(v, |o| match o {
+        HeapObj::Exc { .. } => true,
+        HeapObj::Instance { fields, .. } => fields.iter().any(|(n, _)| n == "message"),
+        _ => false,
+    })
+    .unwrap_or(false)
+}
+
+/// Record `cause` as `exc`'s cause; a null cause is no cause.
+fn set_cause(exc: &Value, cause: Value) {
+    if let (Value::Obj(id), false) = (exc, matches!(cause, Value::Undef)) {
+        CAUSES.with(|c| c.borrow_mut().insert(*id, cause));
+    }
 }
 
 /// `KT_EXC_THROW` — see [`KT_EXC_THROW`].
@@ -3900,6 +3955,7 @@ fn register_builtins(vm: &mut VM) {
     vm.register_builtin(KT_DELEG_GET, b_deleg_get);
     vm.register_builtin(KT_DELEG_SET, b_deleg_set);
     vm.register_builtin(KT_EXC_NEW, b_exc_new);
+    vm.register_builtin(KT_EXC_CAUSE_SET, b_exc_cause_set);
     vm.register_builtin(KT_EXC_THROW, b_exc_throw);
     vm.register_builtin(KT_EXC_PENDING, b_exc_pending);
     vm.register_builtin(KT_EXC_MATCH, b_exc_match);
@@ -9251,6 +9307,15 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         .and_then(|d| d.parse::<usize>().ok())
     {
         return component(recv, idx);
+    }
+    // `Throwable.cause` — the throwable it was constructed with, or Kotlin
+    // `null`.
+    if name == "cause" && args.is_empty() && is_throwable(recv) {
+        if let Value::Obj(id) = recv {
+            return Ok(CAUSES
+                .with(|c| c.borrow().get(id).cloned())
+                .unwrap_or(Value::Undef));
+        }
     }
     // `Throwable.message` — the constructor message, or Kotlin `null`.
     if name == "message" {

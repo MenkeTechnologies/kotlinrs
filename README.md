@@ -592,7 +592,11 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   runs on both the normal and the exceptional path, and an exception raised *by*
   a finalizer replaces the one it interrupted. The modeled throwables construct
   and print like the JVM's (`RuntimeException("boom")` →
-  `java.lang.RuntimeException: boom`, `.message` → `boom` or `null`), and the
+  `java.lang.RuntimeException: boom`, `.message` → `boom` or `null`), and chain
+  a cause the way the JVM's do: `Exception(message, cause)` and
+  `RuntimeException(cause)` (whose message is the cause's `toString()`) on the
+  throwables that declare them, in a direct call or a subclass's supertype call,
+  read back through `.cause` (`null` when there is none), and the
   runtime faults kotlinrs already reported are the *same* catchable exceptions:
   `1 / 0` is an `ArithmeticException`, `!!` on null a `NullPointerException`, an
   out-of-range index an `IndexOutOfBoundsException`. An uncaught exception

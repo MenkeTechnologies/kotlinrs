@@ -19,18 +19,8 @@ shape. They are recorded here so the next round has the measurements.
 | program | kotlinrs | reference |
 | --- | --- | --- |
 | `class C { lateinit var s: String }` then `C().s` | parse error: `expected \`fun\` or a property, found Ident("lateinit")` | `kotlin.UninitializedPropertyAccessException: lateinit property s has not been initialized` |
-| `mapOf("a" to 1).getValue("z")` | `unresolved reference: getValue on Map` | `java.util.NoSuchElementException: Key z is missing in the map.` |
-| `throw RuntimeException("outer", IllegalStateException("inner"))` | `unresolved reference: RuntimeException` | `java.lang.RuntimeException: outer` |
-| `e.cause` | `unresolved reference: cause on <class>` | `null`, or the chained throwable |
 | `kotlin.math.ln(0.0)` | `unresolved reference: kotlin.math.ln` | `-Infinity` |
 | `"\uD83D".length` (a lone surrogate) | `invalid unicode scalar in literal` | `1` |
-
-`cause` and the two-argument `(message, cause)` constructor are the one entry
-here that belongs to this round's theme by subject. They are declined on size,
-not on relevance: `HeapObj::Exc` carries `{ class, msg }` and threading a
-`cause` through it touches the constructor selection, the property read and the
-`toString` chain. The measurement above is the whole specification for whoever
-takes it.
 
 ### `"%2147483647d".format(1)` — the oracle has no stable answer
 
