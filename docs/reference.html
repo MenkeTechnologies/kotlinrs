@@ -405,9 +405,12 @@ println('c' - 'a')      // 2</code></pre>
         </article>
         <article class="doc-entry" id="doc-operators-3">
           <h3><a class="doc-anchor" href="#doc-operators-3">#</a> <code>*</code></h3>
-          <pre><code class="lang-kotlin">a * b</code></pre>
-          <p>Multiplication, wrapping for two <code>Int</code> operands. Its method spelling is <code>times</code>. There is no <code>String * Int</code> repeat operator — use <code>String.repeat</code>.</p>
-          <pre><code class="lang-kotlin">println(6 * 7)   // 42</code></pre>
+          <pre><code class="lang-kotlin">a * b
+f(*array)</code></pre>
+          <p>Multiplication, wrapping for two <code>Int</code> operands. Its method spelling is <code>times</code>. There is no <code>String * Int</code> repeat operator — use <code>String.repeat</code>. In an argument list a prefix <code>*</code> is instead the spread operator: an array's elements passed as that many arguments to a <code>vararg</code> parameter, a stdlib factory (<code>listOf</code>, <code>arrayOf</code>, …) or <code>format</code>, mixed freely with plain arguments. The callee always receives a copy.</p>
+          <pre><code class="lang-kotlin">println(6 * 7)   // 42
+fun sum(vararg xs: Int) = xs.sum()
+println(sum(1, *intArrayOf(2, 3)))   // 6</code></pre>
         </article>
         <article class="doc-entry" id="doc-operators-4">
           <h3><a class="doc-anchor" href="#doc-operators-4">#</a> <code>/</code></h3>
@@ -691,14 +694,7 @@ println(n)   // 1</code></pre>
           <pre><code class="lang-kotlin">var a = 1; a += 1; println(a)   // 2</code></pre>
         </article>
         <article class="doc-entry" id="doc-operators-42">
-          <h3><a class="doc-anchor" href="#doc-operators-42">#</a> <code>*</code></h3>
-          <pre><code class="lang-kotlin">f(*array)</code></pre>
-          <p>The spread operator: an array's elements passed as that many arguments to a <code>vararg</code> parameter, a stdlib factory (<code>listOf</code>, <code>arrayOf</code>, …) or <code>format</code>, mixed freely with plain arguments. The callee always receives a copy.</p>
-          <pre><code class="lang-kotlin">fun sum(vararg xs: Int) = xs.sum()
-println(sum(1, *intArrayOf(2, 3)))   // 6</code></pre>
-        </article>
-        <article class="doc-entry" id="doc-operators-43">
-          <h3><a class="doc-anchor" href="#doc-operators-43">#</a> <code>as</code></h3>
+          <h3><a class="doc-anchor" href="#doc-operators-42">#</a> <code>as</code></h3>
           <pre><code class="lang-kotlin">value as T
 value as? T</code></pre>
           <p>A checked cast. The runtime value is unchanged — what the cast supplies is the static type <code>T</code>, which then decides integer width and <code>/</code> dispatch downstream. A mismatch throws <code>ClassCastException</code>; the safe form <code>as?</code> yields <code>null</code> instead. <code>Int</code> and <code>Long</code> share one runtime representation here, so a cast cannot tell them apart.</p>

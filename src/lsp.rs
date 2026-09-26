@@ -359,9 +359,9 @@ const CORPUS: &[Entry] = &[
     (
         "*",
         "Operators",
-        "a * b",
-        "Multiplication, wrapping for two `Int` operands. Its method spelling is `times`. There is no `String * Int` repeat operator — use `String.repeat`.",
-        "println(6 * 7)   // 42",
+        "a * b\nf(*array)",
+        "Multiplication, wrapping for two `Int` operands. Its method spelling is `times`. There is no `String * Int` repeat operator — use `String.repeat`. In an argument list a prefix `*` is instead the spread operator: an array's elements passed as that many arguments to a `vararg` parameter, a stdlib factory (`listOf`, `arrayOf`, …) or `format`, mixed freely with plain arguments. The callee always receives a copy.",
+        "println(6 * 7)   // 42\nfun sum(vararg xs: Int) = xs.sum()\nprintln(sum(1, *intArrayOf(2, 3)))   // 6",
     ),
     (
         "/",
@@ -2380,13 +2380,6 @@ const CORPUS: &[Entry] = &[
         "val name: T by lazy { … }",
         "Property delegation, on a top-level property, a class property or a local `val`. With `by lazy` the block runs at the FIRST read and its value is cached, so an initializer with an effect fires at use rather than at startup; `lazy` requires `val`. Any other delegate is a user class declaring `operator fun getValue` (and `setValue` for a `var`), which every read and write goes through.",
         "val z: Int by lazy { println(\"forcing\"); 42 }\nfun main() { println(\"before\"); println(z); println(z) }",
-    ),
-    (
-        "*",
-        "Operators",
-        "f(*array)",
-        "The spread operator: an array's elements passed as that many arguments to a `vararg` parameter, a stdlib factory (`listOf`, `arrayOf`, …) or `format`, mixed freely with plain arguments. The callee always receives a copy.",
-        "fun sum(vararg xs: Int) = xs.sum()\nprintln(sum(1, *intArrayOf(2, 3)))   // 6",
     ),
     (
         "as",
