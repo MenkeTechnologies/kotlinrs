@@ -1007,3 +1007,4 @@ fun main() {\n    val names = mutableListOf<String>()\n    fun note(s: String) {
 fun main() {\n    val d = 2.5\n    fun scale(v: Double): Double = v * d\n    println(scale(4.0))\n}	10.0\n
 fun main() {\n    val k = 4L\n    fun wide(n: Long): Long = n * k\n    println(wide(3_000_000_000L))\n}	12000000000\n
 fun main() {\n    val sep = "-"\n    fun join(a: String, b: String = "z"): String = a + sep + b\n    println(join("x") + join("x", "y"))\n}	x-zx-y\n
+class Größe(val wert: Int)\nfun `test sum`(a: Int) = a + 1\nfun main() {\n    val café = 1\n    val π = 3.14\n    val x٣ = 7\n    val `odd name` = 2\n    val `fun` = "kw"\n    val _x = 5\n    println(café + x٣)\n    println("v=$café! π=$π")\n    println(`odd name` * 10)\n    println(`fun`)\n    println(`test sum`(Größe(4).wert))\n    println("$1 and $ and ${1 + 1} $_x x$ $$")\n}	8\nv=1! π=3.14\n20\nkw\n5\n$1 and $ and 2 5 x$ $$\n

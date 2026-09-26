@@ -57,6 +57,26 @@ impl<'a> Lexer<'a> {
     fn peek2(&self) -> u8 {
         *self.src.get(self.pos + 1).unwrap_or(&0)
     }
+    /// The whole character at `pos`, decoded from UTF-8, or `None` at the end
+    /// (or on a malformed sequence, which then falls to the byte-level error).
+    fn peek_char(&self) -> Option<char> {
+        let rest = self.src.get(self.pos..)?;
+        let n = utf8_len(*rest.first()?).min(rest.len());
+        std::str::from_utf8(&rest[..n]).ok()?.chars().next()
+    }
+
+    /// Consume the rest of an identifier: letters and decimal digits of any
+    /// script, and `_` — Kotlin's `Letter | UnicodeDigit | '_'`. A
+    /// newline is never among them, so `line` needs no update.
+    fn scan_ident_part(&mut self) {
+        while let Some(c) = self.peek_char() {
+            if !(c.is_alphanumeric() || c == '_') {
+                break;
+            }
+            self.pos += c.len_utf8();
+        }
+    }
+
     fn bump(&mut self) -> u8 {
         let c = self.peek();
         self.pos += 1;
@@ -109,7 +129,13 @@ impl<'a> Lexer<'a> {
             b'0'..=b'9' => Ok(self.number()),
             b'"' => self.string(),
             b'\'' => self.char_literal(),
-            b'a'..=b'z' | b'A'..=b'Z' | b'_' => Ok(self.ident_or_keyword()),
+            b'`' => self.backtick_ident(),
+            _ if self
+                .peek_char()
+                .is_some_and(|c| c.is_alphabetic() || c == '_') =>
+            {
+                Ok(self.ident_or_keyword())
+            }
             _ => self.operator(),
         }
     }
@@ -271,11 +297,28 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// A backquoted name — `` `odd name` ``, `` `fun` `` — which Kotlin allows to
+    /// hold spaces and to spell a keyword, and which is an ordinary identifier
+    /// once the quotes are gone. It may not span a line or be empty.
+    fn backtick_ident(&mut self) -> Result<Tok, String> {
+        self.bump(); // opening `
+        let start = self.pos;
+        while self.pos < self.src.len() && !matches!(self.peek(), b'`' | b'\n' | b'\r') {
+            self.pos += 1;
+        }
+        if self.peek() != b'`' || self.pos == start {
+            return Err("unterminated or empty backquoted name".into());
+        }
+        let name = std::str::from_utf8(&self.src[start..self.pos])
+            .map_err(|_| "invalid UTF-8 in backquoted name".to_string())?
+            .to_string();
+        self.bump(); // closing `
+        Ok(Tok::Ident(name))
+    }
+
     fn ident_or_keyword(&mut self) -> Tok {
         let start = self.pos;
-        while matches!(self.peek(), b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_') {
-            self.bump();
-        }
+        self.scan_ident_part();
         let s = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
         match s {
             "fun" => Tok::Fun,
@@ -357,11 +400,15 @@ impl<'a> Lexer<'a> {
                         self.bump(); // closing }
                         parts.push(StrPart::Expr(expr));
                     } else {
-                        // Bare `$name` — a simple identifier reference.
+                        // Bare `$name` — a simple identifier reference, which
+                        // starts the way an identifier does: `"$1"` is the
+                        // two characters `$1`, and `"$café"` reads `café`.
                         let estart = self.pos;
-                        while matches!(self.peek(), b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
+                        if self
+                            .peek_char()
+                            .is_some_and(|c| c.is_alphabetic() || c == '_')
                         {
-                            self.bump();
+                            self.scan_ident_part();
                         }
                         let expr = std::str::from_utf8(&self.src[estart..self.pos])
                             .unwrap()
