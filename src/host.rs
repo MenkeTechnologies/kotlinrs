@@ -4212,6 +4212,23 @@ fn math_call(name: &str, args: &[Value]) -> Result<Value, String> {
         // `Int.sign` / `Long.sign` — the same idea as an `Int`.
         "sign" => Ok(Value::Int(a.to_int().signum())),
         "sqrt" => Ok(Value::Float(a.to_float().sqrt())),
+        // The logarithms and `exp` answer what `java.lang.Math` does on the
+        // reference JVM, which is fdlibm's `StrictMath` bit for bit — Rust's
+        // `f64::ln` differs in the last place on about one input in a hundred.
+        // `log2` and `log(x, base)` are Kotlin's own quotients of two `ln`s.
+        "ln" => Ok(Value::Float(crate::fdlibm::log(a.to_float()))),
+        "log10" => Ok(Value::Float(crate::fdlibm::log10(a.to_float()))),
+        "ln1p" => Ok(Value::Float(crate::fdlibm::log1p(a.to_float()))),
+        "exp" => Ok(Value::Float(crate::fdlibm::exp(a.to_float()))),
+        "log2" => Ok(Value::Float(
+            crate::fdlibm::log(a.to_float()) / crate::fdlibm::log(2.0),
+        )),
+        // `kotlin.math.log(x, base)`; the one-argument form is `Math.log`.
+        "log" => Ok(Value::Float(match args.get(1).map(Value::to_float) {
+            Some(base) if base <= 0.0 || base == 1.0 => f64::NAN,
+            Some(base) => crate::fdlibm::log(a.to_float()) / crate::fdlibm::log(base),
+            None => crate::fdlibm::log(a.to_float()),
+        })),
         "floor" => Ok(Value::Float(a.to_float().floor())),
         "ceil" => Ok(Value::Float(a.to_float().ceil())),
         "round" => Ok(Value::Float(a.to_float().round_ties_even())),

@@ -6513,3 +6513,32 @@ fn nesting_deeper_than_one_level_keeps_qualifying() {
         "C(k=7)\ntrue\n"
     );
 }
+
+#[test]
+fn logarithms_and_exp_are_fdlibm_bit_for_bit() {
+    // `java.lang.Math.log`/`exp` on the reference JVM answer fdlibm's
+    // `StrictMath` bits, which differ from a correctly rounded `ln` in the
+    // last place: `exp(1.0)` is `2.7182818284590455`, not `…045`, and
+    // `log10(1.0 / 7.0)` is `-0.8450980400142569`, where Rust's `f64::log10`
+    // answers `…568`. Measured on kotlinc 2.4.20 / JDK 21.
+    assert_eq!(
+        prog(
+            "import kotlin.math.*\n\
+             fun main() {\n\
+             println(ln(0.0))\n\
+             println(exp(1.0))\n\
+             println(log10(1000.0))\n\
+             println(log10(1.0 / 7.0))\n\
+             println(log2(10.0))\n\
+             println(ln1p(1e-10))\n\
+             println(log(8.0, 2.0))\n\
+             println(log(8.0, 1.0))\n\
+             println(ln(2.0f))\n\
+             println(Math.log(10.0) + Math.log1p(0.5))\n\
+             var s = 0.0\n\
+             for (i in 1..2000) s += ln(i.toDouble()) + log10(i * 1.7) + exp(i / 300.0)\n\
+             println(s)\n}"
+        ),
+        "-Infinity\n2.7182818284590455\n3.0\n-0.8450980400142569\n3.3219280948873626\n9.999999999500001E-11\n3.0\nNaN\n0.6931472\n2.7080502011022105\n255227.1451013387\n"
+    );
+}

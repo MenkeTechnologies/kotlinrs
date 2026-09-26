@@ -9092,7 +9092,22 @@ impl Compiler {
 fn is_math_fn(name: &str) -> bool {
     matches!(
         name,
-        "abs" | "max" | "min" | "sqrt" | "floor" | "ceil" | "round" | "maxOf" | "minOf" | "sign"
+        "abs"
+            | "max"
+            | "min"
+            | "sqrt"
+            | "floor"
+            | "ceil"
+            | "round"
+            | "maxOf"
+            | "minOf"
+            | "sign"
+            | "ln"
+            | "log"
+            | "log10"
+            | "log2"
+            | "ln1p"
+            | "exp"
     )
 }
 
@@ -9105,6 +9120,7 @@ fn java_math_only_fn(name: &str) -> Option<&'static str> {
         "signum" => Some("sign"),
         "floorDiv" => Some("floorDiv"),
         "floorMod" => Some("floorMod"),
+        "log1p" => Some("ln1p"),
         _ => None,
     }
 }
@@ -9149,8 +9165,14 @@ fn math_ret_type(name: &str, args: &[Type]) -> Type {
         // The `Float` overloads answer a `Float`, so a `Float` argument selects
         // one and the result must not widen — `sqrt(2.0f)` is `1.4142135`, not
         // the `Double` root's `1.4142135623730951`.
-        "sqrt" | "floor" | "ceil" if args.contains(&Type::Float) => Type::Float,
-        "sqrt" | "floor" | "ceil" | "round" => Type::Double,
+        "sqrt" | "floor" | "ceil" | "ln" | "log" | "log10" | "log2" | "ln1p" | "exp"
+            if args.contains(&Type::Float) =>
+        {
+            Type::Float
+        }
+        "sqrt" | "floor" | "ceil" | "round" | "ln" | "log" | "log10" | "log2" | "ln1p" | "exp" => {
+            Type::Double
+        }
         // `java.lang.Math.round` is the odd one out: `Long`, not `Double`.
         "jround" => Type::Long,
         // `maxOf`/`minOf` over `Comparable` answer one of their arguments, so a
