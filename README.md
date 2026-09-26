@@ -436,7 +436,10 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   the shape is Kotlin's).
 - **Math** — `kotlin.math` `abs`/`max`/`min`/`sqrt`/`floor`/`ceil`/`round` and
   `PI`/`E`, gated on `import kotlin.math.*` (or a single-name import, honouring
-  `as` renames) exactly as Kotlin gates them; the auto-imported `maxOf`/`minOf`;
+  `as` renames) exactly as Kotlin gates them; the auto-imported `maxOf`/`minOf`
+  — the numeric overloads for numbers and the `Comparable` ones for anything
+  else, so `maxOf("q", "r")` is `r` and two user `Comparable`s are compared by
+  their `compareTo`, the earlier argument winning a tie;
   and the `java.lang.Math` statics, which need no import. `round` and
   `Math.round` differ as they do in Kotlin — half-to-even returning `Double`
   versus half-up returning `Long`.

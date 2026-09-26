@@ -23,13 +23,13 @@ use crate::ast::*;
 use crate::host::{
     COLL_COPY, COLL_DEFAULT_CAP, COLL_HASH, COLL_LITERAL, COLL_SORTED, KT_ARRAY, KT_ARRAY_INIT,
     KT_ARRAY_NEW, KT_AS, KT_BOX_F32, KT_BOX_I64, KT_BUILDER, KT_CHR_STRING, KT_CLASSOF,
-    KT_CLASS_REF, KT_CLOSURE_CALL, KT_COLL_HOF, KT_COMPARATOR, KT_COMPARE_REG, KT_DBG_LINE,
-    KT_DDIV, KT_DELEG_GET, KT_DELEG_SET, KT_DISPLAY, KT_ENUM_REG, KT_EQUALS_REG, KT_EXC_ABORT,
-    KT_EXC_CUT, KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE,
-    KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND, KT_F32, KT_F32_ARITH, KT_F32_STR, KT_FFI_CALL,
-    KT_FFI_COMPILE, KT_GENSEQ, KT_GETFIELD, KT_HASH_REG, KT_IDENTITY, KT_IDIV, KT_IMOD,
-    KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE,
-    KT_ITER_SRC, KT_JOIN, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO, KT_LIST_TAG,
+    KT_CLASS_REF, KT_CLOSURE_CALL, KT_COLL_HOF, KT_COMPARATOR, KT_COMPARE_REG, KT_COMPARE_VM,
+    KT_DBG_LINE, KT_DDIV, KT_DELEG_GET, KT_DELEG_SET, KT_DISPLAY, KT_ENUM_REG, KT_EQUALS_REG,
+    KT_EXC_ABORT, KT_EXC_CUT, KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH,
+    KT_EXC_TAKE, KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND, KT_EXTREMUM_VM, KT_F32, KT_F32_ARITH,
+    KT_F32_STR, KT_FFI_CALL, KT_FFI_COMPILE, KT_GENSEQ, KT_GETFIELD, KT_HASH_REG, KT_IDENTITY,
+    KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET,
+    KT_ITER_SIZE, KT_ITER_SRC, KT_JOIN, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO, KT_LIST_TAG,
     KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OBSERVE,
     KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_REIFIED,
     KT_REIFY, KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM,
@@ -5794,6 +5794,33 @@ impl Compiler {
             return Ok(Type::String);
         }
 
+        // `<`/`>`/`<=`/`>=` where NEITHER static type picks a native compare — a
+        // generic `T : Comparable<T>`, a user `Comparable` reached through `Any`,
+        // two values inference lost — are `compareTo` at run time. The native
+        // ops COERCE their operands: `NumGe` read two strings as `0 >= 0`, so
+        // `a >= b` over two `T`s holding `"a"` and `"b"` was `true`, and a user
+        // `compareTo` was never asked. One statically typed side is enough to
+        // choose, because Kotlin only compares a value with its own kind.
+        if matches!(op, BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge)
+            && !native_compare(lt)
+            && !native_compare(rt)
+        {
+            self.compile_expr(sc, l)?;
+            self.compile_expr(sc, r)?;
+            self.b.emit(Op::CallBuiltin(KT_COMPARE_VM, 2), 0);
+            self.b.emit(Op::LoadInt(0), 0);
+            self.b.emit(
+                match op {
+                    BinOp::Lt => Op::NumLt,
+                    BinOp::Gt => Op::NumGt,
+                    BinOp::Le => Op::NumLe,
+                    _ => Op::NumGe,
+                },
+                0,
+            );
+            return Ok(Type::Boolean);
+        }
+
         self.compile_expr(sc, l)?;
         self.compile_expr(sc, r)?;
 
@@ -5812,6 +5839,9 @@ impl Compiler {
         }
 
         let both_str = lt.is_str() && rt.is_str();
+        // An ordering compare needs only ONE side to be a `String`: the other is
+        // then a `String` too, however little inference knew about it.
+        let str_cmp = lt.is_str() || rt.is_str();
         // A statically known `Double` on either side is the only thing that
         // forces IEEE division/remainder; every other combination is decided
         // from the runtime values by `KT_IDIV`/`KT_IMOD`.
@@ -5882,19 +5912,19 @@ impl Compiler {
                 Type::Boolean
             }
             BinOp::Lt => {
-                self.b.emit(if both_str { Op::StrLt } else { Op::NumLt }, 0);
+                self.b.emit(if str_cmp { Op::StrLt } else { Op::NumLt }, 0);
                 Type::Boolean
             }
             BinOp::Gt => {
-                self.b.emit(if both_str { Op::StrGt } else { Op::NumGt }, 0);
+                self.b.emit(if str_cmp { Op::StrGt } else { Op::NumGt }, 0);
                 Type::Boolean
             }
             BinOp::Le => {
-                self.b.emit(if both_str { Op::StrLe } else { Op::NumLe }, 0);
+                self.b.emit(if str_cmp { Op::StrLe } else { Op::NumLe }, 0);
                 Type::Boolean
             }
             BinOp::Ge => {
-                self.b.emit(if both_str { Op::StrGe } else { Op::NumGe }, 0);
+                self.b.emit(if str_cmp { Op::StrGe } else { Op::NumGe }, 0);
                 Type::Boolean
             }
             BinOp::And | BinOp::Or | BinOp::RefEq | BinOp::RefNe => {
@@ -7166,6 +7196,22 @@ impl Compiler {
         let mut tys = Vec::with_capacity(args.len());
         for a in args {
             tys.push(self.compile_expr(sc, a)?);
+        }
+        // `maxOf`/`minOf` over anything but numbers are the `Comparable<T>`
+        // overloads, which answer an ARGUMENT by `compareTo` — and a user
+        // `compareTo` re-enters the VM, which an extension op cannot host.
+        if matches!(name, "max" | "min")
+            && tys.iter().any(|t| {
+                !matches!(
+                    t,
+                    Type::Int | Type::Long | Type::Float | Type::Double
+                )
+            })
+        {
+            self.b.emit(Op::LoadInt(i64::from(name == "max")), line);
+            self.b
+                .emit(Op::CallBuiltin(KT_EXTREMUM_VM, args.len() as u8 + 1), line);
+            return Ok(math_ret_type(name, &tys));
         }
         let nidx = self.b.add_constant(Value::str(name.to_string()));
         self.b.emit(Op::LoadConst(nidx), line);
@@ -8826,6 +8872,19 @@ fn math_ret_type(name: &str, args: &[Type]) -> Type {
         "sqrt" | "floor" | "ceil" | "round" => Type::Double,
         // `java.lang.Math.round` is the odd one out: `Long`, not `Double`.
         "jround" => Type::Long,
+        // `maxOf`/`minOf` over `Comparable` answer one of their arguments, so a
+        // call whose arguments share a non-numeric type has that type — a
+        // `Char` result renders as the character, a `String` one as text — and
+        // one whose arguments are anything else is not statically known.
+        "max" | "min"
+            if args
+                .first()
+                .is_some_and(|t| matches!(t, Type::Char | Type::String | Type::Obj))
+                && args.iter().all(|t| *t == args[0]) =>
+        {
+            args[0]
+        }
+        "max" | "min" if args.iter().any(|t| !t.is_num()) => Type::Unknown,
         _ if args.contains(&Type::Double) => Type::Double,
         _ if args.contains(&Type::Float) => Type::Float,
         // `abs`/`max`/`min` keep their argument's width, so a `Long` argument
@@ -8834,6 +8893,23 @@ fn math_ret_type(name: &str, args: &[Type]) -> Type {
         _ if args.iter().all(|t| t.is_int()) => Type::Int,
         _ => Type::Unknown,
     }
+}
+
+/// Whether a static type picks a native ordering compare — the numeric ops or
+/// the string ones. Everything else (`Obj`, `Unknown`, `Unit`) is decided at run
+/// time by `compareTo`.
+fn native_compare(t: Type) -> bool {
+    matches!(
+        t,
+        Type::Int
+            | Type::Long
+            | Type::Float
+            | Type::Double
+            | Type::Char
+            | Type::Boolean
+            | Type::String
+            | Type::NullableString
+    )
 }
 
 /// The [`crate::host::RangeForm`] discriminant the `KT_RANGE` op carries.

@@ -480,6 +480,22 @@ pub const KT_LIST_TAG: u16 = 136;
 /// [`KT_DISPLAY`] is a builtin. See [`equal_vm`].
 pub const KT_OBJEQ_VM: u16 = 109;
 
+/// Kotlin `a.compareTo(b)` for an ordering operator whose operands' static
+/// types pick no native compare — a generic `T : Comparable<T>`, a user
+/// `Comparable` reached through `Any`. Stack: `[a, b]`; pushes the sign of the
+/// comparison as an `Int` (-1, 0, 1). A builtin for [`KT_OBJEQ_VM`]'s reason:
+/// a user `compareTo` runs re-entrantly. See [`compare_vm`].
+pub const KT_COMPARE_VM: u16 = 140;
+
+/// `maxOf`/`minOf` over arguments that are not all statically numeric.
+/// Stack: `[arg0 .. argN-1, wantMax]`, `argc = N + 1`; pushes the chosen
+/// ARGUMENT. All-numeric values at run time take the numeric overloads
+/// (`java.lang.Math.max`'s NaN and signed-zero rules); anything else is the
+/// `Comparable<T>` overload, `if (a >= b) a else b` in the stdlib, so the
+/// earlier argument wins a tie. A builtin because a user `compareTo`
+/// re-enters the VM.
+pub const KT_EXTREMUM_VM: u16 = 141;
+
 // ── Exception builtins (`try` / `catch` / `finally` / `throw`) ──────────────
 //
 // See the “Exception unwinding” section below for the protocol these implement.
@@ -3855,6 +3871,8 @@ fn register_builtins(vm: &mut VM) {
     vm.register_builtin(KT_DISPLAY, b_display);
     vm.register_builtin(KT_JOIN, b_join);
     vm.register_builtin(KT_OBJEQ_VM, b_objeq);
+    vm.register_builtin(KT_COMPARE_VM, b_compare);
+    vm.register_builtin(KT_EXTREMUM_VM, b_extremum);
     vm.register_builtin(KT_METHOD_VM, b_method);
     vm.register_builtin(KT_SET_VM, b_set_new);
     vm.register_builtin(KT_IN_VM, b_in);
@@ -3898,6 +3916,12 @@ pub fn install_debug(vm: &mut VM) {
 
 fn is_int(v: &Value) -> bool {
     matches!(v, Value::Int(_))
+}
+
+/// Whether a `maxOf`/`minOf` argument selects the numeric overloads: a number,
+/// or the box a `Float`/`Long` travels in through an erased position.
+fn is_numeric_arg(v: &Value) -> bool {
+    matches!(v, Value::Int(_) | Value::Float(_)) || f32_box(v).is_some() || i64_box(v).is_some()
 }
 
 // ── Ranges, arrays, iteration, and kotlin.math ──────────────────────────────
@@ -5047,6 +5071,46 @@ fn b_objeq(vm: &mut VM, _argc: u8) -> Value {
     let b = vm.pop();
     let a = vm.pop();
     Value::Bool(equal_vm(vm, &a, &b))
+}
+
+/// `KT_COMPARE_VM` — see [`KT_COMPARE_VM`].
+fn b_compare(vm: &mut VM, _argc: u8) -> Value {
+    let b = vm.pop();
+    let a = vm.pop();
+    Value::Int(compare_vm(vm, &a, &b) as i64)
+}
+
+/// `KT_EXTREMUM_VM` — see [`KT_EXTREMUM_VM`].
+fn b_extremum(vm: &mut VM, argc: u8) -> Value {
+    let want_max = vm.pop().to_int() != 0;
+    let n = usize::from(argc).saturating_sub(1);
+    let mut args: Vec<Value> = (0..n).map(|_| vm.pop()).collect();
+    args.reverse();
+    if args.iter().all(is_numeric_arg) {
+        // Read through the boxes an erased `Float`/`Long` travels in, which
+        // the numeric overloads would otherwise take for their handles.
+        let plain: Vec<Value> = args
+            .iter()
+            .map(|v| match (i64_box(v), f32_box(v)) {
+                (Some(i), _) => Value::Int(i),
+                (_, Some(f)) => Value::Float(f64::from(f)),
+                _ => v.clone(),
+            })
+            .collect();
+        return math_call(if want_max { "max" } else { "min" }, &plain).unwrap_or(Value::Undef);
+    }
+    let wanted = if want_max {
+        std::cmp::Ordering::Greater
+    } else {
+        std::cmp::Ordering::Less
+    };
+    let mut best = args.first().cloned().unwrap_or(Value::Undef);
+    for v in args.iter().skip(1) {
+        if compare_vm(vm, v, &best) == wanted {
+            best = v.clone();
+        }
+    }
+    best
 }
 
 /// `KT_JOIN` — see [`KT_JOIN`]. `argc` is 1 when a separator was supplied.
