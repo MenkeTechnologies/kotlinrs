@@ -191,7 +191,10 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
                 }
                 prog.funs.push(f);
             }
-            Tok::Val | Tok::Var => prog.props.push(p.body_prop()?),
+            Tok::Val | Tok::Var => match p.extension_prop()? {
+                Some(f) => prog.funs.push(f),
+                None => prog.props.push(p.body_prop()?),
+            },
             Tok::Class | Tok::Data | Tok::Object => prog.classes.push(p.class_decl()?),
             Tok::Ident(w) if w == "interface" => prog.classes.push(p.class_decl()?),
             // `enum class E { … }`. `enum` is a soft keyword, so it is matched
@@ -1773,12 +1776,60 @@ impl Parser {
     /// other override.
     ///
     /// Answers `None` (position untouched) for every other property form.
+    /// A top-level `val Recv.name[: T] get() = …` — an extension property,
+    /// parsed as the zero-parameter extension function it lowers to. `None`,
+    /// with the position untouched, for any other top-level property.
+    fn extension_prop(&mut self) -> Result<Option<FunDecl>, String> {
+        let start = self.pos;
+        match self.accessor_prop(Mods::default())? {
+            Some(f) if f.recv.is_some() => Ok(Some(f)),
+            _ => {
+                self.pos = start;
+                Ok(None)
+            }
+        }
+    }
+
     fn accessor_prop(&mut self, mods: Mods) -> Result<Option<FunDecl>, String> {
         let start = self.pos;
         let line = self.line();
         self.advance(); // `val` / `var`
+                        // `val Recv.name get() = …` is an EXTENSION property: a getter with the
+                        // receiver bound as `this`, which is exactly an extension function of
+                        // no parameters, and is lowered as one.
+        let mut recv: Option<(String, Type, Option<String>)> = None;
         let parsed = (|| -> Result<Option<(String, TypeArg)>, String> {
-            let name = self.ident()?;
+            let mut name = self.ident()?;
+            // `val List<Int>.total` — a generic receiver keeps its head name, as
+            // an extension function's does.
+            if self.at(&Tok::Lt) {
+                let save = self.pos;
+                self.skip_type_args();
+                if self.at(&Tok::Dot) && matches!(self.peek_at(1), Tok::Ident(_)) {
+                    self.advance();
+                    recv = Some((name.clone(), Type::Obj, None));
+                    name = self.ident()?;
+                } else {
+                    self.pos = save;
+                }
+            } else if self.at(&Tok::Dot) && matches!(self.peek_at(1), Tok::Ident(_)) {
+                self.advance();
+                let ty = Type::from_name(&name);
+                recv = Some(if ty == Type::Unknown {
+                    (name.clone(), Type::Obj, Some(name.clone()))
+                } else {
+                    (name.clone(), ty, None)
+                });
+                name = self.ident()?;
+            }
+            // The annotation may be left off when the getter follows at once —
+            // `val size get() = items.size` — and the type is the body's.
+            if matches!(self.peek(), Tok::Ident(w) if w == "get")
+                && matches!(self.peek_at(1), Tok::LParen)
+            {
+                self.last_type_param = None;
+                return Ok(Some((name, TypeArg::unknown())));
+            }
             if !self.at(&Tok::Colon) {
                 return Ok(None);
             }
@@ -1825,7 +1876,7 @@ impl Parser {
         Ok(Some(FunDecl {
             reified: Vec::new(),
             name,
-            recv: None,
+            recv: recv,
             params: Vec::new(),
             ret: annot.ty,
             ret_class: annot.class,

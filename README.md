@@ -264,7 +264,8 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   singleton reached through the class name — `C.K`, `C.of(…)` — and, from inside
   the class, with no qualifier at all.
   A property may be **computed** instead of stored — `val label: String get() =
-  "$name($code)"`, with an `= expr` or a block getter. It has no backing field,
+  "$name($code)"`, with an `= expr` or a block getter. The type may be left to the
+  getter (`val size get() = items.size`). It has no backing field,
   so it runs on every read, and it dispatches virtually like any other member,
   which is what lets an implementor satisfy a declared property that way.
   A property may also be **declared without storage**: `val name: String` in an
@@ -481,7 +482,10 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   the block, so an `Int` receiver's arithmetic still wraps at 32 bits inside it.
 - **Extension functions** — `fun Int.dbl(): Int = this * 2`,
   `fun String.shout() = uppercase() + "!"`, `fun Person.label() = name`, with
-  defaults and `vararg` like any other function. Dispatch is by the receiver's
+  defaults and `vararg` like any other function. An **extension property**
+  (`val Int.squared get() = this * this`, `val List<Int>.total: Int get() =
+  sum()`) is the zero-parameter extension function its getter is, read without
+  parentheses. Dispatch is by the receiver's
   **static** type, which is what keeps an `Int` and a `Long` extension of one
   name apart (they share a runtime representation) and what makes the `Int` one's
   arithmetic wrap at 32 bits. A member function of the same name and arity wins,
