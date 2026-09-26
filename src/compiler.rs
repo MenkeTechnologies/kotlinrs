@@ -547,6 +547,48 @@ impl FnSig {
     }
 }
 
+/// A function with an EXPRESSION body and no written return type takes its type
+/// from the body, and the coarse type system reads nothing out of a body. The
+/// one shape that names a class by its syntax — a constructor call of a
+/// declared class, `fun mk() = V(9)`, `operator fun plus(o: V) = V(x + o.x)` —
+/// is written back onto the declaration, where every later lookup reads it.
+/// Without it `V(1) + V(2) + V(3)` could not find `plus` on the middle result
+/// and added two handles natively.
+/// The class an unannotated expression-bodied function returns by construction,
+/// or `None` when it is annotated or its body is anything else.
+fn constructor_return(f: &FunDecl, is_class: impl Fn(&str) -> bool) -> Option<String> {
+    if f.ret != Type::Unknown || f.ret_class.is_some() {
+        return None;
+    }
+    match f.body.as_slice() {
+        [Stmt {
+            kind: StmtKind::Return(Some(Expr::Call { name, .. })),
+            ..
+        }] if is_class(name) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+fn infer_constructor_returns(program: &Program) -> Program {
+    let classes: std::collections::HashSet<String> =
+        program.classes.iter().map(|c| c.name.clone()).collect();
+    let annotate = |f: &mut FunDecl| {
+        if let Some(c) = constructor_return(f, |n| classes.contains(n)) {
+            f.ret = Type::Obj;
+            f.ret_class = Some(c);
+        }
+    };
+    let mut out = program.clone();
+    out.funs.iter_mut().for_each(annotate);
+    for c in &mut out.classes {
+        c.methods.iter_mut().for_each(annotate);
+        if let Some(comp) = c.companion.as_mut() {
+            comp.methods.iter_mut().for_each(annotate);
+        }
+    }
+    out
+}
+
 /// The mangled sub name an extension function's body is emitted under. `$`
 /// cannot appear in a Kotlin identifier, so it can never collide with a free
 /// function, a method, or another receiver's extension of the same name.
@@ -1577,6 +1619,8 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
 /// adapter both did — walked the whole AST a second time for an answer that was
 /// already in hand.
 pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool), String> {
+    let annotated = infer_constructor_returns(program);
+    let program = &annotated;
     // Extensions live in their own table keyed by `(receiver type, name)`: they
     // are NOT callable as free functions, and two receivers may each declare one
     // of the same name.
@@ -2476,7 +2520,15 @@ impl Compiler {
                 self.local_funs_seen += 1;
                 let sub = format!("{}$local${id}", lf.name);
                 self.local_funs.insert(lf.name.clone(), sub.clone());
-                self.local_sigs.insert(lf.name.clone(), FnSig::of(lf));
+                // A local `fun mk() = V(9)` takes its class from the constructor
+                // call it returns, as a top-level one does (see
+                // [`infer_constructor_returns`]).
+                let mut sig = FnSig::of(lf);
+                if let Some(c) = constructor_return(lf, |n| self.classes.contains_key(n)) {
+                    sig.ret = Type::Obj;
+                    sig.ret_class = Some(c);
+                }
+                self.local_sigs.insert(lf.name.clone(), sig);
                 self.local_caps.insert(lf.name.clone(), caps.clone());
                 let mut decl = lf.clone();
                 decl.name = sub;
@@ -7775,6 +7827,28 @@ impl Compiler {
                 },
             },
             Expr::Binary { op, l, r } => match op {
+                // An arithmetic operator is a CONVENTION resolved against the left
+                // operand, and `compile_binary` lowers it that way first: a user
+                // class declaring it answers its method's type, and any other heap
+                // receiver — a `List`, `Set`, `Map` — answers a heap object. Typing
+                // `listOf(0) + listOf(1)` numerically made the NEXT `+` in a chain
+                // a native add, so `listOf(0) + listOf(1) + listOf(2)` printed
+                // `0.0` and `listOf("a") + "b" + "c"` concatenated a handle.
+                _ if operator_fn(*op).is_some()
+                    && self.declares_operator(sc, l, operator_fn(*op).unwrap()) =>
+                {
+                    self.infer(
+                        sc,
+                        &Expr::MethodCall {
+                            recv: l.clone(),
+                            name: operator_fn(*op).unwrap().to_string(),
+                            args: vec![(**r).clone()],
+                            safe: false,
+                            line: 0,
+                        },
+                    )
+                }
+                _ if operator_fn(*op).is_some() && self.infer(sc, l) == Type::Obj => Type::Obj,
                 BinOp::Eq
                 | BinOp::Ne
                 | BinOp::RefEq
@@ -8731,6 +8805,25 @@ impl Compiler {
     /// not claim.
     fn infer_class_plain(&self, sc: &Scope, e: &Expr) -> Option<String> {
         match e {
+            // `a + b` on a class declaring `operator fun plus` IS `a.plus(b)`, so
+            // its class is that call's — which is what lets the next operator in
+            // a chain (`V(1) + V(2) + V(3)`) find `plus` on it too.
+            Expr::Binary { op, l, r } => {
+                let f = operator_fn(*op)?;
+                if !self.declares_operator(sc, l, f) {
+                    return None;
+                }
+                self.infer_class_plain(
+                    sc,
+                    &Expr::MethodCall {
+                        recv: l.clone(),
+                        name: f.to_string(),
+                        args: vec![(**r).clone()],
+                        safe: false,
+                        line: 0,
+                    },
+                )
+            }
             Expr::Var(n) => {
                 if n == "this" {
                     return self.cur_class.clone().or_else(|| sc.class_of(n));
@@ -8790,7 +8883,11 @@ impl Compiler {
                     "booleanArrayOf" | "BooleanArray" => return Some("BooleanArray".to_string()),
                     _ => {}
                 }
-                self.fun_sig.get(name).and_then(|s| s.ret_class.clone())
+                // A local `fun` shadows a top-level one, as at the call.
+                self.local_sigs
+                    .get(name)
+                    .or_else(|| self.fun_sig.get(name))
+                    .and_then(|s| s.ret_class.clone())
             }
             Expr::Member { recv, name, .. } => {
                 // A `T`-typed property names whatever class the receiver's type
