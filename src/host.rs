@@ -10238,6 +10238,24 @@ fn sequence_member(
     };
     let v = match name {
         "size" | "count" => Value::Int(items.len() as i64),
+        // `indices` is `0..size - 1` on a `Collection`, an array and a
+        // `CharSequence`, and `lastIndex` is `size - 1` on a `List`, an array and
+        // a `CharSequence` — so -1 and the empty `0..-1` for an empty receiver.
+        // A range and a lazy sequence are `Iterable`s and have neither.
+        "indices" if args.is_empty() && !matches!(kind, SeqKind::Range | SeqKind::Seq) => {
+            alloc(HeapObj::Range(RangeObj::new(
+                0,
+                items.len() as i64 - 1,
+                RangeForm::Inclusive,
+                false,
+            )))
+        }
+        "lastIndex"
+            if args.is_empty()
+                && matches!(kind, SeqKind::List | SeqKind::Array | SeqKind::CharSeq) =>
+        {
+            Value::Int(items.len() as i64 - 1)
+        }
         "isEmpty" => Value::Bool(items.is_empty()),
         "isNotEmpty" => Value::Bool(!items.is_empty()),
         "first" => match range {

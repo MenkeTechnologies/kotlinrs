@@ -367,7 +367,8 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `is` checks answer for.
 - **Collections** — `listOf`/`mutableListOf`, `setOf`/`mutableSetOf`, and
   `mapOf`/`mutableMapOf` (with `k to v` `Pair`s), indexing `xs[i]` / `m[k]` (and
-  indexed assignment), `.size`, `.add`/`.remove`/`.get`/`.contains`/`.indexOf`/
+  indexed assignment), `.size`, `.indices`/`.lastIndex` (on a `String` and an
+  array too), `.add`/`.remove`/`.get`/`.contains`/`.indexOf`/
   `.sum` on lists, `.containsKey`/`.keys`/`.values`/`.entries`/`.put` on maps.
   `List`s, `Set`s, arrays, and ranges share one sequence-member table:
   `.count()`, `.first()`/`.last()`, `.max()`/`.min()`, `.average()`,

@@ -7201,12 +7201,9 @@ impl Compiler {
         // overloads, which answer an ARGUMENT by `compareTo` — and a user
         // `compareTo` re-enters the VM, which an extension op cannot host.
         if matches!(name, "max" | "min")
-            && tys.iter().any(|t| {
-                !matches!(
-                    t,
-                    Type::Int | Type::Long | Type::Float | Type::Double
-                )
-            })
+            && tys
+                .iter()
+                .any(|t| !matches!(t, Type::Int | Type::Long | Type::Float | Type::Double))
         {
             self.b.emit(Op::LoadInt(i64::from(name == "max")), line);
             self.b
@@ -9448,7 +9445,7 @@ fn nullable_if_safe(t: Type, safe: bool) -> Type {
 
 fn method_ret_type(name: &str) -> Type {
     match name {
-        "length" | "code" => Type::Int,
+        "length" | "code" | "lastIndex" => Type::Int,
         // The width conversions. `toByte`/`toShort` narrow the VALUE, but their
         // result still takes part in arithmetic at `Int` width (Kotlin promotes
         // both before every operator), so `Int` is their arithmetic type here.
