@@ -24,7 +24,6 @@ shape. They are recorded here so the next round has the measurements.
 | `e.cause` | `unresolved reference: cause on <class>` | `null`, or the chained throwable |
 | `kotlin.math.ln(0.0)` | `unresolved reference: kotlin.math.ln` | `-Infinity` |
 | `"\uD83D".length` (a lone surrogate) | `invalid unicode scalar in literal` | `1` |
-| `"%1\$s".format("a")` (positional) | `UnknownFormatConversionException: Conversion = '$'` | `a` |
 
 `cause` and the two-argument `(message, cause)` constructor are the one entry
 here that belongs to this round's theme by subject. They are declined on size,

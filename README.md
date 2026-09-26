@@ -234,7 +234,11 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `"%,d".format(1234567)` is `1,234,567` and `"%,015d"` of the same is
   `0000001,234,567`, while `%,e`/`%,x`/`%,o`/`%,s`/`%,b` are each a
   `FormatFlagsConversionMismatchException` as on the JVM rather than a silently
-  ignored flag. Numerically,
+  ignored flag. A specifier may name its argument — `%2$s` by position,
+  `%<s` for the one the previous specifier used — without moving the ordinary
+  index, so `"%2$s %s"` is the second argument and then the first; `%0$s` and
+  an index past `Int.MAX_VALUE` are `IllegalFormatArgumentIndexException`, and
+  `<` on `%n`/`%%` is `IllegalFormatFlagsException`. Numerically,
   `.coerceIn()`/`.coerceAtLeast()`/`.coerceAtMost()`, `.pow()`,
   `.absoluteValue`, `.roundToInt()`, the IEEE classifiers
   `.isNaN()`/`.isInfinite()`/`.isFinite()`, and the unsigned 32-bit renderers

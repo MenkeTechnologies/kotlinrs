@@ -1802,6 +1802,18 @@ pub const BUILTIN_THROWABLES: &[(&str, &str)] = &[
         "FormatFlagsConversionMismatchException",
         "java.util.FormatFlagsConversionMismatchException",
     ),
+    // The two faults an argument index raises: `%0$s` and an index past
+    // `Int.MAX_VALUE` are `IllegalFormatArgumentIndexException` (package-private
+    // in `java.util`, so a program reaches it through `IllegalFormatException`),
+    // and `<` on `%n`/`%%` is `IllegalFormatFlagsException`.
+    (
+        "IllegalFormatArgumentIndexException",
+        "java.util.IllegalFormatArgumentIndexException",
+    ),
+    (
+        "IllegalFormatFlagsException",
+        "java.util.IllegalFormatFlagsException",
+    ),
     // Runaway recursion. An `Error` under `VirtualMachineError`, so
     // `catch (e: Exception)` does NOT claim it and `catch (e: Throwable)` does
     // — see [`NESTED_RUN_LIMIT`].
@@ -1852,6 +1864,12 @@ const THROWABLE_PARENTS: &[(&str, &str)] = &[
         "FormatFlagsConversionMismatchException",
         "IllegalFormatException",
     ),
+    // Superclasses read off `getSuperclass()` on JDK 25.
+    (
+        "IllegalFormatArgumentIndexException",
+        "IllegalFormatException",
+    ),
+    ("IllegalFormatFlagsException", "IllegalFormatException"),
     ("VirtualMachineError", "Error"),
     ("StackOverflowError", "VirtualMachineError"),
 ];
@@ -7300,6 +7318,8 @@ fn conversion_accepts(conv: char, arg: &Value) -> bool {
 fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
     let mut out = String::new();
     let mut argi = 0usize;
+    // The argument the previous specifier consumed, which `%<s` reuses.
+    let mut last: Option<Value> = None;
     let mut it = fmt.chars().peekable();
     while let Some(c) = it.next() {
         if c != '%' {
@@ -7315,10 +7335,43 @@ fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
         // The character right after the `%`, kept for the truncated-spec fault
         // below — see [`unknown_conversion`].
         let after = it.peek().copied();
+        // An explicit argument index, `%2$s`: digits followed by `$`. Digits
+        // NOT followed by `$` are flags and a width (`%05d`), so the scan runs
+        // on a copy and is committed only when the `$` is there — the order
+        // `java.util.Formatter`'s specifier grammar reads them in.
+        let mut index: Option<usize> = None;
+        {
+            let mut probe = it.clone();
+            let mut digits = String::new();
+            while probe.peek().is_some_and(|d| d.is_ascii_digit()) {
+                digits.push(probe.next().expect("peeked"));
+            }
+            if !digits.is_empty() && probe.peek() == Some(&'$') {
+                probe.next();
+                it = probe;
+                spec.push_str(&digits);
+                spec.push('$');
+                index = Some(match digits.parse::<i32>() {
+                    Ok(0) => {
+                        return Err("java.util.IllegalFormatArgumentIndexException: \
+                                    Illegal format argument index = 0"
+                            .to_string())
+                    }
+                    Ok(n) => n as usize,
+                    Err(_) => {
+                        return Err("java.util.IllegalFormatArgumentIndexException: \
+                                    Format argument index: (not representable as int)"
+                            .to_string())
+                    }
+                });
+            }
+        }
         let (mut left, mut zero, mut plus, mut space) = (false, false, false, false);
+        let mut relative = false;
         let mut group = false;
         while let Some(f) = it.peek() {
             match f {
+                '<' => relative = true,
                 '-' => left = true,
                 '0' => zero = true,
                 '+' => plus = true,
@@ -7368,21 +7421,35 @@ fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
         // `%%` and `%n` take no argument, but they DO take the width and the
         // `-` flag: `%5%` is four spaces then `%`. Falling through to the
         // padding below is what applies them.
+        let missing = |spec: &str| {
+            format!("java.util.MissingFormatArgumentException: Format specifier '{spec}'")
+        };
         let arg = if matches!(conv, '%' | 'n') {
+            // Neither takes an argument, so neither can reuse one.
+            if relative {
+                return Err("java.util.IllegalFormatFlagsException: Flags = '<'".to_string());
+            }
             Value::Undef
+        } else if relative {
+            // `%<s` — the argument the previous specifier used, which
+            // does not move the ordinary index.
+            last.clone().ok_or_else(|| missing(&spec))?
+        } else if let Some(i) = index {
+            // An explicit index does not move the ordinary index either:
+            // `"%2$s %s"` is the second argument, then the first.
+            args.get(i - 1).cloned().ok_or_else(|| missing(&spec))?
         } else {
             // AN EXHAUSTED ARGUMENT LIST IS A FAULT, not a hole. It used to
             // become `Undef`, which `to_int()` reads as `0`, so
             // `"%d %d".format(1)` answered `1 0` — a wrong answer with no
             // diagnostic anywhere. The JVM raises here.
-            let Some(a) = args.get(argi).cloned() else {
-                return Err(format!(
-                    "java.util.MissingFormatArgumentException: Format specifier '{spec}'"
-                ));
-            };
+            let a = args.get(argi).cloned().ok_or_else(|| missing(&spec))?;
             argi += 1;
             a
         };
+        if !matches!(conv, '%' | 'n') {
+            last = Some(arg.clone());
+        }
         // A CONVERSION IS TYPED. `%d` with a `String` used to coerce through
         // `to_int()` and answer `0`; the JVM refuses the pair outright.
         if !conversion_accepts(conv, &arg) {
