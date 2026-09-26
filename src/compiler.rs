@@ -6738,10 +6738,32 @@ impl Compiler {
                 ));
             }
         }
+        // A TRAILING lambda binds the LAST parameter — Kotlin's rule — so
+        // `f { … }` against `fun f(n: Int = 1, g: (Int) -> String)` fills `g`,
+        // not `n`. The parser does not record whether a lambda sat inside the
+        // parentheses, so the signature decides: a final lambda that the
+        // positional rule would hand to an earlier parameter, when the last
+        // parameter is function-typed, is the trailing one, and is bound by name.
+        let mut args: Vec<Expr> = args.to_vec();
+        if let (Some(Expr::Lambda { .. }), Some(last)) = (args.last(), params.last()) {
+            if vararg_at.is_none()
+                && args.len() < params.len()
+                && last.class.as_deref() == Some("Function")
+                && !args
+                    .iter()
+                    .any(|a| matches!(a, Expr::Named { name, .. } if *name == last.name))
+            {
+                let lambda = args.pop().expect("checked non-empty");
+                args.push(Expr::Named {
+                    name: last.name.clone(),
+                    value: Box::new(lambda),
+                });
+            }
+        }
         // The positional arguments a trailing `vararg` collects: everything from
         // its own position on, up to the first named argument.
         let mut rest: Vec<Expr> = Vec::new();
-        let mut head: Vec<Expr> = args.to_vec();
+        let mut head: Vec<Expr> = args;
         if let Some(v) = vararg_at {
             let split = head
                 .iter()
@@ -9204,6 +9226,20 @@ fn bind_args<'a>(
     let mut seen_named = false;
     for (i, a) in args.iter().enumerate() {
         let Expr::Named { name, value } = a else {
+            // A TRAILING lambda — written after the parentheses — binds the LAST
+            // parameter whatever came before it, named arguments included:
+            // `f(n = 2) { … }`. It is the only positional argument allowed there.
+            if seen_named && i + 1 == args.len() && matches!(a, Expr::Lambda { .. }) {
+                match slots.last_mut() {
+                    Some(slot @ None) => *slot = Some(a),
+                    _ => {
+                        return Err(format!(
+                            "{callee}: the trailing lambda has no parameter left to bind"
+                        ))
+                    }
+                }
+                continue;
+            }
             if seen_named {
                 return Err(format!(
                     "{callee}: a positional argument cannot follow a named one"
@@ -9663,6 +9699,17 @@ fn builtin_params(name: &str) -> Option<&'static [(&'static str, Dflt)]> {
 /// Kotlin's own rules are enforced: positional arguments come first, each name
 /// binds a parameter that exists, and no parameter is bound twice.
 fn bind_named_builtin(name: &str, args: &[Expr]) -> Result<Vec<Expr>, String> {
+    // A trailing lambda after named arguments (`joinToString(separator = "") {
+    // … }`) is the member's last, function-typed parameter. The slot tables
+    // below list only the value parameters, and the host finds a lambda by its
+    // kind, so it is set aside, the rest bound, and it goes back on the end.
+    if let [head @ .., lambda @ Expr::Lambda { .. }] = args {
+        if head.iter().any(|a| matches!(a, Expr::Named { .. })) {
+            let mut out = bind_named_builtin(name, head)?;
+            out.push(lambda.clone());
+            return Ok(out);
+        }
+    }
     // `split(vararg delimiters: String, ignoreCase: Boolean = false,
     // limit: Int = 0)` cannot be a [`builtin_params`] row: its first parameter
     // is a VARARG, so a positional slot table would bind the second delimiter

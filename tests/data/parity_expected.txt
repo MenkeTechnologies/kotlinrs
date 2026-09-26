@@ -1014,3 +1014,7 @@ fun main() {\n    val l = listOf(10, 20, 30); println(l.lastIndex); println(l.in
 fun main() {\n    val s = "a😀b"; println(s.lastIndex); println(s.indices); println("abc".indices.map { "abc"[it] }); println("".lastIndex)\n}	3\n0..3\n[a, b, c]\n-1\n
 fun main() {\n    val a = arrayOf(1, 2); println(a.lastIndex); println(a.indices.toList()); val ia = IntArray(3); println(ia.indices.last); println(setOf(5, 6).indices)\n}	1\n[0, 1]\n2\n0..1\n
 fun main() {\n    val m = mutableListOf(3, 1, 2); for (i in 0 until m.lastIndex) print(m[i]); println(); for (i in m.indices.reversed()) print(m[i]); println(); println(StringBuilder("xy").lastIndex)\n}	31\n213\n1\n
+fun main() {\n    println(listOf(1, 2, 3).joinToString(separator = "") { (it * 2).toString() }); println(listOf(1, 2).joinToString(prefix = "<", postfix = ">") { "x$it" }); println(listOf(1, 2, 3).joinToString(limit = 2, truncated = "~") { "$it!" })\n}	246\n<x1, x2>\n1!, 2!, ~\n
+fun apply(times: Int = 1, prefix: String = "", f: (Int) -> String) = (1..times).joinToString(prefix) { f(it) }\nfun main() { println(apply(times = 3) { "n$it" }); println(apply(prefix = ";", times = 2) { it.toString() }); println(apply { "z" }) }	n1n2n3\n1;2\nz\n
+fun main() {\n    println(listOf(1, 2, 3, 4).windowed(size = 2, step = 2) { it.sum() })\n}	[3, 7]\n
+fun twice(f: () -> Int) = f() + f()\nfun both(a: Int, f: (Int) -> Int = { it }) = f(a)\nfun main() { println(twice { 2 }); println(both(3)); println(both(3) { it * 5 }); println(both(a = 4) { it + 1 }) }	4\n3\n15\n5\n
