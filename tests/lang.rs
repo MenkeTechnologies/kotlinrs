@@ -6737,3 +6737,25 @@ fun main() {
         "stderr was: {err}"
     );
 }
+
+#[test]
+fn unbound_references_to_one_argument_builtin_members() {
+    // `Int::plus` is a two-parameter function (receiver, argument). Lowered as
+    // a one-parameter member access it answered the receiver and dropped the
+    // argument, so `reduce(Int::plus)` answered the first element and
+    // `merge(k, v, Int::plus)` never combined. Measured on kotlinc 2.4.20 /
+    // JDK 21.
+    assert_eq!(
+        stdout(
+            "println(listOf(1, 2, 3).reduce(Int::times))\n\
+             println(listOf(1, 2).fold(10, Int::plus))\n\
+             val m = mutableMapOf(\"a\" to 1); m.merge(\"a\", 5, Int::plus); println(m)\n\
+             println(listOf(\"b\", \"a\").sortedWith(String::compareTo))\n\
+             println(listOf(2.5, 1.0).reduce(Double::plus))\n\
+             println(listOf(\"ab\", \"c\").fold(\"\", String::plus))\n\
+             println(listOf(5, 3).reduce(Int::coerceAtLeast))\n\
+             println(listOf(12, 5).reduce(Int::rem))"
+        ),
+        "6\n13\n{a=6}\n[a, b]\n3.5\nabc\n5\n2\n"
+    );
+}

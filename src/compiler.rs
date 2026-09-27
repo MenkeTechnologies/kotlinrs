@@ -5485,6 +5485,20 @@ impl Compiler {
                 // needs arguments is not expressible this way and fails there
                 // with its own `unresolved reference` rather than silently
                 // binding the wrong arity.
+                // The members that take ONE argument besides the receiver
+                // (`Int::plus`, `String::compareTo`) are the exception: lowered
+                // as an access they answered the receiver and dropped the
+                // argument, so `reduce(Int::plus)` answered the first element.
+                if builtin_binary_member(t, name) && self.companion_of(t).is_none() {
+                    let body = Expr::MethodCall {
+                        recv: Box::new(Expr::Var(param(0))),
+                        name: name.to_string(),
+                        args: vec![Expr::Var(param(1))],
+                        safe: false,
+                        line,
+                    };
+                    return self.compile_expr(sc, &lam(2, body));
+                }
                 if t.starts_with(char::is_uppercase) && self.companion_of(t).is_none() {
                     let body = Expr::Member {
                         recv: Box::new(Expr::Var(param(0))),
@@ -10476,4 +10490,51 @@ pub fn uses_exceptions(program: &Program) -> bool {
                 &|e| matches!(e, Expr::Try(_) | Expr::Throw(_)),
             )
         })
+}
+
+/// The built-in members an unbound reference names as a TWO-parameter function
+/// — the receiver and one argument — keyed by the receiver type. Kotlin reads
+/// the arity off the member's declaration; the frontend has no declaration for
+/// a stdlib member, so the members whose only overloads take exactly one
+/// argument are listed here.
+fn builtin_binary_member(ty: &str, name: &str) -> bool {
+    match ty {
+        "Int" | "Long" | "Short" | "Byte" => matches!(
+            name,
+            "plus"
+                | "minus"
+                | "times"
+                | "div"
+                | "rem"
+                | "mod"
+                | "floorDiv"
+                | "compareTo"
+                | "coerceAtLeast"
+                | "coerceAtMost"
+                | "and"
+                | "or"
+                | "xor"
+                | "shl"
+                | "shr"
+                | "ushr"
+                | "rangeTo"
+                | "until"
+        ),
+        "Double" | "Float" => matches!(
+            name,
+            "plus"
+                | "minus"
+                | "times"
+                | "div"
+                | "rem"
+                | "mod"
+                | "compareTo"
+                | "coerceAtLeast"
+                | "coerceAtMost"
+        ),
+        "String" => matches!(name, "plus" | "compareTo" | "repeat"),
+        "Boolean" => matches!(name, "and" | "or" | "xor" | "compareTo"),
+        "Char" => matches!(name, "compareTo" | "rangeTo"),
+        _ => false,
+    }
 }
