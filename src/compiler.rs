@@ -5954,7 +5954,17 @@ impl Compiler {
             // Any other heap receiver — a `List`, `Set`, `Map` or range.
             // Dispatched at run time because the frontend tracks these as one
             // `Type::Obj` and only the value knows which it is.
-            if lt == Type::Obj {
+            if lt == Type::Obj
+                // A member whose result is a collection by the stdlib's signature
+                // (`arr.toList()`, `xs.sorted()`) even where the receiver's own
+                // type went untracked, which left it `Unknown` and lowered
+                // `arr.toList() + listOf(9)` to a numeric add answering `0.0`.
+                || (lt == Type::Unknown
+                    && matches!(
+                        self.infer_class(sc, l).as_deref(),
+                        Some("List" | "Set" | "Map")
+                    ))
+            {
                 self.emit_operator_call(sc, l, r, fname)?;
                 return Ok(Type::Obj);
             }
