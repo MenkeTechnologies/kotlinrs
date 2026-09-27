@@ -6662,3 +6662,23 @@ fn mutable_map_remapping_defaults() {
         "{a=22, z=1}\n{x=4, q=4}\nnull\n{q=4}\n4\nnull\n"
     );
 }
+
+#[test]
+fn case_insensitive_order_compare_and_max_with() {
+    // `String.CASE_INSENSITIVE_ORDER` is `compareToIgnoreCase`; a comparator
+    // value answers `compare(a, b)`; `maxWith`/`minWith` keep the FIRST of a
+    // tied run and fault on an empty receiver. Measured on kotlinc 2.4.20 /
+    // JDK 21.
+    assert_eq!(
+        stdout(
+            "println(listOf(\"b\", \"A\", \"c\", \"_\", \"a\").sortedWith(String.CASE_INSENSITIVE_ORDER))\n\
+             val ci = String.CASE_INSENSITIVE_ORDER\n\
+             println(ci.compare(\"x\", \"X\"))\n\
+             println(compareBy<String> { it.length }.compare(\"aa\", \"b\"))\n\
+             println(listOf(\"b\", \"C\", \"a\").maxWith(String.CASE_INSENSITIVE_ORDER))\n\
+             println(listOf(10, 10, 3).minWith(compareBy { it % 3 }))\n\
+             try { listOf<Int>().maxWith(compareBy { it }) } catch (e: NoSuchElementException) { println(\"NSE \" + e.message) }"
+        ),
+        "[_, A, a, b, c]\n0\n1\nC\n3\nNSE null\n"
+    );
+}

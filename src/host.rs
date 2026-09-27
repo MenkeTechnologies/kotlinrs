@@ -7266,8 +7266,8 @@ fn coll_hof(
         // wins on both sides. Replacing on `<=` would answer the last, which is
         // a different element whenever the comparator is coarser than equality
         // (`compareBy { it % 3 }` over `[10, 10, 3]`, say).
-        "maxWithOrNull" | "minWithOrNull" => {
-            let want_greater = name == "maxWithOrNull";
+        "maxWith" | "minWith" | "maxWithOrNull" | "minWithOrNull" => {
+            let want_greater = name.starts_with("max");
             let mut best: Option<Value> = None;
             for it in items {
                 match &best {
@@ -8187,6 +8187,15 @@ fn builder_method(
 }
 
 fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    // `Comparator.compare(a, b)` on a comparator value — one `compareBy` built,
+    // or a two-argument lambda standing in for one (`String.CASE_INSENSITIVE_ORDER`,
+    // `Comparator { a, b -> … }`).
+    if name == "compare"
+        && args.len() == 2
+        && (comparator_keys(recv).is_some() || closure_meta(recv).is_some())
+    {
+        return Ok(Value::Int(compare_with(vm, recv, &args[0], &args[1])?));
+    }
     // The two nullable-receiver extensions whose answer is a function of the
     // VALUE, so they resolve ahead of every kind-specific table: a `null`
     // receiver is `true` for both, and a present one asks its own emptiness.

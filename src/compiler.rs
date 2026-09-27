@@ -4151,6 +4151,32 @@ impl Compiler {
         safe: bool,
         line: u32,
     ) -> Result<Type, String> {
+        // `String.CASE_INSENSITIVE_ORDER` — the JDK comparator, which is
+        // `compareToIgnoreCase` and therefore Kotlin's
+        // `a.compareTo(b, ignoreCase = true)`. Lowered to that lambda, so every
+        // `sortedWith`/`maxWith`/`Comparator` consumer takes it as it takes any
+        // other two-argument comparator.
+        if name == "CASE_INSENSITIVE_ORDER"
+            && args.is_empty()
+            && matches!(
+                self.qualifier(sc, recv).as_deref(),
+                Some("String" | "kotlin.String" | "java.lang.String")
+            )
+        {
+            let (a, b) = ("#cio_a".to_string(), "#cio_b".to_string());
+            let body = Expr::MethodCall {
+                recv: Box::new(Expr::Var(a.clone())),
+                name: "compareTo".to_string(),
+                args: vec![Expr::Var(b.clone()), Expr::Bool(true)],
+                safe: false,
+                line,
+            };
+            let lambda = Expr::Lambda {
+                params: vec![(a, Type::String), (b, Type::String)],
+                body: vec![Stmt::new(line, StmtKind::Expr(body))],
+            };
+            return self.compile_expr(sc, &lambda);
+        }
         // `this::name.isInitialized` / `::name.isInitialized` — whether a
         // `lateinit` property of the receiver has been written. Read without
         // the unset check every ordinary property read makes.
@@ -9986,6 +10012,8 @@ fn is_coll_hof(name: &str) -> bool {
             | "compute"
             | "computeIfAbsent"
             | "computeIfPresent"
+            | "maxWith"
+            | "minWith"
     )
 }
 
