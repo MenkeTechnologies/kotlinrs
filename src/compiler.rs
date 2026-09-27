@@ -2034,7 +2034,7 @@ impl Compiler {
             .map(|p| Stmt::new(cd.line, StmtKind::Expr(p.init.clone())))
             .chain(cd.inits.iter().flat_map(|b| b.body.iter().cloned()))
             .collect();
-        let outer_boxed = std::mem::replace(&mut self.boxed_vars, lambda_writes(&ctor_body));
+        let outer_boxed = std::mem::replace(&mut self.boxed_vars, shared_captures(&ctor_body));
         let res: Result<(), String> = (|| {
             for (i, p) in cd.obj_props.iter().enumerate() {
                 self.emit_init_blocks(&mut sc, cd, i)?;
@@ -2210,7 +2210,7 @@ impl Compiler {
             None => ctor_sub_name(&cd.name),
         };
         self.cur_class = Some(cd.name.clone());
-        let outer_boxed = std::mem::replace(&mut self.boxed_vars, lambda_writes(&sec.body));
+        let outer_boxed = std::mem::replace(&mut self.boxed_vars, shared_captures(&sec.body));
         let res: Result<(), String> = (|| {
             let full = self.expand_args(&format!("constructor {}", cd.name), &params, &args)?;
             for a in &full {
@@ -2444,7 +2444,7 @@ impl Compiler {
         self.push_unwind(UnwindKind::Frame);
         let outer_returns = std::mem::take(&mut self.finally_returns);
         let outer_exits = std::mem::take(&mut self.finally_exits);
-        let outer_boxed = std::mem::replace(&mut self.boxed_vars, lambda_writes(&f.body));
+        let outer_boxed = std::mem::replace(&mut self.boxed_vars, shared_captures(&f.body));
         // Local `fun` names belong to the body being lowered. The tables are
         // snapshotted rather than cleared, because a queued local `fun`'s own
         // body is compiled with the environment its declaration saw — which is
@@ -5608,7 +5608,7 @@ impl Compiler {
         let outer_locals = std::mem::replace(&mut self.local_funs, pl.local_funs.clone());
         let outer_local_sigs = std::mem::replace(&mut self.local_sigs, pl.local_sigs.clone());
         let outer_local_caps = std::mem::replace(&mut self.local_caps, pl.local_caps.clone());
-        let outer_boxed = std::mem::replace(&mut self.boxed_vars, lambda_writes(&pl.body));
+        let outer_boxed = std::mem::replace(&mut self.boxed_vars, shared_captures(&pl.body));
         // A lambda declares no return type, so a `return@label` inside one is
         // handing its value to the same erased position the fallthrough result
         // is. See the box after `compile_block_value` below.
@@ -9522,7 +9522,10 @@ fn mentioned_names(body: &[Stmt]) -> HashSet<String> {
     out.into_inner()
 }
 
-/// Every name a lambda or a local `fun` ANYWHERE inside `body` assigns to.
+/// Every `var` of `body`'s frame that a lambda or a local `fun` inside it
+/// shares with the frame: one it ASSIGNS, or one it READS that is assigned
+/// anywhere in the frame (Kotlin's `Ref` wrapping applies to a captured `var`
+/// that is modified at all, so `var x = 1; val f = { x }; x = 2; f()` is 2).
 ///
 /// A `var` of the enclosing frame named here has to be boxed: both constructs
 /// receive their captures BY VALUE — a lambda as closure upvalues, a local
@@ -9532,7 +9535,7 @@ fn mentioned_names(body: &[Stmt]) -> HashSet<String> {
 /// one heap cell, which is what `var c = 0; fun bump() { c += 1 }` needs to
 /// count. Over-approximating (a name that turns out to be the callee's own
 /// local, or a `val`) costs one heap cell and nothing else.
-fn lambda_writes(body: &[Stmt]) -> HashSet<String> {
+fn shared_captures(body: &[Stmt]) -> HashSet<String> {
     let out = RefCell::new(HashSet::new());
     let note = |e: &Expr| {
         if let Expr::IncDec { target, .. } = e {
@@ -9553,19 +9556,24 @@ fn lambda_writes(body: &[Stmt]) -> HashSet<String> {
         // expression rather than an `Assign`.
         body_any(body, &note);
     };
+    // Every write in the frame, the ones inside its lambdas and local `fun`s
+    // included (both walks descend into them).
+    collect(body);
+    let written = out.into_inner();
+    let captured = RefCell::new(HashSet::new());
     body_any(body, &|e| {
         if let Expr::Lambda { body, .. } = e {
-            collect(body);
+            captured.borrow_mut().extend(mentioned_names(body));
         }
         false
     });
     stmt_any(body, &|k| {
         if let StmtKind::LocalFun(lf) = k {
-            collect(&lf.body);
+            captured.borrow_mut().extend(mentioned_names(&lf.body));
         }
         false
     });
-    out.into_inner()
+    captured.into_inner().intersection(&written).cloned().collect()
 }
 
 /// Whether a parameter list can accept arguments of these coarse types.

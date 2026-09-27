@@ -6593,6 +6593,35 @@ fn lateinit_properties_raise_until_written() {
 }
 
 #[test]
+fn a_captured_var_modified_after_capture_is_shared() {
+    // Kotlin wraps a captured `var` that is modified anywhere in a `Ref`, so a
+    // lambda or local `fun` that only READS it still sees a later write from
+    // the declaring frame. A `for` variable is fresh per iteration and is not
+    // shared. Measured on kotlinc 2.4.20.
+    assert_eq!(
+        prog(
+            "fun main() {\n\
+                 var x = 1\n\
+                 val f = { x * 10 }\n\
+                 x = 2\n\
+                 println(f())\n\
+                 var n = 0\n\
+                 fun show() = \"n=$n\"\n\
+                 n++\n\
+                 println(show())\n\
+                 val fs = mutableListOf<() -> Int>()\n\
+                 var k = 0\n\
+                 while (k < 3) { fs.add { k }; k++ }\n\
+                 println(fs.map { it() })\n\
+                 for (i in 0 until 3) { fs.add { i } }\n\
+                 println(fs.map { it() })\n\
+             }"
+        ),
+        "20\nn=1\n[3, 3, 3]\n[3, 3, 3, 0, 1, 2]\n"
+    );
+}
+
+#[test]
 fn descending_sorts_are_stable_and_in_place_sorts_use_compare_to() {
     // `sortedDescending()`/`sortDescending()` are `sortWith(reverseOrder())`:
     // stable, so elements that compare equal keep their order — a sort
