@@ -518,7 +518,10 @@ pub const KT_EXC_CAUSE_SET: u16 = 142;
 /// property starts out holding; `arg` 1 pops `[obj, nameStr]` and pushes
 /// whether that property has been written — `this::name.isInitialized`. `arg` 2
 /// pops `[value, nameStr]` and pushes the value back, raising on the marker —
-/// the check a construction-time read of the property's slot makes. Every
+/// the check a construction-time read of the property's slot makes, and a read
+/// of a `lateinit` local or top-level property. `arg` 3 pops a value and pushes
+/// whether it is NOT the marker — `::top.isInitialized` on a top-level one,
+/// whose global the compiler has already loaded. Every
 /// property READ ([`KT_GETFIELD`] and the dynamic fallback) raises
 /// `UninitializedPropertyAccessException` on the marker, so it never escapes
 /// into a program value.
@@ -3608,6 +3611,10 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
         }
         KT_RANDOM => b_random(vm, arg),
         KT_LATEINIT if arg == 0 => vm.push(lateinit_unset()),
+        KT_LATEINIT if arg == 3 => {
+            let v = vm.pop();
+            vm.push(Value::Bool(!is_lateinit_unset(&v)));
+        }
         KT_LATEINIT if arg == 2 => {
             let name = vm.pop().to_str();
             let v = vm.pop();

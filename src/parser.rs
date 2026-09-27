@@ -172,6 +172,10 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
         if !p.at_decl_kw() && matches!(p.peek(), Tok::Ident(w) if is_modifier_word(w)) {
             let mods = p.modifiers();
             if matches!(p.peek(), Tok::Val | Tok::Var) {
+                if mods.lateinit {
+                    prog.props.push(p.lateinit_prop()?);
+                    continue;
+                }
                 prog.props.push(p.body_prop()?);
                 continue;
             }
@@ -1956,11 +1960,46 @@ impl Parser {
         }
     }
 
-    /// `lateinit var name: T` in a class body. Kotlin allows it only on a
-    /// mutable, non-null, non-primitive property with no initializer; the
-    /// property starts out holding the unset marker ([`Expr::LateinitUnset`]),
-    /// which every read checks.
+    /// `lateinit var name: T` as a class-body or top-level property. It starts
+    /// out holding the unset marker ([`Expr::LateinitUnset`]), which every read
+    /// checks.
     fn lateinit_prop(&mut self) -> Result<BodyProp, String> {
+        let (name, annot) = self.lateinit_decl()?;
+        Ok(BodyProp {
+            name,
+            ty: annot.ty,
+            class: annot.class,
+            init: Expr::LateinitUnset,
+            mutable: true,
+            lazy: false,
+            delegate: false,
+            type_args: annot.args,
+            type_param_of: None,
+        })
+    }
+
+    /// `lateinit var name: T` inside a function body: a local that starts out
+    /// unset exactly as a property does, and raises on a read before its first
+    /// write.
+    fn lateinit_local(&mut self) -> Result<StmtKind, String> {
+        let (name, annot) = self.lateinit_decl()?;
+        Ok(StmtKind::Let {
+            name,
+            ty: Some(annot.ty),
+            class: annot.class,
+            fn_params: Vec::new(),
+            fn_ret: None,
+            type_args: annot.args,
+            init: Expr::LateinitUnset,
+            mutable: true,
+            lazy: false,
+            delegated: false,
+        })
+    }
+
+    /// The `var name: T` after a `lateinit` modifier. Kotlin allows it only on
+    /// a mutable, non-null, non-primitive declaration with no initializer.
+    fn lateinit_decl(&mut self) -> Result<(String, TypeArg), String> {
         let line = self.line();
         if !matches!(self.bump(), Tok::Var) {
             return Err(format!(
@@ -1993,17 +2032,7 @@ impl Parser {
                 "property {name}: 'lateinit' modifier is not allowed on properties with initializer (line {line})"
             ));
         }
-        Ok(BodyProp {
-            name,
-            ty: annot.ty,
-            class: annot.class,
-            init: Expr::LateinitUnset,
-            mutable: true,
-            lazy: false,
-            delegate: false,
-            type_args: annot.args,
-            type_param_of: None,
-        })
+        Ok((name, annot))
     }
 
     fn body_prop(&mut self) -> Result<BodyProp, String> {
@@ -2441,6 +2470,10 @@ impl Parser {
         }
         let kind = match self.peek() {
             Tok::Val | Tok::Var => self.let_decl()?,
+            Tok::Ident(w) if w == "lateinit" && matches!(self.peek_at(1), Tok::Val | Tok::Var) => {
+                self.advance();
+                self.lateinit_local()?
+            }
             // A local `fun`, declared inside another function's body.
             Tok::Fun => StmtKind::LocalFun(self.fun_decl()?),
             // A LOCAL class, declared inside a function body. Kotlin scopes it

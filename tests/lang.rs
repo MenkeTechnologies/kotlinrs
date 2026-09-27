@@ -6593,6 +6593,55 @@ fn lateinit_properties_raise_until_written() {
 }
 
 #[test]
+fn lateinit_top_level_and_local_raise_until_written() {
+    // `lateinit` on a top-level property and on a local, the two positions
+    // besides a class body Kotlin allows it in. A read before the first write
+    // raises from a function, a lambda, and a local `fun` alike, and
+    // `::top.isInitialized` asks the top-level one. Measured on kotlinc 2.4.20.
+    assert_eq!(
+        prog(
+            "lateinit var top: String\n\
+             lateinit var names: MutableList<String>\n\
+             fun setTop() { top = \"set\" }\n\
+             fun main() {\n\
+                 lateinit var loc: String\n\
+                 try { println(top) } catch (e: UninitializedPropertyAccessException) { println(e.message) }\n\
+                 println(::top.isInitialized)\n\
+                 setTop(); println(top); println(::top.isInitialized)\n\
+                 val r = { try { loc.length } catch (e: UninitializedPropertyAccessException) { -1 } }\n\
+                 fun peek(): String = try { loc } catch (e: UninitializedPropertyAccessException) { \"unset\" }\n\
+                 println(r()); println(peek())\n\
+                 loc = \"abc\"\n\
+                 println(r()); println(peek() + top)\n\
+                 names = mutableListOf(\"a\"); names.add(\"b\"); println(names)\n\
+             }"
+        ),
+        "lateinit property top has not been initialized\n\
+         false\n\
+         set\n\
+         true\n\
+         -1\n\
+         unset\n\
+         3\n\
+         abcset\n\
+         [a, b]\n"
+    );
+    let err = prog_err("fun main() { lateinit var loc: String; println(loc) }");
+    assert!(
+        err.contains("UninitializedPropertyAccessException: lateinit property loc has not been initialized"),
+        "stderr was: {err}"
+    );
+    for bad in [
+        "fun main() { lateinit val s: String; println(1) }",
+        "fun main() { lateinit var n: Int; println(1) }",
+        "lateinit var s: String? \nfun main() { println(1) }",
+    ] {
+        let err = prog_err(bad);
+        assert!(err.contains("lateinit"), "{bad}: stderr was: {err}");
+    }
+}
+
+#[test]
 fn a_captured_var_modified_after_capture_is_shared() {
     // Kotlin wraps a captured `var` that is modified anywhere in a `Ref`, so a
     // lambda or local `fun` that only READS it still sees a later write from

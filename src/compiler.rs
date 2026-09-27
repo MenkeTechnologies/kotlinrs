@@ -430,6 +430,7 @@ impl Scope {
                 class: b.class.clone(),
                 elem: b.elem,
                 boxed: b.boxed,
+                lateinit: b.lateinit,
             })
             .collect();
         out.sort_by_key(|c| c.slot);
@@ -446,6 +447,7 @@ impl Scope {
                 class: b.class.clone(),
                 elem: b.elem,
                 boxed: b.boxed,
+                lateinit: b.lateinit,
             })
             .collect();
         // By SLOT, not by name: the capture layout has to be deterministic
@@ -854,6 +856,9 @@ pub struct Compiler {
     /// every function sees them; a local of the same name shadows one, which is
     /// why the slot lookup always runs first.
     globals: HashMap<String, PropMeta>,
+    /// The top-level properties declared `lateinit`: every read of one checks
+    /// its global for the unset marker, and `::name.isInitialized` asks it.
+    lateinit_globals: HashSet<String>,
     /// method name → the `(runtime class tag, owning type)` pairs a call on that
     /// name may land in. Backs virtual dispatch; see [`build_method_index`].
     method_index: HashMap<String, Vec<(String, String)>>,
@@ -1104,6 +1109,9 @@ struct Captured {
     class: Option<String>,
     elem: Type,
     boxed: bool,
+    /// The binding is a `lateinit` one, so a read through the capture checks
+    /// it for the unset marker the same way the declaring frame does.
+    lateinit: bool,
 }
 
 /// One enclosing-frame binding a local `fun` closes over, passed as a
@@ -1128,6 +1136,8 @@ struct LocalCap {
     class: Option<String>,
     elem: Type,
     boxed: bool,
+    /// See [`Captured::lateinit`].
+    lateinit: bool,
 }
 
 /// The scope key a captured `name` is bound under inside a local `fun` whose
@@ -1727,6 +1737,12 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         classes,
         class_alias,
         globals,
+        lateinit_globals: program
+            .props
+            .iter()
+            .filter(|p| matches!(p.init, Expr::LateinitUnset))
+            .map(|p| p.name.clone())
+            .collect(),
         method_index,
         cur_class: None,
         building_object: None,
@@ -2352,6 +2368,7 @@ impl Compiler {
                 class: b.class.clone(),
                 elem: b.elem,
                 boxed: b.boxed,
+                lateinit: b.lateinit,
             })
             .collect()
     }
@@ -2414,6 +2431,9 @@ impl Compiler {
             sc.declare_full(&key, c.ty, c.boxed, c.class.clone(), c.elem);
             if c.boxed {
                 sc.box_binding(&key);
+            }
+            if c.lateinit {
+                sc.mark_lateinit(&key);
             }
             nslots += 1;
         }
@@ -2737,6 +2757,11 @@ impl Compiler {
                 }
                 if boxed {
                     sc.box_binding(name);
+                }
+                // `lateinit var x: T` holds the unset marker until its first
+                // write, and every read checks for it.
+                if matches!(init, Expr::LateinitUnset) {
+                    sc.mark_lateinit(name);
                 }
                 // A raise inside the initializer must not commit its garbage
                 // result to the new binding.
@@ -3441,9 +3466,7 @@ impl Compiler {
                         self.b.emit(Op::CallBuiltin(KT_LAZY_GET, 0), 0);
                     }
                     if sc.is_lateinit(name) {
-                        let nidx = self.b.add_constant(Value::str(name.to_string()));
-                        self.b.emit(Op::LoadConst(nidx), 0);
-                        self.b.emit(Op::Extended(KT_LATEINIT, 2), 0);
+                        self.emit_lateinit_check(name, 0);
                     }
                     // A delegated local holds the DELEGATE, and reading it is
                     // `delegate.getValue(thisRef, property)`. Both arguments are
@@ -3489,6 +3512,9 @@ impl Compiler {
                     self.b.emit(Op::GetVar(g), 0);
                     if p.lazy {
                         self.b.emit(Op::CallBuiltin(KT_LAZY_GET, 0), 0);
+                    }
+                    if self.lateinit_globals.contains(name) {
+                        self.emit_lateinit_check(name, 0);
                     }
                     return Ok(p.ty);
                 }
@@ -4195,6 +4221,19 @@ impl Compiler {
                 ..
             } = recv
             {
+                // `::top.isInitialized` on a top-level `lateinit var`, which
+                // has no receiver: ask its global. A property of the enclosing
+                // class of the same name is what the bare `::name` means there.
+                let member = self
+                    .cur_class
+                    .clone()
+                    .is_some_and(|c| self.class_meta(&c).is_some_and(|m| m.prop(prop).is_some()));
+                if target.is_none() && !member && self.lateinit_globals.contains(prop) {
+                    let g = self.b.add_name(prop);
+                    self.b.emit(Op::GetVar(g), line);
+                    self.b.emit(Op::Extended(KT_LATEINIT, 3), line);
+                    return Ok(Type::Boolean);
+                }
                 match target.as_deref() {
                     None => self.compile_expr(sc, &Expr::Var("this".into()))?,
                     Some(t) => self.compile_expr(sc, t)?,
@@ -5597,6 +5636,9 @@ impl Compiler {
             if c.boxed {
                 sc.box_binding(&c.name);
             }
+            if c.lateinit {
+                sc.mark_lateinit(&c.name);
+            }
         }
         let total = pl.params.len() + pl.captures.len();
         for i in (0..total).rev() {
@@ -6230,6 +6272,15 @@ impl Compiler {
             self.emit_wrap32();
         }
         Ok(ty)
+    }
+
+    /// Check the value on the stack, read from the `lateinit` binding `name`,
+    /// for the unset marker: raise `UninitializedPropertyAccessException` on
+    /// it, leave any other value in place.
+    fn emit_lateinit_check(&mut self, name: &str, line: u32) {
+        let nidx = self.b.add_constant(Value::str(name.to_string()));
+        self.b.emit(Op::LoadConst(nidx), line);
+        self.b.emit(Op::Extended(KT_LATEINIT, 2), line);
     }
 
     /// `delegate.getValue(thisRef, property)` on the delegate already on the
@@ -6965,6 +7016,9 @@ impl Compiler {
                         self.b.emit(Op::GetVar(g), line);
                         if p.lazy {
                             self.b.emit(Op::CallBuiltin(KT_LAZY_GET, 0), line);
+                        }
+                        if self.lateinit_globals.contains(name) {
+                            self.emit_lateinit_check(name, line);
                         }
                         for a in args {
                             self.compile_expr(sc, a)?;
