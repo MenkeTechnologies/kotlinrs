@@ -593,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "kotlinrs"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "fancy-regex",
  "fusevm",
