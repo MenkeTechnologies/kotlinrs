@@ -32,9 +32,9 @@ use crate::host::{
     KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_ITER_SRC, KT_JOIN, KT_LATEINIT,
     KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO, KT_LIST_TAG, KT_MAKE_CLOSURE, KT_MAP_VM,
     KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OBSERVE, KT_OPER_VM, KT_PAIR,
-    KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_REIFIED, KT_REIFY, KT_RESULT_HOF,
-    KT_RUN_CATCHING, KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG,
-    KT_TO_STRING, KT_TYPE_REG, KT_YIELD,
+    KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANDOM, KT_RANGE, KT_RANGE_STEP, KT_REIFIED, KT_REIFY,
+    KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM,
+    KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG, KT_YIELD,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
@@ -945,6 +945,10 @@ pub struct Compiler {
     math_scope: HashMap<String, String>,
     /// Set by `import kotlin.math.*`, which puts every math name in scope.
     math_star: bool,
+    /// Whether `import kotlin.random.Random` (or `kotlin.random.*`) put the
+    /// bare name `Random` in scope. Like `kotlin.math`, `kotlin.random` is not
+    /// auto-imported, so without it only the qualified spelling resolves.
+    random_imported: bool,
     /// True when the program contains a `try`/`throw` anywhere. Only then are the
     /// per-statement unwind checks (and the suppressible print builtins) emitted,
     /// so an exception-free program keeps byte-identical bytecode — and its
@@ -1741,6 +1745,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         lambda_recv: None,
         math_scope: HashMap::new(),
         math_star: false,
+        random_imported: false,
         has_try: uses_exceptions(program),
         cur_ret: None,
         cur_reified: Vec::new(),
@@ -1749,6 +1754,9 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         finally_exits: Vec::new(),
     };
     (c.math_scope, c.math_star) = math_scope(&program.imports);
+    c.random_imported = program.imports.iter().any(|i| {
+        i.alias.is_none() && (i.path == "kotlin.random.Random" || i.path == "kotlin.random.*")
+    });
 
     // Backfill the CLASS of an unannotated top-level property from its
     // initializer. `PropMeta.class` above copies the *annotation*, so
@@ -4475,6 +4483,38 @@ impl Compiler {
         // way `Math` is.
         if let Some(path) = self.qualifier(sc, recv) {
             match path.as_str() {
+                // `kotlin.random.Random(seed)`, spelled out.
+                "kotlin.random" if name == "Random" && args.len() == 1 => {
+                    self.compile_expr(sc, &args[0])?;
+                    self.b.emit(Op::Extended(KT_RANDOM, 0), line);
+                    return Ok(Type::Obj);
+                }
+                // `Random.Default` and the companion's own draws
+                // (`Random.nextInt(10)`), which are `Random.Default`'s.
+                "kotlin.random.Random" | "Random"
+                    if path != "Random"
+                        || (self.random_imported && !self.classes.contains_key("Random")) =>
+                {
+                    self.b.emit(Op::Extended(KT_RANDOM, 1), line);
+                    if name == "Default" && args.is_empty() {
+                        return Ok(Type::Obj);
+                    }
+                    for a in args {
+                        self.compile_expr(sc, a)?;
+                    }
+                    let nidx = self.b.add_constant(Value::str(name.to_string()));
+                    self.b.emit(Op::LoadConst(nidx), line);
+                    self.b
+                        .emit(Op::CallBuiltin(KT_METHOD_VM, args.len() as u8), line);
+                    return Ok(match name {
+                        "nextInt" | "nextBits" => Type::Int,
+                        "nextLong" => Type::Long,
+                        "nextDouble" => Type::Double,
+                        "nextFloat" => Type::Float,
+                        "nextBoolean" => Type::Boolean,
+                        _ => Type::Unknown,
+                    });
+                }
                 "kotlin.math" => {
                     return match name {
                         "PI" | "E" => self.compile_math_const(name, line),
@@ -6477,6 +6517,16 @@ impl Compiler {
             }
             // `Pair(a, b)` / `Triple(a, b, c)` — the constructor spellings of
             // what `a to b` already builds.
+            // `Random(seed)` — the stdlib's seeded `XorWowRandom`.
+            "Random"
+                if args.len() == 1
+                    && self.random_imported
+                    && !self.classes.contains_key("Random") =>
+            {
+                self.compile_expr(sc, &args[0])?;
+                self.b.emit(Op::Extended(KT_RANDOM, 0), line);
+                Ok(Type::Obj)
+            }
             "Pair" if args.len() == 2 => {
                 for a in args {
                     self.compile_erased(sc, a)?;

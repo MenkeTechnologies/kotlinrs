@@ -523,6 +523,9 @@ pub const KT_EXC_CAUSE_SET: u16 = 142;
 /// `UninitializedPropertyAccessException` on the marker, so it never escapes
 /// into a program value.
 pub const KT_LATEINIT: u16 = 143;
+/// `kotlin.random.Random`. `arg` 0 pops a seed and pushes `Random(seed)`, the
+/// stdlib's `XorWowRandom`; `arg` 1 pushes `Random.Default`.
+pub const KT_RANDOM: u16 = 144;
 /// Builtin id for `throw e`: pops the throwable and makes it the in-flight
 /// exception. Returns `Undef` (a `throw` expression's value is never observed).
 pub const KT_EXC_THROW: u16 = 111;
@@ -1467,6 +1470,10 @@ enum HeapObj {
     /// direction: `compareBy { a }.thenByDescending { b }` sorts ascending by
     /// `a` and descending by `b`, which a single sign cannot express.
     Comparator(Vec<(Value, bool)>),
+    /// A `kotlin.random.Random` — the stdlib's `XorWowRandom`, whose six words
+    /// of state (`x`, `y`, `z`, `w`, `v`, `addend`) are all a seeded generator
+    /// is, so a program seeding it draws the reference's exact sequence.
+    Random([i32; 6]),
 }
 
 /// How far a `sequence { … }` block has got.
@@ -3599,6 +3606,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             }
             vm.push(Value::Bool(value_is_type(&v, &ty)));
         }
+        KT_RANDOM => b_random(vm, arg),
         KT_LATEINIT if arg == 0 => vm.push(lateinit_unset()),
         KT_LATEINIT if arg == 2 => {
             let name = vm.pop().to_str();
@@ -8187,6 +8195,9 @@ fn builder_method(
 }
 
 fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    if let Some(r) = random_method(recv, name, args) {
+        return r;
+    }
     // `Comparator.compare(a, b)` on a comparator value — one `compareBy` built,
     // or a two-argument lambda standing in for one (`String.CASE_INSENSITIVE_ORDER`,
     // `Comparator { a, b -> … }`).
@@ -9670,6 +9681,25 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // The elements are copied out and sorted OUTSIDE the heap borrow: a
         // user `compareTo` re-enters the VM, and comparing inside
         // `with_obj_mut` borrowed the heap twice and panicked.
+        // `shuffle(random)` on a `MutableList` or an array, in place; the
+        // unseeded form draws from `Random.Default`.
+        "shuffle" if args.len() <= 1 => {
+            let rng = args.first().cloned().unwrap_or_else(random_default);
+            let taken = with_obj(recv, |o| match o {
+                HeapObj::List(items) | HeapObj::Array { items, .. } => Some(items.clone()),
+                _ => None,
+            })
+            .flatten();
+            if let Some(mut items) = taken {
+                shuffle_with(&mut items, &rng)?;
+                with_obj_mut(recv, |o| {
+                    if let HeapObj::List(dst) | HeapObj::Array { items: dst, .. } = o {
+                        *dst = items;
+                    }
+                });
+                return Ok(Value::Undef);
+            }
+        }
         "sort" | "sortDescending" | "reverse" => {
             let taken = with_obj(recv, |o| match o {
                 HeapObj::List(items) | HeapObj::Array { items, .. } => Some(items.clone()),
@@ -10919,6 +10949,39 @@ fn sequence_member(
             };
             return Some(Ok(alloc(HeapObj::Set(out))));
         }
+        // `shuffled(random)` — a shuffled COPY, declared on `Iterable`, so an
+        // array (which has only the in-place `shuffle`) does not answer it.
+        "shuffled" if args.len() <= 1 && !matches!(kind, SeqKind::Array | SeqKind::CharSeq) => {
+            let rng = args.first().cloned().unwrap_or_else(random_default);
+            let mut out = items.to_vec();
+            if let Err(e) = shuffle_with(&mut out, &rng) {
+                return Some(Err(e));
+            }
+            return Some(Ok(alloc(HeapObj::List(out))));
+        }
+        // `random(random)`/`randomOrNull(random)` — one element at a drawn
+        // index. An empty receiver is a `NoSuchElementException` whose message
+        // names the receiver kind, or null for the `…OrNull` form.
+        "random" | "randomOrNull" if args.len() <= 1 && kind != SeqKind::Seq => {
+            if items.is_empty() {
+                if name == "randomOrNull" {
+                    return Some(Ok(Value::Undef));
+                }
+                let msg = match (kind, &range) {
+                    (SeqKind::Range, Some((a, b))) => format!(
+                        "Cannot get random in empty range: {}..{}",
+                        kotlin_string(a),
+                        kotlin_string(b)
+                    ),
+                    (SeqKind::Array, _) => "Array is empty.".to_string(),
+                    (SeqKind::CharSeq, _) => "Char sequence is empty.".to_string(),
+                    _ => "Collection is empty.".to_string(),
+                };
+                return Some(Err(format!("java.util.NoSuchElementException: {msg}")));
+            }
+            let rng = args.first().cloned().unwrap_or_else(random_default);
+            return Some(random_index(&rng, items.len()).map(|i| items[i].clone()));
+        }
         // `sortedArray()`/`sortedArrayDescending()` answer an ARRAY of the
         // receiver's own kind, where `sorted()` answers a `List`. An empty
         // receiver comes back as itself, as the stdlib's `if (isEmpty()) return
@@ -11099,6 +11162,7 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
         HeapObj::Map(_)
         | HeapObj::Closure { .. }
         | HeapObj::Comparator(_)
+        | HeapObj::Random(_)
         | HeapObj::Coro { .. }
         | HeapObj::Observed { .. }
         | HeapObj::F32(_)
@@ -11807,6 +11871,7 @@ fn obj_hash(recv: &Value) -> Option<i32> {
         | HeapObj::Builder { .. }
         | HeapObj::Closure { .. }
         | HeapObj::Comparator(_)
+        | HeapObj::Random(_)
         | HeapObj::Gen { .. }
         | HeapObj::Grouping { .. }
         | HeapObj::Exc { .. } => None,
@@ -11834,6 +11899,7 @@ fn obj_label(recv: &Value) -> String {
         HeapObj::Entry(_, _) => "Map.Entry".to_string(),
         HeapObj::Closure { .. } => "Function".to_string(),
         HeapObj::Comparator(_) => "Comparator".to_string(),
+        HeapObj::Random(_) => "Random".to_string(),
         HeapObj::F32(_) => "Float".to_string(),
         HeapObj::I64(_) => "Long".to_string(),
         HeapObj::Klass { java, .. } => if *java { "Class" } else { "KClass" }.to_string(),
@@ -11980,6 +12046,9 @@ fn display_obj(id: u32) -> String {
             // A `Comparator` is an anonymous JVM object with no printed form
             // worth reproducing; like a lambda it exists to be invoked.
             HeapObj::Comparator(keys) => format!("(comparator keys={})", keys.len()),
+            // `XorWowRandom` inherits `Object.toString`; the identity hash is the
+            // handle, as it is for every other identity-hashed kind.
+            HeapObj::Random(_) => format!("kotlin.random.XorWowRandom@{id:x}"),
             // A lazy sequence has no printed form worth reproducing either —
             // the JVM renders it as `kotlin.sequences.GeneratorSequence@…`,
             // an identity hash. It exists to be consumed, not displayed.
@@ -12728,4 +12797,276 @@ fn render_decimal(neg: bool, digits: &str, exp: i32) -> String {
     }
     let frac = if digits.len() > 1 { &digits[1..] } else { "0" };
     format!("{sign}{}.{frac}E{exp}", &digits[..1])
+}
+
+// ── kotlin.random ───────────────────────────────────────────────────────────
+
+/// `XorWowRandom(seed1, seed2)` — the state `Random(seed)` starts from, before
+/// the constructor's 64 discarded draws.
+///
+/// `Random(seed: Int)` is `XorWowRandom(seed, seed shr 31)` and
+/// `Random(seed: Long)` is `XorWowRandom(seed.toInt(), (seed shr 32).toInt())`;
+/// for every seed an `Int` can hold those are the same two words, so one
+/// constructor serves both.
+fn xorwow_new(seed: i64) -> Result<[i32; 6], String> {
+    let (s1, s2) = (seed as i32, (seed >> 32) as i32);
+    let mut st = [s1, s2, 0, 0, !s1, (s1 << 10) ^ ((s2 as u32) >> 4) as i32];
+    if (st[0] | st[1] | st[2] | st[3] | st[4]) == 0 {
+        return Err(
+            "java.lang.IllegalArgumentException: Initial state must have at least one non-zero element."
+                .to_string(),
+        );
+    }
+    for _ in 0..64 {
+        xorwow_next(&mut st);
+    }
+    Ok(st)
+}
+
+/// `XorWowRandom.nextInt()` — Marsaglia's xorwow step.
+fn xorwow_next(st: &mut [i32; 6]) -> i32 {
+    let mut t = st[0];
+    t ^= ((t as u32) >> 2) as i32;
+    st[0] = st[1];
+    st[1] = st[2];
+    st[2] = st[3];
+    let v0 = st[4];
+    st[3] = v0;
+    t = (t ^ (t << 1)) ^ v0 ^ (v0 << 4);
+    st[4] = t;
+    st[5] = st[5].wrapping_add(362437);
+    t.wrapping_add(st[5])
+}
+
+/// `nextBits(n)`: the top `n` bits of the next draw (`takeUpperBits`).
+fn xorwow_bits(st: &mut [i32; 6], n: u32) -> i32 {
+    let r = xorwow_next(st);
+    if n == 0 {
+        0
+    } else {
+        ((r as u32) >> (32 - n)) as i32
+    }
+}
+
+/// `Random.nextInt(from, until)`: a power-of-two span takes the top bits, any
+/// other span rejection-samples, and a span wider than `Int` draws until a
+/// value lands inside.
+fn xorwow_int_in(st: &mut [i32; 6], from: i32, until: i32) -> Result<i32, String> {
+    if until <= from {
+        return Err(format!(
+            "java.lang.IllegalArgumentException: Random range is empty: [{from}, {until})."
+        ));
+    }
+    let n = until.wrapping_sub(from);
+    if n > 0 || n == i32::MIN {
+        let rnd = if n & n.wrapping_neg() == n {
+            xorwow_bits(st, 31 - n.leading_zeros())
+        } else {
+            loop {
+                let bits = ((xorwow_next(st) as u32) >> 1) as i32;
+                let v = bits % n;
+                if bits.wrapping_sub(v).wrapping_add(n - 1) >= 0 {
+                    break v;
+                }
+            }
+        };
+        Ok(from.wrapping_add(rnd))
+    } else {
+        loop {
+            let r = xorwow_next(st);
+            if (from..until).contains(&r) {
+                return Ok(r);
+            }
+        }
+    }
+}
+
+/// `Random.nextLong()`.
+fn xorwow_long(st: &mut [i32; 6]) -> i64 {
+    let hi = i64::from(xorwow_next(st));
+    let lo = i64::from(xorwow_next(st));
+    (hi << 32).wrapping_add(lo)
+}
+
+/// `Random.nextLong(from, until)`, on the same plan as the `Int` form.
+fn xorwow_long_in(st: &mut [i32; 6], from: i64, until: i64) -> Result<i64, String> {
+    if until <= from {
+        return Err(format!(
+            "java.lang.IllegalArgumentException: Random range is empty: [{from}, {until})."
+        ));
+    }
+    let n = until.wrapping_sub(from);
+    if n > 0 {
+        let rnd = if n & n.wrapping_neg() == n {
+            let (n_low, n_high) = (n as i32, (n as u64 >> 32) as i32);
+            if n_low != 0 {
+                i64::from(xorwow_bits(st, 31 - n_low.leading_zeros())) & 0xFFFF_FFFF
+            } else if n_high == 1 {
+                i64::from(xorwow_next(st)) & 0xFFFF_FFFF
+            } else {
+                let hi = i64::from(xorwow_bits(st, 31 - n_high.leading_zeros()));
+                (hi << 32).wrapping_add(i64::from(xorwow_next(st)) & 0xFFFF_FFFF)
+            }
+        } else {
+            loop {
+                let bits = ((xorwow_long(st) as u64) >> 1) as i64;
+                let v = bits % n;
+                if bits.wrapping_sub(v).wrapping_add(n - 1) >= 0 {
+                    break v;
+                }
+            }
+        };
+        Ok(from.wrapping_add(rnd))
+    } else {
+        loop {
+            let r = xorwow_long(st);
+            if (from..until).contains(&r) {
+                return Ok(r);
+            }
+        }
+    }
+}
+
+/// `Random.nextDouble()`: 53 bits, as `doubleFromParts(nextBits(26), nextBits(27))`.
+fn xorwow_double(st: &mut [i32; 6]) -> f64 {
+    let hi = i64::from(xorwow_bits(st, 26));
+    let lo = i64::from(xorwow_bits(st, 27));
+    ((hi << 27) + lo) as f64 / (1u64 << 53) as f64
+}
+
+/// `Random.nextDouble(from, until)`, including the halved-span path for a span
+/// that overflows to infinity and the clamp that keeps the answer below `until`.
+fn xorwow_double_in(st: &mut [i32; 6], from: f64, until: f64) -> Result<f64, String> {
+    if until.is_nan() || from.is_nan() || until <= from {
+        return Err(format!(
+            "java.lang.IllegalArgumentException: Random range is empty: [{}, {}).",
+            kotlin_string(&Value::Float(from)),
+            kotlin_string(&Value::Float(until))
+        ));
+    }
+    let size = until - from;
+    let r = if size.is_infinite() && from.is_finite() && until.is_finite() {
+        let r1 = xorwow_double(st) * (until / 2.0 - from / 2.0);
+        from + r1 + r1
+    } else {
+        from + xorwow_double(st) * size
+    };
+    Ok(if r >= until { next_down(until) } else { r })
+}
+
+/// `Math.nextDown` for a finite, non-zero-crossing `f64`.
+fn next_down(x: f64) -> f64 {
+    if x.is_nan() || x == f64::NEG_INFINITY {
+        x
+    } else if x == 0.0 {
+        -f64::from_bits(1)
+    } else if x > 0.0 {
+        f64::from_bits(x.to_bits() - 1)
+    } else {
+        f64::from_bits(x.to_bits() + 1)
+    }
+}
+
+thread_local! {
+    /// `Random.Default`: one generator for the run, seeded from the clock, which
+    /// the unseeded `shuffled()`/`random()`/`Random.nextInt()` all draw from.
+    static RANDOM_DEFAULT: RefCell<Option<Value>> = const { RefCell::new(None) };
+}
+
+/// The `Random.Default` handle.
+fn random_default() -> Value {
+    RANDOM_DEFAULT.with(|c| {
+        c.borrow_mut()
+            .get_or_insert_with(|| {
+                let seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as i64)
+                    .unwrap_or(1)
+                    | 1;
+                alloc(HeapObj::Random(
+                    xorwow_new(seed).unwrap_or([1, 0, 0, 0, 0, 0]),
+                ))
+            })
+            .clone()
+    })
+}
+
+/// Run `f` on the state of the generator `rng`, writing the advanced state
+/// back. `None` when `rng` is not a `Random`.
+fn with_rng<T>(rng: &Value, f: impl FnOnce(&mut [i32; 6]) -> T) -> Option<T> {
+    with_obj_mut(rng, |o| match o {
+        HeapObj::Random(st) => Some(f(st)),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// `KT_RANDOM`: `arg` 0 builds `Random(seed)` from the value on top; `arg` 1
+/// pushes `Random.Default`.
+fn b_random(vm: &mut VM, arg: u8) {
+    if arg == 1 {
+        vm.push(random_default());
+        return;
+    }
+    let seed = vm.pop();
+    match xorwow_new(seed.to_int()) {
+        Ok(st) => vm.push(alloc(HeapObj::Random(st))),
+        Err(e) => {
+            fault(vm, e);
+            vm.push(Value::Undef);
+        }
+    }
+}
+
+/// The members of a `Random` receiver, or `None` for any other receiver.
+fn random_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    if !matches!(
+        with_obj(recv, |o| matches!(o, HeapObj::Random(_))),
+        Some(true)
+    ) {
+        return None;
+    }
+    // A `Float`, boxed so it renders through `Float.toString` — and boxed
+    // AFTER the draw, since allocating inside the generator's heap borrow
+    // would borrow the heap twice.
+    if name == "nextFloat" && args.is_empty() {
+        let bits = with_rng(recv, |st| xorwow_bits(st, 24))?;
+        return Some(Ok(box_f32(f64::from(bits as f32 / (1 << 24) as f32))));
+    }
+    let int = |i: usize| args.get(i).map(|v| v.to_int()).unwrap_or(0);
+    let dbl = |i: usize| args.get(i).map(|v| v.to_float()).unwrap_or(0.0);
+    with_rng(recv, |st| match (name, args.len()) {
+        ("nextInt", 0) => Ok(Value::Int(i64::from(xorwow_next(st)))),
+        ("nextInt", 1) => xorwow_int_in(st, 0, int(0) as i32).map(|v| Value::Int(i64::from(v))),
+        ("nextInt", 2) => {
+            xorwow_int_in(st, int(0) as i32, int(1) as i32).map(|v| Value::Int(i64::from(v)))
+        }
+        ("nextLong", 0) => Ok(Value::Int(xorwow_long(st))),
+        ("nextLong", 1) => xorwow_long_in(st, 0, int(0)).map(Value::Int),
+        ("nextLong", 2) => xorwow_long_in(st, int(0), int(1)).map(Value::Int),
+        ("nextDouble", 0) => Ok(Value::Float(xorwow_double(st))),
+        ("nextDouble", 1) => xorwow_double_in(st, 0.0, dbl(0)).map(Value::Float),
+        ("nextDouble", 2) => xorwow_double_in(st, dbl(0), dbl(1)).map(Value::Float),
+        ("nextBoolean", 0) => Ok(Value::Bool(xorwow_bits(st, 1) != 0)),
+        ("nextBits", 1) => Ok(Value::Int(i64::from(xorwow_bits(st, int(0) as u32)))),
+        _ => Err(format!("unresolved reference: {name} on Random")),
+    })
+}
+
+/// `shuffle(random)`'s walk: from the last index down to 1, swap each slot with
+/// one drawn from `0..=i`. `shuffled` runs it on a copy.
+fn shuffle_with(items: &mut [Value], rng: &Value) -> Result<(), String> {
+    for i in (1..items.len()).rev() {
+        let j = with_rng(rng, |st| xorwow_int_in(st, 0, i as i32 + 1))
+            .ok_or_else(|| format!("unresolved reference: shuffle on {}", obj_label(rng)))??;
+        items.swap(i, j as usize);
+    }
+    Ok(())
+}
+
+/// `random(random)` over a receiver of `n` elements: the index the draw picks.
+fn random_index(rng: &Value, n: usize) -> Result<usize, String> {
+    with_rng(rng, |st| xorwow_int_in(st, 0, n as i32))
+        .ok_or_else(|| format!("unresolved reference: random on {}", obj_label(rng)))?
+        .map(|i| i as usize)
 }

@@ -6682,3 +6682,58 @@ fn case_insensitive_order_compare_and_max_with() {
         "[_, A, a, b, c]\n0\n1\nC\n3\nNSE null\n"
     );
 }
+
+#[test]
+fn seeded_random_draws_the_stdlib_xorwow_sequence() {
+    // `Random(seed)` is the stdlib's `XorWowRandom`, so a seeded program draws
+    // exactly the reference's numbers — through every `next…` member, the
+    // power-of-two and rejection-sampled `nextInt` paths, `shuffled`/`shuffle`
+    // (the descending Fisher–Yates walk), and `random()` on each receiver
+    // kind, with each kind's empty-receiver message. Measured on kotlinc
+    // 2.4.20 / JDK 21.
+    assert_eq!(
+        prog(
+            r#"
+import kotlin.random.Random
+fun main() {
+    val r = Random(42)
+    println(r.nextInt())
+    println(r.nextInt(100))
+    println(r.nextInt(5, 10))
+    println(r.nextInt(-2000000000, 2000000000))
+    println(r.nextLong())
+    println(r.nextLong(1000L))
+    println(r.nextLong(1L shl 40))
+    println(r.nextDouble())
+    println(r.nextDouble(5.0))
+    println(r.nextDouble(-1.0, 1.0))
+    println(r.nextFloat())
+    println(r.nextBoolean())
+    println(r.nextBits(7))
+    println(listOf(1, 2, 3, 4, 5).shuffled(Random(7)))
+    val m = mutableListOf("a", "b", "c", "d"); m.shuffle(Random(3)); println(m)
+    val a = arrayOf(1, 2, 3, 4); a.shuffle(Random(3)); println(a.toList())
+    println(listOf("x", "y", "z").random(Random(11)))
+    println((1..100).random(Random(5)))
+    println("hello".random(Random(9)))
+    println(setOf(3, 4).random(Random(1)))
+    println(listOf<Int>().randomOrNull(Random(1)))
+    try { listOf<Int>().random(Random(1)) } catch (e: NoSuchElementException) { println(e.message) }
+    try { (5..1).random(Random(1)) } catch (e: NoSuchElementException) { println(e.message) }
+    try { Random(1).nextInt(5, 5) } catch (e: IllegalArgumentException) { println(e.message) }
+    val big = Random(-123456789012345L)
+    println(big.nextInt(1000))
+    println(kotlin.random.Random(99).nextInt(10))
+    println(Random(0).nextInt(1 shl 20))
+}
+"#
+        ),
+        "972016666\n40\n6\n-112774692\n4994053466947955232\n508\n202138095686\n0.5926209788406316\n1.471767405343729\n-0.7237029688720977\n0.5930778\nfalse\n10\n[5, 3, 4, 1, 2]\n[d, b, a, c]\n[4, 2, 1, 3]\nz\n42\nl\n3\nnull\nCollection is empty.\nCannot get random in empty range: 5..1\nRandom range is empty: [5, 5).\n149\n7\n576332\n"
+    );
+    // `kotlin.random` is not auto-imported.
+    let err = prog_err("fun main() { println(Random(1).nextInt()) }");
+    assert!(
+        err.contains("unresolved reference: Random"),
+        "stderr was: {err}"
+    );
+}
