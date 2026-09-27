@@ -6636,3 +6636,29 @@ fn a_collection_result_of_an_untracked_receiver_keeps_plus_as_a_collection_op() 
         "[3, 1, 2, 9]\n[1, 5]\n"
     );
 }
+
+#[test]
+fn mutable_map_remapping_defaults() {
+    // `merge`/`compute`/`computeIfAbsent`/`computeIfPresent` are the JDK's
+    // `Map` defaults: a null answer removes the entry, and each call answers the
+    // stored value. Measured on kotlinc 2.4.20 / JDK 21.
+    assert_eq!(
+        stdout(
+            "val m = mutableMapOf(\"a\" to 1)\n\
+             m.compute(\"a\") { _, v -> (v ?: 0) + 10 }\n\
+             m.computeIfAbsent(\"z\") { it.length }\n\
+             m.computeIfPresent(\"a\") { _, v -> v * 2 }\n\
+             println(m)\n\
+             val h = hashMapOf(\"x\" to 1, \"y\" to 2)\n\
+             h.merge(\"x\", 3) { a, b -> a + b }\n\
+             h.merge(\"q\", 4, Int::plus)\n\
+             h.merge(\"y\", 0) { _, _ -> null }\n\
+             println(h)\n\
+             println(h.compute(\"x\") { _, _ -> null })\n\
+             println(h)\n\
+             println(h.computeIfAbsent(\"q\") { 99 })\n\
+             println(h.computeIfPresent(\"nope\") { _, _ -> 1 })"
+        ),
+        "{a=22, z=1}\n{x=4, q=4}\nnull\n{q=4}\n4\nnull\n"
+    );
+}

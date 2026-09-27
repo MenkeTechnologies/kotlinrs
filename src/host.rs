@@ -7121,6 +7121,12 @@ fn coll_hof(
             }
             extremum_or(best, name)
         }
+        // `java.util.Map`'s remapping defaults, which Kotlin reaches on every
+        // `MutableMap`. Each reads the current value, asks the function, and
+        // writes, removes, or leaves the entry by whether the answer is null.
+        "merge" | "compute" | "computeIfAbsent" | "computeIfPresent" => {
+            map_remap(vm, name, recv, extras, clo)
+        }
         // `MutableMap.getOrPut(key) { … }` keys on a NULL VALUE, not on an absent
         // key — that is what the stdlib body tests — so a key present with a null
         // value recomputes and overwrites. The lambda takes no argument and runs
@@ -10201,6 +10207,77 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             obj_label(recv)
         )),
     }
+}
+
+/// `Map.merge`/`compute`/`computeIfAbsent`/`computeIfPresent`, as the JDK's
+/// `Map` defaults specify them:
+///
+/// * `merge(k, v, f)` — `v` must not be null; the new value is `v` for an absent
+///   (or null-valued) key and `f(old, v)` otherwise.
+/// * `compute(k, f)` — `f(k, old)`, `old` null when absent.
+/// * `computeIfAbsent(k, f)` — `f(k)` only when the value is absent or null; the
+///   present value is answered untouched.
+/// * `computeIfPresent(k, f)` — `f(k, old)` only when a non-null value is there.
+///
+/// In every one a null result REMOVES the entry (and writes nothing), and the
+/// answer is the new value — or null when nothing was stored.
+fn map_remap(
+    vm: &mut VM,
+    name: &str,
+    recv: &Value,
+    extras: &[Value],
+    clo: &Value,
+) -> Result<Value, String> {
+    let key = extras.first().cloned().unwrap_or(Value::Undef);
+    let at = key_position(vm, recv, &key);
+    let old = at
+        .and_then(|i| {
+            with_obj(recv, |o| match o {
+                HeapObj::Map(entries) => entries.get(i).map(|(_, v)| v.clone()),
+                _ => None,
+            })
+            .flatten()
+        })
+        .unwrap_or(Value::Undef);
+    let absent = matches!(old, Value::Undef);
+    let new = match name {
+        "merge" => {
+            let v = extras.get(1).cloned().unwrap_or(Value::Undef);
+            if matches!(v, Value::Undef) {
+                return Err("java.lang.NullPointerException".to_string());
+            }
+            if absent {
+                v
+            } else {
+                invoke_closure(vm, clo, &[old, v])?
+            }
+        }
+        "compute" => invoke_closure(vm, clo, &[key.clone(), old])?,
+        "computeIfAbsent" if absent => invoke_closure(vm, clo, std::slice::from_ref(&key))?,
+        "computeIfAbsent" => return Ok(old),
+        _ if absent => return Ok(Value::Undef),
+        _ => invoke_closure(vm, clo, &[key.clone(), old])?,
+    };
+    // The function may have written the map itself, so the key is looked up
+    // again rather than trusted at its old position.
+    let at = key_position(vm, recv, &key);
+    let removing = matches!(new, Value::Undef);
+    with_obj_mut(recv, |o| {
+        if let HeapObj::Map(entries) = o {
+            match (at, removing) {
+                (Some(i), true) => {
+                    entries.remove(i);
+                }
+                (Some(i), false) => entries[i].1 = new.clone(),
+                (None, false) => entries.push((key.clone(), new.clone())),
+                (None, true) => {}
+            }
+        }
+    });
+    if removing && at.is_some() {
+        invalidate_key_index(recv);
+    }
+    Ok(new)
 }
 
 /// Which kind of receiver a shared sequence member was reached through.

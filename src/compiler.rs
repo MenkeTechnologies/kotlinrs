@@ -9982,6 +9982,10 @@ fn is_coll_hof(name: &str) -> bool {
             | "ifBlank"
             | "replaceFirstChar"
             | "getOrPut"
+            | "merge"
+            | "compute"
+            | "computeIfAbsent"
+            | "computeIfPresent"
     )
 }
 
