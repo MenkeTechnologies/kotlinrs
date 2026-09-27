@@ -383,6 +383,13 @@ println(total(1, 2, 3))   // 6</code></pre>
           <pre><code class="lang-kotlin">val z: Int by lazy { println("forcing"); 42 }
 fun main() { println("before"); println(z); println(z) }</code></pre>
         </article>
+        <article class="doc-entry" id="doc-keywords-declarations-45">
+          <h3><a class="doc-anchor" href="#doc-keywords-declarations-45">#</a> <code>lateinit</code></h3>
+          <pre><code class="lang-kotlin">lateinit var name: T</code></pre>
+          <p>A class property with no initializer, assigned before first use. It must be a non-null, non-primitive <code>var</code>. Every read before the first write — through the instance, inside a member, or in an <code>init</code> block — raises <code>kotlin.UninitializedPropertyAccessException</code>; <code>this::name.isInitialized</code> asks without raising.</p>
+          <pre><code class="lang-kotlin">class Conn { lateinit var host: String; fun ready() = this::host.isInitialized }
+fun main() { val c = Conn(); println(c.ready()); c.host = "db"; println(c.host) }   // false, db</code></pre>
+        </article>
       </section>
 
       <section class="tutorial-section" id="ch-operators">
@@ -1132,6 +1139,15 @@ TODO(reason: String): Nothing</code></pre>
           <p>Throws <code>kotlin.NotImplementedError: An operation is not implemented</code>, with <code>: reason</code> appended when one is given. It is an <code>Error</code>, not an <code>Exception</code>, so <code>catch (e: Exception)</code> does not catch it.</p>
           <pre><code class="lang-kotlin">try { TODO("later") } catch (e: Throwable) { println(e) }   // kotlin.NotImplementedError: An operation is not implemented: later</code></pre>
         </article>
+        <article class="doc-entry" id="doc-builtin-functions-42">
+          <h3><a class="doc-anchor" href="#doc-builtin-functions-42">#</a> <code>Random</code></h3>
+          <pre><code class="lang-kotlin">Random(seed: Int): Random
+Random(seed: Long): Random
+Random.Default</code></pre>
+          <p><code>kotlin.random.Random</code> — a seeded generator is the stdlib's <code>XorWowRandom</code>, so it draws the reference's exact sequence through <code>nextInt</code>, <code>nextLong</code>, <code>nextDouble</code>, <code>nextFloat</code>, <code>nextBoolean</code> and <code>nextBits</code> (with the <code>until</code> and <code>from, until</code> bounds). <code>Random.nextInt(…)</code> draws from <code>Random.Default</code>. Needs <code>import kotlin.random.Random</code>.</p>
+          <pre><code class="lang-kotlin">import kotlin.random.Random
+fun main() { println(Random(42).nextInt(100)) }   // 33</code></pre>
+        </article>
       </section>
 
       <section class="tutorial-section" id="ch-math">
@@ -1227,6 +1243,49 @@ Math.round(…)  Math.PI  Math.E</code></pre>
           <pre><code class="lang-kotlin">Math.round(x: Double): Long</code></pre>
           <p>The odd one out of the rounding family: **half-up** (<code>floor(x + 0.5)</code>) and returning a <code>Long</code>, where <code>kotlin.math.round</code> is ties-to-even and returns a <code>Double</code>. It dispatches under its own name for exactly that reason.</p>
           <pre><code class="lang-kotlin">println(Math.round(2.5))   // 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-math-14">
+          <h3><a class="doc-anchor" href="#doc-math-14">#</a> <code>ln</code></h3>
+          <pre><code class="lang-kotlin">ln(x: Double): Double
+ln(x: Float): Float</code></pre>
+          <p>Natural logarithm — <code>Math.log</code>, computed by a port of fdlibm's <code>StrictMath.log</code>, which is what the reference JVM answers bit for bit (a correctly rounded <code>ln</code> differs in the last place on about one input in a hundred). <code>ln(0.0)</code> is <code>-Infinity</code> and a negative argument <code>NaN</code>. Needs the <code>kotlin.math</code> import.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.*
+fun main() { println(ln(E)) }   // 1.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-math-15">
+          <h3><a class="doc-anchor" href="#doc-math-15">#</a> <code>log10</code></h3>
+          <pre><code class="lang-kotlin">log10(x: Double): Double</code></pre>
+          <p>Base-10 logarithm, fdlibm's <code>log10</code>. Needs the <code>kotlin.math</code> import; <code>Math.log10</code> needs none.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.log10
+fun main() { println(log10(1000.0)) }   // 3.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-math-16">
+          <h3><a class="doc-anchor" href="#doc-math-16">#</a> <code>log2</code></h3>
+          <pre><code class="lang-kotlin">log2(x: Double): Double</code></pre>
+          <p>Base-2 logarithm, as Kotlin defines it: <code>ln(x) / ln(2.0)</code>. Needs the <code>kotlin.math</code> import.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.log2
+fun main() { println(log2(8.0)) }   // 3.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-math-17">
+          <h3><a class="doc-anchor" href="#doc-math-17">#</a> <code>log</code></h3>
+          <pre><code class="lang-kotlin">log(x: Double, base: Double): Double</code></pre>
+          <p>Logarithm to an arbitrary base, <code>ln(x) / ln(base)</code>; a base that is not positive, or is <code>1.0</code>, answers <code>NaN</code>. Needs the <code>kotlin.math</code> import. The one-argument <code>Math.log(x)</code> is the natural logarithm.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.log
+fun main() { println(log(8.0, 2.0)) }   // 3.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-math-18">
+          <h3><a class="doc-anchor" href="#doc-math-18">#</a> <code>ln1p</code></h3>
+          <pre><code class="lang-kotlin">ln1p(x: Double): Double</code></pre>
+          <p><code>ln(1 + x)</code>, accurate for <code>x</code> near zero — fdlibm's <code>log1p</code>, also reachable as <code>Math.log1p</code>. Needs the <code>kotlin.math</code> import.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.ln1p
+fun main() { println(ln1p(0.0)) }   // 0.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-math-19">
+          <h3><a class="doc-anchor" href="#doc-math-19">#</a> <code>exp</code></h3>
+          <pre><code class="lang-kotlin">exp(x: Double): Double</code></pre>
+          <p><code>e</code> raised to <code>x</code>, fdlibm's <code>exp</code> — so <code>exp(1.0)</code> is <code>2.7182818284590455</code>, the JVM's answer, not the correctly rounded <code>…045</code>. Needs the <code>kotlin.math</code> import.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.exp
+fun main() { println(exp(1.0)) }   // 2.7182818284590455</code></pre>
         </article>
       </section>
 
@@ -1334,6 +1393,13 @@ try { x!! } catch (e: NullPointerException) { println("caught") }</code></pre>
           <pre><code class="lang-kotlin">NoSuchElementException(message: String)</code></pre>
           <p>The one built-in throwable outside <code>java.lang</code> — it is <code>java.util.NoSuchElementException</code>, and the package is observable through <code>toString</code>. Raised by <code>first</code>, <code>last</code>, <code>get</code>, <code>max</code> and <code>min</code> on an empty sequence, with the message <code>List is empty.</code></p>
           <pre><code class="lang-kotlin">try { listOf&lt;Int&gt;().first() } catch (e: NoSuchElementException) { println(e.message) }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-17">
+          <h3><a class="doc-anchor" href="#doc-throwables-17">#</a> <code>UninitializedPropertyAccessException</code></h3>
+          <pre><code class="lang-kotlin">kotlin.UninitializedPropertyAccessException</code></pre>
+          <p>Raised by a read of a <code>lateinit</code> property before its first write, with the message <code>lateinit property name has not been initialized</code>. A <code>RuntimeException</code>.</p>
+          <pre><code class="lang-kotlin">class Conn { lateinit var host: String }
+fun main() { try { Conn().host } catch (e: UninitializedPropertyAccessException) { println(e.message) } }</code></pre>
         </article>
       </section>
 
@@ -1448,6 +1514,12 @@ println("abc".contains('b'))     // true</code></pre>
 String.substring(start: Int, end: Int): String</code></pre>
           <p>Slice between two UTF-16 offsets, <code>end</code> exclusive and defaulting to the length. An out-of-range or inverted pair raises <code>StringIndexOutOfBoundsException: Range [start, end) out of bounds for length N</code>.</p>
           <pre><code class="lang-kotlin">println("hello".substring(1, 3))   // el</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-members-19">
+          <h3><a class="doc-anchor" href="#doc-string-members-19">#</a> <code>CASE_INSENSITIVE_ORDER</code></h3>
+          <pre><code class="lang-kotlin">String.CASE_INSENSITIVE_ORDER: Comparator&lt;String&gt;</code></pre>
+          <p>The JDK comparator that is <code>compareTo(other, ignoreCase = true)</code>. A comparator value also answers <code>compare(a, b)</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf("b", "A", "c").sortedWith(String.CASE_INSENSITIVE_ORDER))   // [A, b, c]</code></pre>
         </article>
       </section>
 
@@ -1834,6 +1906,37 @@ IntRange.reversed(): IntProgression</code></pre>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).reversed())   // [3, 2, 1]
 println((1..3).reversed())            // 3 downTo 1 step 1</code></pre>
         </article>
+        <article class="doc-entry" id="doc-sequence-members-44">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-44">#</a> <code>shuffled</code></h3>
+          <pre><code class="lang-kotlin">Iterable&lt;T&gt;.shuffled(random: Random = Random.Default): List&lt;T&gt;
+MutableList&lt;T&gt;.shuffle(random: Random)
+Array&lt;T&gt;.shuffle(random: Random)</code></pre>
+          <p>A shuffled copy, or the in-place <code>shuffle</code> on a mutable list or an array — the stdlib's descending Fisher–Yates walk, so a seeded <code>Random</code> gives the reference's exact order.</p>
+          <pre><code class="lang-kotlin">import kotlin.random.Random
+fun main() { println(listOf(1, 2, 3, 4, 5).shuffled(Random(7))) }   // [5, 3, 4, 1, 2]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-45">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-45">#</a> <code>random</code></h3>
+          <pre><code class="lang-kotlin">Collection&lt;T&gt;.random(random: Random = Random.Default): T
+randomOrNull(random: Random = Random.Default): T?</code></pre>
+          <p>One element at an index drawn from <code>random</code>. An empty receiver is a <code>NoSuchElementException</code> naming its kind (<code>Collection is empty.</code>, <code>Array is empty.</code>, <code>Char sequence is empty.</code>, or the empty range), and <code>randomOrNull</code> answers <code>null</code> instead.</p>
+          <pre><code class="lang-kotlin">import kotlin.random.Random
+fun main() { println(listOf("x", "y", "z").random(Random(11))) }   // z</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-46">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-46">#</a> <code>maxWith</code></h3>
+          <pre><code class="lang-kotlin">Iterable&lt;T&gt;.maxWith(comparator: Comparator&lt;T&gt;): T
+minWith(comparator: Comparator&lt;T&gt;): T</code></pre>
+          <p>The extreme element by a comparator, keeping the FIRST of a tied run. An empty receiver is a <code>NoSuchElementException</code>; the <code>…OrNull</code> forms answer <code>null</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf("b", "C", "a").maxWith(String.CASE_INSENSITIVE_ORDER))   // C</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-members-47">
+          <h3><a class="doc-anchor" href="#doc-sequence-members-47">#</a> <code>sortedArray</code></h3>
+          <pre><code class="lang-kotlin">Array&lt;T&gt;.sortedArray(): Array&lt;T&gt;
+sortedArrayDescending(): Array&lt;T&gt;</code></pre>
+          <p>A sorted copy of an array as an array of the same kind (<code>sorted()</code> answers a <code>List</code>). The descending form is stable, like <code>sortedDescending()</code>: elements that compare equal keep their order. An empty array comes back as itself.</p>
+          <pre><code class="lang-kotlin">println(arrayOf(3, 1, 2).sortedArray().contentToString())   // [1, 2, 3]</code></pre>
+        </article>
       </section>
 
       <section class="tutorial-section" id="ch-mutable-collection-members">
@@ -1957,6 +2060,17 @@ println(m.put("a", 2))   // 1</code></pre>
           <p>Drops the entry under a key. It answers a <code>Boolean</code> — whether anything was removed — where Kotlin answers the removed value or <code>null</code>.</p>
           <pre><code class="lang-kotlin">val m = mutableMapOf("a" to 1)
 println(m.remove("a"))   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-members-14">
+          <h3><a class="doc-anchor" href="#doc-map-members-14">#</a> <code>merge</code></h3>
+          <pre><code class="lang-kotlin">MutableMap&lt;K, V&gt;.merge(key: K, value: V, remap: (V, V) -&gt; V?): V?
+MutableMap&lt;K, V&gt;.compute(key: K, remap: (K, V?) -&gt; V?): V?
+MutableMap&lt;K, V&gt;.computeIfAbsent(key: K, f: (K) -&gt; V): V
+MutableMap&lt;K, V&gt;.computeIfPresent(key: K, remap: (K, V) -&gt; V?): V?</code></pre>
+          <p>The <code>java.util.Map</code> remapping defaults. <code>merge</code> stores <code>value</code> for an absent key and <code>remap(old, value)</code> otherwise; <code>compute</code> always asks; <code>computeIfAbsent</code> asks only when the value is absent; <code>computeIfPresent</code> only when it is there. A null answer removes the entry, and each call answers what was stored.</p>
+          <pre><code class="lang-kotlin">val m = mutableMapOf("a" to 1)
+m.merge("a", 5, Int::plus)
+println(m)   // {a=6}</code></pre>
         </article>
       </section>
 

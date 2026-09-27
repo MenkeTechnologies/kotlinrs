@@ -790,3 +790,58 @@ throwable's `cause`, through `(message, cause)`, `(cause)` and `.cause`.
 
 A local `fun` capturing an enclosing `val` (`val k = 5; fun h(x: Int) = x + k`)
 now answers `6`; the fix landed as `77ba084947` after Round 11 was written.
+
+## Round 13 — the stdlib members that were missing, and three answers that were wrong
+
+### The oracle
+
+`kotlinc-jvm 2.4.20` on **JRE 21.0.12.1** (`/opt/homebrew/opt/openjdk@21`) for
+both the compile and the run step, through `scripts/capture-parity.sh`. The
+corpus went from 1035 to 1039 records; one candidate was rejected by the script
+because it deliberately ends in an uncaught exception (exit 1). No test was
+deleted or weakened, and no audit or report script was touched.
+
+### Wrong answers
+
+| program | before | reference and now |
+| --- | --- | --- |
+| `listOf(1, 2, 3).reduce(Int::plus)` | `1` | `6` |
+| `listOf(P(1, "a"), P(2, "b"), P(1, "c"), P(2, "d")).sortedDescending()` (compared by `k`) | `[P(k=2, t=d), P(k=2, t=b), P(k=1, t=c), P(k=1, t=a)]` | `[P(k=2, t=b), P(k=2, t=d), P(k=1, t=a), P(k=1, t=c)]` |
+| `mutableListOf(P(2, "b"), P(1, "a")).sort()` on a user `Comparable` | Rust panic, `RefCell already mutably borrowed` | `[P(k=1, t=a), P(k=2, t=b)]` |
+| `arrayOf(3, 1, 2).toList() + listOf(9)` | `0.0` | `[3, 1, 2, 9]` |
+
+An unbound reference to a built-in member was lowered as a one-parameter member
+ACCESS, so `Int::plus` answered its receiver and dropped the argument; the
+members whose only overloads take one argument now lower to a two-parameter
+call. `sortedDescending`/`sortDescending` sorted and then reversed, which flips
+elements that compare equal; they are now a stable sort by the reversed order,
+as `sortWith(reverseOrder())` is. The in-place `sort` compared with `value_cmp`
+inside the heap borrow, which ignored a user `compareTo` and, for an instance
+receiver, borrowed the heap twice. A member whose stdlib result is a collection
+kept `+` numeric when its receiver's own type went untracked.
+
+### Missing surface, now present
+
+- `lateinit var` with `kotlin.UninitializedPropertyAccessException` on every
+  read before the first write, and `this::p.isInitialized`.
+- `kotlin.math` `ln`/`log10`/`log2`/`ln1p`/`log(x, base)`/`exp`, plus
+  `Math.log1p`. They run on a port of fdlibm (`src/fdlibm.rs`), because the
+  reference JVM's `Math.log`/`exp` answer `StrictMath`'s bits: over 60,025 inputs
+  (random magnitudes across the full exponent range, subnormals, the
+  thresholds, the specials) the port and `java.lang.Math` agree on every bit,
+  where Rust's `f64::ln` differs on 218 of 20,000 and `exp(1.0)` is
+  `2.718281828459045` against the JVM's `2.7182818284590455`.
+- `kotlin.random.Random(seed)` as the stdlib's `XorWowRandom` — `nextInt`,
+  `nextLong`, `nextDouble`, `nextFloat`, `nextBoolean`, `nextBits`, with their
+  bounds — `Random.Default`, and `shuffled`/`shuffle`/`random`/`randomOrNull`.
+  A seeded program draws the reference's exact sequence.
+- `MutableMap.merge`/`compute`/`computeIfAbsent`/`computeIfPresent`.
+- `String.CASE_INSENSITIVE_ORDER`, `Comparator.compare(a, b)` on a comparator
+  value, and `maxWith`/`minWith`.
+- `sortedArray`/`sortedArrayDescending`.
+
+### Still open
+
+`Regex` (no engine dependency yet), a lone surrogate in a string literal, and a
+comparator passed to `sortedSetOf`/`sortedMapOf` — the last is a wrong answer and
+is recorded with its measurement in [BUGS.md](BUGS.md).

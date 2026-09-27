@@ -180,6 +180,12 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 - **Delegated properties** — `by lazy`, a user delegate declaring
   `operator fun getValue`/`setValue` (on a class property or a local), and
   `Delegates.observable`/`vetoable`.
+- **`lateinit var`** — a class property with no initializer whose read before
+  the first write (through the instance, in a member, or in an `init` block) is
+  `kotlin.UninitializedPropertyAccessException`, and `this::p.isInitialized`.
+- **`kotlin.random`** — `Random(seed)` is the stdlib's `XorWowRandom`, so a
+  seeded program draws the reference's exact numbers through every `next…`
+  member; `Random.Default` backs the unseeded forms.
 - **Class objects** — `x::class` and `Type::class` (a `KClass`, with
   `.simpleName`, `.qualifiedName` and `.java`) and `x.javaClass` (a
   `java.lang.Class`, with `.name` and `.simpleName`). A receiver whose STATIC
@@ -388,8 +394,15 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   ones a `MutableList` and a primitive array declare — `.sort()`,
   `.sortDescending()`, `.reverse()`, `.sortBy { }`, `.sortByDescending { }` —
   which answer `Unit` and reorder the receiver, where `sorted…`/`reversed()`
-  answer a new list and leave it alone. A `Map` adds `.getOrPut(k) { }` (which
-  keys on a null VALUE, not on an absent key), `.getOrDefault(k, v)`,
+  answer a new list and leave it alone; the descending forms are stable (equal
+  elements keep their order), and a user `Comparable` is ordered by its own
+  `compareTo`. `.sortedArray()`/`.sortedArrayDescending()` answer an array,
+  `.maxWith`/`.minWith` take a comparator (`String.CASE_INSENSITIVE_ORDER`
+  included), and `.shuffled`/`.shuffle`/`.random` take a `kotlin.random.Random`.
+  A `Map` adds `.getOrPut(k) { }` (which
+  keys on a null VALUE, not on an absent key), the `java.util.Map` remapping
+  defaults `.merge`/`.compute`/`.computeIfAbsent`/`.computeIfPresent` (a null
+  answer removes the entry), `.getOrDefault(k, v)`,
   `.putAll(from)` (over a `Map` or an `Iterable<Pair>`) and `.clear()`. The
   `…OrNull` members answer `null` where their plain counterparts throw:
   `.maxOrNull()`/`.minOrNull()`, `.firstOrNull()`/`.lastOrNull()`,
@@ -440,7 +453,9 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   keeps JVM semantics: `==` is reference identity (`arrayOf(1) == arrayOf(1)` is
   `false`) and `toString()` is `[I@…`-style (the identity-hash digits are ours,
   the shape is Kotlin's).
-- **Math** — `kotlin.math` `abs`/`max`/`min`/`sqrt`/`floor`/`ceil`/`round` and
+- **Math** — `kotlin.math` `abs`/`max`/`min`/`sqrt`/`floor`/`ceil`/`round`, the
+  logarithms and `exp` (`ln`/`log10`/`log2`/`ln1p`/`log(x, base)`/`exp`, on a
+  port of fdlibm that matches the JVM's `StrictMath` bit for bit), and
   `PI`/`E`, gated on `import kotlin.math.*` (or a single-name import, honouring
   `as` renames) exactly as Kotlin gates them; the auto-imported `maxOf`/`minOf`
   — the numeric overloads for numbers and the `Comparable` ones for anything

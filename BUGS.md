@@ -18,8 +18,6 @@ shape. They are recorded here so the next round has the measurements.
 
 | program | kotlinrs | reference |
 | --- | --- | --- |
-| `class C { lateinit var s: String }` then `C().s` | parse error: `expected \`fun\` or a property, found Ident("lateinit")` | `kotlin.UninitializedPropertyAccessException: lateinit property s has not been initialized` |
-| `kotlin.math.ln(0.0)` | `unresolved reference: kotlin.math.ln` | `-Infinity` |
 | `"\uD83D".length` (a lone surrogate) | `invalid unicode scalar in literal` | `1` |
 
 ### `"%2147483647d".format(1)` — the oracle has no stable answer
@@ -114,6 +112,23 @@ rather than its own elements — which every member that snapshots elements
 understand. That is the whole change; the measurements above are its
 specification.
 
+### A comparator passed to a sorted-collection builder is not honoured
+
+`sortedSetOf` and `sortedMapOf` accept a leading `Comparator` in Kotlin, and
+the collection then orders — and de-duplicates — by it. kotlinrs orders every
+sorted collection naturally and has nowhere to keep a comparator: `sortedSetOf`
+takes it as one more element and `sortedMapOf` drops it. Both are wrong answers
+rather than refusals:
+
+| program | kotlinrs | reference |
+| --- | --- | --- |
+| `println(sortedSetOf(String.CASE_INSENSITIVE_ORDER, "b", "B", "a"))` | `[(lambda arity=2), B, a, b]` | `[a, b]` |
+| `println(sortedMapOf(String.CASE_INSENSITIVE_ORDER, "b" to 1, "B" to 2))` | `{B=2, b=1}` | `{b=2}` |
+
+Closing it needs the sorted collections' order to carry the comparator — a
+per-collection entry beside the one the hash order already keeps — and every
+insertion into them to call it re-entrantly.
+
 ## Still missing, with the measurement
 
 Each of these fails LOUDLY — an `unresolved reference` or a parse error — so
@@ -126,12 +141,12 @@ the next round starts from a measurement rather than a guess.
 | `"hello".replace(Regex("l+"), "L")` | `unresolved reference: Regex` | `heLo` |
 | `"a1b2".split(Regex("[0-9]"))` | `unresolved reference: Regex` | `[a, b, ]` |
 | `"a".toRegex()` | `unresolved reference: toRegex on String` | `a` |
+| `println(emptyArray<Int>().size)` | `unresolved reference: emptyArray` | `0` |
+| `listOf(3, 9).map(Int::inc)` | `unresolved reference: inc on Int` | `[4, 10]` |
 | `infix fun Int.pw(n: Int) = …; 2 pw 10` | `expected RParen, found Ident("pw")` | `1024` |
 | `listOf(1, 2, 3).forEach lit@{ if (it == 2) return@lit }` | `a label must precede a loop (`for`/`while`/`do`), found LBrace` | (runs; the label names the lambda) |
-| `listOf("a", "B").sortedWith(String.CASE_INSENSITIVE_ORDER)` | `unresolved reference: String` | `[a, B]` |
-| `listOf(1, 2, 3).random(kotlin.random.Random(1))` | `unresolved reference: kotlin` | `1` |
 
-`Regex` is the largest of the three by far: the class carries `find`/`findAll`/
+`Regex` is the largest by far: the class carries `find`/`findAll`/
 `matches`/`containsMatchIn`/`replace`/`split` plus `MatchResult`'s
 `value`/`groupValues`/`range`, and matching itself needs an engine this crate has
 no dependency for. The other two are parser gaps — a class declaration inside a
