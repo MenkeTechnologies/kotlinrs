@@ -845,3 +845,56 @@ kept `+` numeric when its receiver's own type went untracked.
 `Regex` (no engine dependency yet), a lone surrogate in a string literal, and a
 comparator passed to `sortedSetOf`/`sortedMapOf` — the last is a wrong answer and
 is recorded with its measurement in [BUGS.md](BUGS.md).
+
+## Round 14 — `Regex`, a comparator the sorted collections keep, and a captured `var` that is shared
+
+Measured against `kotlinc` 2.4.20 on the ambient JRE 17.0.4.1. The `Matcher`
+diagnostics quoted below are the same strings in the JDK 27 sources
+(`java.util.regex.Matcher.appendExpandedReplacement`, `Matcher.find(int)`).
+
+### Wrong answers, now right
+
+| program | before | reference |
+| --- | --- | --- |
+| `var x = 1; val f = { x }; x = 2; println(f())` | `1` | `2` |
+| `println(sortedSetOf(String.CASE_INSENSITIVE_ORDER, "b", "B", "a"))` | `[(lambda arity=2), B, a, b]` | `[a, b]` |
+| `println(sortedMapOf(String.CASE_INSENSITIVE_ORDER, "b" to 1, "B" to 2))` | `{B=2, b=1}` | `{b=2}` |
+
+A lambda or local `fun` receives its captures by value, and only a `var` the
+lambda itself ASSIGNED was moved into a shared cell. Kotlin shares every
+captured `var` that is modified anywhere, so a lambda that only reads one saw
+the value at capture time. The cell now covers any `var` a lambda or local `fun`
+mentions and the frame writes; a `for` variable is still fresh per iteration.
+
+A sorted collection now keeps the `Comparator` it was built with
+(`sortedSetOf(cmp, …)`, `sortedMapOf(cmp, …)`, `TreeSet(cmp)`, `TreeMap(cmp)`):
+it orders by it, and — as `java.util.TreeMap` does — identifies elements by it,
+so `add`/`put`/`contains`/`get`/`remove` treat two elements the comparator calls
+equal as one. A later `put` keeps the first key's spelling and takes the new
+value (`{a=0, Key=2}` after `Key`, then `KEY`).
+
+### Missing surface, now present
+
+- `kotlin.text.Regex` on the `fancy-regex` engine (look-around,
+  back-references, named groups): `Regex(p)`/`toRegex()`, `find`/`findAll`
+  (with `startIndex`), `matchEntire`/`matches`/`containsMatchIn`,
+  `replace`/`replaceFirst` with a replacement string or a transform lambda,
+  `split` (with `limit`), and `MatchResult`'s `value`/`range`/`groupValues`/
+  `groups` (by index or group name)/`destructured`/`next()`; `String.replace`/`replaceFirst`/`split`/
+  `matches`/`contains` with a `Regex` argument. `src/regex.rs` adapts the three
+  places `java.util.regex.Matcher` defines behaviour of its own: empty-match
+  iteration (`Regex("a*").findAll("baaa")` ranges `[0..-1, 1..3, 4..3]`),
+  whole-input matching that backtracks into a longer alternative (`a|ab`
+  matches `ab`), and `appendReplacement`'s greedy `$n`, `${name}` and `\`
+  rules with its exact diagnostics (`Illegal group reference: group index is
+  missing`, `named capturing group has 0 length name`, `No group 9`, …).
+- `lateinit var` at the top level and on a local, raising on a read before the
+  first write from a function, a lambda, or a local `fun`, with
+  `::top.isInitialized` on a top-level one.
+
+### Still open
+
+`RegexOption`, `Regex.escape`, and the infix spelling
+`input matches regex` (infix calls do not parse). A pattern the engine refuses
+raises `java.util.regex.PatternSyntaxException` with the Rust engine's
+description; see [BUGS.md](BUGS.md).

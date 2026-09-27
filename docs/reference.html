@@ -386,7 +386,7 @@ fun main() { println("before"); println(z); println(z) }</code></pre>
         <article class="doc-entry" id="doc-keywords-declarations-45">
           <h3><a class="doc-anchor" href="#doc-keywords-declarations-45">#</a> <code>lateinit</code></h3>
           <pre><code class="lang-kotlin">lateinit var name: T</code></pre>
-          <p>A class property with no initializer, assigned before first use. It must be a non-null, non-primitive <code>var</code>. Every read before the first write — through the instance, inside a member, or in an <code>init</code> block — raises <code>kotlin.UninitializedPropertyAccessException</code>; <code>this::name.isInitialized</code> asks without raising.</p>
+          <p>A class property, top-level property, or local with no initializer, assigned before first use. It must be a non-null, non-primitive <code>var</code>. Every read before the first write — through the instance, inside a member, in an <code>init</code> block, or from a lambda or local <code>fun</code> that captured a local — raises <code>kotlin.UninitializedPropertyAccessException</code>; <code>this::name.isInitialized</code> (or <code>::name.isInitialized</code> for a top-level one) asks without raising.</p>
           <pre><code class="lang-kotlin">class Conn { lateinit var host: String; fun ready() = this::host.isInitialized }
 fun main() { val c = Conn(); println(c.ready()); c.host = "db"; println(c.host) }   // false, db</code></pre>
         </article>
@@ -859,6 +859,20 @@ println(r.reversed())   // 5 downTo 1 step 1</code></pre>
           <pre><code class="lang-kotlin">fun fail(): Nothing = throw IllegalStateException("no")
 fun main() { println(try { fail() } catch (e: Exception) { "caught" }) }</code></pre>
         </article>
+        <article class="doc-entry" id="doc-types-21">
+          <h3><a class="doc-anchor" href="#doc-types-21">#</a> <code>Regex</code></h3>
+          <pre><code class="lang-kotlin">Regex(pattern: String)</code></pre>
+          <p>A compiled regular expression with <code>java.util.regex</code> semantics — look-around, back-references, named groups <code>(?&lt;name&gt;…)</code>, inline flags <code>(?i)</code>. <code>toString()</code> and <code>pattern</code> are the source pattern. A pattern the engine refuses raises <code>java.util.regex.PatternSyntaxException</code> (an <code>IllegalArgumentException</code>), whose description is the Rust engine's rather than <code>Pattern</code>'s. <code>RegexOption</code> and <code>Regex.escape</code> are not modelled.</p>
+          <pre><code class="lang-kotlin">val r = Regex("(\\w+)@(\\w+)")
+println(r.find("to: bob@site")?.groupValues)   // [bob@site, bob, site]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-22">
+          <h3><a class="doc-anchor" href="#doc-types-22">#</a> <code>MatchResult</code></h3>
+          <pre><code class="lang-kotlin">value: String · range: IntRange · groupValues: List&lt;String&gt; · groups: List&lt;MatchGroup?&gt; · destructured · next(): MatchResult?</code></pre>
+          <p>One match. <code>groupValues</code> holds the whole match then each group, <code>""</code> for a group that did not participate; <code>groups</code> holds a <code>MatchGroup(value, range)</code> or <code>null</code> per group, indexed by number or by group name (<code>groups["y"]</code>); <code>destructured</code> takes the groups after the whole match apart (<code>val (a, b) = m.destructured</code>); <code>next()</code> is the following match in the same input. Ranges and indices count UTF-16 units, as <code>String</code> indices do.</p>
+          <pre><code class="lang-kotlin">val m = Regex("(\\d)(x)?").find("a1")!!
+println(m.groupValues)   // [1, 1, ]</code></pre>
+        </article>
       </section>
 
       <section class="tutorial-section" id="ch-builtin-functions">
@@ -938,8 +952,9 @@ println(s.add(2))   // true</code></pre>
         </article>
         <article class="doc-entry" id="doc-builtin-functions-12">
           <h3><a class="doc-anchor" href="#doc-builtin-functions-12">#</a> <code>sortedSetOf</code></h3>
-          <pre><code class="lang-kotlin">sortedSetOf(vararg elements: T): MutableSet&lt;T&gt;</code></pre>
-          <p>Builds a <code>TreeSet</code> — the elements in ascending natural order, whatever order they were given in, and kept that way as more are added.</p>
+          <pre><code class="lang-kotlin">sortedSetOf(vararg elements: T): MutableSet&lt;T&gt;
+sortedSetOf(comparator: Comparator&lt;in T&gt;, vararg elements: T): MutableSet&lt;T&gt;</code></pre>
+          <p>Builds a <code>TreeSet</code> — the elements in ascending natural order, whatever order they were given in, and kept that way as more are added. Given a leading <code>Comparator</code> (a <code>compareBy</code> chain, <code>String.CASE_INSENSITIVE_ORDER</code>, a two-argument lambda), the set orders by it and treats two elements it calls equal as one; <code>contains</code>/<code>remove</code> find elements through it. <code>sortedMapOf</code> and <code>TreeMap</code> take one the same way.</p>
           <pre><code class="lang-kotlin">println(sortedSetOf(3, 1, 2))   // [1, 2, 3]</code></pre>
         </article>
         <article class="doc-entry" id="doc-builtin-functions-13">
@@ -997,8 +1012,8 @@ println(m)   // {a=1}</code></pre>
         </article>
         <article class="doc-entry" id="doc-builtin-functions-21">
           <h3><a class="doc-anchor" href="#doc-builtin-functions-21">#</a> <code>TreeSet</code></h3>
-          <pre><code class="lang-kotlin">TreeSet(): MutableSet&lt;T&gt; / TreeSet(other: Collection&lt;T&gt;): MutableSet&lt;T&gt;</code></pre>
-          <p>The ascending-order set constructor, as <code>sortedSetOf</code> builds.</p>
+          <pre><code class="lang-kotlin">TreeSet(): MutableSet&lt;T&gt; / TreeSet(other: Collection&lt;T&gt;): MutableSet&lt;T&gt; / TreeSet(comparator: Comparator&lt;in T&gt;): MutableSet&lt;T&gt;</code></pre>
+          <p>The ascending-order set constructor, as <code>sortedSetOf</code> builds — ordered by the comparator when given one.</p>
           <pre><code class="lang-kotlin">println(TreeSet(listOf(3, 1, 2)))   // [1, 2, 3]</code></pre>
         </article>
         <article class="doc-entry" id="doc-builtin-functions-22">
@@ -1401,6 +1416,12 @@ try { x!! } catch (e: NullPointerException) { println("caught") }</code></pre>
           <pre><code class="lang-kotlin">class Conn { lateinit var host: String }
 fun main() { try { Conn().host } catch (e: UninitializedPropertyAccessException) { println(e.message) } }</code></pre>
         </article>
+        <article class="doc-entry" id="doc-throwables-18">
+          <h3><a class="doc-anchor" href="#doc-throwables-18">#</a> <code>PatternSyntaxException</code></h3>
+          <pre><code class="lang-kotlin">java.util.regex.PatternSyntaxException</code></pre>
+          <p>Raised by <code>Regex(pattern)</code> for a pattern the engine refuses. An <code>IllegalArgumentException</code>; its message is the Rust engine's description, not <code>Pattern</code>'s.</p>
+          <pre><code class="lang-kotlin">try { Regex("(a") } catch (e: IllegalArgumentException) { println("bad") }</code></pre>
+        </article>
       </section>
 
       <section class="tutorial-section" id="ch-string-members">
@@ -1493,7 +1514,7 @@ println("abc".contains('b'))     // true</code></pre>
         <article class="doc-entry" id="doc-string-members-15">
           <h3><a class="doc-anchor" href="#doc-string-members-15">#</a> <code>replace</code></h3>
           <pre><code class="lang-kotlin">String.replace(old: Any, new: Any): String</code></pre>
-          <p>Replaces every occurrence of a literal substring. There is no <code>Regex</code> overload and no <code>ignoreCase</code> parameter.</p>
+          <p>Replaces every occurrence of a literal substring, folding case under <code>ignoreCase = true</code>. With a <code>Regex</code> first argument it replaces every match — see <code>replaceFirst</code> for the replacement-string rules.</p>
           <pre><code class="lang-kotlin">println("a-b-c".replace("-", "+"))   // a+b+c</code></pre>
         </article>
         <article class="doc-entry" id="doc-string-members-16">
@@ -1516,7 +1537,13 @@ String.substring(start: Int, end: Int): String</code></pre>
           <pre><code class="lang-kotlin">println("hello".substring(1, 3))   // el</code></pre>
         </article>
         <article class="doc-entry" id="doc-string-members-19">
-          <h3><a class="doc-anchor" href="#doc-string-members-19">#</a> <code>CASE_INSENSITIVE_ORDER</code></h3>
+          <h3><a class="doc-anchor" href="#doc-string-members-19">#</a> <code>toRegex</code></h3>
+          <pre><code class="lang-kotlin">String.toRegex(): Regex</code></pre>
+          <p>The <code>Regex</code> compiled from the receiver — what <code>Regex(this)</code> builds.</p>
+          <pre><code class="lang-kotlin">println("a1b22".split("[0-9]+".toRegex()))   // [a, b, ]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-members-20">
+          <h3><a class="doc-anchor" href="#doc-string-members-20">#</a> <code>CASE_INSENSITIVE_ORDER</code></h3>
           <pre><code class="lang-kotlin">String.CASE_INSENSITIVE_ORDER: Comparator&lt;String&gt;</code></pre>
           <p>The JDK comparator that is <code>compareTo(other, ignoreCase = true)</code>. A comparator value also answers <code>compare(a, b)</code>.</p>
           <pre><code class="lang-kotlin">println(listOf("b", "A", "c").sortedWith(String.CASE_INSENSITIVE_ORDER))   // [A, b, c]</code></pre>
@@ -2536,6 +2563,60 @@ Result&lt;T&gt;.isFailure: Boolean</code></pre>
           <p>Which branch of the union the result holds. <code>onSuccess</code>/<code>onFailure</code> run a block for the matching branch and yield the result unchanged; <code>map</code> transforms a success and passes a failure through.</p>
           <pre><code class="lang-kotlin">println(runCatching { 6 / 2 }.isSuccess)   // true
 println(runCatching { 6 / 2 }.map { it + 1 })   // Success(4)</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-regex-members">
+        <h2>Regex Members</h2>
+        <article class="doc-entry" id="doc-regex-members-1">
+          <h3><a class="doc-anchor" href="#doc-regex-members-1">#</a> <code>find</code></h3>
+          <pre><code class="lang-kotlin">Regex.find(input: CharSequence, startIndex: Int = 0): MatchResult?</code></pre>
+          <p>The first match at or after <code>startIndex</code>, or <code>null</code>. A <code>startIndex</code> outside <code>0..input.length</code> is <code>IndexOutOfBoundsException: Illegal start index</code>. (On a collection, <code>find { … }</code> is the predicate search.)</p>
+          <pre><code class="lang-kotlin">println(Regex("o").find("foo boo", 3)?.range)   // 5..5</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-regex-members-2">
+          <h3><a class="doc-anchor" href="#doc-regex-members-2">#</a> <code>findAll</code></h3>
+          <pre><code class="lang-kotlin">Regex.findAll(input: CharSequence, startIndex: Int = 0): Sequence&lt;MatchResult&gt;</code></pre>
+          <p>Every match, in <code>Matcher.find()</code> order: after an empty match the search resumes one character later, and an empty match right after a non-empty one is reported. The matches are found eagerly and handed back as a <code>Sequence</code>.</p>
+          <pre><code class="lang-kotlin">println(Regex("a*").findAll("baaa").map { it.range }.toList())   // [0..-1, 1..3, 4..3]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-regex-members-3">
+          <h3><a class="doc-anchor" href="#doc-regex-members-3">#</a> <code>matchEntire</code></h3>
+          <pre><code class="lang-kotlin">Regex.matchEntire(input: CharSequence): MatchResult?</code></pre>
+          <p>The match spanning the whole input, or <code>null</code> — found as <code>Matcher.matches()</code> finds it, backtracking into a longer alternative (<code>a|ab</code> matches all of <code>ab</code>).</p>
+          <pre><code class="lang-kotlin">println(Regex("a|ab").matchEntire("ab")?.value)   // ab</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-regex-members-4">
+          <h3><a class="doc-anchor" href="#doc-regex-members-4">#</a> <code>matches</code></h3>
+          <pre><code class="lang-kotlin">Regex.matches(input: CharSequence): Boolean
+CharSequence.matches(regex: Regex): Boolean</code></pre>
+          <p>Whether the WHOLE input matches, by <code>matchEntire</code>'s rule. The infix spelling <code>input matches regex</code> is not parsed; call it as a member.</p>
+          <pre><code class="lang-kotlin">println(Regex("\\d+").matches("123"))   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-regex-members-5">
+          <h3><a class="doc-anchor" href="#doc-regex-members-5">#</a> <code>containsMatchIn</code></h3>
+          <pre><code class="lang-kotlin">Regex.containsMatchIn(input: CharSequence): Boolean
+CharSequence.contains(regex: Regex): Boolean</code></pre>
+          <p>Whether any part of the input matches.</p>
+          <pre><code class="lang-kotlin">println("A1b2".contains(Regex("[0-9]")))   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-regex-members-6">
+          <h3><a class="doc-anchor" href="#doc-regex-members-6">#</a> <code>replaceFirst</code></h3>
+          <pre><code class="lang-kotlin">String.replaceFirst(old: String, new: String): String
+Regex.replace(input: CharSequence, replacement: String): String
+Regex.replace(input: CharSequence, transform: (MatchResult) -&gt; CharSequence): String
+Regex.replaceFirst(input: CharSequence, replacement: String): String
+CharSequence.replace(regex: Regex, replacement: String): String</code></pre>
+          <p>The first occurrence replaced; on a <code>Regex</code>, <code>replace</code> replaces every match and <code>replaceFirst</code> the first. A replacement STRING given with a <code>Regex</code> follows <code>Matcher.appendReplacement</code>: <code>$n</code> is the longest group number not past the group count (<code>$12</code> with one group is group 1 then <code>2</code>), <code>${name}</code> a named group, <code>\\c</code> a literal <code>c</code>, and a malformed reference raises its <code>IllegalArgumentException</code>/<code>IndexOutOfBoundsException</code>. A <code>transform</code> lambda's answer is inserted literally.</p>
+          <pre><code class="lang-kotlin">println(Regex("(\\w+)@(\\w+)").replace("bob@site", "$2:$1"))   // site:bob</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-regex-members-7">
+          <h3><a class="doc-anchor" href="#doc-regex-members-7">#</a> <code>split</code></h3>
+          <pre><code class="lang-kotlin">String.split(vararg delimiters: String, ignoreCase: Boolean = false): List&lt;String&gt;
+Regex.split(input: CharSequence, limit: Int = 0): List&lt;String&gt;
+CharSequence.split(regex: Regex, limit: Int = 0): List&lt;String&gt;</code></pre>
+          <p>The text between delimiter occurrences or regex matches. Kotlin keeps the trailing empty strings <code>String.split</code> in Java drops; a positive <code>limit</code> caps the number of pieces, the last holding the rest.</p>
+          <pre><code class="lang-kotlin">println("a,b,,c,,".split(Regex(",")))   // [a, b, , c, , ]</code></pre>
         </article>
       </section>
 

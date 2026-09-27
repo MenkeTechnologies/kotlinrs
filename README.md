@@ -180,9 +180,20 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 - **Delegated properties** — `by lazy`, a user delegate declaring
   `operator fun getValue`/`setValue` (on a class property or a local), and
   `Delegates.observable`/`vetoable`.
-- **`lateinit var`** — a class property with no initializer whose read before
-  the first write (through the instance, in a member, or in an `init` block) is
-  `kotlin.UninitializedPropertyAccessException`, and `this::p.isInitialized`.
+- **`lateinit var`** — a class property, top-level property, or local with no
+  initializer whose read before the first write (through the instance, in a
+  member, in an `init` block, or from a lambda or local `fun`) is
+  `kotlin.UninitializedPropertyAccessException`, and `this::p.isInitialized` /
+  `::top.isInitialized`.
+- **`kotlin.text.Regex`** — on the `fancy-regex` engine (look-around,
+  back-references, named groups): `find`/`findAll`/`matchEntire`/`matches`/
+  `containsMatchIn`, `replace`/`replaceFirst` with `Matcher.appendReplacement`
+  group references or a transform lambda, `split`, `MatchResult` (`value`,
+  `range`, `groupValues`, `groups`, `destructured`, `next()`), and the `String`
+  members that take a `Regex`. `RegexOption` and `Regex.escape` are not modelled.
+- **Sorted collections with a comparator** — `sortedSetOf(cmp, …)`,
+  `sortedMapOf(cmp, …)`, `TreeSet(cmp)`, `TreeMap(cmp)` order by the comparator
+  and identify elements by it, as `java.util.TreeMap` does.
 - **`kotlin.random`** — `Random(seed)` is the stdlib's `XorWowRandom`, so a
   seeded program draws the reference's exact numbers through every `next…`
   member; `Random.Default` backs the unseeded forms.
@@ -1622,10 +1633,8 @@ every column doubles with the input out to 40 000; the 80 000 `hashMapOf` cell
 varied from 0.81 s to 1.32 s across repetitions and is reported as the minimum
 rather than trusted to three digits.
 
-Next: `Regex` in every spelling, `sequence { … }`/`yield`, `lateinit`,
-`Throwable.cause` and the
-`(message, cause)` constructors, variance and bounds,
-`Delegates.observable`/`vetoable`, and a growing standard-library surface —
+Next: `RegexOption` and `Regex.escape`, `infix` calls, labels on lambda
+literals, variance and bounds, and a growing standard-library surface —
 alongside the sibling parity tooling (LSP/DAP, reference generator, differential
 harness). Open divergences are tracked in [BUGS.md](BUGS.md); the round-by-round
 record continues in [CHANGELOG.md](CHANGELOG.md).

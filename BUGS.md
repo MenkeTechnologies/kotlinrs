@@ -120,26 +120,38 @@ the next round starts from a measurement rather than a guess.
 
 | program | kotlinrs | reference |
 | --- | --- | --- |
-| `Regex("[0-9]+").findAll("a1b22c").map { it.value }.toList()` | `unresolved reference: Regex` | `[1, 22]` |
-| `"hello".replace(Regex("l+"), "L")` | `unresolved reference: Regex` | `heLo` |
-| `"a1b2".split(Regex("[0-9]"))` | `unresolved reference: Regex` | `[a, b, ]` |
-| `"a".toRegex()` | `unresolved reference: toRegex on String` | `a` |
 | `println(emptyArray<Int>().size)` | `unresolved reference: emptyArray` | `0` |
 | `listOf(3, 9).map(Int::inc)` | `unresolved reference: inc on Int` | `[4, 10]` |
 | `infix fun Int.pw(n: Int) = …; 2 pw 10` | `expected RParen, found Ident("pw")` | `1024` |
 | `listOf(1, 2, 3).forEach lit@{ if (it == 2) return@lit }` | `a label must precede a loop (`for`/`while`/`do`), found LBrace` | (runs; the label names the lambda) |
 
-`Regex` is the largest by far: the class carries `find`/`findAll`/
-`matches`/`containsMatchIn`/`replace`/`split` plus `MatchResult`'s
-`value`/`groupValues`/`range`, and matching itself needs an engine this crate has
-no dependency for. The other two are parser gaps — a class declaration inside a
-function body, and a label on a lambda literal rather than on a loop.
+The last two are parser gaps — an `infix` call, and a label on a lambda literal
+rather than on a loop.
 
 `Double.MIN_VALUE` is absent deliberately and for a different reason: it is the
 shortest decimal that round-trips a subnormal, and this frontend carries every
 floating value as an `f64`, so it would print `5.0E-324` where Kotlin prints
 `4.9E-324`. Leaving it unresolved keeps that divergence out of running programs
 (see `primitive_const` in `src/compiler.rs`).
+
+## `Regex` — what is not modelled
+
+`Regex` runs on `fancy-regex`, not `java.util.regex.Pattern`, and three parts of
+the Kotlin surface are absent. Each fails loudly:
+
+| program | kotlinrs | reference |
+| --- | --- | --- |
+| `Regex("a", RegexOption.IGNORE_CASE).matches("A")` | `unresolved reference: Regex` | `true` |
+| `Regex.escape("a.b")` | `unresolved reference: Regex` | `\Qa.b\E` |
+| `"7" matches Regex("\\d")` | `expected RParen, found Ident("matches")` | `true` |
+
+`(?i)` inline flags cover the first; the member spelling `"7".matches(r)` covers
+the last. One divergence is a different MESSAGE rather than a refusal: a pattern
+the engine rejects raises `java.util.regex.PatternSyntaxException` (catchable as
+the `IllegalArgumentException` it is), but the description after the class name
+is the Rust engine's, not `Pattern`'s `… near index N` with its caret line.
+Pattern dialects differ at the edges too — `fancy-regex` has no `\Q…\E`
+quoting, so such a pattern is refused rather than matched differently.
 
 ## A lone surrogate has no `String` to live in
 
