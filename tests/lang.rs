@@ -6642,6 +6642,56 @@ fn lateinit_top_level_and_local_raise_until_written() {
 }
 
 #[test]
+fn a_sorted_collection_built_with_a_comparator_orders_and_dedups_by_it() {
+    // `sortedSetOf`/`sortedMapOf`/`TreeSet`/`TreeMap` take a leading
+    // `Comparator`, and the collection then orders AND identifies its elements
+    // by it: two keys it calls equal are one key (the first spelling stays, a
+    // map takes the later value), and `contains`/`get`/`remove` find elements
+    // through it rather than `equals`. Measured on kotlinc 2.4.20.
+    assert_eq!(
+        prog(
+            "import java.util.TreeSet\n\
+             import java.util.TreeMap\n\
+             fun main() {\n\
+                 println(sortedSetOf(String.CASE_INSENSITIVE_ORDER, \"b\", \"B\", \"a\"))\n\
+                 println(sortedMapOf(String.CASE_INSENSITIVE_ORDER, \"b\" to 1, \"B\" to 2))\n\
+                 val s = sortedSetOf(compareByDescending<Int> { it }, 3, 1, 2)\n\
+                 s.add(5); s.add(0); s.add(3); println(s)\n\
+                 println(s.contains(2)); println(2 in s); println(s.first()); println(s.last())\n\
+                 val m = sortedMapOf(compareByDescending<String> { it }, \"a\" to 1, \"c\" to 3, \"b\" to 2)\n\
+                 m[\"d\"] = 4; println(m); println(m[\"c\"]); println(m.keys)\n\
+                 val t = TreeSet<String>(compareBy { it.length })\n\
+                 t.add(\"ccc\"); t.add(\"a\"); t.add(\"bb\"); t.add(\"dd\"); println(t)\n\
+                 val ci = sortedSetOf(compareBy<String> { it.lowercase() }, \"X\", \"y\", \"x\")\n\
+                 println(ci); println(ci.contains(\"Y\")); ci.remove(\"x\"); println(ci)\n\
+                 val tm = TreeMap<String, Int>(String.CASE_INSENSITIVE_ORDER)\n\
+                 tm[\"Key\"] = 1; tm[\"KEY\"] = 2; tm[\"a\"] = 0\n\
+                 println(tm); println(tm[\"key\"]); println(tm.containsKey(\"kEy\"))\n\
+                 println(sortedSetOf(3, 1, 2))\n\
+             }"
+        ),
+        "[a, b]\n\
+         {b=2}\n\
+         [5, 3, 2, 1, 0]\n\
+         true\n\
+         true\n\
+         5\n\
+         0\n\
+         {d=4, c=3, b=2, a=1}\n\
+         3\n\
+         [d, c, b, a]\n\
+         [a, bb, ccc]\n\
+         [X, y]\n\
+         true\n\
+         [y]\n\
+         {a=0, Key=2}\n\
+         2\n\
+         true\n\
+         [1, 2, 3]\n"
+    );
+}
+
+#[test]
 fn a_captured_var_modified_after_capture_is_shared() {
     // Kotlin wraps a captured `var` that is modified anywhere in a `Ref`, so a
     // lambda or local `fun` that only READS it still sees a later write from

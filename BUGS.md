@@ -112,23 +112,6 @@ rather than its own elements — which every member that snapshots elements
 understand. That is the whole change; the measurements above are its
 specification.
 
-### A comparator passed to a sorted-collection builder is not honoured
-
-`sortedSetOf` and `sortedMapOf` accept a leading `Comparator` in Kotlin, and
-the collection then orders — and de-duplicates — by it. kotlinrs orders every
-sorted collection naturally and has nowhere to keep a comparator: `sortedSetOf`
-takes it as one more element and `sortedMapOf` drops it. Both are wrong answers
-rather than refusals:
-
-| program | kotlinrs | reference |
-| --- | --- | --- |
-| `println(sortedSetOf(String.CASE_INSENSITIVE_ORDER, "b", "B", "a"))` | `[(lambda arity=2), B, a, b]` | `[a, b]` |
-| `println(sortedMapOf(String.CASE_INSENSITIVE_ORDER, "b" to 1, "B" to 2))` | `{B=2, b=1}` | `{b=2}` |
-
-Closing it needs the sorted collections' order to carry the comparator — a
-per-collection entry beside the one the hash order already keeps — and every
-insertion into them to call it re-entrantly.
-
 ## Still missing, with the measurement
 
 Each of these fails LOUDLY — an `unresolved reference` or a parse error — so

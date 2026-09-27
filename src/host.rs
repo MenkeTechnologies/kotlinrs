@@ -659,6 +659,15 @@ thread_local! {
     static COLL_ORDER: RefCell<std::collections::HashMap<u32, CollOrder>> =
         RefCell::new(std::collections::HashMap::new());
 
+    /// The `Comparator` a sorted `Set`/`Map` was built with —
+    /// `sortedSetOf(cmp, …)`, `sortedMapOf(cmp, …)`, `TreeSet(cmp)`,
+    /// `TreeMap(cmp)`. It decides both the order and which elements are the
+    /// SAME one: a `TreeSet` treats two elements its comparator calls equal as
+    /// one, whatever their `equals` says. A sorted collection with no entry
+    /// orders naturally.
+    static COLL_CMP: RefCell<std::collections::HashMap<u32, Value>> =
+        RefCell::new(std::collections::HashMap::new());
+
     /// The handles built by a READ-ONLY `Set`/`Map` literal — see
     /// [`COLL_LITERAL`]. What a list records in [`LIST_IMPL`], for the two
     /// collections that have no such tag of their own.
@@ -984,6 +993,71 @@ fn order_of(v: &Value) -> Option<CollOrder> {
     }
 }
 
+/// The comparator a sorted collection was built with, if any — see [`COLL_CMP`].
+fn comparator_of(v: &Value) -> Option<Value> {
+    match v {
+        Value::Obj(id) => COLL_CMP.with(|c| c.borrow().get(id).cloned()),
+        _ => None,
+    }
+}
+
+/// Whether `v` can be a sorted collection's comparator: a `compareBy` chain,
+/// or a two-argument lambda (`Comparator { a, b -> … }`,
+/// `String.CASE_INSENSITIVE_ORDER`).
+fn is_comparator(v: &Value) -> bool {
+    comparator_keys(v).is_some() || closure_meta(v).is_some_and(|(_, params, _)| params == 2)
+}
+
+/// Take the leading comparator off a SORTED builder's arguments —
+/// `sortedSetOf(cmp, a, b)`, `TreeMap(cmp)` — and answer it.
+fn take_comparator(spec: &CollSpec, args: &mut Vec<Value>) -> Option<Value> {
+    if spec.order != Some(CollOrder::Sorted) || !args.first().is_some_and(is_comparator) {
+        return None;
+    }
+    Some(args.remove(0))
+}
+
+/// Record the comparator a sorted builder took, when it took one.
+fn record_comparator(v: &Value, cmp: Option<Value>) {
+    if let (Value::Obj(id), Some(c)) = (v, cmp) {
+        COLL_CMP.with(|t| t.borrow_mut().insert(*id, c));
+    }
+}
+
+/// Whether `cmp` calls `probe` and `stored` the same element, asked the way
+/// `java.util.TreeMap` asks: `compare(probe, stored) == 0`. A comparator that
+/// throws faults the run and answers `false`.
+fn cmp_same(vm: &mut VM, cmp: &Value, probe: &Value, stored: &Value) -> bool {
+    match compare_with(vm, cmp, probe, stored) {
+        Ok(r) => r == 0,
+        Err(e) => {
+            fault(vm, e);
+            false
+        }
+    }
+}
+
+/// The positions of `keys` in ascending order under `cmp`, ties keeping their
+/// arrival order. A binary insertion rather than `sort_by`, whose contract a
+/// user comparator need not honour: an inconsistent one must give some order,
+/// not a panic.
+fn sort_by_comparator(vm: &mut VM, cmp: &Value, keys: &[Value]) -> Result<Vec<usize>, String> {
+    let mut order: Vec<usize> = Vec::with_capacity(keys.len());
+    for i in 0..keys.len() {
+        let (mut lo, mut hi) = (0, order.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if compare_with(vm, cmp, &keys[i], &keys[order[mid]])? < 0 {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        order.insert(lo, i);
+    }
+    Ok(order)
+}
+
 /// Note that `v`'s stored sequence is no longer in its iteration order, so the
 /// next reader that CARES restores it. O(1), and nothing at all for the
 /// insertion-ordered collections, which have no [`COLL_ORDER`] entry.
@@ -1125,11 +1199,20 @@ fn reorder(vm: &mut VM, v: &Value) {
     };
     let order = match ord {
         CollOrder::Hash(initial) => hash_order(vm, &keys, initial),
-        CollOrder::Sorted => {
-            let mut idx: Vec<usize> = (0..keys.len()).collect();
-            idx.sort_by(|&a, &b| value_cmp(&keys[a], &keys[b]));
-            idx
-        }
+        CollOrder::Sorted => match comparator_of(v) {
+            Some(cmp) => match sort_by_comparator(vm, &cmp, &keys) {
+                Ok(idx) => idx,
+                Err(e) => {
+                    fault(vm, e);
+                    return;
+                }
+            },
+            None => {
+                let mut idx: Vec<usize> = (0..keys.len()).collect();
+                idx.sort_by(|&a, &b| value_cmp(&keys[a], &keys[b]));
+                idx
+            }
+        },
     };
     with_obj_mut(v, |o| match o {
         HeapObj::Map(entries) => {
@@ -1664,6 +1747,7 @@ fn reset_heap() {
     HEAP.with(|h| h.borrow_mut().clear());
     CAUSES.with(|c| c.borrow_mut().clear());
     COLL_ORDER.with(|c| c.borrow_mut().clear());
+    COLL_CMP.with(|c| c.borrow_mut().clear());
     COLL_UNORDERED.with(|d| d.borrow_mut().clear());
     COLL_LITERAL_TAG.with(|t| t.borrow_mut().clear());
     MAP_INDEX.with(|t| t.borrow_mut().clear());
@@ -4094,6 +4178,9 @@ fn contains_value(vm: &mut VM, container: &Value, value: &Value) -> bool {
     if let Value::Str(s) = container {
         return s.contains(&kotlin_string(value));
     }
+    if comparator_of(container).is_some() {
+        return key_position(vm, container, value).is_some();
+    }
     // A range answers without any element comparison. Everything else hands back
     // its elements so the search runs OUTSIDE the heap borrow: an `equals`
     // override allocates, and comparing under `with_obj`'s shared borrow would
@@ -4893,6 +4980,7 @@ fn b_map_new(vm: &mut VM, argc: u8) -> Value {
         pairs.push(vm.pop());
     }
     pairs.reverse();
+    let cmp = take_comparator(&spec, &mut pairs);
     // The copy form `HashMap(other)` takes ONE map and re-buckets its entries;
     // the builder form takes `k to v` pairs.
     let sources: Vec<(Value, Value)> = if spec.copy {
@@ -4911,10 +4999,20 @@ fn b_map_new(vm: &mut VM, argc: u8) -> Value {
     };
     let mut entries: Vec<(Value, Value)> = Vec::with_capacity(sources.len());
     for (k, v) in sources {
-        map_upsert(vm, &mut entries, k, v);
+        match &cmp {
+            // `TreeMap.put` under a comparator: an existing key the comparator
+            // calls equal keeps its place and its own spelling, and takes the
+            // new value.
+            Some(c) => match entries.iter().position(|(e, _)| cmp_same(vm, c, &k, e)) {
+                Some(i) => entries[i].1 = v,
+                None => entries.push((k, v)),
+            },
+            None => map_upsert(vm, &mut entries, k, v),
+        }
     }
     let n = entries.len();
     let m = alloc(HeapObj::Map(entries));
+    record_comparator(&m, cmp);
     spec.apply(vm, &m, n);
     m
 }
@@ -4945,14 +5043,29 @@ fn b_set_new(vm: &mut VM, argc: u8) -> Value {
         vals.push(vm.pop());
     }
     vals.reverse();
+    let cmp = take_comparator(&spec, &mut vals);
     // `HashSet(other)` copies the argument's elements; `hashSetOf(a, b)` takes
     // the arguments themselves.
     if spec.copy {
         vals = vals.first().and_then(as_iterable).unwrap_or_default();
     }
-    let items = distinct(vm, &vals);
+    let items = match &cmp {
+        // `TreeSet.add` under a comparator: the first of the elements it calls
+        // equal stays, and the rest are not added.
+        Some(c) => {
+            let mut out: Vec<Value> = Vec::with_capacity(vals.len());
+            for v in vals {
+                if !out.iter().any(|e| cmp_same(vm, c, &v, e)) {
+                    out.push(v);
+                }
+            }
+            out
+        }
+        None => distinct(vm, &vals),
+    };
     let n = items.len();
     let s = alloc(HeapObj::Set(items));
+    record_comparator(&s, cmp);
     spec.apply(vm, &s, n);
     s
 }
@@ -10676,6 +10789,16 @@ fn sequence_member(
                 items[from as usize..to as usize].to_vec(),
             ))));
         }
+        // A sorted set built with a comparator finds its elements by that
+        // comparator, not by `equals` — see [`COLL_CMP`].
+        "contains" | "containsAll" if recv.and_then(comparator_of).is_some() => {
+            let recv = recv.expect("guarded above");
+            let wanted = match name {
+                "contains" => args.first().cloned().into_iter().collect(),
+                _ => args.first().map(sequence_items).unwrap_or_default(),
+            };
+            Value::Bool(wanted.iter().all(|w| key_position(vm, recv, w).is_some()))
+        }
         "contains" => {
             let needle = args.first().cloned();
             Value::Bool(needle.is_some_and(|a| items.iter().any(|v| member_eq(vm, v, &a, hashed))))
@@ -11417,6 +11540,18 @@ fn key_index_candidates(recv: &Value, q: &Value) -> Option<Vec<usize>> {
 /// the mutation takes would panic, which is why every mutator below locates
 /// first and mutates second.
 fn key_position(vm: &mut VM, recv: &Value, v: &Value) -> Option<usize> {
+    // A sorted collection built with a comparator finds its element by that
+    // comparator alone, as `TreeMap.getEntryUsingComparator` does — `equals`
+    // and `hashCode` never enter it, so the key index cannot answer either.
+    if let Some(cmp) = comparator_of(recv) {
+        let keys = with_obj(recv, |o| match o {
+            HeapObj::Set(items) => items.clone(),
+            HeapObj::Map(entries) => entries.iter().map(|(k, _)| k.clone()).collect(),
+            _ => Vec::new(),
+        })
+        .unwrap_or_default();
+        return keys.iter().position(|k| cmp_same(vm, &cmp, v, k));
+    }
     // A `Map` asks its [`KeyIndex`] first. The candidates it answers with are
     // still confirmed below with the same `member_eq` the scan uses, so this
     // changes which keys are COMPARED and nothing about the verdict.
