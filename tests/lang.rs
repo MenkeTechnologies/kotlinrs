@@ -6591,3 +6591,48 @@ fn lateinit_properties_raise_until_written() {
         assert!(err.contains("lateinit"), "{bad}: stderr was: {err}");
     }
 }
+
+#[test]
+fn descending_sorts_are_stable_and_in_place_sorts_use_compare_to() {
+    // `sortedDescending()`/`sortDescending()` are `sortWith(reverseOrder())`:
+    // stable, so elements that compare equal keep their order — a sort
+    // followed by `reverse()` flipped them. The in-place `sort()` orders a
+    // `Comparable` by its own `compareTo`, and comparing inside the heap borrow
+    // used to panic. `sortedArray()` answers an array of the receiver's kind.
+    // Measured on kotlinc 2.4.20 / JDK 21.
+    assert_eq!(
+        prog(
+            "data class P(val k: Int, val t: String) : Comparable<P> {\n\
+                 override fun compareTo(other: P) = k.compareTo(other.k)\n\
+             }\n\
+             fun main() {\n\
+                 val l = listOf(P(1, \"a\"), P(2, \"b\"), P(1, \"c\"), P(2, \"d\"))\n\
+                 println(l.sortedDescending())\n\
+                 val m = l.toMutableList(); m.sort(); println(m)\n\
+                 m.sortDescending(); println(m)\n\
+                 println(arrayOf(P(1, \"a\"), P(2, \"b\"), P(1, \"c\")).sortedArrayDescending().toList())\n\
+                 println(arrayOf(3, 1, 2).sortedArray().toList() + intArrayOf(5, 4).sortedArray().toList())\n\
+                 println(doubleArrayOf(2.0, -1.0).sortedArrayDescending().contentToString())\n\
+                 val e = arrayOf<Int>(); println(e.sortedArray() === e)\n\
+             }"
+        ),
+        "[P(k=2, t=b), P(k=2, t=d), P(k=1, t=a), P(k=1, t=c)]\n\
+         [P(k=1, t=a), P(k=1, t=c), P(k=2, t=b), P(k=2, t=d)]\n\
+         [P(k=2, t=b), P(k=2, t=d), P(k=1, t=a), P(k=1, t=c)]\n\
+         [P(k=2, t=b), P(k=1, t=a), P(k=1, t=c)]\n\
+         [1, 2, 3, 4, 5]\n\
+         [2.0, -1.0]\n\
+         true\n"
+    );
+}
+
+#[test]
+fn a_collection_result_of_an_untracked_receiver_keeps_plus_as_a_collection_op() {
+    // `arr.toList()` names a `List` by the stdlib signature even where the
+    // array's own type went untracked; its `+` is the collection convention,
+    // not the numeric add that answered `0.0`.
+    assert_eq!(
+        stdout("println(arrayOf(3, 1, 2).toList() + listOf(9)); val m = mutableListOf(1); println(m.toList() + 5)"),
+        "[3, 1, 2, 9]\n[1, 5]\n"
+    );
+}

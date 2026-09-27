@@ -6231,17 +6231,35 @@ fn compare_vm(vm: &mut VM, a: &Value, b: &Value) -> std::cmp::Ordering {
 /// the indices, which is what keeps every `compareTo` call outside the sort's
 /// own borrow. A user-`Comparable` list is short in practice; a list of
 /// anything else never reaches here, because the registry is empty for it.
-fn sort_vm(vm: &mut VM, items: &mut [Value]) {
+///
+/// `descending` sorts in DESCENDING order — `sortWith(reverseOrder())`,
+/// which is how the stdlib spells `sortedDescending`/`sortDescending` over a
+/// `Comparable`. It is a stable sort by the reversed comparator, not a sort
+/// followed by `reverse()`: elements that compare equal keep their original
+/// relative order either way.
+fn sort_vm(vm: &mut VM, items: &mut [Value], descending: bool) {
+    let before = if descending {
+        std::cmp::Ordering::Greater
+    } else {
+        std::cmp::Ordering::Less
+    };
     let ordered = COMPARE_SUBS.with(|t| !t.borrow().is_empty());
     if !ordered {
-        items.sort_by(value_cmp);
+        items.sort_by(|a, b| {
+            let o = value_cmp(a, b);
+            if descending {
+                o.reverse()
+            } else {
+                o
+            }
+        });
         return;
     }
     for i in 1..items.len() {
         let mut j = i;
         while j > 0 {
             let (a, b) = (items[j].clone(), items[j - 1].clone());
-            if compare_vm(vm, &a, &b) != std::cmp::Ordering::Less {
+            if compare_vm(vm, &a, &b) != before {
                 break;
             }
             items.swap(j, j - 1);
@@ -9633,23 +9651,26 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // point: `l.sortDescending()` answers `Unit` and leaves `l` reordered,
         // where `l.sortedDescending()` answers a new list and leaves `l` alone.
         // They are declared on `MutableList` and on the primitive arrays.
+        //
+        // The elements are copied out and sorted OUTSIDE the heap borrow: a
+        // user `compareTo` re-enters the VM, and comparing inside
+        // `with_obj_mut` borrowed the heap twice and panicked.
         "sort" | "sortDescending" | "reverse" => {
-            let done = with_obj_mut(recv, |o| match o {
-                HeapObj::List(items) | HeapObj::Array { items, .. } => {
-                    if name == "reverse" {
-                        items.reverse();
-                    } else {
-                        items.sort_by(value_cmp);
-                        if name == "sortDescending" {
-                            items.reverse();
-                        }
-                    }
-                    true
-                }
-                _ => false,
+            let taken = with_obj(recv, |o| match o {
+                HeapObj::List(items) | HeapObj::Array { items, .. } => Some(items.clone()),
+                _ => None,
             })
-            .unwrap_or(false);
-            if done {
+            .flatten();
+            if let Some(mut items) = taken {
+                match name {
+                    "reverse" => items.reverse(),
+                    _ => sort_vm(vm, &mut items, name == "sortDescending"),
+                }
+                with_obj_mut(recv, |o| {
+                    if let HeapObj::List(dst) | HeapObj::Array { items: dst, .. } = o {
+                        *dst = items;
+                    }
+                });
                 return Ok(Value::Undef);
             }
         }
@@ -10812,15 +10833,33 @@ fn sequence_member(
             };
             return Some(Ok(alloc(HeapObj::Set(out))));
         }
+        // `sortedArray()`/`sortedArrayDescending()` answer an ARRAY of the
+        // receiver's own kind, where `sorted()` answers a `List`. An empty
+        // receiver comes back as itself, as the stdlib's `if (isEmpty()) return
+        // this` has it.
+        "sortedArray" | "sortedArrayDescending" if kind == SeqKind::Array && args.is_empty() => {
+            if items.is_empty() {
+                return recv.cloned().map(Ok);
+            }
+            let mut out = items.to_vec();
+            sort_vm(vm, &mut out, name == "sortedArrayDescending");
+            let desc = recv
+                .and_then(|r| {
+                    with_obj(r, |o| match o {
+                        HeapObj::Array { desc, .. } => Some(desc.clone()),
+                        _ => None,
+                    })
+                    .flatten()
+                })
+                .unwrap_or_else(|| array_desc(&out));
+            return Some(Ok(alloc(HeapObj::Array { items: out, desc })));
+        }
         "sorted" | "sortedDescending" => {
             let mut out = items.to_vec();
             // `sort_vm`, not `sort_by(value_cmp)`: `sorted()` is declared over
             // `Comparable`, and a class that implements it is ordered by the
             // body it wrote. Without this a `List<Op>` sorted by heap slot.
-            sort_vm(vm, &mut out);
-            if name == "sortedDescending" {
-                out.reverse();
-            }
+            sort_vm(vm, &mut out, name == "sortedDescending");
             return Some(Ok(alloc_sorted_list(out, kind.is_collection())));
         }
         // `take`/`drop` clamp rather than fault: Kotlin returns the whole
