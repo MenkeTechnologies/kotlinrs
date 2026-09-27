@@ -6642,6 +6642,82 @@ fn lateinit_top_level_and_local_raise_until_written() {
 }
 
 #[test]
+fn regex_matches_finds_replaces_and_splits_like_java_util_regex() {
+    // `kotlin.text.Regex` over `java.util.regex` semantics: `Matcher.find`'s
+    // empty-match iteration, `matches()` backtracking into a longer
+    // alternative, `appendReplacement`'s group references, look-behind and
+    // back-references, and Kotlin's own `split` (trailing empties kept).
+    // Measured on kotlinc 2.4.20.
+    assert_eq!(
+        prog(
+            "fun main() {\n\
+                 println(Regex(\"[0-9]+\").findAll(\"a1b22c\").map { it.value }.toList())\n\
+                 println(\"hello\".replace(Regex(\"l+\"), \"L\"))\n\
+                 println(\"a1b2\".split(Regex(\"[0-9]\")))\n\
+                 val r = Regex(\"(\\\\w+)@(\\\\w+)\\\\.com\")\n\
+                 val m = r.find(\"mail bob@site.com and amy@web.com\")\n\
+                 println(m?.value); println(m?.range); println(m?.groupValues)\n\
+                 println(m?.next()?.value); println(m?.next()?.next())\n\
+                 println(r.matches(\"x@y.com\")); println(r.matches(\" x@y.com\"))\n\
+                 println(r.replace(\"bob@site.com, amy@web.com\", \"$2:$1\"))\n\
+                 println(r.replace(\"bob@site.com, amy@web.com\") { it.groupValues[1].uppercase() })\n\
+                 println(Regex(\"a*\").findAll(\"baaa\").map { it.range }.toList())\n\
+                 println(\"abc\".split(Regex(\"\")))\n\
+                 println(\"a,b,c\".split(Regex(\",\"), 2))\n\
+                 println(Regex(\"a|ab\").matchEntire(\"ab\")?.value)\n\
+                 println(Regex(\"(a)(x)?\").find(\"a\")?.groups)\n\
+                 val (user, host) = r.find(\"q@w.com\")!!.destructured\n\
+                 println(\"$user $host\")\n\
+                 println(Regex(\"(?<y>\\\\d{4})-(?<m>\\\\d\\\\d)\").replace(\"2024-05\", \"\\${m}/\\${y}\"))\n\
+                 println(Regex(\"(?<=a)b\").findAll(\"abab cb\").count())\n\
+                 println(Regex(\"(\\\\w)\\\\1\").findAll(\"aabbcd\").map { it.value }.toList())\n\
+                 println(Regex(\"ö\").find(\"héllo wörld\")?.range)\n\
+                 println(\"A1b2\".contains(\"[0-9]\".toRegex()))\n\
+                 try { Regex(\"a\").find(\"abc\", 9) } catch (e: IndexOutOfBoundsException) { println(e.message) }\n\
+                 try { Regex(\"a\").findAll(\"abc\", 9) } catch (e: IndexOutOfBoundsException) { println(e.message) }\n\
+                 try { Regex(\"(a\") } catch (e: IllegalArgumentException) { println(\"bad pattern\") }\n\
+                 for (rep in listOf(\"$\", \"\\${-}\", \"\\${1a}\", \"\\$x\", \"$9\")) {\n\
+                     try { println(Regex(\"(?<g>a)\").replace(\"ab\", rep)) } catch (e: Exception) { println(e.message) }\n\
+                 }\n\
+                 println(Regex(\"(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)\").replace(\"abcdefghijk\", \"$11-$10-$1\"))\n\
+             }"
+        ),
+        "[1, 22]\n\
+         heLo\n\
+         [a, b, ]\n\
+         bob@site.com\n\
+         5..16\n\
+         [bob@site.com, bob, site]\n\
+         amy@web.com\n\
+         null\n\
+         true\n\
+         false\n\
+         site:bob, web:amy\n\
+         BOB, AMY\n\
+         [0..-1, 1..3, 4..3]\n\
+         [, a, b, c, ]\n\
+         [a, b,c]\n\
+         ab\n\
+         [MatchGroup(value=a, range=0..0), MatchGroup(value=a, range=0..0), null]\n\
+         q w\n\
+         05/2024\n\
+         2\n\
+         [aa, bb]\n\
+         7..7\n\
+         true\n\
+         Illegal start index\n\
+         Start index out of bounds: 9, input length: 3\n\
+         bad pattern\n\
+         Illegal group reference: group index is missing\n\
+         named capturing group has 0 length name\n\
+         capturing group name {1a} starts with digit character\n\
+         Illegal group reference\n\
+         No group 9\n\
+         k-j-a\n"
+    );
+}
+
+#[test]
 fn a_sorted_collection_built_with_a_comparator_orders_and_dedups_by_it() {
     // `sortedSetOf`/`sortedMapOf`/`TreeSet`/`TreeMap` take a leading
     // `Comparator`, and the collection then orders AND identifies its elements

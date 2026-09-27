@@ -73,6 +73,11 @@ lsp-types = "0.97.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
+# `kotlin.text.Regex`. Kotlin on the JVM matches with `java.util.regex`, a
+# backtracking engine with look-around and back-references; fancy-regex is the
+# Rust engine with that feature set (src/regex.rs adapts `Matcher`'s iteration,
+# whole-input, and replacement rules).
+fancy-regex = "0.18"
 
 [dev-dependencies]
 tempfile = "3"

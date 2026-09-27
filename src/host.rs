@@ -19,6 +19,9 @@
 
 use fusevm::{Frame, NumOp, VMResult, Value, VM};
 use std::cell::RefCell;
+use std::rc::Rc;
+
+use crate::regex::{next_search, KRegex, Match};
 
 /// Coerce the top of stack to its Kotlin `toString()` form.
 pub const KT_TO_STRING: u16 = 1;
@@ -1560,6 +1563,21 @@ enum HeapObj {
     /// of state (`x`, `y`, `z`, `w`, `v`, `addend`) are all a seeded generator
     /// is, so a program seeding it draws the reference's exact sequence.
     Random([i32; 6]),
+    /// A `kotlin.text.Regex` — see [`crate::regex`].
+    Regex(Rc<KRegex>),
+    /// A `MatchResult`: the regex and input it came from (which `next()`
+    /// resumes over) and the byte span of the match and of each group.
+    RegexMatch {
+        re: Rc<KRegex>,
+        text: Rc<str>,
+        groups: Vec<Option<(usize, usize)>>,
+    },
+    /// A `MatchGroup` — one captured group's text and its UTF-16 index range.
+    MatchGroup {
+        value: String,
+        first: i64,
+        last: i64,
+    },
 }
 
 /// How far a `sequence { … }` block has got.
@@ -1960,6 +1978,10 @@ pub const BUILTIN_THROWABLES: &[(&str, &str)] = &[
     // — see [`NESTED_RUN_LIMIT`].
     ("VirtualMachineError", "java.lang.VirtualMachineError"),
     ("StackOverflowError", "java.lang.StackOverflowError"),
+    (
+        "PatternSyntaxException",
+        "java.util.regex.PatternSyntaxException",
+    ),
 ];
 
 /// The JVM throwable hierarchy kotlinrs models, as `(class, superclass)` simple
@@ -2014,6 +2036,7 @@ const THROWABLE_PARENTS: &[(&str, &str)] = &[
     ("IllegalFormatFlagsException", "IllegalFormatException"),
     ("VirtualMachineError", "Error"),
     ("StackOverflowError", "VirtualMachineError"),
+    ("PatternSyntaxException", "IllegalArgumentException"),
 ];
 
 /// The fully-qualified name of a throwable's simple name, or `None` when the
@@ -5572,6 +5595,23 @@ fn b_coll_hof(vm: &mut VM, argc: u8) -> Value {
     }
     extras.reverse();
     let recv = vm.pop();
+    // `Regex.find(input)` shares its name with the collection predicate, so a
+    // call on a `Regex` (or a `String` member taking one) arrives here with its
+    // last argument in the lambda's place. Put it back and dispatch as a member.
+    if regex_of(&recv).is_some() || extras.first().and_then(regex_of).is_some() {
+        extras.push(clo);
+        return match regex_method(vm, &recv, &name, &extras) {
+            Some(Ok(v)) => v,
+            Some(Err(e)) => {
+                fault(vm, e);
+                Value::Undef
+            }
+            None => {
+                fault(vm, format!("unresolved reference: {name} on {}", obj_label(&recv)));
+                Value::Undef
+            }
+        };
+    }
     // `map`/`filter`/`forEach`/`fold` over a `HashSet` visit its elements in
     // ITS order, and the answer of a `fold` or a `joinToString` depends on it.
     ensure_ordered(vm, &recv);
@@ -8316,6 +8356,9 @@ fn builder_method(
 
 fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     if let Some(r) = random_method(recv, name, args) {
+        return r;
+    }
+    if let Some(r) = regex_method(vm, recv, name, args) {
         return r;
     }
     // `Comparator.compare(a, b)` on a comparator value — one `compareBy` built,
@@ -11293,6 +11336,9 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
         | HeapObj::Closure { .. }
         | HeapObj::Comparator(_)
         | HeapObj::Random(_)
+        | HeapObj::Regex(_)
+        | HeapObj::RegexMatch { .. }
+        | HeapObj::MatchGroup { .. }
         | HeapObj::Coro { .. }
         | HeapObj::Observed { .. }
         | HeapObj::F32(_)
@@ -12014,6 +12060,9 @@ fn obj_hash(recv: &Value) -> Option<i32> {
         | HeapObj::Closure { .. }
         | HeapObj::Comparator(_)
         | HeapObj::Random(_)
+        | HeapObj::Regex(_)
+        | HeapObj::RegexMatch { .. }
+        | HeapObj::MatchGroup { .. }
         | HeapObj::Gen { .. }
         | HeapObj::Grouping { .. }
         | HeapObj::Exc { .. } => None,
@@ -12042,6 +12091,9 @@ fn obj_label(recv: &Value) -> String {
         HeapObj::Closure { .. } => "Function".to_string(),
         HeapObj::Comparator(_) => "Comparator".to_string(),
         HeapObj::Random(_) => "Random".to_string(),
+        HeapObj::Regex(_) => "Regex".to_string(),
+        HeapObj::RegexMatch { .. } => "MatchResult".to_string(),
+        HeapObj::MatchGroup { .. } => "MatchGroup".to_string(),
         HeapObj::F32(_) => "Float".to_string(),
         HeapObj::I64(_) => "Long".to_string(),
         HeapObj::Klass { java, .. } => if *java { "Class" } else { "KClass" }.to_string(),
@@ -12191,6 +12243,13 @@ fn display_obj(id: u32) -> String {
             // `XorWowRandom` inherits `Object.toString`; the identity hash is the
             // handle, as it is for every other identity-hashed kind.
             HeapObj::Random(_) => format!("kotlin.random.XorWowRandom@{id:x}"),
+            // `Regex.toString()` is its pattern; `MatchResult` inherits
+            // `Object.toString`; `MatchGroup` is a data class.
+            HeapObj::Regex(re) => re.pattern.clone(),
+            HeapObj::RegexMatch { .. } => format!("kotlin.text.MatcherMatchResult@{id:x}"),
+            HeapObj::MatchGroup { value, first, last } => {
+                format!("MatchGroup(value={value}, range={first}..{last})")
+            }
             // A lazy sequence has no printed form worth reproducing either —
             // the JVM renders it as `kotlin.sequences.GeneratorSequence@…`,
             // an identity hash. It exists to be consumed, not displayed.
@@ -13193,6 +13252,235 @@ fn random_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Valu
         ("nextBits", 1) => Ok(Value::Int(i64::from(xorwow_bits(st, int(0) as u32)))),
         _ => Err(format!("unresolved reference: {name} on Random")),
     })
+}
+
+/// The `Regex` behind `v`, when `v` is one.
+fn regex_of(v: &Value) -> Option<Rc<KRegex>> {
+    with_obj(v, |o| match o {
+        HeapObj::Regex(re) => Some(re.clone()),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// The UTF-16 index of byte offset `byte` in `text` — the unit every Kotlin
+/// `String` position is counted in.
+fn utf16_index(text: &str, byte: usize) -> i64 {
+    text[..byte].encode_utf16().count() as i64
+}
+
+/// The byte offset of UTF-16 index `index` in `text`, or `None` for an index
+/// outside `0..=length`.
+fn byte_of_utf16(text: &str, index: i64) -> Option<usize> {
+    let len = text.encode_utf16().count() as i64;
+    if !(0..=len).contains(&index) {
+        return None;
+    }
+    let mut units = 0i64;
+    for (b, c) in text.char_indices() {
+        if units >= index {
+            return Some(b);
+        }
+        units += c.len_utf16() as i64;
+    }
+    Some(text.len())
+}
+
+/// The `IntRange` Kotlin reports for the byte span `start..end` of `text`:
+/// inclusive, so an empty match at 3 is `3..2`.
+fn utf16_range(text: &str, start: usize, end: usize) -> Value {
+    let first = utf16_index(text, start);
+    let last = utf16_index(text, end) - 1;
+    alloc(HeapObj::Range(RangeObj::new(first, last, RangeForm::Inclusive, false)))
+}
+
+fn alloc_match(re: &Rc<KRegex>, text: &Rc<str>, m: Match) -> Value {
+    alloc(HeapObj::RegexMatch {
+        re: re.clone(),
+        text: text.clone(),
+        groups: m.groups,
+    })
+}
+
+/// A nullable `MatchResult` — `find`/`matchEntire` answer `null` for no match.
+fn match_or_null(re: &Rc<KRegex>, text: &Rc<str>, m: Option<Match>) -> Value {
+    m.map_or(Value::Undef, |m| alloc_match(re, text, m))
+}
+
+/// `regex.replace(input, …)` / `input.replace(regex, …)`: every match (or only
+/// the first) replaced by the expanded `with` string, or by what a
+/// `(MatchResult) -> CharSequence` lambda answers for it — which, unlike the
+/// string, is inserted literally.
+fn regex_replace(
+    vm: &mut VM,
+    re: &Rc<KRegex>,
+    input: &str,
+    with: &Value,
+    first_only: bool,
+) -> Result<Value, String> {
+    let text: Rc<str> = Rc::from(input);
+    let mut matches = re.find_all(input, 0)?;
+    if first_only {
+        matches.truncate(1);
+    }
+    let lambda = closure_meta(with).is_some();
+    let mut out = String::new();
+    let mut last = 0;
+    for m in matches {
+        out.push_str(&input[last..m.start()]);
+        let end = m.end();
+        if lambda {
+            let arg = alloc_match(re, &text, m);
+            out.push_str(&kotlin_string(&invoke_closure(vm, with, &[arg])?));
+        } else {
+            out.push_str(&re.expand(input, &m, &kotlin_string(with))?);
+        }
+        last = end;
+    }
+    out.push_str(&input[last..]);
+    Ok(Value::str(out))
+}
+
+/// `Regex(pattern)` / `pattern.toRegex()`.
+fn new_regex(pattern: &str) -> Result<Value, String> {
+    Ok(alloc(HeapObj::Regex(Rc::new(KRegex::new(pattern)?))))
+}
+
+/// The members of `Regex`, `MatchResult`, and `MatchGroup`, and the `String`
+/// members that take a `Regex` — or `None` for any other receiver.
+fn regex_method(
+    vm: &mut VM,
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    if let Value::Str(s) = recv {
+        if name == "toRegex" && args.is_empty() {
+            return Some(new_regex(s));
+        }
+        let re = args.first().and_then(regex_of)?;
+        let input = s.to_string();
+        return Some(match (name, args.len()) {
+            ("replace", 2) => regex_replace(vm, &re, &input, &args[1], false),
+            ("replaceFirst", 2) => regex_replace(vm, &re, &input, &args[1], true),
+            ("matches", 1) => re.match_entire(&input).map(|m| Value::Bool(m.is_some())),
+            ("contains", 1) => re.contains_match(&input).map(Value::Bool),
+            ("split", 1 | 2) => regex_split(&re, &input, args.get(1)),
+            _ => return None,
+        });
+    }
+    if let Some(re) = regex_of(recv) {
+        let input = args.first().map(kotlin_string).unwrap_or_default();
+        let text: Rc<str> = Rc::from(input.as_str());
+        // The optional `startIndex`. An index outside the input is refused
+        // in two wordings: `find` passes it to `Matcher.find(int)`, while
+        // `findAll` checks it in Kotlin first.
+        let start = args.get(1).map_or(0, |v| v.to_int());
+        let from = |refusal: String| -> Result<usize, String> {
+            byte_of_utf16(&input, start)
+                .ok_or_else(|| format!("java.lang.IndexOutOfBoundsException: {refusal}"))
+        };
+        let len = input.encode_utf16().count();
+        return Some(match (name, args.len()) {
+            ("pattern" | "toString", 0) => Ok(Value::str(re.pattern.clone())),
+            ("matches", 1) => re.match_entire(&input).map(|m| Value::Bool(m.is_some())),
+            ("containsMatchIn", 1) => re.contains_match(&input).map(Value::Bool),
+            ("matchEntire", 1) => re
+                .match_entire(&input)
+                .map(|m| match_or_null(&re, &text, m)),
+            ("find", 1 | 2) => from("Illegal start index".to_string())
+                .and_then(|at| re.find_at(&input, at))
+                .map(|m| match_or_null(&re, &text, m)),
+            ("findAll", 1 | 2) => from(format!(
+                "Start index out of bounds: {start}, input length: {len}"
+            )).and_then(|at| re.find_all(&input, at)).map(|ms| {
+                let items = ms.into_iter().map(|m| alloc_match(&re, &text, m)).collect();
+                tag_sequence(alloc(HeapObj::List(items)))
+            }),
+            ("replace", 2) => regex_replace(vm, &re, &input, &args[1], false),
+            ("replaceFirst", 2) => regex_replace(vm, &re, &input, &args[1], true),
+            ("split", 1 | 2) => regex_split(&re, &input, args.get(1)),
+            _ => Err(format!("unresolved reference: {name} on Regex")),
+        });
+    }
+    let found = with_obj(recv, |o| match o {
+        HeapObj::RegexMatch { re, text, groups } => {
+            Some((re.clone(), text.clone(), groups.clone()))
+        }
+        _ => None,
+    })
+    .flatten();
+    if let Some((re, text, groups)) = found {
+        let slice = |g: &Option<(usize, usize)>| g.map(|(s, e)| text[s..e].to_string());
+        let (start, end) = groups[0].unwrap_or((0, 0));
+        return Some(match (name, args.len()) {
+            ("value", 0) => Ok(Value::str(text[start..end].to_string())),
+            ("range", 0) => Ok(utf16_range(&text, start, end)),
+            ("groupValues", 0) => Ok(alloc_ro_list(
+                groups
+                    .iter()
+                    .map(|g| Value::str(slice(g).unwrap_or_default()))
+                    .collect(),
+            )),
+            // `destructured` is the groups after the whole match, taken apart
+            // through `component1()`…, which a list answers.
+            ("destructured", 0) => Ok(alloc_ro_list(
+                groups
+                    .iter()
+                    .skip(1)
+                    .map(|g| Value::str(slice(g).unwrap_or_default()))
+                    .collect(),
+            )),
+            ("groups", 0) => Ok(alloc_ro_list(
+                groups
+                    .iter()
+                    .map(|g| match g {
+                        Some((s, e)) => alloc(HeapObj::MatchGroup {
+                            value: text[*s..*e].to_string(),
+                            first: utf16_index(&text, *s),
+                            last: utf16_index(&text, *e) - 1,
+                        }),
+                        None => Value::Undef,
+                    })
+                    .collect(),
+            )),
+            ("next", 0) => {
+                let m = Match { groups };
+                match next_search(&text, &m) {
+                    Some(at) => re
+                        .find_at(&text, at)
+                        .map(|n| match_or_null(&re, &text, n)),
+                    None => Ok(Value::Undef),
+                }
+            }
+            _ => Err(format!("unresolved reference: {name} on MatchResult")),
+        });
+    }
+    let group = with_obj(recv, |o| match o {
+        HeapObj::MatchGroup { value, first, last } => Some((value.clone(), *first, *last)),
+        _ => None,
+    })
+    .flatten()?;
+    let (value, first, last) = group;
+    let range = || alloc(HeapObj::Range(RangeObj::new(first, last, RangeForm::Inclusive, false)));
+    Some(match (name, args.len()) {
+        ("value" | "component1", 0) => Ok(Value::str(value)),
+        ("range" | "component2", 0) => Ok(range()),
+        _ => Err(format!("unresolved reference: {name} on MatchGroup")),
+    })
+}
+
+/// `split(regex, limit)` in either spelling. A negative limit is Kotlin's
+/// `IllegalArgumentException`.
+fn regex_split(re: &KRegex, input: &str, limit: Option<&Value>) -> Result<Value, String> {
+    let limit = limit.map_or(0, |v| v.to_int());
+    if limit < 0 {
+        return Err(format!(
+            "java.lang.IllegalArgumentException: Limit must be non-negative, but was {limit}"
+        ));
+    }
+    let parts = re.split(input, limit as usize)?;
+    Ok(alloc_ro_list(parts.into_iter().map(Value::str).collect()))
 }
 
 /// `shuffle(random)`'s walk: from the last index down to 1, swap each slot with

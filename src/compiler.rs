@@ -6592,6 +6592,15 @@ impl Compiler {
                 self.b.emit(Op::Extended(KT_RANDOM, 0), line);
                 Ok(Type::Obj)
             }
+            // `Regex(pattern)` — the same value `pattern.toRegex()` builds, so it
+            // lowers to that member call.
+            "Regex" if args.len() == 1 && !self.classes.contains_key("Regex") => {
+                self.compile_expr(sc, &args[0])?;
+                let nidx = self.b.add_constant(Value::str("toRegex"));
+                self.b.emit(Op::LoadConst(nidx), line);
+                self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 0), line);
+                Ok(Type::Obj)
+            }
             "Pair" if args.len() == 2 => {
                 for a in args {
                     self.compile_erased(sc, a)?;
