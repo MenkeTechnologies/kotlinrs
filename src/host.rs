@@ -671,6 +671,12 @@ thread_local! {
     static COLL_CMP: RefCell<std::collections::HashMap<u32, Value>> =
         RefCell::new(std::collections::HashMap::new());
 
+    /// A `MatchResult.groups` list → the `Regex` it came from, whose group
+    /// NAMES `groups["name"]` resolves through. The list is an ordinary one
+    /// for every other reader.
+    static MATCH_GROUPS: RefCell<std::collections::HashMap<u32, Rc<KRegex>>> =
+        RefCell::new(std::collections::HashMap::new());
+
     /// The handles built by a READ-ONLY `Set`/`Map` literal — see
     /// [`COLL_LITERAL`]. What a list records in [`LIST_IMPL`], for the two
     /// collections that have no such tag of their own.
@@ -1766,6 +1772,7 @@ fn reset_heap() {
     CAUSES.with(|c| c.borrow_mut().clear());
     COLL_ORDER.with(|c| c.borrow_mut().clear());
     COLL_CMP.with(|c| c.borrow_mut().clear());
+    MATCH_GROUPS.with(|c| c.borrow_mut().clear());
     COLL_UNORDERED.with(|d| d.borrow_mut().clear());
     COLL_LITERAL_TAG.with(|t| t.borrow_mut().clear());
     MAP_INDEX.with(|t| t.borrow_mut().clear());
@@ -8361,6 +8368,11 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
     if let Some(r) = regex_method(vm, recv, name, args) {
         return r;
     }
+    if name == "get" && args.len() == 1 {
+        if let Some(r) = named_group(recv, &args[0]) {
+            return r;
+        }
+    }
     // `Comparator.compare(a, b)` on a comparator value — one `compareBy` built,
     // or a two-argument lambda standing in for one (`String.CASE_INSENSITIVE_ORDER`,
     // `Comparator { a, b -> … }`).
@@ -11403,6 +11415,9 @@ fn index_get(vm: &mut VM, recv: &Value, index: &Value) -> Result<Value, String> 
             None => Err(sioobe_index(i, units.len())),
         };
     }
+    if let Some(r) = named_group(recv, index) {
+        return r;
+    }
     // A `Map` key search runs first and OUTSIDE the heap borrow below: it is
     // hash-gated container equality, which re-enters the VM for a user
     // `equals`/`hashCode`.
@@ -13431,19 +13446,25 @@ fn regex_method(
                     .map(|g| Value::str(slice(g).unwrap_or_default()))
                     .collect(),
             )),
-            ("groups", 0) => Ok(alloc_ro_list(
-                groups
-                    .iter()
-                    .map(|g| match g {
-                        Some((s, e)) => alloc(HeapObj::MatchGroup {
-                            value: text[*s..*e].to_string(),
-                            first: utf16_index(&text, *s),
-                            last: utf16_index(&text, *e) - 1,
-                        }),
-                        None => Value::Undef,
-                    })
-                    .collect(),
-            )),
+            ("groups", 0) => {
+                let list = alloc_ro_list(
+                    groups
+                        .iter()
+                        .map(|g| match g {
+                            Some((s, e)) => alloc(HeapObj::MatchGroup {
+                                value: text[*s..*e].to_string(),
+                                first: utf16_index(&text, *s),
+                                last: utf16_index(&text, *e) - 1,
+                            }),
+                            None => Value::Undef,
+                        })
+                        .collect(),
+                );
+                if let Value::Obj(id) = list {
+                    MATCH_GROUPS.with(|t| t.borrow_mut().insert(id, re.clone()));
+                }
+                Ok(list)
+            }
             ("next", 0) => {
                 let m = Match { groups };
                 match next_search(&text, &m) {
@@ -13467,6 +13488,25 @@ fn regex_method(
         ("value" | "component1", 0) => Ok(Value::str(value)),
         ("range" | "component2", 0) => Ok(range()),
         _ => Err(format!("unresolved reference: {name} on MatchGroup")),
+    })
+}
+
+/// `groups["name"]` / `groups.get("name")` on a `MatchResult.groups` list: the
+/// group declared under that name, or `Matcher`'s refusal for a name the
+/// pattern does not declare. `None` for any other receiver or a non-`String`
+/// index.
+fn named_group(recv: &Value, index: &Value) -> Option<Result<Value, String>> {
+    let (Value::Obj(id), Value::Str(name)) = (recv, index) else {
+        return None;
+    };
+    let re = MATCH_GROUPS.with(|t| t.borrow().get(id).cloned())?;
+    Some(match re.group_index(name) {
+        Some(i) => Ok(list_snapshot(recv)
+            .and_then(|items| items.get(i).cloned())
+            .unwrap_or(Value::Undef)),
+        None => Err(format!(
+            "java.lang.IllegalArgumentException: No group with name <{name}>"
+        )),
     })
 }
 

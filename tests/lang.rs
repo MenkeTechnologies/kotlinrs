@@ -6718,6 +6718,26 @@ fn regex_matches_finds_replaces_and_splits_like_java_util_regex() {
 }
 
 #[test]
+fn match_groups_resolve_a_group_name() {
+    // `groups["name"]` is the named group, not whatever index a `String`
+    // coerces to (it answered the whole match); an undeclared name is
+    // `Matcher`'s `IllegalArgumentException`. Measured on kotlinc 2.4.20.
+    assert_eq!(
+        prog(
+            "fun main() {\n\
+                 val m = Regex(\"a(?<y>\\\\d+)(?<z>x)?\").find(\"a7\")!!\n\
+                 println(m.groups[\"y\"]?.value)\n\
+                 println(m.groups.get(\"y\")?.range)\n\
+                 println(m.groups[\"z\"])\n\
+                 println(m.groups[1]?.value)\n\
+                 try { m.groups[\"nope\"] } catch (e: IllegalArgumentException) { println(e.message) }\n\
+             }"
+        ),
+        "7\n1..1\nnull\n7\nNo group with name <nope>\n"
+    );
+}
+
+#[test]
 fn a_sorted_collection_built_with_a_comparator_orders_and_dedups_by_it() {
     // `sortedSetOf`/`sortedMapOf`/`TreeSet`/`TreeMap` take a leading
     // `Comparator`, and the collection then orders AND identifies its elements
