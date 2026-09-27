@@ -135,6 +135,9 @@ struct Mods {
     /// a nested declaration rejects it, because there the outer reference is
     /// exactly what the hoist cannot reproduce.
     inner: bool,
+    /// `lateinit var` — a class property with no initializer, whose read
+    /// before its first write is `UninitializedPropertyAccessException`.
+    lateinit: bool,
 }
 
 /// Parse a full program: top-level `fun`, `class`/`data class`, `interface`, and
@@ -500,6 +503,7 @@ fn is_modifier_word(w: &str) -> bool {
             | "internal"
             | "protected"
             | "inner"
+            | "lateinit"
             // Accepted and discarded: each affects how a declaration is COMPILED
             // on the JVM (inlining, tail-call rewriting, call syntax,
             // compile-time constants) without changing what it computes, and
@@ -665,6 +669,7 @@ impl Parser {
                 "override" => m.override_ = true,
                 "sealed" => m.sealed = true,
                 "inner" => m.inner = true,
+                "lateinit" => m.lateinit = true,
                 "final" | "public" | "private" | "internal" | "protected" | "inline"
                 | "noinline" | "crossinline" | "tailrec" | "operator" | "infix" | "const" => {}
                 _ => break,
@@ -1240,6 +1245,10 @@ impl Parser {
                     // class as well as an `object`. An `interface` has no
                     // storage to put one in, so it is rejected there.
                     Tok::Val | Tok::Var => {
+                        if mods.lateinit {
+                            obj_props.push(self.lateinit_prop()?);
+                            continue;
+                        }
                         // `val x: T get() = …` is a computed property: a
                         // zero-argument method wearing property syntax, which is
                         // what it lowers to. An interface may carry one too —
@@ -1945,6 +1954,56 @@ impl Parser {
                 Ok(None)
             }
         }
+    }
+
+    /// `lateinit var name: T` in a class body. Kotlin allows it only on a
+    /// mutable, non-null, non-primitive property with no initializer; the
+    /// property starts out holding the unset marker ([`Expr::LateinitUnset`]),
+    /// which every read checks.
+    fn lateinit_prop(&mut self) -> Result<BodyProp, String> {
+        let line = self.line();
+        if !matches!(self.bump(), Tok::Var) {
+            return Err(format!(
+                "'lateinit' modifier is allowed only on mutable properties (line {line})"
+            ));
+        }
+        let name = self.ident()?;
+        if !self.at(&Tok::Colon) {
+            return Err(format!(
+                "property {name}: a 'lateinit' property must declare its type (line {line})"
+            ));
+        }
+        self.advance();
+        let annot = self.type_ref()?;
+        if matches!(self.toks[self.pos - 1].tok, Tok::Question) {
+            return Err(format!(
+                "property {name}: 'lateinit' modifier is not allowed on properties of nullable types (line {line})"
+            ));
+        }
+        if matches!(
+            annot.ty,
+            Type::Int | Type::Long | Type::Double | Type::Float | Type::Boolean | Type::Char
+        ) {
+            return Err(format!(
+                "property {name}: 'lateinit' modifier is not allowed on properties of primitive types (line {line})"
+            ));
+        }
+        if self.at(&Tok::Assign) {
+            return Err(format!(
+                "property {name}: 'lateinit' modifier is not allowed on properties with initializer (line {line})"
+            ));
+        }
+        Ok(BodyProp {
+            name,
+            ty: annot.ty,
+            class: annot.class,
+            init: Expr::LateinitUnset,
+            mutable: true,
+            lazy: false,
+            delegate: false,
+            type_args: annot.args,
+            type_param_of: None,
+        })
     }
 
     fn body_prop(&mut self) -> Result<BodyProp, String> {

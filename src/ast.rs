@@ -994,6 +994,9 @@ pub enum Expr {
         params: Vec<(String, Type)>,
         body: Vec<Stmt>,
     },
+    /// The value a `lateinit var` holds before its first write. Every property
+    /// read checks for it and raises `UninitializedPropertyAccessException`.
+    LateinitUnset,
     /// A callable reference — `::inc`, `String::length`, `obj::method`.
     ///
     /// The three spellings differ only in `recv`: absent for a free function or

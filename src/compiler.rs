@@ -29,10 +29,10 @@ use crate::host::{
     KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND,
     KT_EXTREMUM_VM, KT_F32, KT_F32_ARITH, KT_F32_STR, KT_FFI_CALL, KT_FFI_COMPILE, KT_GENSEQ,
     KT_GETFIELD, KT_HASH_REG, KT_IDENTITY, KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM,
-    KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_ITER_SRC, KT_JOIN, KT_LAZY_GET,
-    KT_LAZY_NEW, KT_LIST, KT_LIST_RO, KT_LIST_TAG, KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH,
-    KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OBSERVE, KT_OPER_VM, KT_PAIR, KT_PRECOND,
-    KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_REIFIED, KT_REIFY, KT_RESULT_HOF,
+    KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_ITER_SRC, KT_JOIN, KT_LATEINIT,
+    KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO, KT_LIST_TAG, KT_MAKE_CLOSURE, KT_MAP_VM,
+    KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OBSERVE, KT_OPER_VM, KT_PAIR,
+    KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANGE, KT_RANGE_STEP, KT_REIFIED, KT_REIFY, KT_RESULT_HOF,
     KT_RUN_CATCHING, KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG,
     KT_TO_STRING, KT_TYPE_REG, KT_YIELD,
 };
@@ -213,6 +213,10 @@ struct Binding {
     /// Declared `by <delegate>` with something other than `lazy`: the slot
     /// holds the delegate and every read is a `getValue` on it.
     delegated: bool,
+    /// This slot is a `lateinit` property during its class's construction, so
+    /// a read checks it for the unset marker — the `init` block that reads one
+    /// before assigning it raises exactly as a read through the instance does.
+    lateinit: bool,
 }
 
 /// A checkpoint of scope state, taken on block entry and restored on block exit
@@ -307,6 +311,7 @@ impl Scope {
                 boxed: false,
                 lazy: false,
                 delegated: false,
+                lateinit: false,
             },
         );
         self.undo.push((name.to_string(), prev));
@@ -465,6 +470,14 @@ impl Scope {
     }
     fn is_lazy(&self, name: &str) -> bool {
         self.map.get(name).is_some_and(|b| b.lazy)
+    }
+    fn mark_lateinit(&mut self, name: &str) {
+        if let Some(b) = self.map.get_mut(name) {
+            b.lateinit = true;
+        }
+    }
+    fn is_lateinit(&self, name: &str) -> bool {
+        self.map.get(name).is_some_and(|b| b.lateinit)
     }
     fn mark_delegated(&mut self, name: &str) {
         if let Some(b) = self.map.get_mut(name) {
@@ -1890,6 +1903,9 @@ impl Compiler {
             }
             let ty = if p.ty == Type::Unknown { t } else { p.ty };
             let slot = sc.declare_obj(&p.name, ty, p.mutable, p.class.clone());
+            if matches!(p.init, Expr::LateinitUnset) {
+                sc.mark_lateinit(&p.name);
+            }
             self.b.emit(Op::SetSlot(slot), cd.line);
         }
         self.building_object = outer;
@@ -2020,6 +2036,9 @@ impl Compiler {
                 }
                 let ty = if p.ty == Type::Unknown { t } else { p.ty };
                 let slot = sc.declare_obj(&p.name, ty, p.mutable, p.class.clone());
+                if matches!(p.init, Expr::LateinitUnset) {
+                    sc.mark_lateinit(&p.name);
+                }
                 self.b.emit(Op::SetSlot(slot), cd.line);
             }
             self.emit_init_blocks(&mut sc, cd, cd.obj_props.len())
@@ -3391,6 +3410,10 @@ impl Compiler {
                 self.b.emit(Op::LoadUndef, 0);
                 Ok(Type::Unknown)
             }
+            Expr::LateinitUnset => {
+                self.b.emit(Op::Extended(KT_LATEINIT, 0), 0);
+                Ok(Type::Unknown)
+            }
             Expr::Str(parts) => {
                 self.compile_str(sc, parts)?;
                 Ok(Type::String)
@@ -3408,6 +3431,11 @@ impl Compiler {
                     // runs the thunk — the first read only.
                     if sc.is_lazy(name) {
                         self.b.emit(Op::CallBuiltin(KT_LAZY_GET, 0), 0);
+                    }
+                    if sc.is_lateinit(name) {
+                        let nidx = self.b.add_constant(Value::str(name.to_string()));
+                        self.b.emit(Op::LoadConst(nidx), 0);
+                        self.b.emit(Op::Extended(KT_LATEINIT, 2), 0);
                     }
                     // A delegated local holds the DELEGATE, and reading it is
                     // `delegate.getValue(thisRef, property)`. Both arguments are
@@ -4123,6 +4151,26 @@ impl Compiler {
         safe: bool,
         line: u32,
     ) -> Result<Type, String> {
+        // `this::name.isInitialized` / `::name.isInitialized` — whether a
+        // `lateinit` property of the receiver has been written. Read without
+        // the unset check every ordinary property read makes.
+        if name == "isInitialized" && args.is_empty() {
+            if let Expr::FunRef {
+                recv: target,
+                name: prop,
+                ..
+            } = recv
+            {
+                match target.as_deref() {
+                    None => self.compile_expr(sc, &Expr::Var("this".into()))?,
+                    Some(t) => self.compile_expr(sc, t)?,
+                };
+                let nidx = self.b.add_constant(Value::str(prop.clone()));
+                self.b.emit(Op::LoadConst(nidx), line);
+                self.b.emit(Op::Extended(KT_LATEINIT, 1), line);
+                return Ok(Type::Boolean);
+            }
+        }
         // `fmt.format(*args)` — the arguments packed into one array, which the
         // host's `format*` member spreads back into the formatter.
         if name == "format" && args.iter().any(|a| matches!(a, Expr::Spread(_))) {
@@ -7879,6 +7927,7 @@ impl Compiler {
             Expr::Bool(_) => Type::Boolean,
             Expr::Char(_) => Type::Char,
             Expr::Null => Type::Unknown,
+            Expr::LateinitUnset => Type::Unknown,
             Expr::Str(_) => Type::String,
             Expr::Var(n) => {
                 if sc.slot(n).is_some() {
@@ -10286,6 +10335,7 @@ fn expr_any(e: &Expr, f: &dyn Fn(&Expr) -> bool) -> bool {
         | Expr::Bool(_)
         | Expr::Char(_)
         | Expr::Null
+        | Expr::LateinitUnset
         | Expr::Super { .. }
         | Expr::Var(_) => false,
     }

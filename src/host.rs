@@ -514,6 +514,15 @@ pub const KT_EXC_NEW: u16 = 110;
 /// `[exc, cause]`; pushes `exc`. A cause that is not a throwable (the
 /// `Exception(message)` form reaching here) records nothing.
 pub const KT_EXC_CAUSE_SET: u16 = 142;
+/// `lateinit var` support. `arg` 0 pushes the unset marker a `lateinit`
+/// property starts out holding; `arg` 1 pops `[obj, nameStr]` and pushes
+/// whether that property has been written — `this::name.isInitialized`. `arg` 2
+/// pops `[value, nameStr]` and pushes the value back, raising on the marker —
+/// the check a construction-time read of the property's slot makes. Every
+/// property READ ([`KT_GETFIELD`] and the dynamic fallback) raises
+/// `UninitializedPropertyAccessException` on the marker, so it never escapes
+/// into a program value.
+pub const KT_LATEINIT: u16 = 143;
 /// Builtin id for `throw e`: pops the throwable and makes it the in-flight
 /// exception. Returns `Undef` (a `throw` expression's value is never observed).
 pub const KT_EXC_THROW: u16 = 111;
@@ -1777,6 +1786,10 @@ pub const BUILTIN_THROWABLES: &[(&str, &str)] = &[
         "java.lang.IllegalArgumentException",
     ),
     ("IllegalStateException", "java.lang.IllegalStateException"),
+    (
+        "UninitializedPropertyAccessException",
+        "kotlin.UninitializedPropertyAccessException",
+    ),
     ("NumberFormatException", "java.lang.NumberFormatException"),
     (
         "IndexOutOfBoundsException",
@@ -1866,6 +1879,7 @@ const THROWABLE_PARENTS: &[(&str, &str)] = &[
     ("ArithmeticException", "RuntimeException"),
     ("IllegalArgumentException", "RuntimeException"),
     ("IllegalStateException", "RuntimeException"),
+    ("UninitializedPropertyAccessException", "RuntimeException"),
     ("NumberFormatException", "IllegalArgumentException"),
     ("IndexOutOfBoundsException", "RuntimeException"),
     (
@@ -3179,6 +3193,41 @@ pub fn take_error() -> Option<String> {
     KT_ERROR.with(|e| e.borrow_mut().take())
 }
 
+thread_local! {
+    /// The handle of the marker every unset `lateinit` property holds,
+    /// allocated on first use. Its identity is the whole of its meaning.
+    static LATEINIT_UNSET: std::cell::Cell<Option<Value>> = const { std::cell::Cell::new(None) };
+}
+
+/// The unset-`lateinit` marker: one heap handle no program value can equal.
+fn lateinit_unset() -> Value {
+    LATEINIT_UNSET.with(|c| {
+        let cur = c.take();
+        let v = cur.unwrap_or_else(|| alloc(HeapObj::List(Vec::new())));
+        c.set(Some(v.clone()));
+        v
+    })
+}
+
+/// Whether `v` is the unset-`lateinit` marker.
+fn is_lateinit_unset(v: &Value) -> bool {
+    matches!(v, Value::Obj(_))
+        && LATEINIT_UNSET.with(|c| {
+            let cur = c.take();
+            let hit = matches!((cur.as_ref(), v), (Some(Value::Obj(a)), Value::Obj(b)) if a == b);
+            c.set(cur);
+            hit
+        })
+}
+
+/// The fault a read of an unset `lateinit` property raises — Kotlin's
+/// `throwUninitializedPropertyAccessException` wording.
+fn lateinit_fault(name: &str) -> String {
+    format!(
+        "kotlin.UninitializedPropertyAccessException: lateinit property {name} has not been initialized"
+    )
+}
+
 /// Stop the run with `msg` — or, when the message names a JVM throwable and the
 /// program contains a `try`, raise it as a catchable exception instead.
 ///
@@ -3385,6 +3434,10 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             })
             .flatten();
             match got {
+                Some(v) if is_lateinit_unset(&v) => {
+                    fault(vm, lateinit_fault(&name));
+                    vm.push(Value::Undef);
+                }
                 Some(v) => vm.push(v),
                 None => {
                     fault(vm, format!("unresolved reference: {name}"));
@@ -3545,6 +3598,30 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
                 return;
             }
             vm.push(Value::Bool(value_is_type(&v, &ty)));
+        }
+        KT_LATEINIT if arg == 0 => vm.push(lateinit_unset()),
+        KT_LATEINIT if arg == 2 => {
+            let name = vm.pop().to_str();
+            let v = vm.pop();
+            if is_lateinit_unset(&v) {
+                fault(vm, lateinit_fault(&name));
+                vm.push(Value::Undef);
+            } else {
+                vm.push(v);
+            }
+        }
+        KT_LATEINIT => {
+            let name = vm.pop().to_str();
+            let obj = vm.pop();
+            let set = with_obj(&obj, |o| match o {
+                HeapObj::Instance { fields, .. } => fields
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .is_some_and(|(_, v)| !is_lateinit_unset(v)),
+                _ => false,
+            })
+            .unwrap_or(false);
+            vm.push(Value::Bool(set));
         }
         KT_LAZY_NEW => {
             let thunk = vm.pop();
@@ -10096,6 +10173,7 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         _ => None,
     });
     match res.flatten() {
+        Some(v) if is_lateinit_unset(&v) => Err(lateinit_fault(name)),
         Some(v) => Ok(v),
         None => Err(format!(
             "unresolved reference: {name} on {}",

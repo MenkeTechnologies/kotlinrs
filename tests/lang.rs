@@ -6542,3 +6542,52 @@ fn logarithms_and_exp_are_fdlibm_bit_for_bit() {
         "-Infinity\n2.7182818284590455\n3.0\n-0.8450980400142569\n3.3219280948873626\n9.999999999500001E-11\n3.0\nNaN\n0.6931472\n2.7080502011022105\n255227.1451013387\n"
     );
 }
+
+#[test]
+fn lateinit_properties_raise_until_written() {
+    // A `lateinit var` holds nothing until its first write, and every read
+    // before that — through the instance, inside a member, or in an `init`
+    // block — is `kotlin.UninitializedPropertyAccessException` with Kotlin's
+    // wording. `this::s.isInitialized` reads without raising. Measured on
+    // kotlinc 2.4.20 / JDK 21.
+    assert_eq!(
+        prog(
+            "class C {\n\
+                 lateinit var s: String\n\
+                 lateinit var xs: MutableList<Int>\n\
+                 fun ready() = this::s.isInitialized\n\
+                 fun show() = \"s=$s\"\n\
+             }\n\
+             class E { lateinit var s: String; init { println(s.length) } }\n\
+             class D { lateinit var s: String; init { s = \"set in init\" } }\n\
+             fun main() {\n\
+                 val c = C()\n\
+                 println(c.ready())\n\
+                 try { println(c.s) } catch (e: UninitializedPropertyAccessException) { println(e.message) }\n\
+                 try { println(c.show()) } catch (e: RuntimeException) { println(\"RT \" + e) }\n\
+                 c.s = \"x\"; println(c.s + c.ready() + c.show())\n\
+                 c.xs = mutableListOf(1); c.xs.add(2); println(c.xs)\n\
+                 try { E() } catch (e: Exception) { println(e.message) }\n\
+                 println(D().s)\n\
+             }"
+        ),
+        "false\n\
+         lateinit property s has not been initialized\n\
+         RT kotlin.UninitializedPropertyAccessException: lateinit property s has not been initialized\n\
+         xtrues=x\n\
+         [1, 2]\n\
+         lateinit property s has not been initialized\n\
+         set in init\n"
+    );
+    // Kotlin refuses the modifier on a `val`, a nullable or primitive type, and
+    // a property with an initializer.
+    for bad in [
+        "class C { lateinit val s: String }",
+        "class C { lateinit var s: String? }",
+        "class C { lateinit var n: Int }",
+        "class C { lateinit var s: String = \"\" }",
+    ] {
+        let err = prog_err(&format!("{bad}\nfun main() {{ println(1) }}"));
+        assert!(err.contains("lateinit"), "{bad}: stderr was: {err}");
+    }
+}
