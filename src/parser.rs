@@ -1423,14 +1423,45 @@ impl Parser {
                 // ordinary class body, so it is hoisted to the top level under
                 // the qualified name `Owner$Nested` and resolved from there.
                 // The forms accepted are exactly the top-level ones.
+                // An `inner class` is hoisted the same way, carrying the
+                // enclosing instance as a hidden first constructor property.
                 if self.at_class_kw() {
-                    if mods.inner {
-                        return Err(format!(
-                            "class {name}: an `inner` class keeps a reference to the enclosing \
-                             instance, which a nested declaration here does not carry"
-                        ));
+                    let inner = mods.inner;
+                    let mut nested = self.class_decl_mods(mods, None, Some(&name))?;
+                    if inner {
+                        if is_interface || is_object {
+                            return Err(format!(
+                                "{name}: an `inner` class needs an enclosing instance; \
+                                 an interface and an object have none"
+                            ));
+                        }
+                        if nested.is_data
+                            || nested.is_object
+                            || nested.is_interface
+                            || nested.is_enum
+                            || (!nested.has_primary && !nested.secondaries.is_empty())
+                        {
+                            return Err(format!(
+                                "class {}: only a plain `inner class` with a primary \
+                                 constructor is supported",
+                                nested.name
+                            ));
+                        }
+                        nested.params.insert(
+                            0,
+                            CtorProp {
+                                name: INNER_OUTER_FIELD.to_string(),
+                                ty: Type::Obj,
+                                class: Some(name.clone()),
+                                kind: PropKind::Val,
+                                default: None,
+                                type_param_of: None,
+                                type_args: Vec::new(),
+                            },
+                        );
+                        nested.has_primary = true;
+                        nested.inner_of = Some(name.clone());
                     }
-                    let nested = self.class_decl_mods(mods, None, Some(&name))?;
                     self.nested_names.push(nested.name.clone());
                     self.pending_classes.push(nested);
                     continue;
@@ -1533,6 +1564,7 @@ impl Parser {
             obj_props,
             methods,
             is_data,
+            inner_of: None,
             is_object,
             is_interface,
             is_abstract,
@@ -1649,6 +1681,7 @@ impl Parser {
             Some(c) => *c,
             None => ClassDecl {
                 name: companion_name(cls),
+                inner_of: None,
                 // An `enum class` cannot declare type parameters.
                 type_params: Vec::new(),
                 params: Vec::new(),
@@ -1704,6 +1737,7 @@ impl Parser {
                     let sub = entry_class_name(cls, &e.name);
                     self.pending_classes.push(ClassDecl {
                         name: sub.clone(),
+                        inner_of: None,
                         type_params: Vec::new(),
                         params: Vec::new(),
                         obj_props: Vec::new(),
@@ -4225,6 +4259,18 @@ impl Parser {
                     None
                 };
                 Ok(Expr::Super { qualifier })
+            }
+            // `this@Outer` — a qualified `this`. Carried as one name, which the
+            // compiler resolves against the enclosing classes.
+            Tok::Ident(name)
+                if name == "this"
+                    && matches!(self.peek_at(1), Tok::At)
+                    && matches!(self.peek_at(2), Tok::Ident(_)) =>
+            {
+                self.advance();
+                self.advance();
+                let label = self.ident()?;
+                Ok(Expr::Var(format!("this@{label}")))
             }
             Tok::Ident(name) => {
                 self.advance();

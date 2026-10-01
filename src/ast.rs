@@ -371,8 +371,18 @@ pub struct ClassDecl {
     /// this flag carries them: `toString()` is the entry's `name` rather than
     /// `Class@hash`, and `compareTo`/`<` order by `ordinal`.
     pub is_enum: bool,
+    /// `inner class` — the (hoisted) name of the enclosing class whose
+    /// instance this one carries. The parser prepends that instance as the
+    /// hidden first constructor property [`INNER_OUTER_FIELD`]; the compiler
+    /// passes it at every construction and reads the enclosing class's
+    /// members through it.
+    pub inner_of: Option<String>,
     pub line: u32,
 }
+
+/// The field an `inner class` instance keeps its enclosing instance in. `$`
+/// cannot appear in a Kotlin identifier, so no program can name or shadow it.
+pub const INNER_OUTER_FIELD: &str = "this$0";
 
 /// An `init { … }` block and its position among the body properties.
 #[derive(Debug, Clone)]

@@ -241,9 +241,11 @@ fun main() { println(Box(7).v) }   // 7</code></pre>
         <article class="doc-entry" id="doc-keywords-declarations-25">
           <h3><a class="doc-anchor" href="#doc-keywords-declarations-25">#</a> <code>inner</code></h3>
           <pre><code class="lang-kotlin">inner class C</code></pre>
-          <p>Accepted and discarded. kotlinrs has no nested classes at all — every <code>class</code> is top-level — so the modifier never changes what is compiled.</p>
-          <pre><code class="lang-kotlin">class Holder(val v: Int)
-fun main() { println(Holder(1).v) }   // 1</code></pre>
+          <p>A nested class that keeps a reference to an instance of the enclosing class. It is constructed on that instance (<code>outer.In(…)</code>, or a bare <code>In(…)</code> inside the outer class), reads and writes the outer class's members unqualified, and names the outer instance as <code>this@Outer</code>.</p>
+          <pre><code class="lang-kotlin">class Outer(val name: String) {
+    inner class In(val k: Int) { fun g() = "$name/$k" }
+}
+fun main() { println(Outer("o").In(3).g()) }   // o/3</code></pre>
         </article>
         <article class="doc-entry" id="doc-keywords-declarations-26">
           <h3><a class="doc-anchor" href="#doc-keywords-declarations-26">#</a> <code>super</code></h3>

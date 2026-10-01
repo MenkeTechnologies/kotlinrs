@@ -6501,14 +6501,38 @@ fn a_nested_class_name_is_only_a_qualifier_until_it_is_called() {
 }
 
 #[test]
-fn an_inner_class_is_refused_rather_than_hoisted() {
-    // `inner` is the one nested form the hoist cannot reproduce: it carries a
-    // reference to the enclosing INSTANCE, which a top-level class has nowhere
-    // to keep. Accepting it silently would answer for the wrong receiver.
-    let out = eval("class O { val v = 1; inner class I { fun get() = v } }; println(1)");
+fn an_inner_class_reads_and_writes_its_enclosing_instance() {
+    // `inner` carries a reference to the enclosing INSTANCE: each `In` sees
+    // the `Outer` it was built on, not some other one, and a write through it
+    // lands on that instance. Two instances keep the receivers apart. Output
+    // captured from kotlinc 2.4.20 / JRE 21.
+    let src = r#"
+class Outer(val name: String) {
+    var count = 0
+    fun bump() = ++count
+    inner class In(val k: Int) {
+        val tag = "$name:$k"
+        init { count += 10 }
+        fun g() = "$name/$k/$tag"
+        fun touch() { count += k; bump() }
+        fun me() = this@Outer.name + this@In.k
+        inner class Deep { fun d() = "$name-$k-$count" }
+    }
+    fun make(k: Int) = In(k)
+}
+fun main() {
+    val a = Outer("a"); val b = Outer("b")
+    val i = a.In(3)
+    println(i.g()); println(b.make(5).g())
+    i.touch(); println(a.count); println(b.count)
+    println(i.me()); println(i.Deep().d())
+}"#;
+    assert_eq!(stdout(src), "a/3/a:3\nb/5/b:5\n14\n10\na3\na-3-14\n");
+    // A non-`inner` nested class has no enclosing instance to read through.
+    let out = eval(
+        "class O { val v = 1; class N { fun get() = v } }\nfun main() { println(O.N().get()) }",
+    );
     assert!(!out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("enclosing instance"), "stderr was: {err}");
 }
 
 #[test]

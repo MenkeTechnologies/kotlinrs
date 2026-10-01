@@ -226,8 +226,8 @@ const CORPUS: &[Entry] = &[
         "inner",
         "Keywords & Declarations",
         "inner class C",
-        "Accepted and discarded. kotlinrs has no nested classes at all — every `class` is top-level — so the modifier never changes what is compiled.",
-        "class Holder(val v: Int)\nfun main() { println(Holder(1).v) }   // 1",
+        "A nested class that keeps a reference to an instance of the enclosing class. It is constructed on that instance (`outer.In(…)`, or a bare `In(…)` inside the outer class), reads and writes the outer class's members unqualified, and names the outer instance as `this@Outer`.",
+        "class Outer(val name: String) {\n    inner class In(val k: Int) { fun g() = \"$name/$k\" }\n}\nfun main() { println(Outer(\"o\").In(3).g()) }   // o/3",
     ),
     (
         "super",

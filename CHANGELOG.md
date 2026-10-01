@@ -945,8 +945,8 @@ on the previous release and passes now.
 Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1 through `scripts/capture-parity.sh`.
 The baseline was a clean corpus replay and a clean 480-probe `parity-fuzz` run
 (seed 4242001), so the round worked from 270 hand-written probes compared one
-by one against the reference. Seven corpus records cover what changed; each
-fails on the previous commit and passes now.
+by one against the reference. Nine corpus records cover what changed; each
+fails on the round's starting commit and passes now.
 
 - **A user method named like a stdlib extension was never called.** A class
   declaring `fun <R> map(f: (T) -> R)` — or `filter`, `let`, `thenBy`, any of
@@ -975,3 +975,10 @@ fails on the previous commit and passes now.
   Kotlin's member includes) and the **box-class constants** `Integer.MAX_VALUE`,
   `java.lang.Long.MIN_VALUE`, `Character.MAX_VALUE`, typed so that
   `Integer.MAX_VALUE + 1` wraps.
+- **`inner class`** was refused. It is now hoisted like any nested class, with
+  the enclosing instance as a hidden first constructor property: built on an
+  instance (`outer.In(…)`, or a bare `In(…)` inside the outer class, which
+  passes `this`), reading and writing the outer class's members unqualified from
+  its methods, lambdas, property initializers and `init` blocks, nesting more
+  than one level deep, and naming the outer instance `this@Outer`. Two more
+  corpus records cover it.

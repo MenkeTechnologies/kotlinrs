@@ -398,10 +398,14 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   from outside the owner (`Sd.Circ(2)`, `is Sd.Circ`, `catch (e: Outer.Boom)`,
   `val x: A.B.C`) and bare from inside it, where the lookup walks outward from
   the enclosing declaration — so two owners nesting the same simple name each
-  see their own, exactly as in Kotlin. An `inner class` is REFUSED rather than
-  hoisted: it keeps a reference to the enclosing instance, which a top-level
-  class has nowhere to store, and answering for the wrong receiver would be
-  worse than not compiling. A bare name written OUTSIDE every owner also
+  see their own, exactly as in Kotlin. An `inner class` is hoisted the same
+  way with the enclosing instance as a hidden first constructor property: it
+  is constructed on an instance (`outer.In(…)`, or a bare `In(…)` from inside
+  the outer class, which passes `this`), reads and writes the outer class's
+  members unqualified — from its methods, its lambdas and its property
+  initializers alike — and names the outer instance `this@Outer`. Only a plain
+  `inner class` with a primary constructor is accepted; an `inner data class`
+  or one with only secondary constructors is refused. A bare name written OUTSIDE every owner also
   resolves when exactly one nested class answers to it, which is wider than
   Kotlin — the qualified spelling is the one that always means what it says.
 - **`object`** — singleton declarations with `val`/`var` properties and methods,

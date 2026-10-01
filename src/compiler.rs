@@ -676,6 +676,10 @@ struct ClassMeta {
     /// class carries a synthetic `message` field and displays / is caught like
     /// the built-in throwables.
     throwable_base: Option<String>,
+    /// `inner class`: the enclosing class whose instance the hidden first
+    /// constructor property [`INNER_OUTER_FIELD`] holds. See
+    /// [`ClassDecl::inner_of`].
+    outer: Option<String>,
 }
 
 impl ClassMeta {
@@ -865,6 +869,10 @@ pub struct Compiler {
     /// The class whose method is currently being lowered (enables implicit
     /// `this` for member/method access). `None` at top level and in free funcs.
     cur_class: Option<String>,
+    /// Set by a construction of an `inner class` that already carries the
+    /// enclosing instance as its first argument; read and cleared by the very
+    /// next [`Compiler::compile_call`]. See there.
+    outer_supplied: bool,
     /// The `object` whose property initializers are being lowered right now.
     ///
     /// [`Compiler::build_object`] evaluates every initializer into a local slot
@@ -1587,6 +1595,7 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
                 sec_arities: cd.secondaries.iter().map(|s| s.params.len()).collect(),
                 sec_params: cd.secondaries.iter().map(|s| s.params.clone()).collect(),
                 throwable_base,
+                outer: cd.inner_of.clone(),
             },
         );
     }
@@ -1745,6 +1754,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
             .collect(),
         method_index,
         cur_class: None,
+        outer_supplied: false,
         building_object: None,
         debug,
         has_ffi,
@@ -2840,6 +2850,10 @@ impl Compiler {
                             );
                         }
                     }
+                    // A property of an enclosing class, from an `inner class`.
+                    if let Some(recv) = self.outer_receiver(sc, |m| m.prop(name).is_some()) {
+                        return self.compile_set_member(sc, &recv, name, op, value);
+                    }
                 }
                 // A top-level `var`.
                 if sc.slot(name).is_none() {
@@ -3494,6 +3508,19 @@ impl Compiler {
                         );
                     }
                 }
+                // Inside an `inner class`, a member of an enclosing class.
+                if let Some(recv) = self.outer_receiver(sc, |m| {
+                    m.prop(name).is_some() || m.methods.get(name).is_some_and(|s| s.arity == 0)
+                }) {
+                    return self.compile_member(sc, &recv, name, &[], false, 0);
+                }
+                // `this@Outer` — a qualified `this`.
+                if let Some(label) = name.strip_prefix("this@") {
+                    let recv = self
+                        .this_label(sc, label)
+                        .ok_or_else(|| format!("unresolved label: this@{label}"))?;
+                    return self.compile_expr(sc, &recv);
+                }
                 // A companion property named without a qualifier from inside the
                 // owning class — `companion object { val K = 7 }` makes `K`
                 // visible to every member.
@@ -3605,6 +3632,21 @@ impl Compiler {
                 let target = self.nested_ctor(recv, name).expect("guarded above");
                 let (args, line) = (args.clone(), *line);
                 self.compile_call(sc, &target, &args, line)
+            }
+            // `outer.In(args)` — constructing an `inner class` on an instance
+            // of its enclosing class, which becomes the hidden first argument.
+            Expr::MethodCall {
+                recv,
+                name,
+                args,
+                line,
+                ..
+            } if self.nests() && self.inner_ctor(sc, recv, name).is_some() => {
+                let target = self.inner_ctor(sc, recv, name).expect("guarded above");
+                let mut full = vec![(**recv).clone()];
+                full.extend(args.iter().cloned());
+                self.outer_supplied = true;
+                self.compile_call(sc, &target, &full, *line)
             }
             // `b.onClick()` — a CALL, with no arguments, of a property holding a
             // function. `compile_member` reads a zero-argument member as the
@@ -6527,6 +6569,29 @@ impl Compiler {
         args: &[Expr],
         line: u32,
     ) -> Result<Type, String> {
+        // A bare `In(args)` naming an `inner class` passes the enclosing
+        // instance in scope as the hidden first argument. `outer_supplied`
+        // marks the call that already carries it (this rewrite, or the
+        // `outer.In(args)` spelling).
+        let outer_supplied = std::mem::take(&mut self.outer_supplied);
+        if !outer_supplied && sc.slot(name).is_none() {
+            if let Some(meta) = self.class_meta(name).filter(|m| m.outer.is_some()) {
+                let target = meta.name.clone();
+                let outer = meta.outer.clone().unwrap_or_default();
+                let recv = self
+                    .enclosing_instance(sc, true, |m| m.mro.iter().any(|a| a == &outer))
+                    .ok_or_else(|| {
+                        format!(
+                            "constructor of inner class {name} needs an enclosing \
+                             instance of {outer} (line {line})"
+                        )
+                    })?;
+                let mut full = vec![recv];
+                full.extend(args.iter().cloned());
+                self.outer_supplied = true;
+                return self.compile_call(sc, &target, &full, line);
+            }
+        }
         // A spread into a stdlib factory — `listOf(*xs, 3)`, `arrayOf(*a)` — packs
         // its arguments the way a user `vararg` call does and converts the array
         // to what the factory returns. A user declaration of the name wins.
@@ -7355,6 +7420,15 @@ impl Compiler {
                         );
                     }
                 }
+                // Inside an `inner class`, a method (or function-valued
+                // property) of an enclosing class.
+                if let Some(recv) = self.outer_receiver(sc, |m| {
+                    m.methods.contains_key(name)
+                        || m.prop(name)
+                            .is_some_and(|p| p.class.as_deref() == Some("Function"))
+                }) {
+                    return self.compile_member(sc, &recv, name, args, false, line);
+                }
                 // Inside a receiver scope whose receiver is not a user class, an
                 // unqualified call is a member of it: `with("x") { uppercase() }`.
                 // The `Expr::Var` arm applies the same rule to a bare name.
@@ -7636,6 +7710,66 @@ impl Compiler {
         self.nested_class(outer, name)
             .filter(|m| !m.is_object)
             .map(|m| m.name.clone())
+    }
+
+    /// `outer.In(args)` — the hoisted name of the `inner class` that call
+    /// constructs, when `outer`'s static class (or a supertype of it) declares
+    /// one named `name`. The receiver becomes the enclosing instance.
+    fn inner_ctor(&self, sc: &Scope, outer: &Expr, name: &str) -> Option<String> {
+        let cls = self.infer_class(sc, outer)?;
+        self.classes.get(&cls)?.mro.iter().find_map(|owner| {
+            self.classes
+                .get(&nested_class_name(owner, name))
+                .filter(|m| m.outer.as_deref() == Some(owner.as_str()))
+                .map(|m| m.name.clone())
+        })
+    }
+
+    /// The innermost instance in scope accepted by `matches`, as an
+    /// expression: `this`, else the enclosing instance an `inner class`
+    /// carries, one `this$0` hop per level of nesting. `include_self: false`
+    /// starts the search at the enclosing instance, which is what a bare name
+    /// the current class does not declare resolves against.
+    ///
+    /// A primary constructor's property initializers and `init` blocks run
+    /// before `this` exists; there the constructor parameters are locals, and
+    /// the hidden enclosing instance is the local the walk starts from.
+    fn enclosing_instance(
+        &self,
+        sc: &Scope,
+        include_self: bool,
+        matches: impl Fn(&ClassMeta) -> bool,
+    ) -> Option<Expr> {
+        let (mut recv, mut cls, mut is_self) = match &self.cur_class {
+            Some(c) if sc.slot("this").is_some() => (Expr::Var("this".into()), c.clone(), true),
+            _ if sc.slot(INNER_OUTER_FIELD).is_some() => (
+                Expr::Var(INNER_OUTER_FIELD.into()),
+                sc.class_of(INNER_OUTER_FIELD)?,
+                false,
+            ),
+            _ => return None,
+        };
+        loop {
+            let meta = self.classes.get(&cls)?;
+            if (include_self || !is_self) && matches(meta) {
+                return Some(recv);
+            }
+            cls = meta.outer.clone()?;
+            recv = outer_hop(recv);
+            is_self = false;
+        }
+    }
+
+    /// The receiver through which a bare `name` inside an `inner class`
+    /// reaches a member of an ENCLOSING class (`has` says which class
+    /// declares it). `None` outside an inner class, or when none does.
+    fn outer_receiver(&self, sc: &Scope, has: impl Fn(&ClassMeta) -> bool) -> Option<Expr> {
+        self.enclosing_instance(sc, false, has)
+    }
+
+    /// `this@Label`: the enclosing class whose simple name is `label`.
+    fn this_label(&self, sc: &Scope, label: &str) -> Option<Expr> {
+        self.enclosing_instance(sc, true, |m| m.name.rsplit('$').next() == Some(label))
     }
 
     /// The canonical class name an expression denotes when it is read as a TYPE
@@ -8459,7 +8593,9 @@ impl Compiler {
             // Inference has to agree, or the value would be compared and
             // displayed as an untyped one.
             Expr::MethodCall { recv, name, .. }
-                if self.nests() && self.nested_ctor(recv, name).is_some() =>
+                if self.nests()
+                    && (self.nested_ctor(recv, name).is_some()
+                        || self.inner_ctor(sc, recv, name).is_some()) =>
             {
                 Type::Obj
             }
@@ -9533,7 +9669,10 @@ impl Compiler {
         match e {
             // The class half of the nested-class rewrite `infer` mirrors above.
             Expr::MethodCall { recv, name, .. } if self.nests() => {
-                match self.nested_ctor(recv, name) {
+                match self
+                    .nested_ctor(recv, name)
+                    .or_else(|| self.inner_ctor(sc, recv, name))
+                {
                     Some(canon) => Some(canon),
                     None => self.infer_class_plain(sc, e),
                 }
@@ -10294,6 +10433,17 @@ fn jdk_box_const(path: &str, name: &str) -> Option<(Value, Type)> {
         _ => return None,
     };
     primitive_const(prim, name)
+}
+
+/// `recv.this$0` — one step out from an `inner class` instance to the
+/// instance enclosing it.
+fn outer_hop(recv: Expr) -> Expr {
+    Expr::Member {
+        recv: Box::new(recv),
+        name: INNER_OUTER_FIELD.to_string(),
+        safe: false,
+        line: 0,
+    }
 }
 
 fn primitive_const(ty: &str, name: &str) -> Option<(Value, Type)> {
