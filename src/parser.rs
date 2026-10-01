@@ -94,6 +94,11 @@ pub struct Parser {
     /// order — published as [`Program::nested`], which is what reconstructs the
     /// qualified and bare spellings that reach them.
     nested_names: Vec<String>,
+    /// Set while a SUBJECTLESS `when` arm's condition is parsed. There an
+    /// `x is T ->` is the condition itself, not the next subject-form arm's
+    /// `is T ->` header that [`Parser::at_when_is_arm`] looks for. Each `when`
+    /// clears it for its own arms and restores it after.
+    in_subjectless_cond: bool,
 }
 
 /// Whether a postfix `(` may apply to this expression as an invocation.
@@ -336,6 +341,7 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
         pending_classes: Vec::new(),
         anon_object: None,
         nested_names: Vec::new(),
+        in_subjectless_cond: false,
     };
     let mut prog = Program::default();
     while !p.at(&Tok::Eof) {
@@ -2308,6 +2314,7 @@ impl Parser {
             pending_classes: Vec::new(),
             anon_object: None,
             nested_names: Vec::new(),
+            in_subjectless_cond: false,
         })
     }
 
@@ -3374,6 +3381,9 @@ impl Parser {
     /// Whether the parser sits on a `when` arm's `is Type ->` / `!is Type ->`
     /// header rather than on an `is` operator continuing the current expression.
     fn at_when_is_arm(&self) -> bool {
+        if self.in_subjectless_cond {
+            return false;
+        }
         let off = usize::from(self.at(&Tok::Not));
         if !matches!(self.peek_at(off), Tok::Is) || !matches!(self.peek_at(off + 1), Tok::Ident(_))
         {
@@ -4476,6 +4486,13 @@ impl Parser {
     /// Arms are `guard -> body`, with `guard` either `else`, or one or more
     /// comma-separated conditions.
     fn when_expr(&mut self) -> Result<WhenExpr, String> {
+        let outer_cond = std::mem::replace(&mut self.in_subjectless_cond, false);
+        let w = self.when_expr_inner();
+        self.in_subjectless_cond = outer_cond;
+        w
+    }
+
+    fn when_expr_inner(&mut self) -> Result<WhenExpr, String> {
         let line = self.line();
         self.eat(&Tok::When)?;
         // `when (val n = subject)` names the subject for the arm bodies; the
@@ -4567,8 +4584,12 @@ impl Parser {
                 }
                 _ => {}
             }
+            return Ok(WhenCond::Expr(self.expr()?));
         }
-        Ok(WhenCond::Expr(self.expr()?))
+        self.in_subjectless_cond = true;
+        let e = self.expr();
+        self.in_subjectless_cond = false;
+        Ok(WhenCond::Expr(e?))
     }
 
     /// The type after `is`/`!is`/`as`: a name, optionally with type arguments
@@ -4671,6 +4692,7 @@ impl Parser {
                         pending_classes: Vec::new(),
                         anon_object: None,
                         nested_names: Vec::new(),
+                        in_subjectless_cond: false,
                     };
                     let e = sub.expr()?;
                     out.push(StrExpr::Expr(Box::new(e)));

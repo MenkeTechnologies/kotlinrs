@@ -257,6 +257,7 @@ struct ScopeMark {
 /// takes the cheap path and generated code takes the scalable one.
 const CAPTURE_SCAN_FLOOR: usize = 32;
 
+#[derive(Clone)]
 struct Scope {
     map: HashMap<String, Binding>,
     next_slot: u16,
@@ -353,6 +354,26 @@ impl Scope {
     }
     fn ty(&self, name: &str) -> Type {
         self.map.get(name).map(|b| b.ty).unwrap_or(Type::Unknown)
+    }
+    /// Retype an existing binding until the enclosing [`Scope::exit`] — a
+    /// smart cast. The slot is the same one; only what the frontend knows
+    /// about its contents changes.
+    fn narrow(&mut self, name: &str, ty: Type) {
+        if let Some(b) = self.map.get(name).cloned() {
+            let narrowed = Binding {
+                ty,
+                class: None,
+                ..b.clone()
+            };
+            self.map.insert(name.to_string(), narrowed);
+            self.undo.push((name.to_string(), Some(b)));
+        }
+    }
+    /// Apply every `(name, type)` smart cast in `casts`. See [`smart_casts`].
+    fn narrow_all(&mut self, casts: &[(String, Type)]) {
+        for (n, t) in casts {
+            self.narrow(n, *t);
+        }
     }
     /// The class/container name bound to `name`, if any.
     fn class_of(&self, name: &str) -> Option<String> {
@@ -2786,25 +2807,8 @@ impl Compiler {
                     // reassignment. It is the `plusAssign` convention, which
                     // MUTATES the object the name is bound to and leaves the
                     // binding itself alone (see `operator_assign_fn`).
-                    if let Some(fname) = op.and_then(operator_assign_fn) {
-                        let recv = Expr::Var(name.clone());
-                        if self.declares_operator(sc, &recv, fname) {
-                            self.compile_member(
-                                sc,
-                                &recv,
-                                fname,
-                                std::slice::from_ref(value),
-                                false,
-                                0,
-                            )?;
-                            self.b.emit(Op::Pop, 0);
-                            return Ok(());
-                        }
-                        if self.infer(sc, &recv) == Type::Obj {
-                            self.emit_operator_call(sc, &recv, value, fname)?;
-                            self.b.emit(Op::Pop, 0);
-                            return Ok(());
-                        }
+                    if self.compile_val_assign_op(sc, &Expr::Var(name.clone()), op, value)? {
+                        return Ok(());
                     }
                     return Err(format!("val cannot be reassigned: {name}"));
                 }
@@ -2859,6 +2863,10 @@ impl Compiler {
                 if sc.slot(name).is_none() {
                     if let Some(p) = self.globals.get(name).cloned() {
                         if !p.mutable {
+                            let recv = Expr::Var(name.clone());
+                            if self.compile_val_assign_op(sc, &recv, op, value)? {
+                                return Ok(());
+                            }
                             return Err(format!("val cannot be reassigned: {name}"));
                         }
                         let full = match op {
@@ -5952,6 +5960,34 @@ impl Compiler {
         Ok(())
     }
 
+    /// `c += x` where `c` is a `val`: not a reassignment but the
+    /// `plusAssign`/`minusAssign` convention, which MUTATES the object `c`
+    /// holds (see `operator_assign_fn`). Emitted, and `true` answered, when
+    /// the target declares the operator or is a value of a non-primitive type
+    /// (a collection, whose static type the frontend may not have tracked); a
+    /// primitive or `String` `val` has no such operator and stays the
+    /// reassignment error the caller raises.
+    fn compile_val_assign_op(
+        &mut self,
+        sc: &mut Scope,
+        target: &Expr,
+        op: &Option<BinOp>,
+        value: &Expr,
+    ) -> Result<bool, String> {
+        let Some(fname) = op.and_then(operator_assign_fn) else {
+            return Ok(false);
+        };
+        if self.declares_operator(sc, target, fname) {
+            self.compile_member(sc, target, fname, std::slice::from_ref(value), false, 0)?;
+        } else if !is_primitive_recv(self.infer(sc, target)) {
+            self.emit_operator_call(sc, target, value, fname)?;
+        } else {
+            return Ok(false);
+        }
+        self.b.emit(Op::Pop, 0);
+        Ok(true)
+    }
+
     fn compile_set_member(
         &mut self,
         sc: &mut Scope,
@@ -5964,6 +6000,15 @@ impl Compiler {
         if let Some(cls) = self.infer_class(sc, recv) {
             if let Some(p) = self.classes.get(&cls).and_then(|m| m.prop(name)) {
                 if !p.mutable {
+                    let target = Expr::Member {
+                        recv: Box::new(recv.clone()),
+                        name: name.to_string(),
+                        safe: false,
+                        line: 0,
+                    };
+                    if self.compile_val_assign_op(sc, &target, op, value)? {
+                        return Ok(());
+                    }
                     return Err(format!("val cannot be reassigned: {name}"));
                 }
             }
@@ -6172,7 +6217,13 @@ impl Compiler {
                 self.compile_expr(sc, l)?;
                 let j = self.b.emit(Op::JumpIfFalseKeep(0), 0);
                 self.b.emit(Op::Pop, 0);
-                self.compile_expr(sc, r)?;
+                // `x is Int && x > 3` — the right operand runs only where the
+                // left held, so it sees the left's smart casts.
+                let mark = sc.enter();
+                sc.narrow_all(&smart_casts(sc, l, true));
+                let rt = self.compile_expr(sc, r);
+                sc.exit(mark);
+                rt?;
                 let end = self.b.current_pos();
                 self.b.patch_jump(j, end);
                 return Ok(Type::Boolean);
@@ -6181,7 +6232,13 @@ impl Compiler {
                 self.compile_expr(sc, l)?;
                 let j = self.b.emit(Op::JumpIfTrueKeep(0), 0);
                 self.b.emit(Op::Pop, 0);
-                self.compile_expr(sc, r)?;
+                // `x !is Int || x > 3` — the right operand runs only where the
+                // left failed.
+                let mark = sc.enter();
+                sc.narrow_all(&smart_casts(sc, l, false));
+                let rt = self.compile_expr(sc, r);
+                sc.exit(mark);
+                rt?;
                 let end = self.b.current_pos();
                 self.b.patch_jump(j, end);
                 return Ok(Type::Boolean);
@@ -8298,13 +8355,21 @@ impl Compiler {
     fn compile_if_stmt(&mut self, sc: &mut Scope, ie: &IfExpr) -> Result<(), String> {
         self.compile_expr(sc, &ie.cond)?;
         let jf = self.b.emit(Op::JumpIfFalse(0), ie.line);
-        self.compile_block_stmts(sc, &ie.then)?;
+        let mark = sc.enter();
+        sc.narrow_all(&smart_casts(sc, &ie.cond, true));
+        let then = self.compile_block_stmts(sc, &ie.then);
+        sc.exit(mark);
+        then?;
         match &ie.els {
             Some(els) => {
                 let jmp = self.b.emit(Op::Jump(0), ie.line);
                 let else_pos = self.b.current_pos();
                 self.b.patch_jump(jf, else_pos);
-                self.compile_block_stmts(sc, els)?;
+                let mark = sc.enter();
+                sc.narrow_all(&smart_casts(sc, &ie.cond, false));
+                let els = self.compile_block_stmts(sc, els);
+                sc.exit(mark);
+                els?;
                 let end = self.b.current_pos();
                 self.b.patch_jump(jmp, end);
             }
@@ -8334,12 +8399,22 @@ impl Compiler {
     fn compile_if(&mut self, sc: &mut Scope, ie: &IfExpr) -> Result<Type, String> {
         self.compile_expr(sc, &ie.cond)?;
         let jf = self.b.emit(Op::JumpIfFalse(0), ie.line);
-        let tt = self.compile_block_value(sc, &ie.then)?;
+        let mark = sc.enter();
+        sc.narrow_all(&smart_casts(sc, &ie.cond, true));
+        let tt = self.compile_block_value(sc, &ie.then);
+        sc.exit(mark);
+        let tt = tt?;
         let jmp = self.b.emit(Op::Jump(0), ie.line);
         let else_pos = self.b.current_pos();
         self.b.patch_jump(jf, else_pos);
         let et = match &ie.els {
-            Some(els) => self.compile_block_value(sc, els)?,
+            Some(els) => {
+                let mark = sc.enter();
+                sc.narrow_all(&smart_casts(sc, &ie.cond, false));
+                let et = self.compile_block_value(sc, els);
+                sc.exit(mark);
+                et?
+            }
             None => {
                 self.b.emit(Op::LoadUndef, ie.line);
                 Type::Unit
@@ -8418,7 +8493,34 @@ impl Compiler {
                     for j in hit_jumps {
                         self.b.patch_jump(j, body_pos);
                     }
-                    let t = self.compile_arm_body(sc, &arm.body, want_value)?;
+                    // A single `is T` arm smart-casts a subject that names a
+                    // local (or the `when (val n = …)` binding); a subjectless
+                    // arm smart-casts by its condition, as an `if` does.
+                    let casts = match (conds.as_slice(), &w.subject) {
+                        (
+                            [WhenCond::Is {
+                                negated: false,
+                                nullable: false,
+                                ty,
+                            }],
+                            Some(subject),
+                        ) => {
+                            let name = match (&w.binding, &**subject) {
+                                (Some(n), _) | (None, Expr::Var(n)) => Some(n.clone()),
+                                _ => None,
+                            };
+                            name.and_then(|n| smart_cast_of(sc, &n, ty))
+                                .into_iter()
+                                .collect()
+                        }
+                        ([WhenCond::Expr(e)], None) => smart_casts(sc, e, true),
+                        _ => Vec::new(),
+                    };
+                    let arm_mark = sc.enter();
+                    sc.narrow_all(&casts);
+                    let t = self.compile_arm_body(sc, &arm.body, want_value);
+                    sc.exit(arm_mark);
+                    let t = t?;
                     result_ty = Some(join_ty(result_ty, t));
                     end_jumps.push(self.b.emit(Op::Jump(0), 0));
                     let next = self.b.current_pos();
@@ -8518,8 +8620,20 @@ impl Compiler {
                 ty,
                 nullable,
             } => {
-                let (slot, _) = subj.ok_or("`is` condition requires a `when` subject")?;
+                let (slot, sty) = subj.ok_or("`is` condition requires a `when` subject")?;
                 self.b.emit(Op::GetSlot(slot), 0);
+                // Boxed for the test exactly as an `is` expression's operand is
+                // (see `compile_erased`): `is Float` / `is Long` answer for a
+                // box, which is the only form that tells them apart.
+                match sty {
+                    Type::Float => {
+                        self.b.emit(Op::Extended(KT_BOX_F32, 0), 0);
+                    }
+                    Type::Long => {
+                        self.b.emit(Op::Extended(KT_BOX_I64, 0), 0);
+                    }
+                    _ => {}
+                }
                 let nidx = self.b.add_constant(Value::str(self.canon_class(ty)));
                 self.b.emit(Op::LoadConst(nidx), 0);
                 // The operand says whether the tested type was written `T?`,
@@ -8951,17 +9065,23 @@ impl Compiler {
             }
             Expr::NotNull(inner) => self.infer(sc, inner),
             Expr::If(ie) => {
-                let tt = ie
-                    .then
-                    .last()
-                    .map(|s| self.infer_stmt(sc, s))
-                    .unwrap_or(Type::Unit);
+                // Each branch is inferred under the smart casts its lowering
+                // applies, so the two agree on the result's width.
+                let branch = |then: bool, body: &[Stmt]| {
+                    let casts = smart_casts(sc, &ie.cond, then);
+                    let last = body.last();
+                    if casts.is_empty() {
+                        return last.map(|s| self.infer_stmt(sc, s)).unwrap_or(Type::Unit);
+                    }
+                    let mut narrowed = sc.clone();
+                    narrowed.narrow_all(&casts);
+                    last.map(|s| self.infer_stmt(&narrowed, s))
+                        .unwrap_or(Type::Unit)
+                };
+                let tt = branch(true, &ie.then);
                 match &ie.els {
                     Some(els) => {
-                        let et = els
-                            .last()
-                            .map(|s| self.infer_stmt(sc, s))
-                            .unwrap_or(Type::Unit);
+                        let et = branch(false, els);
                         if tt == et {
                             tt
                         } else {
@@ -10444,6 +10564,65 @@ fn outer_hop(recv: Expr) -> Expr {
         safe: false,
         line: 0,
     }
+}
+
+/// The smart casts `cond` establishes where it evaluated to `holds`: each
+/// local that an `is T` test (through `&&`, `||` and `!`) proves is a `T`.
+/// Only casts to a type the frontend tracks statically are reported — a
+/// primitive or `String` — since a user class is already dispatched on its
+/// runtime tag.
+fn smart_casts(sc: &Scope, cond: &Expr, holds: bool) -> Vec<(String, Type)> {
+    match cond {
+        Expr::Is {
+            value,
+            ty,
+            negated,
+            nullable: false,
+        } if *negated != holds => match &**value {
+            Expr::Var(n) => smart_cast_of(sc, n, ty).into_iter().collect(),
+            _ => Vec::new(),
+        },
+        Expr::Binary {
+            op: BinOp::And,
+            l,
+            r,
+        } if holds => {
+            let mut v = smart_casts(sc, l, true);
+            v.extend(smart_casts(sc, r, true));
+            v
+        }
+        Expr::Binary {
+            op: BinOp::Or,
+            l,
+            r,
+        } if !holds => {
+            let mut v = smart_casts(sc, l, false);
+            v.extend(smart_casts(sc, r, false));
+            v
+        }
+        Expr::Unary {
+            op: UnOp::Not,
+            expr,
+        } => smart_casts(sc, expr, !holds),
+        _ => Vec::new(),
+    }
+}
+
+/// `name is ty` as a smart cast of the local `name`, when `ty` is a type the
+/// frontend tracks and the binding is not already known to be one.
+fn smart_cast_of(sc: &Scope, name: &str, ty: &str) -> Option<(String, Type)> {
+    let t = Type::from_name(ty);
+    let tracked = matches!(
+        t,
+        Type::Int
+            | Type::Long
+            | Type::Double
+            | Type::Float
+            | Type::Boolean
+            | Type::Char
+            | Type::String
+    );
+    (tracked && sc.slot(name).is_some() && sc.ty(name) != t).then(|| (name.to_string(), t))
 }
 
 fn primitive_const(ty: &str, name: &str) -> Option<(Value, Type)> {

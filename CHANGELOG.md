@@ -982,3 +982,30 @@ fails on the round's starting commit and passes now.
   its methods, lambdas, property initializers and `init` blocks, nesting more
   than one level deep, and naming the outer instance `this@Outer`. Two more
   corpus records cover it.
+
+Wrong answers and refusals found by a third probe batch, each byte-checked
+against the reference and covered by one of five more corpus records:
+
+- **`b += x` on a `val` collection** was `val cannot be reassigned` whenever
+  the frontend had not tracked the binding's type (`val b =
+  a.toMutableList()`), and always for a class property or a top-level `val`. A
+  `val` of any non-primitive type now takes the `plusAssign`/`minusAssign`
+  convention, as Kotlin resolves it; a `val` `Int` or `String` is still the
+  reassignment error.
+- **`String.slice(…)` answered a `List<Char>`** (`[o, t, l]` for `otl`). It
+  answers a `String`: an `IntRange` is `substring`, with its
+  `StringIndexOutOfBoundsException`, and any other index sequence picks code
+  units one at a time.
+- **Smart casts to a primitive.** `if (x is Int) x + 1`, a `when (x) { is
+  Double -> x * 2 }` arm, a subjectless `when { x is Int -> … }` arm and the
+  right operand of `x is Int && x > 3` (or `x !is Int || …`) now see `x` as the
+  tested type; arithmetic on an `Any` there was `unresolved reference: plus on
+  value`. A subjectless `when` arm written `x is T ->` no longer parses as the
+  next subject-form arm.
+- **`2.5 is Float` was `true`.** A bare floating value is a `Double`; only a
+  boxed `Float` answers `is Float`, and a `when` subject whose static type is
+  `Float` or `Long` is now boxed for its `is` arms as an `is` operand already
+  was.
+- **`(1..Int.MAX_VALUE).asSequence()`** snapshotted every element before the
+  first `take` could stop it, and timed out. A range's `asSequence()` is now a
+  lazy pipeline stepping the range on demand.

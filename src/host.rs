@@ -5910,7 +5910,27 @@ fn gen_drive(
                 },
                 (None, None) => {
                     let Some(p) = prev.clone() else { break };
-                    let next = invoke_closure(vm, &step, std::slice::from_ref(&p))?;
+                    // A range's `asSequence()` keeps the RANGE as its step: the
+                    // next element is one step on, up to the range's last.
+                    let range = with_obj(&step, |o| match o {
+                        HeapObj::Range(r) => Some(*r),
+                        _ => None,
+                    })
+                    .flatten();
+                    let next = match range {
+                        Some(r) => {
+                            let cur = char_code(&p).unwrap_or_else(|| p.to_int());
+                            if cur == r.last() {
+                                break;
+                            }
+                            if r.is_char {
+                                char_of(cur + r.step)
+                            } else {
+                                Value::Int(cur + r.step)
+                            }
+                        }
+                        None => invoke_closure(vm, &step, std::slice::from_ref(&p))?,
+                    };
                     if matches!(next, Value::Undef) {
                         break;
                     }
@@ -9598,6 +9618,33 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
             src: recv.clone(),
             at: 0,
         })),
+        // `String.slice` answers a `String`, where the `CharSequence` members
+        // below would answer a `List<Char>`. An `IntRange` is `substring` (with
+        // its fault); any other index sequence — a `downTo`, a stepped
+        // progression, a list — picks code units one at a time.
+        (Value::Str(_), "slice") if args.len() == 1 => {
+            let range = with_obj(&args[0], |o| match o {
+                HeapObj::Range(r) if !r.progression => Some((r.first, r.end)),
+                _ => None,
+            })
+            .flatten();
+            match range {
+                Some((first, end)) if first > end => Ok(Value::str("")),
+                Some((first, end)) => kt_method(
+                    vm,
+                    recv,
+                    "substring",
+                    &[Value::Int(first), Value::Int(end.wrapping_add(1))],
+                ),
+                None => {
+                    let mut out = String::new();
+                    for i in sequence_items(&args[0]) {
+                        out.push_str(&kotlin_string(&kt_method(vm, recv, "get", &[i])?));
+                    }
+                    Ok(Value::str(out))
+                }
+            }
+        }
         // A `String` member the text-specific arms above did not claim:
         // `kotlin.text` also mirrors the LAMBDA-FREE collection members on
         // `CharSequence`, over the characters. Reached last so a member that
@@ -10635,6 +10682,20 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         if name == "step" {
             if let Some(r) = range {
                 return Ok(Value::Int(r.step));
+            }
+        }
+        // `(1..Int.MAX_VALUE).asSequence()` — a lazy pipeline whose SOURCE is
+        // the range itself, stepped on demand. Snapshotting the elements first
+        // would build two billion of them before the first `take` could stop it.
+        if name == "asSequence" && args.is_empty() {
+            if let Some(r) = range {
+                return Ok(alloc(HeapObj::Gen {
+                    block: None,
+                    items: None,
+                    seed: (r.count() > 0).then(|| r.value_at(0)),
+                    step: recv.clone(),
+                    stages: Vec::new(),
+                }));
             }
         }
         let items = list_snapshot(recv).unwrap_or_default();
@@ -13240,7 +13301,9 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         "Int" | "Byte" | "Short" => matches!(v, Value::Int(_)),
         // A boxed `Float` answers `is Float` and NOT `is Double`, which is the
         // one place the two runtime forms of a floating value are told apart.
-        "Float" => matches!(v, Value::Float(_)) || f32_box(v).is_some(),
+        // A bare `Value::Float` is a `Double`: an `is` operand whose static
+        // type is `Float` is boxed before the test, as a `Long` one is.
+        "Float" => f32_box(v).is_some(),
         "Double" => matches!(v, Value::Float(_)),
         "Boolean" => matches!(v, Value::Bool(_)),
         "String" => matches!(v, Value::Str(_)),
