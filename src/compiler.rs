@@ -4359,6 +4359,17 @@ impl Compiler {
                 None => return Err(format!("unresolved reference: {name}")),
             }
         };
+        // `Float.pow(…)` is the `Float` overload: `Math.pow` over the widened
+        // operands, narrowed once to a `Float` — `2f.pow(0.5f)` is `1.4142135`.
+        if name == "pow" && args.len() == 1 && !safe && self.infer(sc, recv) == Type::Float {
+            self.compile_expr(sc, recv)?;
+            self.compile_expr(sc, &args[0])?;
+            let nidx = self.b.add_constant(Value::str("pow"));
+            self.b.emit(Op::LoadConst(nidx), line);
+            self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 1), line);
+            self.b.emit(Op::Extended(KT_F32, 0), line);
+            return Ok(Type::Float);
+        }
         // `Pair.copy(…)` / `Triple.copy(…)` — both are `data class`es in the
         // stdlib, so `copy` takes each component by position or by name and
         // defaults the rest to the receiver's. Lowered to the constructor over
@@ -9006,6 +9017,11 @@ impl Compiler {
                     let tys: Vec<Type> = args.iter().map(|a| self.infer(sc, a)).collect();
                     return math_ret_type(name, &tys);
                 }
+                // `Float.pow` is the `Float` overload `compile_member` lowers.
+                if name == "pow" && args.len() == 1 && !*safe && self.infer(sc, recv) == Type::Float
+                {
+                    return Type::Float;
+                }
                 // A bitwise member keeps the receiver's width, so it must agree
                 // with the type `compile_member` returns for the same node.
                 if matches!(
@@ -10011,6 +10027,17 @@ fn is_math_fn(name: &str) -> bool {
             | "log2"
             | "ln1p"
             | "exp"
+            | "expm1"
+            | "tan"
+            | "asin"
+            | "acos"
+            | "atan"
+            | "atan2"
+            | "sinh"
+            | "cosh"
+            | "tanh"
+            | "cbrt"
+            | "hypot"
     )
 }
 
@@ -10024,6 +10051,7 @@ fn java_math_only_fn(name: &str) -> Option<&'static str> {
         "floorDiv" => Some("floorDiv"),
         "floorMod" => Some("floorMod"),
         "log1p" => Some("ln1p"),
+        "pow" => Some("pow"),
         _ => None,
     }
 }
@@ -10063,19 +10091,44 @@ fn auto_math_fn(name: &str) -> Option<&'static str> {
 /// rounding family are `Double`-only; `abs`/`max`/`min` are overloaded and keep
 /// an `Int` result for integral arguments — which matters because it decides
 /// whether a following `/` lowers to truncating integer or IEEE division.
+/// The `kotlin.math` functions whose result is a floating value whatever the
+/// argument's type — a `Double`, or a `Float` for the `Float` overload. `pow`
+/// is `Math.pow`, which only exists for `Double`.
+fn is_transcendental(name: &str) -> bool {
+    matches!(
+        name,
+        "sqrt"
+            | "floor"
+            | "ceil"
+            | "ln"
+            | "log"
+            | "log10"
+            | "log2"
+            | "ln1p"
+            | "exp"
+            | "expm1"
+            | "tan"
+            | "asin"
+            | "acos"
+            | "atan"
+            | "atan2"
+            | "sinh"
+            | "cosh"
+            | "tanh"
+            | "cbrt"
+            | "hypot"
+            | "pow"
+    )
+}
+
 fn math_ret_type(name: &str, args: &[Type]) -> Type {
     match name {
         // The `Float` overloads answer a `Float`, so a `Float` argument selects
         // one and the result must not widen — `sqrt(2.0f)` is `1.4142135`, not
         // the `Double` root's `1.4142135623730951`.
-        "sqrt" | "floor" | "ceil" | "ln" | "log" | "log10" | "log2" | "ln1p" | "exp"
-            if args.contains(&Type::Float) =>
-        {
-            Type::Float
-        }
-        "sqrt" | "floor" | "ceil" | "round" | "ln" | "log" | "log10" | "log2" | "ln1p" | "exp" => {
-            Type::Double
-        }
+        _ if is_transcendental(name) && args.contains(&Type::Float) => Type::Float,
+        "round" => Type::Double,
+        _ if is_transcendental(name) => Type::Double,
         // `java.lang.Math.round` is the odd one out: `Long`, not `Double`.
         "jround" => Type::Long,
         // `maxOf`/`minOf` over `Comparable` answer one of their arguments, so a

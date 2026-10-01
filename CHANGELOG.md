@@ -1009,3 +1009,13 @@ against the reference and covered by one of five more corpus records:
 - **`(1..Int.MAX_VALUE).asSequence()`** snapshotted every element before the
   first `take` could stop it, and timed out. A range's `asSequence()` is now a
   lazy pipeline stepping the range on demand.
+- **`kotlin.math`'s trigonometric, hyperbolic and power functions.** `tan`,
+  `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `cbrt`, `hypot` and
+  `expm1` were `unresolved reference`, and `pow` answered Rust's `powf`, which
+  differs from the JVM in the last place on about one input in thirty-six and
+  answered `1.0` for `1.0.pow(Double.POSITIVE_INFINITY)` where the JVM answers
+  `NaN`. All twelve are now ports of fdlibm's routines as JDK 21's `StrictMath`
+  runs them — `tan` with the full `pi/2` reduction for huge arguments — which
+  the reference JVM's `Math` answers bit for bit: zero differences over 250 000
+  inputs each. `Float.pow` narrows once to a `Float`. `sin`/`cos` stay out:
+  BUGS.md has the measurement.

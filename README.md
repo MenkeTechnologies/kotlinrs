@@ -493,8 +493,12 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `false`) and `toString()` is `[I@…`-style (the identity-hash digits are ours,
   the shape is Kotlin's).
 - **Math** — `kotlin.math` `abs`/`max`/`min`/`sqrt`/`floor`/`ceil`/`round`, the
-  logarithms and `exp` (`ln`/`log10`/`log2`/`ln1p`/`log(x, base)`/`exp`, on a
-  port of fdlibm that matches the JVM's `StrictMath` bit for bit), and
+  logarithms and `exp` (`ln`/`log10`/`log2`/`ln1p`/`log(x, base)`/`exp`), the
+  trigonometric and hyperbolic functions other than `sin`/`cos`
+  (`tan`/`asin`/`acos`/`atan`/`atan2`/`sinh`/`cosh`/`tanh`), `cbrt`, `hypot`,
+  `expm1` and the `pow` extension — all on a port of fdlibm that matches the
+  JVM's `StrictMath` bit for bit (`sin`/`cos` are left out because the JVM's
+  are a platform intrinsic; see BUGS.md) — and
   `PI`/`E`, gated on `import kotlin.math.*` (or a single-name import, honouring
   `as` renames) exactly as Kotlin gates them; the auto-imported `maxOf`/`minOf`
   — the numeric overloads for numbers and the `Comparable` ones for anything

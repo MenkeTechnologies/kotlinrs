@@ -1304,6 +1304,62 @@ fun main() { println(ln1p(0.0)) }   // 0.0</code></pre>
           <pre><code class="lang-kotlin">import kotlin.math.exp
 fun main() { println(exp(1.0)) }   // 2.7182818284590455</code></pre>
         </article>
+        <article class="doc-entry" id="doc-math-20">
+          <h3><a class="doc-anchor" href="#doc-math-20">#</a> <code>tan</code></h3>
+          <pre><code class="lang-kotlin">tan(x: Double): Double
+asin(x: Double): Double
+acos(x: Double): Double
+atan(x: Double): Double</code></pre>
+          <p>Tangent and the inverse trigonometric functions, by ports of fdlibm's routines (with its full <code>pi/2</code> argument reduction for <code>tan</code>), which the reference JVM's <code>Math</code> answers bit for bit. <code>sin</code> and <code>cos</code> are absent: the reference's are a platform intrinsic no fdlibm port reproduces. Needs the <code>kotlin.math</code> import; the <code>Math.</code> spellings need none.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.*
+fun main() { println(tan(PI / 4)) }   // 0.9999999999999999</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-math-21">
+          <h3><a class="doc-anchor" href="#doc-math-21">#</a> <code>atan2</code></h3>
+          <pre><code class="lang-kotlin">atan2(y: Double, x: Double): Double</code></pre>
+          <p>The angle of the point <code>(x, y)</code> in <code>(-pi, pi]</code>, fdlibm's <code>atan2</code>. Needs the <code>kotlin.math</code> import.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.atan2
+fun main() { println(atan2(1.0, 1.0)) }   // 0.7853981633974483</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-math-22">
+          <h3><a class="doc-anchor" href="#doc-math-22">#</a> <code>sinh</code></h3>
+          <pre><code class="lang-kotlin">sinh(x: Double): Double
+cosh(x: Double): Double
+tanh(x: Double): Double</code></pre>
+          <p>The hyperbolic functions, fdlibm's routines over its <code>exp</code> and <code>expm1</code>. Needs the <code>kotlin.math</code> import.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.sinh
+fun main() { println(sinh(1.0)) }   // 1.1752011936438014</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-math-23">
+          <h3><a class="doc-anchor" href="#doc-math-23">#</a> <code>cbrt</code></h3>
+          <pre><code class="lang-kotlin">cbrt(x: Double): Double</code></pre>
+          <p>The real cube root, negative for a negative argument — fdlibm's <code>cbrt</code>. Needs the <code>kotlin.math</code> import.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.cbrt
+fun main() { println(cbrt(27.0)) }   // 3.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-math-24">
+          <h3><a class="doc-anchor" href="#doc-math-24">#</a> <code>hypot</code></h3>
+          <pre><code class="lang-kotlin">hypot(x: Double, y: Double): Double</code></pre>
+          <p><code>sqrt(x*x + y*y)</code> without the intermediate overflow or underflow; an infinite argument answers <code>Infinity</code> even beside a <code>NaN</code>. fdlibm's <code>hypot</code>. Needs the <code>kotlin.math</code> import.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.hypot
+fun main() { println(hypot(3.0, 4.0)) }   // 5.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-math-25">
+          <h3><a class="doc-anchor" href="#doc-math-25">#</a> <code>expm1</code></h3>
+          <pre><code class="lang-kotlin">expm1(x: Double): Double</code></pre>
+          <p><code>e^x - 1</code>, accurate for <code>x</code> near zero — fdlibm's <code>expm1</code>. Needs the <code>kotlin.math</code> import.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.expm1
+fun main() { println(expm1(1e-10)) }   // 1.00000000005E-10</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-math-26">
+          <h3><a class="doc-anchor" href="#doc-math-26">#</a> <code>pow</code></h3>
+          <pre><code class="lang-kotlin">Double.pow(x: Double): Double
+Double.pow(n: Int): Double
+Float.pow(x: Float): Float</code></pre>
+          <p><code>this</code> raised to <code>x</code> — <code>Math.pow</code>, by a port of fdlibm's <code>pow</code> as JDK 21 runs it, so <code>1.0.pow(Double.POSITIVE_INFINITY)</code> is <code>NaN</code> as on the JVM. The <code>Float</code> overload computes in <code>Double</code> and narrows once. An extension: needs the <code>kotlin.math</code> import.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.pow
+fun main() { println(2.0.pow(0.5)) }   // 1.4142135623730951</code></pre>
+        </article>
       </section>
 
       <section class="tutorial-section" id="ch-throwables">

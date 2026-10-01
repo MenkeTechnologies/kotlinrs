@@ -4520,6 +4520,26 @@ fn math_call(name: &str, args: &[Value]) -> Result<Value, String> {
         "log10" => Ok(Value::Float(crate::fdlibm::log10(a.to_float()))),
         "ln1p" => Ok(Value::Float(crate::fdlibm::log1p(a.to_float()))),
         "exp" => Ok(Value::Float(crate::fdlibm::exp(a.to_float()))),
+        // The trigonometric, hyperbolic and power routines are fdlibm's too,
+        // for the same reason — measured equal to the reference JVM's `Math`
+        // on every sampled input. (`sin`/`cos` are not: see BUGS.md.)
+        "expm1" => Ok(Value::Float(crate::fdlibm::expm1(a.to_float()))),
+        "tan" => Ok(Value::Float(crate::fdlibm::tan(a.to_float()))),
+        "asin" => Ok(Value::Float(crate::fdlibm::asin(a.to_float()))),
+        "acos" => Ok(Value::Float(crate::fdlibm::acos(a.to_float()))),
+        "atan" => Ok(Value::Float(crate::fdlibm::atan(a.to_float()))),
+        "sinh" => Ok(Value::Float(crate::fdlibm::sinh(a.to_float()))),
+        "cosh" => Ok(Value::Float(crate::fdlibm::cosh(a.to_float()))),
+        "tanh" => Ok(Value::Float(crate::fdlibm::tanh(a.to_float()))),
+        "cbrt" => Ok(Value::Float(crate::fdlibm::cbrt(a.to_float()))),
+        "atan2" | "hypot" | "pow" => {
+            let (x, y) = (a.to_float(), args.get(1).map_or(0.0, Value::to_float));
+            Ok(Value::Float(match name {
+                "atan2" => crate::fdlibm::atan2(x, y),
+                "hypot" => crate::fdlibm::hypot(x, y),
+                _ => crate::fdlibm::pow(x, y),
+            }))
+        }
         "log2" => Ok(Value::Float(
             crate::fdlibm::log(a.to_float()) / crate::fdlibm::log(2.0),
         )),
@@ -9426,10 +9446,10 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         }
         // `kotlin.math` members in their receiver spelling: `2.0.pow(3.0)`,
         // `(-1.5).absoluteValue`, `2.6.roundToInt()`.
-        (Value::Int(_) | Value::Float(_), "pow") => Ok(Value::Float(
-            recv.to_float()
-                .powf(args.first().map(|v| v.to_float()).unwrap_or(0.0)),
-        )),
+        (Value::Int(_) | Value::Float(_), "pow") => Ok(Value::Float(crate::fdlibm::pow(
+            recv.to_float(),
+            args.first().map(|v| v.to_float()).unwrap_or(0.0),
+        ))),
         // `Int.sign` / `Double.sign` — the `kotlin.math` property spelling of
         // the same function; see [`math_call`] for why neither is `f64::signum`.
         (Value::Int(_) | Value::Float(_), "sign") => math_call("sign", std::slice::from_ref(recv)),

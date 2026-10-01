@@ -238,14 +238,11 @@ now, as they are on the JVM.
 Each fails loudly with a diagnostic rather than answering wrongly. Recorded so
 the next round has the measurement rather than a guess.
 
-| program | kotlinrs | reference |
-| --- | --- | --- |
-| `class Op(val v: Int) : Comparable<Op>` | `unresolved supertype Comparable of class Op` | compiles; `<` is the `compareTo` override |
-| `enumValues<E>().size` | `unresolved reference: enumValues` | `2` (`E.values()` DOES work) |
-`enumValues<E>()` and a `Comparable<T>` supertype are still open; the rest of
-what this table used to hold — `orEmpty`/`isNullOrEmpty`/`isNullOrBlank`,
-`IntRange(a, b)`, `iterator()`, `Result.success`/`failure`, `putAll`, `clear`,
-`::class` and `javaClass` — is implemented and pinned in the corpus.
+Every row this table held is closed: `enumValues<E>()` and a `Comparable<T>`
+supertype (re-measured in round 16: `2` and `true`, as the reference answers),
+and before them `orEmpty`/`isNullOrEmpty`/`isNullOrBlank`, `IntRange(a, b)`,
+`iterator()`, `Result.success`/`failure`, `putAll`, `clear`, `::class` and
+`javaClass`, all implemented and pinned in the corpus.
 
 ## `Delegates.observable` before the write, `vetoable` deciding it
 
@@ -284,6 +281,25 @@ the reference — a synthetic class name carrying the loader's address and an
 identity hash, both of which change from run to run — so there is nothing there
 to match and nothing that could be frozen in the corpus.
 
+## `sin` and `cos` — the reference is a platform intrinsic
+
+Measured on the reference JVM (JDK 21.0.12.1 on macOS aarch64, 400 000
+sampled inputs per function): `Math.sin` differs from `StrictMath.sin` — fdlibm
+— on 18 960 of them and `Math.cos` on 17 150, in the last place. Every other
+`kotlin.math` function agreed with `StrictMath` on every sample, and those are
+the ones ported (`tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`,
+`tanh`, `cbrt`, `hypot`, `expm1`, `pow`), each then compared against the JVM
+over 250 000 further inputs with no difference.
+
+| program | kotlinrs | reference |
+| --- | --- | --- |
+| `import kotlin.math.*; println(sin(1.0))` | `unresolved reference: sin` | `0.8414709848078965` |
+
+`kotlin.math.sin` IS `Math.sin`, and HotSpot answers it with a stub of its own,
+which on x86_64 is a different algorithm again — so there is no
+platform-independent answer for a port to reproduce, and an fdlibm port would
+be wrong in the last digit on about one input in twenty here. Both stay loud.
+
 ## Measured this round and not closed
 
 Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
@@ -292,7 +308,6 @@ Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 | --- | --- | --- |
 | `object : Comparator<String> { override fun compare(a: String, b: String) = a.length - b.length }` | `unresolved supertype Comparator` | a comparator `sortedWith` takes |
 | `val k = 2; object : I { override fun f() = k }` | `unresolved reference: k` | captures `k` |
-| `Character.isDigit('5')` | `unresolved reference: Character` | `true` |
 | `"hello".encodeToByteArray().size` | `unresolved reference: encodeToByteArray on String` | `5` |
 | `listOf(1, 2).shuffled(java.util.Random(1))` | `unresolved reference: java` | a seeded order |
 | `println(check(true) == Unit)` | `unresolved reference: Unit` | `true` |
