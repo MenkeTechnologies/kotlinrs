@@ -898,3 +898,44 @@ value (`{a=0, Key=2}` after `Key`, then `KEY`).
 `input matches regex` (infix calls do not parse). A pattern the engine refuses
 raises `java.util.regex.PatternSyntaxException` with the Rust engine's
 description; see [BUGS.md](BUGS.md).
+
+## Round 15 — the common spellings that stopped a program
+
+Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1 through `scripts/capture-parity.sh`.
+Each item below was a parse error or an `unresolved reference` at the start of
+the round; eleven corpus records cover them, and every one of the eleven failed
+on the previous release and passes now.
+
+- **Raw strings.** `"""…"""` lexed as an empty string followed by another
+  literal. It now takes no escapes, spans lines, keeps `$` templates, and closes
+  at the LAST three quotes of a run. `trimIndent`, `trimMargin`,
+  `replaceIndent` and `replaceIndentByMargin` are ports of `Indent.kt`;
+  `lines()` also splits at a lone `\r`, which it did not.
+- **Property accessors with a backing field.** `var x = 0 get() = … set(v) { field
+  = … }` was a parse error. It desugars to a delegated property over a holder
+  for `field`, with the accessor bodies compiled as methods of the owner.
+- **Object expressions.** `object : T { … }` was a parse error. It is an
+  anonymous class constructed fresh per evaluation; it does not capture locals.
+- **`typealias`**, plain and generic, expanded before parsing.
+- **`fun interface`**: the SAM constructor, and a lambda or function reference
+  passed where the interface is expected.
+- **Operator extensions** on a user class and on `String`. Resolving them
+  exposed a wrong answer: an extension lookup for a receiver of KNOWN type fell
+  back to the sole program-wide extension of that name, so `v.compareTo(o.v)`
+  inside `operator fun Node.compareTo` resolved `Int.compareTo` to the `Node`
+  extension. A known receiver now only falls back to an extension on a type the
+  frontend cannot name.
+- **`ArrayDeque`**, with its own wording: `ArrayDeque is empty.` and
+  `index: 5, size: 2`, and `kotlin.collections.ArrayDeque` as its class.
+- **`MutableList.removeFirst`/`removeLast`** and the `OrNull` pair. On JDK 21
+  the throwing pair resolves to `java.util.List`'s own members, so an empty list
+  faults with a messageless `java.util.NoSuchElementException`, not the
+  extension's `List is empty.`
+- **Collection members:** `clear()` on a list or set, `removeIf`/
+  `removeAll { }`/`retainAll { }`, `replaceAll` on a list and a map, `sortWith`,
+  `set(i, v)` (answering the replaced element), `lastIndexOf`, `fill` (with
+  `Arrays.fill`'s range faults), `addFirst`/`addLast`, `contentEquals`,
+  `elementAtOrElse`, `concatToString` and `String(chars)`,
+  `toSortedMap(comparator)`, `naturalOrder()`/`reverseOrder()`,
+  `Int.digitToChar(radix)`. The in-place mutators print `kotlin.Unit`.
+- A bare `apply { }`/`also { }`/`let { }` inside a member applies to `this`.

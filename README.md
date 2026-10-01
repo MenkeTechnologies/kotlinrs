@@ -131,6 +131,10 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `NEGATIVE_INFINITY`/`NaN`.
 - **Strings** — literals with `\n`/`\t`/`\\`/`\"`/`\$` escapes and `$name` /
   `${expr}` templates; `+` concatenates when either side is a `String`.
+  Raw `"""…"""` strings take no escapes, span lines and keep their templates;
+  `trimIndent`, `trimMargin`, `replaceIndent` and `replaceIndentByMargin` are
+  ports of the stdlib's `Indent.kt`, and `lines()` splits at `\r\n`, `\n`
+  and a lone `\r`.
 - **Call arguments** — positional and named (`f(count = 3)`, `p.copy(y = 2)`)
   for user functions, constructors and the `data class` `copy`, with Kotlin's
   rules enforced: positional arguments come first and each name binds a distinct
@@ -180,6 +184,26 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 - **Delegated properties** — `by lazy`, a user delegate declaring
   `operator fun getValue`/`setValue` (on a class property or a local), and
   `Delegates.observable`/`vetoable`.
+- **Property accessors with a backing field** — `var x = 0 get() = … set(v)
+  { field = … }` on a class property, `field` included; a bodyless `private
+  set` is accepted. The accessors compile as methods of the owner and the
+  property as a delegated one over a holder for the field. A `return` inside a
+  custom setter is refused.
+- **Object expressions** — `object : T { … }` (and a bare `object { … }`)
+  builds a fresh instance of an anonymous class per evaluation. Like a local
+  class it cannot capture the enclosing function's locals; a body that tries
+  is an `unresolved reference`.
+- **`typealias`** — plain and generic (`typealias Pred<T> = (T) -> Boolean`),
+  expanded where it is written, constructor calls included.
+- **`fun interface`** — the SAM constructor `P { … }`, and a lambda or
+  function reference passed where a `P` is expected, both convert to an
+  instance whose single abstract member calls the lambda.
+- **Operator extensions** — `operator fun Node.plus(o: Node)` (and the other
+  arithmetic conventions and `compareTo`) on a user class, and on `String` for
+  a convention `String` does not declare (`"ab" * 3`).
+- **`ArrayDeque`** — `addFirst`/`addLast`/`removeFirst`/`removeLast` and the
+  `OrNull` pair over a mutable list, with the deque's own fault wording
+  (`ArrayDeque is empty.`, `index: 5, size: 2`).
 - **`lateinit var`** — a class property, top-level property, or local with no
   initializer whose read before the first write (through the instance, in a
   member, in an `init` block, or from a lambda or local `fun`) is

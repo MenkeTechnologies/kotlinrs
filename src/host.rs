@@ -758,6 +758,16 @@ enum ListImpl {
     /// where every other `List` here says `Index 9 out of bounds for length 2`.
     /// Measured on kotlinc 2.4.10 / JDK 21.0.12 at sizes 0, 1 and 2.
     Builder,
+    /// `kotlin.collections.ArrayDeque` — a mutable list whose own members word
+    /// their faults: an out-of-range index is `index: 9, size: 2` as the
+    /// builder's is, and an empty `first`/`last`/`removeFirst`/`removeLast`
+    /// is `ArrayDeque is empty.` Measured on kotlinc 2.4.10 / JDK 21.0.12.
+    Deque,
+}
+
+/// Whether `v` is an `ArrayDeque` — see [`ListImpl::Deque`].
+fn is_deque(v: Option<&Value>) -> bool {
+    matches!(v, Some(Value::Obj(id)) if LIST_IMPL.with(|t| t.borrow().get(id).copied()) == Some(ListImpl::Deque))
 }
 
 /// Record `list`'s implementation class. A no-op for a non-handle.
@@ -2617,6 +2627,86 @@ fn kotlin_trim(s: &str, start: bool, end: bool) -> &str {
     out
 }
 
+/// `CharSequence.lines()` — split at every `\r\n`, `\n` and lone `\r`, the
+/// three terminators `lineSequence()` recognises. A trailing terminator leaves
+/// a trailing empty line, as Kotlin's does.
+fn kotlin_lines(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let (mut start, mut i) = (0, 0);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            b'\r' => {
+                out.push(&s[start..i]);
+                if bytes.get(i + 1) == Some(&b'\n') {
+                    i += 1;
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(&s[start..]);
+    out
+}
+
+/// Port of `kotlin.text.reindent` (Indent.kt): drop a blank FIRST or LAST
+/// line, run every other line through `cut` (a `None` keeps the line as it
+/// was), prefix what survives with `indent`, and join on `\n`.
+fn kotlin_reindent(lines: &[&str], indent: &str, cut: impl Fn(&str) -> Option<String>) -> String {
+    let last = lines.len().saturating_sub(1);
+    lines
+        .iter()
+        .enumerate()
+        .filter(|&(i, l)| !((i == 0 || i == last) && kotlin_trim(l, true, true).is_empty()))
+        .map(|(_, l)| match cut(l) {
+            Some(c) => format!("{indent}{c}"),
+            None => l.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `String.replaceIndent(newIndent)` — `trimIndent()` is this with `""`. The
+/// common indent is the least leading-whitespace width over the non-blank
+/// lines, counted in `Char`s, and every line loses that many.
+fn kotlin_replace_indent(s: &str, indent: &str) -> String {
+    let lines = kotlin_lines(s);
+    let width = |l: &str| {
+        l.chars()
+            .position(|c| !kotlin_is_whitespace(c))
+            .unwrap_or_else(|| l.chars().count())
+    };
+    let common = lines
+        .iter()
+        .filter(|l| !kotlin_trim(l, true, true).is_empty())
+        .map(|l| width(l))
+        .min()
+        .unwrap_or(0);
+    kotlin_reindent(&lines, indent, |l| Some(l.chars().skip(common).collect()))
+}
+
+/// `String.replaceIndentByMargin(newIndent, marginPrefix)` — `trimMargin()` is
+/// this with `""`. A line whose first non-whitespace text is the margin prefix
+/// keeps what follows it; any other line is kept whole.
+fn kotlin_replace_indent_by_margin(s: &str, indent: &str, margin: &str) -> Result<String, String> {
+    if kotlin_trim(margin, true, true).is_empty() {
+        return Err(
+            "java.lang.IllegalArgumentException: marginPrefix must be non-blank string.".into(),
+        );
+    }
+    let lines = kotlin_lines(s);
+    Ok(kotlin_reindent(&lines, indent, |l| {
+        let at = l.find(|c: char| !kotlin_is_whitespace(c))?;
+        l[at..].strip_prefix(margin).map(str::to_string)
+    }))
+}
+
 /// `String.trim(vararg chars: Char)` and its one-sided pair.
 ///
 /// The vararg overload trims a CHARACTER SET rather than whitespace, so it
@@ -3604,6 +3694,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let list = vm.pop();
             let which = match tag.as_str() {
                 "builder" => ListImpl::Builder,
+                "deque" => ListImpl::Deque,
                 _ => ListImpl::Literal,
             };
             vm.push(tag_if_list(list, which));
@@ -7332,6 +7423,78 @@ fn coll_hof(
             });
             Ok(fresh)
         }
+        // The in-place predicate filters of `MutableCollection` —
+        // `removeIf`/`removeAll { }` drop what the predicate accepts,
+        // `retainAll { }` keeps it — answering whether anything was removed.
+        // The predicate runs over a snapshot, outside the heap borrow, because
+        // it re-enters the VM.
+        "removeIf" | "removeAll" | "retainAll" => {
+            let want = name == "retainAll";
+            let mut keep = Vec::with_capacity(items.len());
+            for it in &items {
+                keep.push(truthy(&invoke_closure(vm, clo, std::slice::from_ref(it))?) == want);
+            }
+            let changed = with_obj_mut(recv, |o| match o {
+                HeapObj::List(xs) | HeapObj::Set(xs) => {
+                    let before = xs.len();
+                    let mut k = keep.iter();
+                    xs.retain(|_| *k.next().unwrap_or(&true));
+                    Some(xs.len() != before)
+                }
+                _ => None,
+            })
+            .flatten();
+            invalidate_key_index(recv);
+            match changed {
+                Some(b) => Ok(Value::Bool(b)),
+                None => Err(format!(
+                    "unresolved reference: {name} on {}",
+                    obj_label(recv)
+                )),
+            }
+        }
+        // `MutableList.replaceAll { }` rewrites every element in place;
+        // `MutableMap.replaceAll { k, v -> }` rewrites every VALUE.
+        "replaceAll" => {
+            let is_map = with_obj(recv, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false);
+            let mut fresh = Vec::with_capacity(items.len());
+            for it in &items {
+                let args = if is_map {
+                    with_obj(it, |o| match o {
+                        HeapObj::Entry(k, v) | HeapObj::Pair(k, v) => vec![k.clone(), v.clone()],
+                        _ => vec![it.clone()],
+                    })
+                    .unwrap_or_default()
+                } else {
+                    vec![it.clone()]
+                };
+                fresh.push(invoke_closure(vm, clo, &args)?);
+            }
+            let done = with_obj_mut(recv, |o| match o {
+                HeapObj::List(xs) => {
+                    for (x, f) in xs.iter_mut().zip(fresh) {
+                        *x = f;
+                    }
+                    true
+                }
+                HeapObj::Map(entries) => {
+                    for (e, f) in entries.iter_mut().zip(fresh) {
+                        e.1 = f;
+                    }
+                    true
+                }
+                _ => false,
+            })
+            .unwrap_or(false);
+            if done {
+                Ok(Value::Undef)
+            } else {
+                Err(format!(
+                    "unresolved reference: {name} on {}",
+                    obj_label(recv)
+                ))
+            }
+        }
         // `Map.filterKeys { }` / `filterValues { }` keep the entries whose KEY
         // (or VALUE) satisfies the predicate. Unlike `mapKeys`/`mapValues`
         // below, the lambda sees that half alone, not the whole entry — which
@@ -7406,7 +7569,8 @@ fn coll_hof(
         // sequence it is an INDEX. Routing a map receiver through the index form
         // read `items` as the entry list, so `mapOf("a" to 1).getOrElse("z") {
         // 9 }` answered the entry at index 0 — `a=1` — instead of `9`.
-        "getOrElse" => {
+        // `elementAtOrElse` is the `Iterable` spelling of the index form.
+        "getOrElse" | "elementAtOrElse" => {
             let key = extras.first().cloned().unwrap_or(Value::Undef);
             if matches!(with_obj(recv, |o| matches!(o, HeapObj::Map(_))), Some(true)) {
                 let found = items.iter().find_map(|it| {
@@ -7459,7 +7623,9 @@ fn coll_hof(
         }
         // `sortedWith(comparator)` / `sortedBy`-with-a-comparator: the closure
         // answers a negative/zero/positive `Int` for a pair of elements.
-        "sortedWith" => {
+        // `sortWith` is the IN-PLACE twin: the same stable order, written back
+        // through the handle, answering `Unit`.
+        "sortedWith" | "sortWith" => {
             // A comparison that raises must not be swallowed by `sort_by`, so
             // the ordering is computed up front over an index permutation.
             let mut order: Vec<usize> = (0..items.len()).collect();
@@ -7493,6 +7659,15 @@ fn coll_hof(
             }
             match err {
                 Some(e) => Err(e),
+                None if name == "sortWith" => {
+                    let out: Vec<Value> = order.into_iter().map(|i| items[i].clone()).collect();
+                    with_obj_mut(recv, |o| {
+                        if let HeapObj::List(dst) | HeapObj::Array { items: dst, .. } = o {
+                            *dst = out;
+                        }
+                    });
+                    Ok(Value::Undef)
+                }
                 None => Ok(tag_if_list(
                     same_kind_as(recv, order.into_iter().map(|i| items[i].clone()).collect()),
                     if kind.is_collection() {
@@ -8916,10 +9091,31 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
             Ok(alloc(HeapObj::List(parts)))
         }
         (Value::Str(s), "lines") => Ok(alloc(HeapObj::List(
-            s.split('\n')
-                .map(|l| Value::str(l.strip_suffix('\r').unwrap_or(l).to_string()))
+            kotlin_lines(s)
+                .into_iter()
+                .map(|l| Value::str(l.to_string()))
                 .collect(),
         ))),
+        (Value::Str(s), "trimIndent") => Ok(Value::str(kotlin_replace_indent(s, ""))),
+        (Value::Str(s), "replaceIndent") => {
+            let indent = args.first().map(|_| arg_str(args, 0)).unwrap_or_default();
+            Ok(Value::str(kotlin_replace_indent(s, &indent)))
+        }
+        (Value::Str(s), "trimMargin") => {
+            let margin = args
+                .first()
+                .map(|_| arg_str(args, 0))
+                .unwrap_or_else(|| "|".into());
+            kotlin_replace_indent_by_margin(s, "", &margin).map(Value::str)
+        }
+        (Value::Str(s), "replaceIndentByMargin") => {
+            let indent = args.first().map(|_| arg_str(args, 0)).unwrap_or_default();
+            let margin = args
+                .get(1)
+                .map(|_| arg_str(args, 1))
+                .unwrap_or_else(|| "|".into());
+            kotlin_replace_indent_by_margin(s, &indent, &margin).map(Value::str)
+        }
         (Value::Str(s), "toCharArray") => {
             let items: Vec<Value> = s.encode_utf16().map(|u| char_of(u as i64)).collect();
             Ok(alloc(HeapObj::Array {
@@ -9338,6 +9534,28 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         (_, "equals") => Ok(Value::Bool(args.first().is_some_and(|o| value_eq(recv, o)))),
         // `compareTo` on the primitives answers the sign, unlike `String`'s
         // (handled above), which answers the code-unit difference.
+        // `Int.digitToChar(radix = 10)` — the inverse of `Char.digitToInt`: a
+        // digit in `0 until radix` as `0`..`9` then `A`..`Z`. The radix is
+        // checked first, as the stdlib's `checkRadix` runs first.
+        (Value::Int(n), "digitToChar") => {
+            let n = *n;
+            let radix = args.first().map(Value::to_int);
+            if let Some(r) = radix.filter(|r| !(2..=36).contains(r)) {
+                return Err(format!(
+                    "java.lang.IllegalArgumentException: Invalid radix: {r}. Valid radix values are in range 2..36"
+                ));
+            }
+            let r = radix.unwrap_or(10);
+            if n < 0 || n >= r {
+                return Err(match radix {
+                    None => format!("java.lang.IllegalArgumentException: Int {n} is not a decimal digit"),
+                    Some(_) => format!(
+                        "java.lang.IllegalArgumentException: Digit {n} does not represent a valid digit in radix {r}"
+                    ),
+                });
+            }
+            Ok(char_of(if n < 10 { 48 + n } else { 55 + n }))
+        }
         (Value::Int(_) | Value::Float(_) | Value::Bool(_), "compareTo") => {
             let other = args.first().cloned().unwrap_or(Value::Int(0));
             Ok(Value::Int(match value_cmp(recv, &other) {
@@ -9972,6 +10190,146 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 None => format!("unresolved reference: removeAt on {}", obj_label(recv)),
             });
         }
+        // `CharArray.concatToString()` — and `String(chars)`, which lowers to
+        // it. The array holds UTF-16 code units, so a surrogate pair split
+        // across two elements rejoins into one character.
+        "concatToString" if args.is_empty() => {
+            let units = with_obj(recv, |o| match o {
+                HeapObj::Array { items, desc } if desc == "[C" => Some(
+                    items
+                        .iter()
+                        .filter_map(char_code)
+                        .map(|c| c as u16)
+                        .collect::<Vec<u16>>(),
+                ),
+                _ => None,
+            })
+            .flatten();
+            return match units {
+                Some(u) => Ok(Value::str(utf16_to_string(&u))),
+                None => Err(format!(
+                    "unresolved reference: concatToString on {}",
+                    obj_label(recv)
+                )),
+            };
+        }
+        // `MutableList.set(index, element)` / `Array.set` — the member `l[i] = v`
+        // lowers past; spelled out it ANSWERS the element it replaced.
+        "set"
+            if args.len() == 2
+                && !with_obj(recv, |o| matches!(o, HeapObj::Map(_))).unwrap_or(true) =>
+        {
+            let i = args[0].to_int();
+            let v = args[1].clone();
+            let out = with_obj_mut(recv, |o| match o {
+                HeapObj::List(items) | HeapObj::Array { items, .. } => {
+                    Some(match usize::try_from(i).ok().filter(|&k| k < items.len()) {
+                        Some(k) => Ok(std::mem::replace(&mut items[k], v)),
+                        None => Err(items.len()),
+                    })
+                }
+                _ => None,
+            })
+            .flatten();
+            return match out {
+                Some(Ok(prev)) => Ok(prev),
+                Some(Err(len)) => Err(index_fault(seq_kind_of(recv), Some(recv), i, len)),
+                None => Err(format!("unresolved reference: set on {}", obj_label(recv))),
+            };
+        }
+        // `Array.fill(element, fromIndex = 0, toIndex = size)` — `Arrays.fill`,
+        // whose `rangeCheck` words the faults — and `MutableList.fill(value)`.
+        "fill" if (1..=3).contains(&args.len()) => {
+            let v = args[0].clone();
+            let from = args.get(1).map(Value::to_int);
+            let to = args.get(2).map(Value::to_int);
+            let out = with_obj_mut(recv, |o| match o {
+                HeapObj::List(items) | HeapObj::Array { items, .. } => {
+                    let (f, t) = (from.unwrap_or(0), to.unwrap_or(items.len() as i64));
+                    if f > t {
+                        return Some(Err(format!(
+                            "java.lang.IllegalArgumentException: fromIndex({f}) > toIndex({t})"
+                        )));
+                    }
+                    if f < 0 || t > items.len() as i64 {
+                        let bad = if f < 0 { f } else { t };
+                        return Some(Err(format!(
+                            "java.lang.ArrayIndexOutOfBoundsException: Array index out of range: {bad}"
+                        )));
+                    }
+                    for x in &mut items[f as usize..t as usize] {
+                        *x = v.clone();
+                    }
+                    Some(Ok(Value::Undef))
+                }
+                _ => None,
+            })
+            .flatten();
+            return out.unwrap_or_else(|| {
+                Err(format!("unresolved reference: fill on {}", obj_label(recv)))
+            });
+        }
+        // `addFirst(e)` / `addLast(e)` — `ArrayDeque`'s own members, and on JDK 21
+        // every `MutableList`'s through `SequencedCollection`.
+        "addFirst" | "addLast" if args.len() == 1 => {
+            let v = args[0].clone();
+            let front = name == "addFirst";
+            let done = with_obj_mut(recv, |o| match o {
+                HeapObj::List(items) => {
+                    if front {
+                        items.insert(0, v);
+                    } else {
+                        items.push(v);
+                    }
+                    true
+                }
+                _ => false,
+            })
+            .unwrap_or(false);
+            return if done {
+                Ok(Value::Undef)
+            } else {
+                Err(format!(
+                    "unresolved reference: {name} on {}",
+                    obj_label(recv)
+                ))
+            };
+        }
+        // `MutableList.removeFirst()`/`removeLast()` and their `OrNull` pair.
+        // On JDK 21 the throwing spelling resolves to `java.util.List`'s own
+        // member (SequencedCollection), not Kotlin's extension, so an empty
+        // list faults with a MESSAGELESS `NoSuchElementException` rather than
+        // the extension's `List is empty.` — measured on kotlinc 2.4.10 / JRE
+        // 21. An `ArrayDeque` declares its own pair, worded `ArrayDeque is empty.`
+        // The `OrNull` spelling answers null instead.
+        "removeFirst" | "removeLast" | "removeFirstOrNull" | "removeLastOrNull"
+            if args.is_empty() =>
+        {
+            let front = name.starts_with("removeFirst");
+            let out = with_obj_mut(recv, |o| match o {
+                HeapObj::List(items) => Some(if items.is_empty() {
+                    None
+                } else if front {
+                    Some(items.remove(0))
+                } else {
+                    items.pop()
+                }),
+                _ => None,
+            })
+            .flatten();
+            return match out {
+                Some(Some(v)) => Ok(v),
+                Some(None) if name.ends_with("OrNull") => Ok(Value::Undef),
+                Some(None) if is_deque(Some(recv)) => {
+                    Err("java.util.NoSuchElementException: ArrayDeque is empty.".into())
+                }
+                Some(None) => Err("java.util.NoSuchElementException".into()),
+                None => Err(format!(
+                    "unresolved reference: {name} on {}",
+                    obj_label(recv)
+                )),
+            };
+        }
         // `entries` is the `Map.Entry` SET — a `Set`, not a list, which is what
         // makes `entries.hashCode()` the sum of the entry hashes rather than a
         // 31-fold and `keys == setOf(…)` order-insensitive. Each entry is a
@@ -10069,6 +10427,8 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             .flatten()
             {
                 let sorted = alloc(HeapObj::Map(entries));
+                // `toSortedMap(comparator)` orders by the comparator instead.
+                record_comparator(&sorted, args.first().filter(|c| is_comparator(c)).cloned());
                 // Recording the discipline rather than sorting once: a `TreeMap`
                 // stays in key order across later `put`s, which is exactly what
                 // [`reorder`] maintains for the other sorted collections.
@@ -10125,6 +10485,20 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             with_obj_mut(recv, |o| {
                 if let HeapObj::Map(entries) = o {
                     entries.clear();
+                }
+            });
+            invalidate_key_index(recv);
+            return Ok(Value::Undef);
+        }
+        // `MutableCollection.clear()` on a list or a set.
+        "clear"
+            if args.is_empty()
+                && with_obj(recv, |o| matches!(o, HeapObj::List(_) | HeapObj::Set(_)))
+                    .unwrap_or(false) =>
+        {
+            with_obj_mut(recv, |o| {
+                if let HeapObj::List(items) | HeapObj::Set(items) = o {
+                    items.clear();
                 }
             });
             invalidate_key_index(recv);
@@ -10647,6 +11021,16 @@ fn seq_kind_of(v: &Value) -> SeqKind {
     .unwrap_or(SeqKind::List)
 }
 
+/// The `NoSuchElementException` detail for an empty receiver: the kind's
+/// own wording, or `ArrayDeque`'s, whose members declare their own.
+fn empty_detail(kind: SeqKind, recv: Option<&Value>) -> &'static str {
+    if is_deque(recv) {
+        "ArrayDeque is empty."
+    } else {
+        kind.empty()
+    }
+}
+
 /// The out-of-range diagnostic for `get`/`elementAt` on a `kind` receiver.
 ///
 /// Four different exceptions, because four different stdlib declarations answer
@@ -10674,7 +11058,7 @@ fn index_fault(kind: SeqKind, recv: Option<&Value>, i: i64, len: usize) -> Strin
             match (which, len) {
                 // The builder collapses at NO size and words the fault its own
                 // way, so it is decided before the two small-size rows.
-                (Some(ListImpl::Builder), _) => {
+                (Some(ListImpl::Builder | ListImpl::Deque), _) => {
                     format!("java.lang.IndexOutOfBoundsException: index: {i}, size: {len}")
                 }
                 // `optimizeReadOnlyList` collapses BOTH read-only kinds at the
@@ -10732,7 +11116,12 @@ fn sequence_member(
     // Kotlin throws on `first()`/`last()`/`single()` over an empty sequence
     // rather than returning null, and the message NAMES the receiver kind.
     let need = |v: Option<Value>| -> Result<Value, String> {
-        v.ok_or_else(|| format!("java.util.NoSuchElementException: {}", kind.empty()))
+        v.ok_or_else(|| {
+            format!(
+                "java.util.NoSuchElementException: {}",
+                empty_detail(kind, recv)
+            )
+        })
     };
     let v = match name {
         "size" | "count" => Value::Int(items.len() as i64),
@@ -10878,6 +11267,12 @@ fn sequence_member(
                     .unwrap_or(-1),
             )
         }
+        "lastIndexOf" if args.len() == 1 => Value::Int(
+            items
+                .iter()
+                .rposition(|v| member_eq(vm, v, &args[0], hashed))
+                .map_or(-1, |p| p as i64),
+        ),
         // `binarySearch(element)` over a list the caller has already sorted.
         //
         // THE MISS ANSWER IS NOT -1. Kotlin (and `java.util.Collections`) answer
@@ -11059,7 +11454,7 @@ fn sequence_member(
                 (_, "singleOrNull") => Ok(Value::Undef),
                 (0, _) => Err(format!(
                     "java.util.NoSuchElementException: {}",
-                    kind.empty()
+                    empty_detail(kind, recv)
                 )),
                 _ => Err(format!(
                     "java.lang.IllegalArgumentException: {} has more than one element.",
@@ -11282,6 +11677,14 @@ fn sequence_member(
                     .collect::<Vec<_>>()
                     .join(", ")
             ))))
+        }
+        // `contentEquals` compares two arrays ELEMENT-WISE with `equals`, where
+        // `==` on arrays is identity. A null argument is unequal.
+        "contentEquals" if args.len() == 1 => {
+            let other = list_snapshot(&args[0]);
+            return Some(Ok(Value::Bool(other.is_some_and(|o| {
+                o.len() == items.len() && o.iter().zip(items.iter()).all(|(a, b)| value_eq(a, b))
+            }))));
         }
         // `asReversed()` is a REVERSED VIEW on the receiver, where `reversed()`
         // copies. The two agree for every read; they part only when the backing
@@ -12568,6 +12971,7 @@ fn runtime_jvm_class(v: &Value) -> Option<(String, bool)> {
                 (Some(ListImpl::Builder), _) => {
                     ("kotlin.collections.builders.ListBuilder".to_string(), false)
                 }
+                (Some(ListImpl::Deque), _) => ("kotlin.collections.ArrayDeque".to_string(), false),
                 // `optimizeReadOnlyList` collapses every read-only builder at
                 // the two small sizes, exactly as the index diagnostics do.
                 (Some(_), 0) => ("kotlin.collections.EmptyList".to_string(), false),

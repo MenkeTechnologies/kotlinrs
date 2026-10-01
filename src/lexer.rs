@@ -353,7 +353,15 @@ impl<'a> Lexer<'a> {
     }
 
     fn string(&mut self) -> Result<Tok, String> {
-        self.bump(); // opening "
+        // `"""` opens a RAW string: no escapes, newlines allowed, `$` templates
+        // still live. It closes at the LAST three quotes of a run, so the extra
+        // quotes of `""""a""""` are content (Kotlin's `TRIPLE_QUOTE_CLOSE` is
+        // `MultiLineStringQuote? '"""'`).
+        let raw = self.src[self.pos..].starts_with(b"\"\"\"");
+        let opening = if raw { 3 } else { 1 };
+        for _ in 0..opening {
+            self.bump();
+        }
         let mut parts: Vec<StrPart> = Vec::new();
         let mut cur = String::new();
         loop {
@@ -362,11 +370,31 @@ impl<'a> Lexer<'a> {
             }
             let c = self.peek();
             match c {
+                b'"' if raw => {
+                    let run = self.src[self.pos..]
+                        .iter()
+                        .take_while(|&&b| b == b'"')
+                        .count();
+                    if run < 3 {
+                        for _ in 0..run {
+                            cur.push('"');
+                            self.bump();
+                        }
+                        continue;
+                    }
+                    for _ in 0..run - 3 {
+                        cur.push('"');
+                    }
+                    for _ in 0..run {
+                        self.bump();
+                    }
+                    break;
+                }
                 b'"' => {
                     self.bump();
                     break;
                 }
-                b'\\' => {
+                b'\\' if !raw => {
                     self.bump();
                     cur.push(self.escape()?);
                 }

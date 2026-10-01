@@ -86,6 +86,10 @@ pub struct Parser {
     /// A LOCAL class — one declared inside a function body — queues here too,
     /// for the same reason and through the same drain.
     pending_classes: Vec<ClassDecl>,
+    /// The hoisted name an `object : T { … }` EXPRESSION is about to be
+    /// declared under — set by [`Parser::primary`] and consumed by
+    /// [`Parser::class_decl_mods`] in place of a written name.
+    anon_object: Option<String>,
     /// The hoisted names of the nested classes seen so far, in declaration
     /// order — published as [`Program::nested`], which is what reconstructs the
     /// qualified and bare spellings that reach them.
@@ -140,10 +144,174 @@ struct Mods {
     lateinit: bool,
 }
 
+/// A `typealias` declaration: its type-parameter names and the tokens of the
+/// type it abbreviates.
+struct TypeAlias {
+    params: Vec<String>,
+    target: Vec<Tok>,
+}
+
+/// Expand every `typealias` in the token stream and drop the declarations.
+///
+/// A type alias introduces no new type — `typealias IntOp = (Int, Int) -> Int`
+/// makes `IntOp` another spelling of the function type, and a class alias
+/// another spelling of the class, constructor calls included. So the alias
+/// name is replaced by the tokens it stands for wherever it is written, before
+/// the parser sees it, and every later stage reads the type as if it had been
+/// written out. A generic alias (`typealias Pred<T> = (T) -> Boolean`)
+/// substitutes the written type arguments for its parameters at each use.
+///
+/// The target runs to the end of the declaration's line (or a `;`), which is
+/// where Kotlin's grammar ends it too.
+fn expand_typealiases(toks: Vec<Spanned>) -> Result<Vec<Spanned>, String> {
+    let is_alias_kw = |t: &Tok| matches!(t, Tok::Ident(w) if w == "typealias");
+    if !toks.iter().any(|s| is_alias_kw(&s.tok)) {
+        return Ok(toks);
+    }
+    let mut aliases: HashMap<String, TypeAlias> = HashMap::new();
+    let mut out: Vec<Spanned> = Vec::with_capacity(toks.len());
+    let mut i = 0;
+    while i < toks.len() {
+        let t = &toks[i];
+        if is_alias_kw(&t.tok) && matches!(toks.get(i + 1).map(|s| &s.tok), Some(Tok::Ident(_))) {
+            // Modifiers in front of the declaration (`private typealias`) were
+            // already emitted; they belong to it, so take them back.
+            while out
+                .last()
+                .is_some_and(|s| matches!(&s.tok, Tok::Ident(w) if matches!(w.as_str(), "private" | "internal" | "public")))
+            {
+                out.pop();
+            }
+            let Tok::Ident(name) = toks[i + 1].tok.clone() else {
+                unreachable!()
+            };
+            i += 2;
+            let mut params = Vec::new();
+            if matches!(toks[i].tok, Tok::Lt) {
+                i += 1;
+                while !matches!(toks[i].tok, Tok::Gt | Tok::Eof) {
+                    match &toks[i].tok {
+                        Tok::Ident(p) if !matches!(p.as_str(), "in" | "out") => {
+                            params.push(p.clone())
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            if !matches!(toks[i].tok, Tok::Assign) {
+                return Err(format!(
+                    "typealias {name}: expected `=` (line {})",
+                    toks[i].line
+                ));
+            }
+            let line = toks[i].line;
+            i += 1;
+            let start = i;
+            while toks[i].line == line && !matches!(toks[i].tok, Tok::Semi | Tok::Eof) {
+                i += 1;
+            }
+            // An alias may name an earlier one; expand it now so a use site
+            // never needs more than one round.
+            let target = substitute_aliases(&toks[start..i], &aliases)?
+                .into_iter()
+                .map(|s| s.tok)
+                .collect();
+            aliases.insert(name, TypeAlias { params, target });
+            continue;
+        }
+        out.push(t.clone());
+        i += 1;
+    }
+    substitute_aliases(&out, &aliases)
+}
+
+/// Replace every alias name in `toks` by its target, binding a generic alias's
+/// parameters to the `<…>` arguments that follow the name.
+fn substitute_aliases(
+    toks: &[Spanned],
+    aliases: &HashMap<String, TypeAlias>,
+) -> Result<Vec<Spanned>, String> {
+    let mut out = Vec::with_capacity(toks.len());
+    let mut i = 0;
+    while i < toks.len() {
+        let Tok::Ident(name) = &toks[i].tok else {
+            out.push(toks[i].clone());
+            i += 1;
+            continue;
+        };
+        // A member named like the alias (`x.Name`) is not a type use.
+        let after_dot = i > 0 && matches!(toks[i - 1].tok, Tok::Dot);
+        let Some(alias) = aliases.get(name).filter(|_| !after_dot) else {
+            out.push(toks[i].clone());
+            i += 1;
+            continue;
+        };
+        let line = toks[i].line;
+        i += 1;
+        // The written type arguments, split at top-level commas.
+        let mut args: Vec<Vec<Tok>> = Vec::new();
+        if !alias.params.is_empty() && matches!(toks.get(i).map(|s| &s.tok), Some(Tok::Lt)) {
+            let mut depth = 0;
+            let mut cur = Vec::new();
+            i += 1;
+            while i < toks.len() {
+                match &toks[i].tok {
+                    Tok::Lt | Tok::LParen => depth += 1,
+                    Tok::Gt | Tok::RParen if depth > 0 => depth -= 1,
+                    Tok::Gt => break,
+                    Tok::Comma if depth == 0 => {
+                        args.push(std::mem::take(&mut cur));
+                        i += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+                cur.push(toks[i].tok.clone());
+                i += 1;
+            }
+            args.push(cur);
+            i += 1; // closing `>`
+            if args.len() != alias.params.len() {
+                return Err(format!(
+                    "typealias {name}: expects {} type argument(s), {} given (line {line})",
+                    alias.params.len(),
+                    args.len()
+                ));
+            }
+        }
+        for t in &alias.target {
+            match t {
+                Tok::Ident(p) => match alias
+                    .params
+                    .iter()
+                    .position(|q| q == p)
+                    .and_then(|k| args.get(k))
+                {
+                    Some(arg) => out.extend(arg.iter().map(|a| Spanned {
+                        tok: a.clone(),
+                        line,
+                    })),
+                    None => out.push(Spanned {
+                        tok: t.clone(),
+                        line,
+                    }),
+                },
+                _ => out.push(Spanned {
+                    tok: t.clone(),
+                    line,
+                }),
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Parse a full program: top-level `fun`, `class`/`data class`, `interface`, and
 /// `object` declarations, each optionally preceded by modifiers.
 pub fn parse_program(src: &str) -> Result<Program, String> {
-    let toks = Lexer::new(src).tokenize()?;
+    let toks = expand_typealiases(Lexer::new(src).tokenize()?)?;
     let mut p = Parser {
         toks,
         pos: 0,
@@ -155,6 +323,7 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
         reified_params: Vec::new(),
         no_trailing_lambda: false,
         pending_classes: Vec::new(),
+        anon_object: None,
         nested_names: Vec::new(),
     };
     let mut prog = Program::default();
@@ -191,6 +360,15 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
             continue;
         }
         match p.peek() {
+            // `fun interface P { fun test(n: Int): Boolean }` — an interface
+            // with one abstract member, which a lambda converts to.
+            Tok::Fun if matches!(p.peek_at(1), Tok::Ident(w) if w == "interface") => {
+                p.advance();
+                let decl = p.class_decl()?;
+                let sam = p.sam_class(&decl)?;
+                prog.classes.push(decl);
+                prog.classes.push(sam);
+            }
             Tok::Fun => {
                 let f = p.fun_decl()?;
                 if f.is_abstract {
@@ -971,7 +1149,9 @@ impl Parser {
             false
         } else if self.at(&Tok::Object) {
             self.advance();
-            true
+            // An object EXPRESSION is a class, not a singleton: every
+            // evaluation builds a fresh instance.
+            self.anon_object.is_none()
         } else {
             self.eat(&Tok::Class)?;
             false
@@ -986,6 +1166,7 @@ impl Parser {
                 }
                 companion_name(owner)
             }
+            None if self.anon_object.is_some() => self.anon_object.take().unwrap_or_default(),
             None => {
                 let simple = self.ident()?;
                 match nested_in {
@@ -1276,7 +1457,9 @@ impl Parser {
                                  interfaces have none"
                             ));
                         }
-                        obj_props.push(self.body_prop()?);
+                        let mut prop = self.body_prop()?;
+                        methods.extend(self.prop_accessors(&mut prop, &name)?);
+                        obj_props.push(prop);
                     }
                     other => {
                         return Err(format!(
@@ -2033,6 +2216,223 @@ impl Parser {
             ));
         }
         Ok((name, annot))
+    }
+
+    /// The class a SAM conversion to `fun interface` `decl` builds: it holds
+    /// the converted lambda and implements the one abstract member by calling
+    /// it, so `P { it > 0 }.test(5)` and a lambda passed where a `P` is
+    /// expected both reach the lambda through ordinary member dispatch, and
+    /// `is P` holds.
+    ///
+    /// ```text
+    /// class P$<sam>(val `<fn>`: (Any?) -> Any?) : P { override fun test(p0: Any?): Any? = this.`<fn>`(p0) }
+    /// ```
+    fn sam_class(&mut self, decl: &ClassDecl) -> Result<ClassDecl, String> {
+        let abs: Vec<&FunDecl> = decl.methods.iter().filter(|m| m.is_abstract).collect();
+        let [m] = abs.as_slice() else {
+            return Err(format!(
+                "fun interface {} must have exactly one abstract member, found {}",
+                decl.name,
+                abs.len()
+            ));
+        };
+        let ps: Vec<String> = (0..m.params.len()).map(|i| format!("p{i}")).collect();
+        let sam = format!("{}$<sam>", decl.name);
+        let src = format!(
+            "class `{sam}`(val `<fn>`: ({}) -> Any?) : `{}` {{ override fun `{}`({}): Any? = this.`<fn>`({}) }}",
+            vec!["Any?"; ps.len()].join(", "),
+            decl.name,
+            m.name,
+            ps.iter().map(|p| format!("{p}: Any?")).collect::<Vec<_>>().join(", "),
+            ps.join(", ")
+        );
+        Parser::synthetic(&src)?.class_decl()
+    }
+
+    /// A parser over synthesized source, for the declarations a desugaring
+    /// writes out as Kotlin rather than assembling node by node.
+    fn synthetic(src: &str) -> Result<Parser, String> {
+        Ok(Parser {
+            reified_params: Vec::new(),
+            type_params: Vec::new(),
+            class_type_params: Vec::new(),
+            toks: Lexer::new(src).tokenize()?,
+            pos: 0,
+            fn_param_types: Vec::new(),
+            fn_ret_types: Vec::new(),
+            last_type_param: None,
+            no_trailing_lambda: false,
+            pending_classes: Vec::new(),
+            anon_object: None,
+            nested_names: Vec::new(),
+        })
+    }
+
+    /// The `get()` / `set(v)` accessors that may follow a body property with a
+    /// backing field — `var nick = "" get() = … set(value) { field = … }` —
+    /// and the desugaring that gives them one.
+    ///
+    /// The property becomes a DELEGATED one, reusing the `getValue`/`setValue`
+    /// lowering every read, write and compound assignment already goes
+    /// through. The delegate is a synthesized class holding the backing field
+    /// and nothing else; its two operators call back into the OWNER, where the
+    /// accessor bodies are compiled as ordinary methods so that an unqualified
+    /// name in them resolves against the owner's members, as Kotlin's does:
+    ///
+    /// ```text
+    /// class Owner$<nick-field>(var field: Any?) {
+    ///     operator fun getValue(r: Any?, p: Any?) = (r as Owner).`<get-nick>`(field)
+    ///     operator fun setValue(r: Any?, p: Any?, v: Any?) { field = (r as Owner).`<set-nick>`(field, v) }
+    /// }
+    /// // in Owner:
+    /// fun `<get-nick>`(field: T): T = <getter body>
+    /// fun `<set-nick>`(`field$in`: T, value: T): T { var field = `field$in`; <setter body>; return field }
+    /// ```
+    ///
+    /// `field` is a parameter of the getter and a local of the setter, which
+    /// hands its final value back for the delegate to store. A setter body that
+    /// leaves early with `return` therefore stores nothing useful; that form is
+    /// rejected rather than lowered wrong.
+    ///
+    /// Visibility on an accessor (`private set`) changes nothing a running
+    /// program observes, so a property whose accessors carry no body stays an
+    /// ordinary stored one.
+    fn prop_accessors(&mut self, p: &mut BodyProp, owner: &str) -> Result<Vec<FunDecl>, String> {
+        let line = self.line();
+        let mut getter: Option<Vec<Stmt>> = None;
+        let mut setter: Option<(String, Vec<Stmt>)> = None;
+        loop {
+            let save = self.pos;
+            while matches!(self.peek(), Tok::Ident(w) if matches!(w.as_str(), "private" | "protected" | "internal" | "public"))
+            {
+                self.advance();
+            }
+            let is_get = matches!(self.peek(), Tok::Ident(w) if w == "get");
+            if !is_get && !matches!(self.peek(), Tok::Ident(w) if w == "set") {
+                self.pos = save;
+                break;
+            }
+            self.advance();
+            if !self.at(&Tok::LParen) {
+                continue; // `private set` — visibility only, no body.
+            }
+            self.advance();
+            let param = if is_get { None } else { Some(self.ident()?) };
+            if !is_get && self.at(&Tok::Colon) {
+                self.advance();
+                self.type_ref()?;
+            }
+            self.eat(&Tok::RParen)?;
+            if is_get && self.at(&Tok::Colon) {
+                self.advance();
+                self.type_ref()?;
+            }
+            let at = self.line();
+            let body = if self.at(&Tok::Assign) {
+                self.advance();
+                let e = self.expr()?;
+                vec![Stmt::new(
+                    at,
+                    if is_get {
+                        StmtKind::Return(Some(e))
+                    } else {
+                        StmtKind::Expr(e)
+                    },
+                )]
+            } else {
+                self.block()?
+            };
+            match param {
+                None => getter = Some(body),
+                Some(v) => {
+                    if body.iter().any(|s| matches!(s.kind, StmtKind::Return(_))) {
+                        return Err(format!(
+                            "property {}: a `return` inside a custom setter is not supported (line {at})",
+                            p.name
+                        ));
+                    }
+                    setter = Some((v, body));
+                }
+            }
+        }
+        if getter.is_none() && setter.is_none() {
+            return Ok(Vec::new());
+        }
+        if p.lazy || p.delegate {
+            return Err(format!(
+                "property {}: a delegated property cannot declare accessors (line {line})",
+                p.name
+            ));
+        }
+        let stmts = |src: &str| -> Result<Vec<Stmt>, String> {
+            let mut sub = Parser::synthetic(src)?;
+            let mut out = Vec::new();
+            while !sub.at(&Tok::Eof) {
+                out.push(sub.stmt()?);
+                while sub.at(&Tok::Semi) {
+                    sub.advance();
+                }
+            }
+            Ok(out)
+        };
+        let typed = |name: &str| Param {
+            name: name.to_string(),
+            ty: p.ty,
+            class: p.class.clone(),
+            default: None,
+            vararg: None,
+            type_args: p.type_args.clone(),
+            type_param_of: None,
+        };
+        let method = |name: String, params: Vec<Param>, body: Vec<Stmt>| FunDecl {
+            name,
+            reified: Vec::new(),
+            recv: None,
+            params,
+            ret: p.ty,
+            ret_class: p.class.clone(),
+            ret_type_param_of: None,
+            ret_class_type_param_of: p.type_param_of,
+            ret_type_args: p.type_args.clone(),
+            body,
+            line,
+            is_abstract: false,
+            is_open: false,
+            is_override: false,
+        };
+        let (get_name, set_name) = (format!("<get-{}>", p.name), format!("<set-{}>", p.name));
+        let get_body = match getter {
+            Some(b) => b,
+            None => stmts("return field")?,
+        };
+        let (value, set_body) = setter.unwrap_or_else(|| ("value".to_string(), Vec::new()));
+        let mut full_set = stmts("var field = `field$in`")?;
+        if set_body.is_empty() {
+            full_set.extend(stmts(&format!("field = `{value}`"))?);
+        } else {
+            full_set.extend(set_body);
+        }
+        full_set.extend(stmts("return field")?);
+        let holder = format!("{owner}$<{}-field>", p.name);
+        let src = format!(
+            "class `{holder}`(var field: Any?) {{\n\
+             operator fun getValue(thisRef: Any?, property: Any?): Any? = (thisRef as `{owner}`).`{get_name}`(field)\n\
+             operator fun setValue(thisRef: Any?, property: Any?, value: Any?) {{ field = (thisRef as `{owner}`).`{set_name}`(field, value) }}\n\
+             }}"
+        );
+        let decl = Parser::synthetic(&src)?.class_decl()?;
+        self.pending_classes.push(decl);
+        let init = std::mem::replace(&mut p.init, Expr::Null);
+        p.init = Expr::Call {
+            name: holder,
+            args: vec![init],
+            line,
+        };
+        p.delegate = true;
+        Ok(vec![
+            method(get_name, vec![typed("field")], get_body),
+            method(set_name, vec![typed("field$in"), typed(&value)], full_set),
+        ])
     }
 
     fn body_prop(&mut self) -> Result<BodyProp, String> {
@@ -3706,6 +4106,24 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Null)
             }
+            // `object : T { … }` — an object EXPRESSION. It is hoisted as an
+            // anonymous top-level class (the way a local class is, and with the
+            // same limit: it cannot capture the enclosing function's locals, and
+            // a body that tries is an `unresolved reference`), and the
+            // expression constructs a fresh instance of it.
+            Tok::Object => {
+                static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let name = format!("<anonymous>${n}");
+                self.anon_object = Some(name.clone());
+                let decl = self.class_decl()?;
+                self.pending_classes.push(decl);
+                Ok(Expr::Call {
+                    name,
+                    args: Vec::new(),
+                    line,
+                })
+            }
             Tok::Str(parts) => {
                 self.advance();
                 Ok(Expr::Str(self.str_parts(&parts)?))
@@ -4165,6 +4583,7 @@ impl Parser {
                         // A string template holds an expression, which can
                         // never declare a class.
                         pending_classes: Vec::new(),
+                        anon_object: None,
                         nested_names: Vec::new(),
                     };
                     let e = sub.expr()?;

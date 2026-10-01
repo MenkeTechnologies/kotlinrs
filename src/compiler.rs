@@ -6421,6 +6421,40 @@ impl Compiler {
             self.b.emit(Op::Extended(KT_REIFY, 1), line);
             return Ok(t);
         }
+        // `P { … }` for a `fun interface P` — the SAM constructor, which builds
+        // the interface's conversion class around the lambda.
+        if args.len() == 1 && matches!(args[0], Expr::Lambda { .. } | Expr::FunRef { .. }) {
+            let sam = format!("{name}$<sam>");
+            if self.classes.contains_key(&sam) {
+                return self.compile_call(sc, &sam, args, line);
+            }
+        }
+        // `apply { … }` / `also { … }` / `let { … }` with no receiver, inside a
+        // body that has a `this` — the scope functions are extensions on any
+        // `T`, so the implicit receiver is the one they apply to:
+        // `fun birthday() = apply { age++ }`. A user function or member of the
+        // same name is declared closer and wins.
+        if matches!(name, "apply" | "also" | "let" | "takeIf" | "takeUnless")
+            && args.len() == 1
+            && is_lambda(&args[0])
+            && sc.slot("this").is_some()
+            && !self.fun_sig.contains_key(name)
+            && !self.local_sigs.contains_key(name)
+            && !self
+                .cur_class
+                .as_ref()
+                .and_then(|c| self.classes.get(c))
+                .is_some_and(|m| m.methods.contains_key(name))
+        {
+            let call = Expr::MethodCall {
+                recv: Box::new(Expr::Var("this".into())),
+                name: name.to_string(),
+                args: args.to_vec(),
+                safe: false,
+                line,
+            };
+            return self.compile_expr(sc, &call);
+        }
         // The width-boxing intrinsic (see [`BOX_WIDTH`]).
         if name == BOX_WIDTH {
             if let Some(inner) = args.first() {
@@ -6606,6 +6640,64 @@ impl Compiler {
                     self.compile_erased(sc, a)?;
                 }
                 self.b.emit(Op::Extended(KT_PAIR, 0), line);
+                Ok(Type::Obj)
+            }
+            // `String(chars)` — the `CharArray` constructor, which is
+            // `chars.concatToString()`.
+            "String" if args.len() == 1 && !self.classes.contains_key("String") => {
+                let call = Expr::MethodCall {
+                    recv: Box::new(args[0].clone()),
+                    name: "concatToString".to_string(),
+                    args: Vec::new(),
+                    safe: false,
+                    line,
+                };
+                self.compile_expr(sc, &call)?;
+                Ok(Type::String)
+            }
+            // `naturalOrder()` / `reverseOrder()` — the `Comparable` order and its
+            // reverse, lowered to the two-argument comparator lambda every
+            // `sortedWith`/`maxWith`/`toSortedMap` consumer already takes.
+            "naturalOrder" | "reverseOrder"
+                if args.is_empty()
+                    && !self.fun_sig.contains_key(name)
+                    && !self.local_sigs.contains_key(name) =>
+            {
+                let (a, b) = ("#ord_a".to_string(), "#ord_b".to_string());
+                let (l, r) = if name == "naturalOrder" {
+                    (&a, &b)
+                } else {
+                    (&b, &a)
+                };
+                let body = Expr::MethodCall {
+                    recv: Box::new(Expr::Var(l.clone())),
+                    name: "compareTo".to_string(),
+                    args: vec![Expr::Var(r.clone())],
+                    safe: false,
+                    line,
+                };
+                let lambda = Expr::Lambda {
+                    params: vec![(a.clone(), Type::Unknown), (b.clone(), Type::Unknown)],
+                    body: vec![Stmt::new(line, StmtKind::Expr(body))],
+                };
+                self.compile_expr(sc, &lambda)?;
+                Ok(Type::Obj)
+            }
+            // `ArrayDeque()` / `ArrayDeque(capacity)` / `ArrayDeque(elements)` —
+            // a mutable list tagged as the deque class, whose members word
+            // their own faults (see `host::ListImpl::Deque`).
+            "ArrayDeque" if args.len() <= 1 && !self.classes.contains_key("ArrayDeque") => {
+                match args.first() {
+                    Some(a) if !self.infer(sc, a).is_int() => {
+                        self.compile_member(sc, a, "toMutableList", &[], false, line)?;
+                    }
+                    _ => {
+                        self.b.emit(Op::Extended(KT_LIST, 0), line);
+                    }
+                }
+                let tidx = self.b.add_constant(Value::str("deque"));
+                self.b.emit(Op::LoadConst(tidx), line);
+                self.b.emit(Op::Extended(KT_LIST_TAG, 0), line);
                 Ok(Type::Obj)
             }
             "Triple" if args.len() == 3 => {
@@ -7201,7 +7293,7 @@ impl Compiler {
                     rest.insert(0, a.clone());
                     out.push(spread_concat(elem, &rest));
                 }
-                (Some(a), None, _) => out.push(a.clone()),
+                (Some(a), None, _) => out.push(self.sam_convert(p, a)),
                 (None, Some(elem), _) => out.push(spread_concat(elem, &rest)),
                 (None, _, Some(d)) => out.push(d.clone()),
                 (None, None, None) => {
@@ -7210,6 +7302,27 @@ impl Compiler {
             }
         }
         Ok(out)
+    }
+
+    /// SAM conversion: a lambda or function reference passed where a `fun
+    /// interface` is expected becomes an instance of that interface's
+    /// conversion class (see `Parser::sam_class`), which is what lets the
+    /// callee call its member. Any other argument passes through.
+    fn sam_convert(&self, p: &Param, a: &Expr) -> Expr {
+        let sam = p.class.as_ref().map(|c| format!("{c}$<sam>"));
+        match sam {
+            Some(s)
+                if self.classes.contains_key(&s)
+                    && matches!(a, Expr::Lambda { .. } | Expr::FunRef { .. }) =>
+            {
+                Expr::Call {
+                    name: s,
+                    args: vec![a.clone()],
+                    line: 0,
+                }
+            }
+            _ => a.clone(),
+        }
     }
 
     /// The extension declared for `name` on the receiver's static type, if the
@@ -7224,7 +7337,8 @@ impl Compiler {
         if self.extensions.is_empty() {
             return None;
         }
-        if let Some(tn) = self.recv_type_name(sc, recv) {
+        let known = self.recv_type_name(sc, recv);
+        if let Some(tn) = known.clone() {
             if let Some(sig) = self.extensions.get(&(tn.clone(), name.to_string())) {
                 return Some((ext_sub_name(&tn, name), sig.clone()));
             }
@@ -7237,10 +7351,18 @@ impl Compiler {
                 }
             }
         }
+        // A receiver whose type IS known never falls back to an extension on a
+        // different CONCRETE type: inside `operator fun Node.compareTo(o: Node)
+        // = v.compareTo(o.v)` the `Int` receiver `v` is not a `Node`, and
+        // taking the sole `compareTo` extension for it recursed into the wrong
+        // body. Only an extension on a type the frontend cannot name (a type
+        // variable, a container) is still a candidate.
+        let concrete =
+            |r: &str| is_primitive_type_name(r) || r == "String" || self.classes.contains_key(r);
         let mut hits = self
             .extensions
             .iter()
-            .filter(|((_, n), _)| n == name)
+            .filter(|((r, n), _)| n == name && (known.is_none() || !concrete(r)))
             .map(|((r, n), s)| (ext_sub_name(r, n), s.clone()));
         let first = hits.next()?;
         hits.next().is_none().then_some(first)
@@ -8667,13 +8789,15 @@ impl Compiler {
             // `sortedWith(comparator)`'s lambda compares two elements, and so do
             // `maxWithOrNull`/`minWithOrNull`'s — all three take a COMPARATOR
             // rather than a selector.
-            "sortedWith" | "maxWithOrNull" | "minWithOrNull" => vec![(elem, inner), (elem, inner)],
+            "sortedWith" | "sortWith" | "maxWithOrNull" | "minWithOrNull" => {
+                vec![(elem, inner), (elem, inner)]
+            }
             // These hand the lambda a GROUP of the receiver's elements, so the
             // group's ELEMENT type is the receiver's element type.
             "chunked" | "windowed" => vec![(Type::Obj, elem)],
             // `getOrElse` hands an index and `mapValues`/`mapKeys` an entry —
             // neither is the element type, so neither is hinted.
-            "getOrElse" | "mapValues" | "mapKeys" => Vec::new(),
+            "getOrElse" | "elementAtOrElse" | "mapValues" | "mapKeys" => Vec::new(),
             _ => one(elem),
         }
     }
@@ -9020,6 +9144,36 @@ impl Compiler {
                     // kind rather than by a method table entry.
                     || (m.is_enum && name == "compareTo")
             })
+            || self.declares_ext_operator(sc, e, name)
+    }
+
+    /// Whether an `operator fun T.plus(…)`-style EXTENSION supplies the
+    /// convention for `e`'s static type — `operator fun Node.plus(o: Node)`
+    /// makes `a + b` call it, and `operator fun String.times(n: Int)` makes
+    /// `"ab" * 3` call it.
+    ///
+    /// A member always wins over an extension, so a primitive receiver (whose
+    /// arithmetic is all members) never takes one, and neither does a `String`
+    /// convention `String` itself declares. A user class's own member is
+    /// checked by the caller first.
+    fn declares_ext_operator(&self, sc: &Scope, e: &Expr, name: &str) -> bool {
+        let Some(tn) = self.recv_type_name(sc, e) else {
+            return false;
+        };
+        if is_primitive_type_name(&tn) || builtin_binary_member(&tn, name) {
+            return false;
+        }
+        if tn != "String" && !self.classes.contains_key(&tn) {
+            return false;
+        }
+        let own = std::iter::once(tn.clone());
+        let ancestors = self
+            .classes
+            .get(&tn)
+            .map(|m| m.mro.clone())
+            .unwrap_or_default();
+        own.chain(ancestors)
+            .any(|t| self.extensions.contains_key(&(t, name.to_string())))
     }
 
     /// Emit the trailing iteration-order spec a `Set`/`Map` builder passes to
@@ -10053,7 +10207,11 @@ fn method_ret_type(name: &str) -> Type {
         "toDouble" => Type::Double,
         "toFloat" => Type::Float,
         "isEmpty" | "isNotEmpty" => Type::Boolean,
-        "toChar" => Type::Char,
+        "toChar" | "digitToChar" => Type::Char,
+        // The in-place mutators answer `Unit`, which prints as `kotlin.Unit`.
+        // (`reverse` is not among them: `StringBuilder.reverse()` answers the
+        // builder.)
+        "sort" | "sortDescending" | "shuffle" | "fill" | "addFirst" | "addLast" => Type::Unit,
         "uppercase" | "toUpperCase" | "lowercase" | "toLowerCase" | "trim" | "toString" => {
             Type::String
         }
@@ -10130,6 +10288,7 @@ fn is_coll_hof(name: &str) -> bool {
             | "filterKeys"
             | "filterValues"
             | "sortedWith"
+            | "sortWith"
             | "maxWithOrNull"
             | "minWithOrNull"
             | "distinctBy"
@@ -10143,6 +10302,8 @@ fn is_coll_hof(name: &str) -> bool {
             | "ifBlank"
             | "replaceFirstChar"
             | "getOrPut"
+            | "removeIf"
+            | "replaceAll"
             | "merge"
             | "compute"
             | "computeIfAbsent"
@@ -10167,6 +10328,9 @@ fn is_optional_hof(name: &str) -> bool {
             | "zip"
             | "joinToString"
             | "getOrElse"
+            | "elementAtOrElse"
+            | "removeAll"
+            | "retainAll"
             | "trim"
             | "trimStart"
             | "trimEnd"
@@ -10385,7 +10549,8 @@ fn hof_ret_type(name: &str) -> Type {
         | "associate" | "associateBy" | "associateWith" | "groupBy" | "groupingBy" => Type::Obj,
         "filterIndexed" | "mapValues" | "mapKeys" | "sortedWith" | "chunked" | "windowed"
         | "zip" | "filterKeys" | "filterValues" | "zipWithNext" => Type::Obj,
-        "forEach" | "forEachIndexed" => Type::Unit,
+        "forEach" | "forEachIndexed" | "sortBy" | "sortByDescending" | "sortWith"
+        | "replaceAll" => Type::Unit,
         "any" | "all" | "none" => Type::Boolean,
         "count" | "indexOfFirst" | "indexOfLast" => Type::Int,
         "joinToString" => Type::String,

@@ -288,3 +288,19 @@ the reference — a synthetic class name carrying the loader's address and an
 identity hash, both of which change from run to run — so there is nothing there
 to match and nothing that could be frozen in the corpus.
 
+## Measured this round and not closed
+
+Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
+
+| program | kotlinrs | reference |
+| --- | --- | --- |
+| `object : Comparator<String> { override fun compare(a: String, b: String) = a.length - b.length }` | `unresolved supertype Comparator` | a comparator `sortedWith` takes |
+| `val k = 2; object : I { override fun f() = k }` | `unresolved reference: k` | captures `k` |
+| `Character.isDigit('5')` | `unresolved reference: Character` | `true` |
+| `"hello".encodeToByteArray().size` | `unresolved reference: encodeToByteArray on String` | `5` |
+| `listOf(1, 2).shuffled(java.util.Random(1))` | `unresolved reference: java` | a seeded order |
+| `println(check(true) == Unit)` | `unresolved reference: Unit` | `true` |
+
+The first needs a host-side call into a user `compare` with two arguments; the
+`compareTo` registry passes one. The second is the capture limit object
+expressions share with local classes: both are hoisted to the top level.
