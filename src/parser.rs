@@ -308,6 +308,17 @@ fn substitute_aliases(
     Ok(out)
 }
 
+/// Parse one expression of synthesized source, for a lowering in the compiler
+/// that is clearer written out as Kotlin than assembled node by node.
+pub(crate) fn parse_synthetic_expr(src: &str) -> Result<Expr, String> {
+    let mut p = Parser::synthetic(src)?;
+    let e = p.expr()?;
+    if !p.at(&Tok::Eof) {
+        return Err(format!("synthetic expression: trailing input in `{src}`"));
+    }
+    Ok(e)
+}
+
 /// Parse a full program: top-level `fun`, `class`/`data class`, `interface`, and
 /// `object` declarations, each optionally preceded by modifiers.
 pub fn parse_program(src: &str) -> Result<Program, String> {
@@ -2060,14 +2071,12 @@ impl Parser {
         } else {
             self.block()?
         };
-        // A `set(value) { … }` would need a settable non-field property, which
-        // has no lowering here; rejecting is better than silently dropping the
-        // writes.
-        if matches!(self.peek(), Tok::Ident(w) if w == "set") {
-            return Err(format!(
-                "property {name}: a custom `set` accessor is not supported (line {})",
-                self.line()
-            ));
+        // A getter followed by a setter is a settable property: it goes through
+        // [`Parser::body_prop`] and [`Parser::prop_accessors`], which give it a
+        // holder whether or not the accessors ever touch `field`.
+        if self.accessor_follows(true) {
+            self.pos = start;
+            return Ok(None);
         }
         Ok(Some(FunDecl {
             reified: Vec::new(),
@@ -2303,6 +2312,11 @@ impl Parser {
         let mut setter: Option<(String, Vec<Stmt>)> = None;
         loop {
             let save = self.pos;
+            // Kotlin's grammar allows a `;` before each accessor, which is what
+            // separates `get() = …; set(v) { … }` written on one line.
+            while self.at(&Tok::Semi) {
+                self.advance();
+            }
             while matches!(self.peek(), Tok::Ident(w) if matches!(w.as_str(), "private" | "protected" | "internal" | "public"))
             {
                 self.advance();
@@ -2435,6 +2449,24 @@ impl Parser {
         ])
     }
 
+    /// Whether a property accessor (`get` / `set`, optionally behind a
+    /// visibility modifier) starts at the cursor, past any `;` separators.
+    /// `setter_only` asks for a `set` alone. The cursor does not move.
+    fn accessor_follows(&self, setter_only: bool) -> bool {
+        let mut i = 0;
+        while matches!(self.peek_at(i), Tok::Semi) {
+            i += 1;
+        }
+        while matches!(self.peek_at(i), Tok::Ident(w)
+            if matches!(w.as_str(), "private" | "protected" | "internal" | "public"))
+        {
+            i += 1;
+        }
+        let named = |w: &str| w == "set" || (!setter_only && w == "get");
+        matches!(self.peek_at(i), Tok::Ident(w) if named(w))
+            && matches!(self.peek_at(i + 1), Tok::LParen)
+    }
+
     fn body_prop(&mut self) -> Result<BodyProp, String> {
         let mutable = matches!(self.bump(), Tok::Var);
         let name = self.ident()?;
@@ -2501,8 +2533,16 @@ impl Parser {
                 type_param_of,
             });
         }
-        self.eat(&Tok::Assign)?;
-        let init = self.expr()?;
+        // `var f: Double get() = … set(v) { … }` with no initializer: accessors
+        // that compute from other state leave no backing field to initialize.
+        // The holder `prop_accessors` builds still needs a value, and nothing
+        // reads it unless an accessor names `field`.
+        let init = if !self.at(&Tok::Assign) && self.accessor_follows(false) {
+            Expr::Null
+        } else {
+            self.eat(&Tok::Assign)?;
+            self.expr()?
+        };
         Ok(BodyProp {
             name,
             ty,

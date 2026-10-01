@@ -5705,7 +5705,10 @@ fn b_coll_hof(vm: &mut VM, argc: u8) -> Value {
                 Value::Undef
             }
             None => {
-                fault(vm, format!("unresolved reference: {name} on {}", obj_label(&recv)));
+                fault(
+                    vm,
+                    format!("unresolved reference: {name} on {}", obj_label(&recv)),
+                );
                 Value::Undef
             }
         };
@@ -9290,6 +9293,16 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
 
         // `Int.toChar()` → the `Char` for the low 16 bits of the receiver.
         (Value::Int(n), "toChar") => Ok(char_of(*n)),
+        // `Char(code)`: the constructor checks the range `toChar` truncates.
+        (Value::Int(n), "#charOfCode") => {
+            if (0..=0xFFFF).contains(n) {
+                Ok(char_of(*n))
+            } else {
+                Err(format!(
+                    "java.lang.IllegalArgumentException: Invalid Char code: {n}"
+                ))
+            }
+        }
         // The bitwise member functions, which the parser reaches through their
         // infix spelling (`a and b`, `x shl 4`). `and`/`or`/`xor` cannot widen a
         // value, so they operate on the `i64` directly.
@@ -9460,6 +9473,18 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
             }
             Ok(Value::Int(java_math_round(x)))
         }
+
+        // The unary operator conventions in their method spelling, reached here
+        // through an unbound reference (`map(Int::inc)`) or an untyped
+        // receiver; a statically-typed receiver lowers to the operator itself.
+        (Value::Int(n), "inc") => Ok(Value::Int(n.wrapping_add(1))),
+        (Value::Int(n), "dec") => Ok(Value::Int(n.wrapping_sub(1))),
+        (Value::Int(n), "unaryMinus") => Ok(Value::Int(n.wrapping_neg())),
+        (Value::Float(x), "inc") => Ok(Value::Float(x + 1.0)),
+        (Value::Float(x), "dec") => Ok(Value::Float(x - 1.0)),
+        (Value::Float(x), "unaryMinus") => Ok(Value::Float(-x)),
+        (Value::Int(_) | Value::Float(_), "unaryPlus") => Ok(recv.clone()),
+        (Value::Bool(b), "not") => Ok(Value::Bool(!b)),
 
         // ── the arithmetic operators in their method spelling ──
         // `a.plus(b)` is what `a + b` compiles to on the JVM, and the method
@@ -9637,6 +9662,8 @@ fn char_method(code: i64, name: &str, args: &[Value]) -> Result<Value, String> {
         ),
         "equals" => Value::Bool(args.first().is_some_and(|o| value_eq(&char_of(code), o))),
         "compareTo" => Value::Int((code - other()).signum()),
+        "inc" => char_of(code + 1),
+        "dec" => char_of(code - 1),
         "plus" => char_of(code + other()),
         "minus" if args.first().is_some_and(is_char) => Value::Int(code - other()),
         "minus" => char_of(code - other()),
@@ -9644,6 +9671,12 @@ fn char_method(code: i64, name: &str, args: &[Value]) -> Result<Value, String> {
         "isLetter" => Value::Bool(c.is_alphabetic()),
         "isLetterOrDigit" => Value::Bool(c.is_alphanumeric()),
         "isWhitespace" => Value::Bool(kotlin_is_whitespace(c)),
+        // `java.lang.Character.isWhitespace`: Kotlin's member less the three
+        // non-breaking spaces, which the JDK method excludes and Kotlin's
+        // `isSpaceChar` term puts back.
+        "#javaIsWhitespace" => {
+            Value::Bool(kotlin_is_whitespace(c) && !matches!(c, '\u{a0}' | '\u{2007}' | '\u{202f}'))
+        }
         "isUpperCase" => Value::Bool(c.is_uppercase()),
         "isLowerCase" => Value::Bool(c.is_lowercase()),
         "uppercaseChar" | "lowercaseChar" | "titlecaseChar" if surrogate => char_of(code),
@@ -10718,6 +10751,30 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         }
     }
 
+    // `pair.copy(…)` / `triple.copy(…)` through a receiver the compiler could
+    // not type (`xs.map { it.copy(second = 0) }`): the components, then a bit
+    // mask of the ones the call wrote. An unwritten one keeps the receiver's.
+    if name == "#tupleCopy" && args.len() == 4 {
+        let mask = args[3].to_int();
+        let pick = |i: usize, old: &Value| {
+            if mask & (1 << i) != 0 {
+                args[i].clone()
+            } else {
+                old.clone()
+            }
+        };
+        let built = with_obj(recv, |o| match o {
+            HeapObj::Pair(a, b) if mask & 4 == 0 => Some(HeapObj::Pair(pick(0, a), pick(1, b))),
+            HeapObj::Triple(a, b, c) => Some(HeapObj::Triple(pick(0, a), pick(1, b), pick(2, c))),
+            _ => None,
+        })
+        .flatten();
+        return match built {
+            Some(o) => Ok(alloc(o)),
+            None => Err(format!("unresolved reference: copy on {}", obj_label(recv))),
+        };
+    }
+
     // `Pair.toList()` / `Triple.toList()` — the tuple's components in order,
     // and the only way either becomes a collection. It sits OUTSIDE the
     // read-only block below because it ALLOCATES, and that block runs under a
@@ -11562,16 +11619,22 @@ fn sequence_member(
             let rng = args.first().cloned().unwrap_or_else(random_default);
             return Some(random_index(&rng, items.len()).map(|i| items[i].clone()));
         }
-        // `sortedArray()`/`sortedArrayDescending()` answer an ARRAY of the
-        // receiver's own kind, where `sorted()` answers a `List`. An empty
-        // receiver comes back as itself, as the stdlib's `if (isEmpty()) return
-        // this` has it.
-        "sortedArray" | "sortedArrayDescending" if kind == SeqKind::Array && args.is_empty() => {
+        // `sortedArray()`/`sortedArrayDescending()`/`reversedArray()` answer an
+        // ARRAY of the receiver's own kind, where `sorted()`/`reversed()`
+        // answer a `List`. An empty receiver comes back as itself, as the
+        // stdlib's `if (isEmpty()) return this` has it.
+        "sortedArray" | "sortedArrayDescending" | "reversedArray"
+            if kind == SeqKind::Array && args.is_empty() =>
+        {
             if items.is_empty() {
                 return recv.cloned().map(Ok);
             }
             let mut out = items.to_vec();
-            sort_vm(vm, &mut out, name == "sortedArrayDescending");
+            if name == "reversedArray" {
+                out.reverse();
+            } else {
+                sort_vm(vm, &mut out, name == "sortedArrayDescending");
+            }
             let desc = recv
                 .and_then(|r| {
                     with_obj(r, |o| match o {
@@ -13710,7 +13773,12 @@ fn byte_of_utf16(text: &str, index: i64) -> Option<usize> {
 fn utf16_range(text: &str, start: usize, end: usize) -> Value {
     let first = utf16_index(text, start);
     let last = utf16_index(text, end) - 1;
-    alloc(HeapObj::Range(RangeObj::new(first, last, RangeForm::Inclusive, false)))
+    alloc(HeapObj::Range(RangeObj::new(
+        first,
+        last,
+        RangeForm::Inclusive,
+        false,
+    )))
 }
 
 fn alloc_match(re: &Rc<KRegex>, text: &Rc<str>, m: Match) -> Value {
@@ -13812,7 +13880,9 @@ fn regex_method(
                 .map(|m| match_or_null(&re, &text, m)),
             ("findAll", 1 | 2) => from(format!(
                 "Start index out of bounds: {start}, input length: {len}"
-            )).and_then(|at| re.find_all(&input, at)).map(|ms| {
+            ))
+            .and_then(|at| re.find_all(&input, at))
+            .map(|ms| {
                 let items = ms.into_iter().map(|m| alloc_match(&re, &text, m)).collect();
                 tag_sequence(alloc(HeapObj::List(items)))
             }),
@@ -13872,9 +13942,7 @@ fn regex_method(
             ("next", 0) => {
                 let m = Match { groups };
                 match next_search(&text, &m) {
-                    Some(at) => re
-                        .find_at(&text, at)
-                        .map(|n| match_or_null(&re, &text, n)),
+                    Some(at) => re.find_at(&text, at).map(|n| match_or_null(&re, &text, n)),
                     None => Ok(Value::Undef),
                 }
             }
@@ -13887,7 +13955,14 @@ fn regex_method(
     })
     .flatten()?;
     let (value, first, last) = group;
-    let range = || alloc(HeapObj::Range(RangeObj::new(first, last, RangeForm::Inclusive, false)));
+    let range = || {
+        alloc(HeapObj::Range(RangeObj::new(
+            first,
+            last,
+            RangeForm::Inclusive,
+            false,
+        )))
+    };
     Some(match (name, args.len()) {
         ("value" | "component1", 0) => Ok(Value::str(value)),
         ("range" | "component2", 0) => Ok(range()),

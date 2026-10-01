@@ -3281,12 +3281,22 @@ fun main() {
 }"#;
     assert_eq!(stdout(src), "1\n2\n2\n");
 
-    // A settable computed property has no lowering here, and dropping the
-    // writes silently would be worse than refusing the program.
-    let out = eval("class C { var x: Int get() = 1\nset(v) {} }\nfun main() { println(1) }");
-    assert!(!out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("`set` accessor"), "stderr was: {err}");
+    // A settable computed property: no initializer and no backing field, the
+    // setter writes other state and the getter reads it back. On one line the
+    // accessors are separated by `;`. Output captured from kotlinc 2.4.20.
+    let settable = r#"
+class Temp { var c: Double = 0.0; var f: Double get() = c * 9 / 5 + 32; set(v) { c = (v - 32) * 5 / 9 } }
+class T2 {
+    var c = 0.0
+    var f: Double
+        get() = c * 9 / 5 + 32
+        set(v) { c = (v - 32) * 5 / 9 }
+}
+fun main() {
+    val t = Temp(); t.f = 212.0; println(t.c); println(t.f)
+    val u = T2(); u.f = 32.0; println(u.c); u.f += 18.0; println(u.c)
+}"#;
+    assert_eq!(stdout(settable), "100.0\n212.0\n0.0\n10.0\n");
 }
 
 #[test]
@@ -6628,7 +6638,9 @@ fn lateinit_top_level_and_local_raise_until_written() {
     );
     let err = prog_err("fun main() { lateinit var loc: String; println(loc) }");
     assert!(
-        err.contains("UninitializedPropertyAccessException: lateinit property loc has not been initialized"),
+        err.contains(
+            "UninitializedPropertyAccessException: lateinit property loc has not been initialized"
+        ),
         "stderr was: {err}"
     );
     for bad in [

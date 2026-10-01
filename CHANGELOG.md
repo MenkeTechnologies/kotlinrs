@@ -939,3 +939,39 @@ on the previous release and passes now.
   `toSortedMap(comparator)`, `naturalOrder()`/`reverseOrder()`,
   `Int.digitToChar(radix)`. The in-place mutators print `kotlin.Unit`.
 - A bare `apply { }`/`also { }`/`let { }` inside a member applies to `this`.
+
+## Round 16 — a member that shadows a stdlib name, and the spellings that still stopped a program
+
+Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1 through `scripts/capture-parity.sh`.
+The baseline was a clean corpus replay and a clean 480-probe `parity-fuzz` run
+(seed 4242001), so the round worked from 270 hand-written probes compared one
+by one against the reference. Seven corpus records cover what changed; each
+fails on the previous commit and passes now.
+
+- **A user method named like a stdlib extension was never called.** A class
+  declaring `fun <R> map(f: (T) -> R)` — or `filter`, `let`, `thenBy`, any of
+  the names the collection, `Result` and scope-function lowerings intercept —
+  had the call routed to the stdlib lowering instead, which answered
+  `unresolved reference: map on Box`. A member of the receiver's static class
+  now wins over all of them, as it does in Kotlin.
+- **A settable property with no backing field.** `var f: Double get() = …
+  set(v) { … }` with no initializer was refused, and the accessors could not be
+  separated by `;` on one line. Both now go through the backing-field
+  desugaring, whose holder simply goes unread.
+- **The operator conventions in method form.** `5.inc()`, `x.dec()`,
+  `y.unaryMinus()`, `unaryPlus()`, `flag.not()`, `1.rangeTo(3)`,
+  `1.rangeUntil(3)` lower to the operator node itself, so the 32-bit `Int` wrap
+  and `Char` arithmetic agree with the symbol; `Int::inc`, `Char::inc`,
+  `Boolean::not` and friends work as references.
+- **`Char(code)`**, with the constructor's own range check
+  (`IllegalArgumentException: Invalid Char code: 70000`) where `toChar()`
+  truncates; **`emptyArray<T>()`**; **`reversedArray()`**.
+- **`Pair.copy` / `Triple.copy`**, positional or named, on a typed receiver and
+  inside an untyped lambda (`xs.map { it.copy(second = …) }`).
+- **`use { }`** on a class implementing `AutoCloseable`/`Closeable`: the block's
+  result, `close()` after it whether it returned or threw.
+- **`java.lang.Character` statics** (`isDigit`, `isLetter`, `toUpperCase`, …;
+  `isWhitespace` keeps the JDK's exclusion of the three non-breaking spaces that
+  Kotlin's member includes) and the **box-class constants** `Integer.MAX_VALUE`,
+  `java.lang.Long.MIN_VALUE`, `Character.MAX_VALUE`, typed so that
+  `Integer.MAX_VALUE + 1` wraps.

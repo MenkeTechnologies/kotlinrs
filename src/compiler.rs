@@ -4309,6 +4309,43 @@ impl Compiler {
                 None => return Err(format!("unresolved reference: {name}")),
             }
         };
+        // `Pair.copy(…)` / `Triple.copy(…)` — both are `data class`es in the
+        // stdlib, so `copy` takes each component by position or by name and
+        // defaults the rest to the receiver's. Lowered to the constructor over
+        // a receiver evaluated once into a hidden local.
+        if name == "copy" && !safe {
+            let fields: &[&str] = match self.infer_class(sc, recv).as_deref() {
+                Some("Pair") if self.class_meta("Pair").is_none() => &["first", "second"],
+                Some("Triple") if self.class_meta("Triple").is_none() => {
+                    &["first", "second", "third"]
+                }
+                _ => &[],
+            };
+            if !fields.is_empty() {
+                return self.compile_tuple_copy(sc, recv, fields, args, line);
+            }
+        }
+        // `res.use { … }` on a user class implementing `AutoCloseable` (or
+        // `java.io.Closeable`) that does not declare a `use` of its own.
+        if name == "use" && args.len() == 1 && !safe {
+            if let Some(cls) = self.infer_class(sc, recv) {
+                // The marker interfaces stay out of the linearization, so each
+                // class on it is asked for its own written supertypes.
+                let closeable = self.classes.get(&cls).is_some_and(|m| {
+                    !m.methods.contains_key("use")
+                        && m.mro.iter().any(|a| {
+                            self.classes.get(a).is_some_and(|am| {
+                                am.parents
+                                    .iter()
+                                    .any(|p| matches!(p.as_str(), "AutoCloseable" | "Closeable"))
+                            })
+                        })
+                });
+                if closeable {
+                    return self.compile_use(sc, recv, &cls, &args[0], line);
+                }
+            }
+        }
         // A named argument on a STDLIB member. A user function binds its names
         // in `bind_args` from the declaration; a builtin has no declaration
         // here, so the parameter list comes from [`builtin_params`] and the
@@ -4359,6 +4396,62 @@ impl Compiler {
                 by: Box::new(args[0].clone()),
             };
             return self.compile_expr(sc, &stepped);
+        }
+        // The unary operator conventions and `rangeTo`/`rangeUntil` in their
+        // METHOD spelling on a primitive receiver: `5.inc()`, `x.unaryMinus()`,
+        // `flag.not()`, `1.rangeTo(3)`. Each IS the operator Kotlin compiles
+        // its symbol to, so it lowers to the same node — which keeps the 32-bit
+        // `Int` wrap, the `Char` arithmetic and the range kind identical
+        // between the two spellings. The name is tested before `infer` walks
+        // the receiver, which every other member call would otherwise pay for.
+        if matches!(
+            name,
+            "inc" | "dec" | "unaryMinus" | "unaryPlus" | "not" | "rangeTo" | "rangeUntil"
+        ) {
+            let rty = self.infer(sc, recv);
+            let numeric = matches!(
+                rty,
+                Type::Int | Type::Long | Type::Double | Type::Float | Type::Char
+            );
+            let one = || Box::new(Expr::Int(1));
+            let rewritten = match (name, args.len()) {
+                ("inc", 0) if numeric => Some(Expr::Binary {
+                    op: BinOp::Add,
+                    l: Box::new(recv.clone()),
+                    r: one(),
+                }),
+                ("dec", 0) if numeric => Some(Expr::Binary {
+                    op: BinOp::Sub,
+                    l: Box::new(recv.clone()),
+                    r: one(),
+                }),
+                ("unaryMinus", 0) if numeric && rty != Type::Char => Some(Expr::Unary {
+                    op: UnOp::Neg,
+                    expr: Box::new(recv.clone()),
+                }),
+                ("unaryPlus", 0) if numeric && rty != Type::Char => Some(recv.clone()),
+                ("not", 0) if rty == Type::Boolean => Some(Expr::Unary {
+                    op: UnOp::Not,
+                    expr: Box::new(recv.clone()),
+                }),
+                ("rangeTo" | "rangeUntil", 1)
+                    if matches!(rty, Type::Int | Type::Long | Type::Char) =>
+                {
+                    Some(Expr::Range {
+                        start: Box::new(recv.clone()),
+                        end: Box::new(args[0].clone()),
+                        kind: if name == "rangeTo" {
+                            RangeKind::Inclusive
+                        } else {
+                            RangeKind::Until
+                        },
+                    })
+                }
+                _ => None,
+            };
+            if let Some(e) = rewritten {
+                return self.compile_expr(sc, &e);
+            }
         }
         // `x.orEmpty()` — the nullable-receiver extension, lowered as the elvis
         // it is defined to be. The EMPTY it falls back to depends on the
@@ -4585,6 +4678,31 @@ impl Compiler {
                 {
                     return self.compile_member(sc, &args[0], name, &[], false, line)
                 }
+                // The `java.lang.Character` classification statics are the
+                // `Char` members under another name, moved onto the argument.
+                // `isWhitespace` is the one that is NOT: Kotlin's member adds
+                // `Character.isSpaceChar`, so the JDK method has its own name.
+                "Character" | "java.lang.Character" if args.len() == 1 => {
+                    let member = match name {
+                        "isDigit" | "isLetter" | "isLetterOrDigit" | "isUpperCase"
+                        | "isLowerCase" => Some(name),
+                        "toUpperCase" => Some("uppercaseChar"),
+                        "toLowerCase" => Some("lowercaseChar"),
+                        "isWhitespace" => Some("#javaIsWhitespace"),
+                        _ => None,
+                    };
+                    if let Some(m) = member {
+                        return self.compile_member(sc, &args[0], m, &[], false, line);
+                    }
+                }
+                // `Integer.MAX_VALUE`, `java.lang.Long.MIN_VALUE`, … — the JDK
+                // box classes' constants are the Kotlin primitives' own.
+                _ if args.is_empty() => {
+                    if let Some((v, vty)) = jdk_box_const(&path, name) {
+                        self.emit_const_value(v, line);
+                        return Ok(vty);
+                    }
+                }
                 _ => {}
             }
         }
@@ -4648,17 +4766,7 @@ impl Compiler {
             if let Expr::Var(ty) = recv {
                 if self.is_type_ref(sc, ty) {
                     if let Some((v, vty)) = primitive_const(ty, name) {
-                        match v {
-                            Value::Int(n) => self.b.emit(Op::LoadInt(n), line),
-                            Value::Float(f) => self.b.emit(Op::LoadFloat(f), line),
-                            // `Char.MIN_VALUE`/`MAX_VALUE`. A `Char` is a tagged
-                            // handle rather than a number, so it rides in the
-                            // constant pool exactly as a `'x'` literal does.
-                            other => {
-                                let idx = self.b.add_constant(other);
-                                self.b.emit(Op::LoadConst(idx), line)
-                            }
-                        };
+                        self.emit_const_value(v, line);
                         return Ok(vty);
                     }
                 }
@@ -4723,10 +4831,17 @@ impl Compiler {
                 return Ok(sig.ret);
             }
         }
+        // Every arm from here to the user-class dispatch below intercepts a
+        // STDLIB extension by name (`map`, `filter`, `let`, `thenBy`, …). A
+        // member declared on the receiver's static class wins over any
+        // extension in Kotlin, so `Box(2).map { … }` on a class declaring
+        // `fun <R> map(f: (T) -> R)` must reach that method, not the
+        // collection HOF that answered `unresolved reference: map on Box`.
         // The lambda-taking `Result` members. Routed before the collection HOFs
         // because `map`/`getOrElse` are spelled the same there and mean
         // something else — the receiver's static class is what tells them apart.
-        if matches!(name, "getOrElse" | "onSuccess" | "onFailure" | "map")
+        if !member_wins
+            && matches!(name, "getOrElse" | "onSuccess" | "onFailure" | "map")
             && args.len() == 1
             && self.infer_class(sc, recv).as_deref() == Some("Result")
         {
@@ -4740,11 +4855,11 @@ impl Compiler {
         // Collection higher-order functions take a first-class lambda VALUE (a
         // trailing-lambda literal or a passed closure) and invoke it per element
         // at runtime via the `KT_COLL_HOF` builtin.
-        if is_coll_hof(name) && !args.is_empty() {
+        if !member_wins && is_coll_hof(name) && !args.is_empty() {
             return self.compile_coll_hof(sc, recv, name, args, line);
         }
         // The overloaded forms route by whether a lambda was actually written.
-        if is_optional_hof(name) && args.last().is_some_and(is_lambda) {
+        if !member_wins && is_optional_hof(name) && args.last().is_some_and(is_lambda) {
             return self.compile_coll_hof(sc, recv, name, args, line);
         }
         // `cmp.thenBy { … }` / `thenByDescending` extend a comparator with a
@@ -4752,7 +4867,11 @@ impl Compiler {
         // this must precede nothing in particular — but it must not fall into
         // the member dispatch, which would look for the name on a heap kind
         // that has no members at all.
-        if matches!(name, "thenBy" | "thenByDescending") && args.len() == 1 && is_lambda(&args[0]) {
+        if !member_wins
+            && matches!(name, "thenBy" | "thenByDescending")
+            && args.len() == 1
+            && is_lambda(&args[0])
+        {
             self.compile_expr(sc, recv)?;
             self.lambda_hint = Some(vec![(Type::Unknown, Type::Unknown)]);
             self.compile_expr(sc, &args[0])?;
@@ -4768,7 +4887,7 @@ impl Compiler {
         // what makes `"abc".run { length }` read a member with no qualifier.
         // The two are one lowering: both invoke a one-parameter closure with the
         // receiver, and only the parameter's NAME differs.
-        if is_scope_fn(name) && args.len() == 1 {
+        if !member_wins && is_scope_fn(name) && args.len() == 1 {
             let rty = self.infer(sc, recv);
             let relem = self.infer_elem(sc, recv);
             let rcls = self.infer_class(sc, recv);
@@ -5147,7 +5266,15 @@ impl Compiler {
                 }
             };
         }
-        if arms.is_empty() {
+        // A `Pair`/`Triple` receiver — the stdlib's own data classes — binds
+        // the same arguments against `first`/`second`/`third`, and is tried
+        // after every user data class at run time.
+        let tuple_names: Vec<String> = ["first", "second", "third"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let tuple = bind_args("Pair.copy", &tuple_names, args).ok();
+        if arms.is_empty() && tuple.is_none() {
             return Err(
                 first_err.unwrap_or_else(|| "copy: no data class in this program".to_string())
             );
@@ -5197,9 +5324,34 @@ impl Compiler {
         // dispatch, which raises the same `unresolved reference: copy on X`
         // any other unknown member does — naming the class it actually was.
         self.b.emit(Op::GetSlot(rslot), line);
-        let nidx = self.b.add_constant(Value::str("copy".to_string()));
-        self.b.emit(Op::LoadConst(nidx), line);
-        self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 0), line);
+        match &tuple {
+            // Every component, written or not, then a bit mask of the written
+            // ones: a `null` argument is a value like any other, so absence
+            // cannot ride in the component slot itself.
+            Some(slots) => {
+                let mut written = 0;
+                for (i, s) in slots.iter().enumerate() {
+                    match s {
+                        Some(a) => {
+                            self.compile_erased(sc, a)?;
+                            written |= 1 << i;
+                        }
+                        None => {
+                            self.b.emit(Op::LoadUndef, line);
+                        }
+                    }
+                }
+                self.b.emit(Op::LoadInt(written), line);
+                let nidx = self.b.add_constant(Value::str("#tupleCopy".to_string()));
+                self.b.emit(Op::LoadConst(nidx), line);
+                self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 4), line);
+            }
+            None => {
+                let nidx = self.b.add_constant(Value::str("copy".to_string()));
+                self.b.emit(Op::LoadConst(nidx), line);
+                self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 0), line);
+            }
+        }
         let end = self.b.current_pos();
         for j in done {
             self.b.patch_jump(j, end);
@@ -6988,6 +7140,24 @@ impl Compiler {
                 self.b.emit(Op::CallBuiltin(KT_ARRAY_INIT, 0), line);
                 Ok(Type::Obj)
             }
+            // `emptyArray<T>()` — `arrayOf<T>()` with nothing in it.
+            "emptyArray" if args.is_empty() && !self.fun_sig.contains_key(name) => {
+                let didx = self
+                    .b
+                    .add_constant(Value::str(array_literal_desc("arrayOf")));
+                self.b.emit(Op::LoadConst(didx), line);
+                self.b.emit(Op::Extended(KT_ARRAY, 0), line);
+                Ok(Type::Obj)
+            }
+            // `Char(code)` — the checked constructor. Unlike `code.toChar()`,
+            // which truncates, a code outside `0..0xFFFF` is refused.
+            "Char" if args.len() == 1 && self.class_meta(name).is_none() => {
+                self.compile_expr(sc, &args[0])?;
+                let nidx = self.b.add_constant(Value::str("#charOfCode"));
+                self.b.emit(Op::LoadConst(nidx), line);
+                self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 0), line);
+                Ok(Type::Char)
+            }
             // A built-in throwable constructor: `RuntimeException("boom")`,
             // `IllegalStateException()`. Only reached when no user class or local
             // shadows the name (the constructor/user-function arms run first).
@@ -7730,6 +7900,108 @@ impl Compiler {
         sc.slot(name).is_none() && !self.classes.contains_key(name)
     }
 
+    /// `pair.copy(second = 2)` — see the call site in `compile_member`. Each
+    /// component takes the positional argument at its index, else the named
+    /// one, else the receiver's own value; an unknown name is the reference
+    /// compiler's `no parameter with name` error.
+    fn compile_tuple_copy(
+        &mut self,
+        sc: &mut Scope,
+        recv: &Expr,
+        fields: &[&str],
+        args: &[Expr],
+        line: u32,
+    ) -> Result<Type, String> {
+        let mut bound: Vec<Option<Expr>> = vec![None; fields.len()];
+        let mut next = 0;
+        for a in args {
+            let (at, value) = match a {
+                Expr::Named { name, value } => match fields.iter().position(|f| f == name) {
+                    Some(i) => (i, (**value).clone()),
+                    None => return Err(format!("no parameter with name '{name}' found")),
+                },
+                other => {
+                    next += 1;
+                    (next - 1, other.clone())
+                }
+            };
+            if at >= fields.len() {
+                return Err(format!("copy: too many arguments (line {line})"));
+            }
+            bound[at] = Some(value);
+        }
+        let mark = sc.enter();
+        self.compile_expr(sc, recv)?;
+        let hidden = "$copy";
+        let slot = sc.declare(hidden, Type::Obj, false);
+        self.b.emit(Op::SetSlot(slot), line);
+        let ctor_args = bound
+            .into_iter()
+            .zip(fields)
+            .map(|(b, f)| {
+                b.unwrap_or_else(|| Expr::Member {
+                    recv: Box::new(Expr::Var(hidden.to_string())),
+                    name: f.to_string(),
+                    safe: false,
+                    line,
+                })
+            })
+            .collect();
+        let ctor = Expr::Call {
+            name: if fields.len() == 2 { "Pair" } else { "Triple" }.to_string(),
+            args: ctor_args,
+            line,
+        };
+        let t = self.compile_expr(sc, &ctor);
+        sc.exit(mark);
+        t
+    }
+
+    /// `res.use(block)` — `kotlin.io.use`: the block's result, with `close()`
+    /// run after it whether it returned or threw. A throw from the block
+    /// propagates past a throwing `close()` (the stdlib records that one as a
+    /// suppressed exception, which nothing here can observe), and a `null`
+    /// receiver is not closed.
+    fn compile_use(
+        &mut self,
+        sc: &mut Scope,
+        recv: &Expr,
+        cls: &str,
+        block: &Expr,
+        line: u32,
+    ) -> Result<Type, String> {
+        let mark = sc.enter();
+        self.compile_expr(sc, recv)?;
+        let rslot = sc.declare_obj("$useRecv", Type::Obj, false, Some(cls.to_string()));
+        self.b.emit(Op::SetSlot(rslot), line);
+        self.compile_expr(sc, block)?;
+        let bslot = sc.declare("$useBlock", Type::Unknown, false);
+        self.b.emit(Op::SetSlot(bslot), line);
+        let lowered = crate::parser::parse_synthetic_expr(
+            "run { val `$useResult` = try { `$useBlock`(`$useRecv`) } \
+             catch (`$useCause`: Throwable) { \
+             try { `$useRecv`?.close() } catch (`$useClose`: Throwable) {}; throw `$useCause` }; \
+             `$useRecv`?.close(); `$useResult` }",
+        )?;
+        let t = self.compile_expr(sc, &lowered);
+        sc.exit(mark);
+        t.map(|_| Type::Unknown)
+    }
+
+    /// Push a folded [`primitive_const`] value. A `Char` is a tagged handle
+    /// rather than a number, so it rides in the constant pool exactly as a
+    /// `'x'` literal does.
+    fn emit_const_value(&mut self, v: Value, line: u32) {
+        match v {
+            Value::Int(n) => self.b.emit(Op::LoadInt(n), line),
+            Value::Float(f) => self.b.emit(Op::LoadFloat(f), line),
+            other => {
+                let idx = self.b.add_constant(other);
+                self.b.emit(Op::LoadConst(idx), line)
+            }
+        };
+    }
+
     /// `Math.PI` / `kotlin.math.PI` — a literal `Double` constant, so it folds at
     /// compile time rather than paying a host dispatch.
     fn compile_math_const(&mut self, name: &str, line: u32) -> Result<Type, String> {
@@ -8327,10 +8599,10 @@ impl Compiler {
                 | "mapOf" | "mutableMapOf" | "hashMapOf" | "emptyMap" | "setOf"
                 | "mutableSetOf" | "hashSetOf" | "linkedSetOf" | "sortedSetOf" | "emptySet"
                 | "HashSet" | "LinkedHashSet" | "TreeSet" | "HashMap" | "LinkedHashMap"
-                | "linkedMapOf" | "sortedMapOf" | "TreeMap" | "arrayOf" | "intArrayOf"
-                | "longArrayOf" | "doubleArrayOf" | "floatArrayOf" | "booleanArrayOf"
-                | "charArrayOf" | "IntArray" | "DoubleArray" | "BooleanArray" | "CharArray"
-                | "Array" => Type::Obj,
+                | "linkedMapOf" | "sortedMapOf" | "TreeMap" | "arrayOf" | "emptyArray"
+                | "intArrayOf" | "longArrayOf" | "doubleArrayOf" | "floatArrayOf"
+                | "booleanArrayOf" | "charArrayOf" | "IntArray" | "DoubleArray"
+                | "BooleanArray" | "CharArray" | "Array" => Type::Obj,
                 // `Pair`/`Triple`/`Result` are heap objects, and saying so is
                 // what routes `==` on them to STRUCTURAL equality: the native
                 // compare would coerce two handles to numbers and answer `true`
@@ -8414,6 +8686,12 @@ impl Compiler {
                             return vty;
                         }
                     }
+                }
+                if let Some((_, vty)) = self
+                    .qualifier(sc, recv)
+                    .and_then(|path| jdk_box_const(&path, name))
+                {
+                    return vty;
                 }
                 // A property read on a known class yields the property's type —
                 // or, for a property declared with one of the class's type
@@ -9790,7 +10068,11 @@ fn shared_captures(body: &[Stmt]) -> HashSet<String> {
         }
         false
     });
-    captured.into_inner().intersection(&written).cloned().collect()
+    captured
+        .into_inner()
+        .intersection(&written)
+        .cloned()
+        .collect()
 }
 
 /// Whether a parameter list can accept arguments of these coarse types.
@@ -10001,6 +10283,19 @@ fn bind_args<'a>(
 /// `Long`, and the difference decides whether the arithmetic around it narrows
 /// to 32 bits (`Int.MAX_VALUE + 1` is `-2147483648`, `Long.MAX_VALUE + 1L` is
 /// `-9223372036854775808`).
+/// `Integer.MAX_VALUE`, `java.lang.Long.MIN_VALUE`, … — a JDK box class's
+/// constant, which is the Kotlin primitive's own. `path` is the receiver as
+/// written, with or without the auto-imported `java.lang.` prefix.
+fn jdk_box_const(path: &str, name: &str) -> Option<(Value, Type)> {
+    let prim = match path.strip_prefix("java.lang.").unwrap_or(path) {
+        "Integer" => "Int",
+        "Character" => "Char",
+        p @ ("Long" | "Short" | "Byte" | "Double" | "Float") => p,
+        _ => return None,
+    };
+    primitive_const(prim, name)
+}
+
 fn primitive_const(ty: &str, name: &str) -> Option<(Value, Type)> {
     let v = match (ty, name) {
         ("Byte", "MAX_VALUE") => (Value::Int(i8::MAX as i64), Type::Int),

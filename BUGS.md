@@ -120,13 +120,9 @@ the next round starts from a measurement rather than a guess.
 
 | program | kotlinrs | reference |
 | --- | --- | --- |
-| `println(emptyArray<Int>().size)` | `unresolved reference: emptyArray` | `0` |
-| `listOf(3, 9).map(Int::inc)` | `unresolved reference: inc on Int` | `[4, 10]` |
 | `infix fun Int.pw(n: Int) = …; 2 pw 10` | `expected RParen, found Ident("pw")` | `1024` |
-| `listOf(1, 2, 3).forEach lit@{ if (it == 2) return@lit }` | `a label must precede a loop (`for`/`while`/`do`), found LBrace` | (runs; the label names the lambda) |
 
-The last two are parser gaps — an `infix` call, and a label on a lambda literal
-rather than on a loop.
+The `infix` row is a parser gap.
 
 `Double.MIN_VALUE` is absent deliberately and for a different reason: it is the
 shortest decimal that round-trips a subnormal, and this frontend carries every
