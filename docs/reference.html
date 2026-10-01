@@ -116,9 +116,9 @@ println("a" in mapOf("a" to 1))     // true</code></pre>
           <h3><a class="doc-anchor" href="#doc-keywords-declarations-9">#</a> <code>return</code></h3>
           <pre><code class="lang-kotlin">return
 return expr</code></pre>
-          <p>Returns from the enclosing function. A bare <code>return</code> yields <code>Unit</code>. There is no labeled <code>return@label</code> for returning out of a lambda.</p>
-          <pre><code class="lang-kotlin">fun answer(): Int { return 42 }
-fun main() { println(answer()) }</code></pre>
+          <p>Returns from the enclosing function. A bare <code>return</code> yields <code>Unit</code>. Written inside a lambda, a bare <code>return</code> is Kotlin's NON-LOCAL return: it leaves the function the lambda is written in, through <code>forEach</code>, <code>let</code>, <code>run</code> and the rest, and no <code>catch</code> intercepts it. <code>return@label</code> leaves only the labelled lambda; in an anonymous <code>fun(…)</code>, <code>return</code> leaves the anonymous function.</p>
+          <pre><code class="lang-kotlin">fun firstEven(xs: List&lt;Int&gt;): Int? { xs.forEach { if (it % 2 == 0) return it }; return null }
+fun main() { println(firstEven(listOf(1, 4, 6))) }   // 4</code></pre>
         </article>
         <article class="doc-entry" id="doc-keywords-declarations-10">
           <h3><a class="doc-anchor" href="#doc-keywords-declarations-10">#</a> <code>until</code></h3>
@@ -651,7 +651,7 @@ println(f(21))   // 42</code></pre>
           <h3><a class="doc-anchor" href="#doc-operators-34">#</a> <code>@</code></h3>
           <pre><code class="lang-kotlin">label@ for (…) { … }
 break@label</code></pre>
-          <p>Loop labels. A <code>label@</code> prefix names the loop that follows, and <code>break@label</code> / <code>continue@label</code> target it. There is no <code>this@Label</code> and no <code>return@label</code>.</p>
+          <p>Labels. A <code>label@</code> prefix names the loop that follows, and <code>break@label</code> / <code>continue@label</code> target it; on a lambda (<code>forEach lit@ { … }</code>) it names the lambda a <code>return@lit</code> leaves. <code>this@Outer</code> names an enclosing class's instance from an <code>inner class</code>.</p>
           <pre><code class="lang-kotlin">outer@ for (i in 1..3) { for (j in 1..3) { if (j == 2) continue@outer; print(i) } }   // 123</code></pre>
         </article>
         <article class="doc-entry" id="doc-operators-35">

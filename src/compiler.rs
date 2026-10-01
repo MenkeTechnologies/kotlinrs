@@ -31,10 +31,10 @@ use crate::host::{
     KT_GETFIELD, KT_HASH_REG, KT_IDENTITY, KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM,
     KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_ITER_SRC, KT_JOIN, KT_LATEINIT,
     KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO, KT_LIST_TAG, KT_MAKE_CLOSURE, KT_MAP_VM,
-    KT_MATH, KT_METHOD_VM, KT_NEW, KT_NOTNULL, KT_OBJEQ_VM, KT_OBSERVE, KT_OPER_VM, KT_PAIR,
-    KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANDOM, KT_RANGE, KT_RANGE_STEP, KT_REIFIED, KT_REIFY,
-    KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM,
-    KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG, KT_YIELD,
+    KT_MATH, KT_METHOD_VM, KT_NEW, KT_NLR_MATCH, KT_NLR_RAISE, KT_NLR_TAKE, KT_NOTNULL,
+    KT_OBJEQ_VM, KT_OBSERVE, KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANDOM,
+    KT_RANGE, KT_RANGE_STEP, KT_REIFIED, KT_REIFY, KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN,
+    KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG, KT_YIELD,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
@@ -994,6 +994,14 @@ pub struct Compiler {
     /// the value leaves as an `Any` and only a box can carry its width past the
     /// frame. `None` outside a function body.
     cur_ret: Option<Type>,
+    /// The function a non-local `return` written in the body being lowered
+    /// leaves — its sub name and declared return type. Set by a function body
+    /// and inherited by every lambda written inside it, however deeply nested.
+    nlr_target: Option<(String, Type)>,
+    /// The sub name of the function being lowered when its body holds a
+    /// non-local `return` (in some lambda), so its own frame boundary claims
+    /// one aimed at it. `None` in a lambda body, which never claims one.
+    nlr_catch: Option<String>,
     /// The `reified` type-parameter names of the function whose body is being
     /// lowered. A `T::class`, `x is T` or `x as T` naming one of these reads
     /// the type the CALL bound rather than a constant. Empty everywhere else.
@@ -1118,6 +1126,10 @@ struct PendingLambda {
     /// The capture lists of those local `fun`s, so a call to one from inside
     /// this lambda pushes the same bindings an outer call would.
     local_caps: HashMap<String, Vec<LocalCap>>,
+    /// The function a non-local `return` in this body leaves (see
+    /// [`Compiler::nlr_target`]), snapshotted because the body is emitted
+    /// after that function's lowering finished.
+    nlr_target: Option<(String, Type)>,
     /// The `reified` type-parameter names in scope at the literal. A lambda
     /// inside a `reified` body sees them — Kotlin inlines the lambda into that
     /// body, so `xs.firstOrNull { it is T }` is a test against the CALL's type
@@ -1795,6 +1807,8 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         random_imported: false,
         has_try: uses_exceptions(program),
         cur_ret: None,
+        nlr_target: None,
+        nlr_catch: None,
         cur_reified: Vec::new(),
         unwind: Vec::new(),
         finally_returns: Vec::new(),
@@ -2505,6 +2519,11 @@ impl Compiler {
         let outer_local_caps = self.local_caps.clone();
         let outer_ret = self.cur_ret.replace(f.ret);
         let outer_reified = std::mem::replace(&mut self.cur_reified, f.reified.clone());
+        let outer_nlr = self.nlr_target.replace((sub_name.clone(), f.ret));
+        let outer_catch = std::mem::replace(
+            &mut self.nlr_catch,
+            has_nonlocal_return(&f.body).then(|| sub_name.clone()),
+        );
         let res: Result<(), String> = (|| {
             for s in &f.body {
                 self.compile_stmt(&mut sc, s)?;
@@ -2513,6 +2532,8 @@ impl Compiler {
         })();
         self.cur_ret = outer_ret;
         self.cur_reified = outer_reified;
+        self.nlr_target = outer_nlr;
+        self.nlr_catch = outer_catch;
         self.local_funs = outer_locals;
         self.local_sigs = outer_local_sigs;
         self.local_caps = outer_local_caps;
@@ -2574,7 +2595,21 @@ impl Compiler {
             // frame is popped (`Op::ReturnValue` truncates the value stack to the
             // frame base, so the abandoned operands cost nothing). The caller's
             // own check resumes the walk.
+            //
+            // A function a lambda inside it non-locally returns from first asks
+            // whether the unwind is that return, aimed at it — and if so ends
+            // the walk here, returning the parked value.
             Some(UnwindKind::Frame) | None => {
+                if let Some(target) = self.nlr_catch.clone() {
+                    let t = self.b.add_constant(Value::str(target));
+                    self.b.emit(Op::LoadConst(t), 0);
+                    self.b.emit(Op::CallBuiltin(KT_NLR_MATCH, 1), 0);
+                    let other = self.b.emit(Op::JumpIfFalse(0), 0);
+                    self.b.emit(Op::CallBuiltin(KT_NLR_TAKE, 0), 0);
+                    self.b.emit(Op::ReturnValue, 0);
+                    let at = self.b.current_pos();
+                    self.b.patch_jump(other, at);
+                }
                 self.b.emit(Op::LoadUndef, 0);
                 self.b.emit(Op::ReturnValue, 0);
             }
@@ -2965,6 +3000,13 @@ impl Compiler {
                     None => {
                         self.b.emit(Op::LoadUndef, 0);
                     }
+                }
+                // `return xs.map { if (…) return … }` — a lambda in the
+                // returned expression may have non-locally returned from THIS
+                // function, and its value, not the half-computed one, is the
+                // answer. The frame's own check claims it.
+                if self.nlr_catch.is_some() {
+                    self.unwind_check_dropping(1);
                 }
                 // Inside a `try` that owns a `finally`, the finalizer must run
                 // before the frame is left: park the value and jump to that
@@ -4739,6 +4781,45 @@ impl Compiler {
                 {
                     return self.compile_member(sc, &args[0], name, &[], false, line)
                 }
+                // The JDK's bit statics on `Integer`/`Long` are the `kotlin`
+                // members on the argument, which carry its width.
+                "Integer" | "java.lang.Integer" | "java.lang.Long"
+                    if jdk_bit_static(name).is_some() && matches!(args.len(), 1 | 2) =>
+                {
+                    let member = jdk_bit_static(name).unwrap_or(name);
+                    return self.compile_member(sc, &args[0], member, &args[1..], false, line);
+                }
+                // `Integer.toString(i)` / `Integer.toString(i, radix)` and
+                // `Integer.parseInt(s, radix)` — the members under their JDK
+                // names.
+                "Integer" | "java.lang.Integer" | "java.lang.Long"
+                    if name == "toString" && matches!(args.len(), 1 | 2) =>
+                {
+                    return self.compile_member(sc, &args[0], "toString", &args[1..], false, line)
+                }
+                "Integer" | "java.lang.Integer" if name == "parseInt" && args.len() == 2 => {
+                    return self.compile_member(sc, &args[0], "toInt", &args[1..], false, line)
+                }
+                // `Integer.compare(a, b)` is `a.compareTo(b)`; `Integer.max`/
+                // `min`/`sum` are the plain two-operand operations.
+                "Integer" | "java.lang.Integer" | "java.lang.Long"
+                    if args.len() == 2 && matches!(name, "compare" | "max" | "min" | "sum") =>
+                {
+                    return match name {
+                        "compare" => {
+                            self.compile_member(sc, &args[0], "compareTo", &args[1..], false, line)
+                        }
+                        "sum" => self.compile_expr(
+                            sc,
+                            &Expr::Binary {
+                                op: BinOp::Add,
+                                l: Box::new(args[0].clone()),
+                                r: Box::new(args[1].clone()),
+                            },
+                        ),
+                        _ => self.compile_math(sc, name, args, line),
+                    };
+                }
                 // The `java.lang.Character` classification statics are the
                 // `Char` members under another name, moved onto the argument.
                 // `isWhitespace` is the one that is NOT: Kotlin's member adds
@@ -5124,23 +5205,25 @@ impl Compiler {
             self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 1), line);
             return Ok(Type::Int);
         }
-        if matches!(name, "shl" | "shr" | "ushr" | "inv" | "and" | "or" | "xor")
-            && args.len() == usize::from(name != "inv")
+        if (matches!(name, "shl" | "shr" | "ushr" | "inv" | "and" | "or" | "xor")
+            && args.len() == usize::from(name != "inv"))
+            || (is_width_bit_member(name)
+                && args.len() == usize::from(matches!(name, "rotateLeft" | "rotateRight")))
         {
             let rt = self.infer(sc, recv);
             if matches!(rt, Type::Int | Type::Long | Type::Unknown) {
-                let ty = if rt == Type::Long {
+                let ty = if rt == Type::Long && !name.starts_with("count") {
                     Type::Long
                 } else {
                     Type::Int
                 };
-                if matches!(name, "shl" | "shr" | "ushr" | "inv") {
+                if matches!(name, "shl" | "shr" | "ushr" | "inv") || is_width_bit_member(name) {
                     self.compile_expr(sc, recv)?;
                     for a in args {
                         self.compile_expr(sc, a)?;
                     }
                     self.b
-                        .emit(Op::LoadInt(if ty == Type::Long { 64 } else { 32 }), line);
+                        .emit(Op::LoadInt(if rt == Type::Long { 64 } else { 32 }), line);
                     let nidx = self.b.add_constant(Value::str(name.to_string()));
                     self.b.emit(Op::LoadConst(nidx), line);
                     self.b
@@ -5626,6 +5709,7 @@ impl Compiler {
             local_sigs: self.local_sigs.clone(),
             local_caps: self.local_caps.clone(),
             reified: self.cur_reified.clone(),
+            nlr_target: self.nlr_target.clone(),
         });
         self.b.emit(Op::LoadInt(name_idx as i64), 0);
         self.b.emit(Op::LoadInt(effective.len() as i64), 0);
@@ -5873,6 +5957,8 @@ impl Compiler {
         // T }` is a test against the call's type argument and not an
         // unresolvable name.
         let outer_reified = std::mem::replace(&mut self.cur_reified, pl.reified.clone());
+        let outer_nlr = std::mem::replace(&mut self.nlr_target, pl.nlr_target.clone());
+        let outer_catch = self.nlr_catch.take();
         // A lambda body is invoked through a nested `vm.run()`, so it is its own
         // frame for unwinding too: a raise inside it returns out, and the host
         // suppresses any further invocation while the exception is in flight.
@@ -5889,6 +5975,8 @@ impl Compiler {
         self.finally_exits = outer_exits;
         self.cur_ret = outer_ret;
         self.cur_reified = outer_reified;
+        self.nlr_target = outer_nlr;
+        self.nlr_catch = outer_catch;
         let here = self.b.current_pos();
         self.pop_unwind_to(here);
         // A lambda's RESULT is an erased position: a closure carries no return
@@ -6739,6 +6827,29 @@ impl Compiler {
                 line,
             };
             return self.compile_expr(sc, &call);
+        }
+        // A non-local `return` (see [`NONLOCAL_RETURN`]): the value, boxed for
+        // the target function's declared result exactly as its own `return`
+        // would box it, then the raise that carries it out of the lambda.
+        if name == NONLOCAL_RETURN {
+            let Some((target, ret)) = self.nlr_target.clone() else {
+                return Err(format!("`return` is not allowed here (line {line})"));
+            };
+            match args.first() {
+                Some(e) if ret == Type::Float => {
+                    self.compile_expr(sc, e)?;
+                }
+                Some(e) => {
+                    self.compile_erased(sc, e)?;
+                }
+                None => {
+                    self.b.emit(Op::LoadUndef, line);
+                }
+            }
+            let t = self.b.add_constant(Value::str(target));
+            self.b.emit(Op::LoadConst(t), line);
+            self.b.emit(Op::CallBuiltin(KT_NLR_RAISE, 2), line);
+            return Ok(Type::Unit);
         }
         // The width-boxing intrinsic (see [`BOX_WIDTH`]).
         if name == BOX_WIDTH {
@@ -9022,12 +9133,19 @@ impl Compiler {
                 {
                     return Type::Float;
                 }
+                // The bit counts answer an `Int` whatever the receiver's width.
+                if name.starts_with("count") && is_width_bit_member(name) && args.is_empty() {
+                    return Type::Int;
+                }
                 // A bitwise member keeps the receiver's width, so it must agree
                 // with the type `compile_member` returns for the same node.
-                if matches!(
+                if (matches!(
                     name.as_str(),
                     "shl" | "shr" | "ushr" | "inv" | "and" | "or" | "xor"
-                ) && args.len() == usize::from(name != "inv")
+                ) && args.len() == usize::from(name != "inv"))
+                    || (is_width_bit_member(name)
+                        && args.len()
+                            == usize::from(matches!(name.as_str(), "rotateLeft" | "rotateRight")))
                 {
                     match self.infer(sc, recv) {
                         Type::Long => return Type::Long,
@@ -10608,6 +10726,23 @@ fn jdk_box_const(path: &str, name: &str) -> Option<(Value, Type)> {
     primitive_const(prim, name)
 }
 
+/// The `kotlin` bit-manipulation members whose answer depends on the
+/// receiver's WIDTH, which the compiler pushes as a trailing argument as it
+/// does for the shifts: `(-1).countOneBits()` is 32 and `(-1L).countOneBits()`
+/// is 64 from one runtime value.
+fn is_width_bit_member(name: &str) -> bool {
+    matches!(
+        name,
+        "countOneBits"
+            | "countLeadingZeroBits"
+            | "countTrailingZeroBits"
+            | "takeHighestOneBit"
+            | "takeLowestOneBit"
+            | "rotateLeft"
+            | "rotateRight"
+    )
+}
+
 /// `recv.this$0` — one step out from an `inner class` instance to the
 /// instance enclosing it.
 fn outer_hop(recv: Expr) -> Expr {
@@ -10676,6 +10811,20 @@ fn smart_cast_of(sc: &Scope, name: &str, ty: &str) -> Option<(String, Type)> {
             | Type::String
     );
     (tracked && sc.slot(name).is_some() && sc.ty(name) != t).then(|| (name.to_string(), t))
+}
+
+/// The `kotlin` member a `java.lang.Integer`/`Long` bit static names.
+fn jdk_bit_static(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "bitCount" => "countOneBits",
+        "numberOfLeadingZeros" => "countLeadingZeroBits",
+        "numberOfTrailingZeros" => "countTrailingZeroBits",
+        "highestOneBit" => "takeHighestOneBit",
+        "lowestOneBit" => "takeLowestOneBit",
+        "rotateLeft" => "rotateLeft",
+        "rotateRight" => "rotateRight",
+        _ => return None,
+    })
 }
 
 fn primitive_const(ty: &str, name: &str) -> Option<(Value, Type)> {
@@ -11372,6 +11521,15 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
 /// True when the program contains a `try` or a `throw` anywhere — in `main`, a
 /// free `fun`, a method, or a lambda body. Only such a program pays for the
 /// per-statement unwind checks and the suppressible print builtins.
+/// Whether a non-local `return` sits anywhere in `body` — in a lambda written
+/// in it, at any depth.
+fn has_nonlocal_return(body: &[Stmt]) -> bool {
+    body_any(
+        body,
+        &|e| matches!(e, Expr::Call { name, .. } if name == NONLOCAL_RETURN),
+    )
+}
+
 pub fn uses_exceptions(program: &Program) -> bool {
     // `runCatching` catches, so a program containing one needs the pending-slot
     // machinery even with no `try` written anywhere. So do `Result.success` and
@@ -11383,7 +11541,8 @@ pub fn uses_exceptions(program: &Program) -> bool {
     let has = |body: &[Stmt]| {
         body_any(body, &|e| match e {
             Expr::Try(_) | Expr::Throw(_) => true,
-            Expr::Call { name, .. } => name == "runCatching",
+            // A non-local `return` travels on the same unwind checks.
+            Expr::Call { name, .. } => name == "runCatching" || name == NONLOCAL_RETURN,
             Expr::MethodCall { recv, name, .. } => {
                 name == "runCatching"
                     || (matches!(name.as_str(), "success" | "failure")

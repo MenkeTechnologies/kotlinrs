@@ -114,8 +114,8 @@ const CORPUS: &[Entry] = &[
         "return",
         "Keywords & Declarations",
         "return\nreturn expr",
-        "Returns from the enclosing function. A bare `return` yields `Unit`. There is no labeled `return@label` for returning out of a lambda.",
-        "fun answer(): Int { return 42 }\nfun main() { println(answer()) }",
+        "Returns from the enclosing function. A bare `return` yields `Unit`. Written inside a lambda, a bare `return` is Kotlin's NON-LOCAL return: it leaves the function the lambda is written in, through `forEach`, `let`, `run` and the rest, and no `catch` intercepts it. `return@label` leaves only the labelled lambda; in an anonymous `fun(…)`, `return` leaves the anonymous function.",
+        "fun firstEven(xs: List<Int>): Int? { xs.forEach { if (it % 2 == 0) return it }; return null }\nfun main() { println(firstEven(listOf(1, 4, 6))) }   // 4",
     ),
     (
         "until",
@@ -577,7 +577,7 @@ const CORPUS: &[Entry] = &[
         "@",
         "Operators",
         "label@ for (…) { … }\nbreak@label",
-        "Loop labels. A `label@` prefix names the loop that follows, and `break@label` / `continue@label` target it. There is no `this@Label` and no `return@label`.",
+        "Labels. A `label@` prefix names the loop that follows, and `break@label` / `continue@label` target it; on a lambda (`forEach lit@ { … }`) it names the lambda a `return@lit` leaves. `this@Outer` names an enclosing class's instance from an `inner class`.",
         "outer@ for (i in 1..3) { for (j in 1..3) { if (j == 2) continue@outer; print(i) } }   // 123",
     ),
     (

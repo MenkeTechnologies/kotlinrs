@@ -532,6 +532,19 @@ pub const KT_LATEINIT: u16 = 143;
 /// `kotlin.random.Random`. `arg` 0 pops a seed and pushes `Random(seed)`, the
 /// stdlib's `XorWowRandom`; `arg` 1 pushes `Random.Default`.
 pub const KT_RANDOM: u16 = 144;
+/// Builtin id for a NON-LOCAL `return` out of a lambda. Stack: `[value,
+/// target]`, `target` the sub name of the function the `return` leaves. Parks
+/// the value and raises the marker the unwind checks carry out of the lambda
+/// and every frame in between, as they carry an exception.
+pub const KT_NLR_RAISE: u16 = 145;
+/// Builtin id for the test a function containing such a `return` makes at its
+/// own frame boundary. Stack: `[target]`; pushes whether the in-flight marker
+/// is a non-local return aimed at `target`. Consumes nothing.
+pub const KT_NLR_MATCH: u16 = 146;
+/// Builtin id that ends a non-local return [`KT_NLR_MATCH`] claimed: clears
+/// the in-flight marker and pushes the parked value, which the function then
+/// returns.
+pub const KT_NLR_TAKE: u16 = 147;
 /// Builtin id for `throw e`: pops the throwable and makes it the in-flight
 /// exception. Returns `Undef` (a `throw` expression's value is never observed).
 pub const KT_EXC_THROW: u16 = 111;
@@ -2311,6 +2324,58 @@ fn b_exc_throw(vm: &mut VM, _argc: u8) -> Value {
     Value::Undef
 }
 
+/// The class of the marker a non-local `return` raises. `$` cannot appear in
+/// a Kotlin name, so no `catch` clause can spell it.
+const NLR_MARKER: &str = "$return";
+
+thread_local! {
+    /// The non-local return in flight: the target function's sub name and the
+    /// value it returns.
+    static NLR: RefCell<Option<(String, Value)>> = const { RefCell::new(None) };
+}
+
+/// Whether `v` is the marker of a non-local return rather than a throwable.
+fn is_nlr_marker(v: &Value) -> bool {
+    with_obj(
+        v,
+        |o| matches!(o, HeapObj::Exc { class, .. } if class == NLR_MARKER),
+    )
+    .unwrap_or(false)
+}
+
+/// Whether the in-flight unwind is a non-local return, which no `catch` and
+/// no `runCatching` may intercept.
+fn nlr_pending() -> bool {
+    PENDING.with(|p| p.borrow().as_ref().is_some_and(is_nlr_marker))
+}
+
+/// `KT_NLR_RAISE` — see [`KT_NLR_RAISE`].
+fn b_nlr_raise(vm: &mut VM, _argc: u8) -> Value {
+    let target = vm.pop().to_str();
+    let value = vm.pop();
+    if unwinding() {
+        return Value::Undef;
+    }
+    NLR.with(|n| *n.borrow_mut() = Some((target, value)));
+    raise(vm, new_throwable(NLR_MARKER, None));
+    Value::Undef
+}
+
+/// `KT_NLR_MATCH` — see [`KT_NLR_MATCH`].
+fn b_nlr_match(vm: &mut VM, _argc: u8) -> Value {
+    let target = vm.pop().to_str();
+    Value::Bool(
+        nlr_pending() && NLR.with(|n| n.borrow().as_ref().is_some_and(|(t, _)| *t == target)),
+    )
+}
+
+/// `KT_NLR_TAKE` — see [`KT_NLR_TAKE`].
+fn b_nlr_take(_vm: &mut VM, _argc: u8) -> Value {
+    PENDING.with(|p| p.borrow_mut().take());
+    NLR.with(|n| n.borrow_mut().take())
+        .map_or(Value::Undef, |(_, v)| v)
+}
+
 /// `KT_EXC_PENDING` — see [`KT_EXC_PENDING`].
 fn b_exc_pending(_vm: &mut VM, _argc: u8) -> Value {
     Value::Bool(unwinding())
@@ -2321,6 +2386,8 @@ fn b_exc_match(vm: &mut VM, _argc: u8) -> Value {
     let want = vm.pop().to_str();
     let thrown = PENDING.with(|p| p.borrow().clone());
     Value::Bool(match thrown {
+        // A non-local `return` is a jump, not a throwable: nothing catches it.
+        Some(v) if is_nlr_marker(&v) => false,
         // `catch (e: Throwable)` catches everything, including a value outside
         // the modeled hierarchy.
         Some(_) if want == "Throwable" => true,
@@ -3038,6 +3105,47 @@ fn kotlin_capitalize(s: &str, up: bool) -> String {
 /// dialect that a version gate could have caught; NO JVM produces it.
 fn negative_array_size(n: i64) -> String {
     format!("java.lang.NegativeArraySizeException: {n}")
+}
+
+/// The descriptor of the array `recv`, or one inferred from `items` when the
+/// receiver is not an array object.
+fn own_array_desc(recv: Option<&Value>, items: &[Value]) -> String {
+    recv.and_then(|r| {
+        with_obj(r, |o| match o {
+            HeapObj::Array { desc, .. } => Some(desc.clone()),
+            _ => None,
+        })
+        .flatten()
+    })
+    .unwrap_or_else(|| array_desc(items))
+}
+
+/// The JVM's default element for an array of descriptor `desc`: `0`, `0.0`,
+/// `false` or the NUL `Char` for a primitive array, `null` for an object one.
+fn array_zero(desc: &str) -> Value {
+    match desc {
+        "[D" | "[F" => Value::Float(0.0),
+        "[Z" => Value::Bool(false),
+        "[C" => char_of(0),
+        "[I" | "[J" | "[S" | "[B" => Value::Int(0),
+        _ => Value::Undef,
+    }
+}
+
+/// The element-type word `System.arraycopy` names an array by in its faults:
+/// `int`, `double`, … for a primitive array, `object array` otherwise.
+fn arraycopy_kind(desc: &str) -> &'static str {
+    match desc {
+        "[I" => "int",
+        "[J" => "long",
+        "[D" => "double",
+        "[F" => "float",
+        "[Z" => "boolean",
+        "[C" => "char",
+        "[S" => "short",
+        "[B" => "byte",
+        _ => "object array",
+    }
 }
 
 /// `KT_ARRAY_INIT` — see [`KT_ARRAY_INIT`]. An empty `desc` means the generic
@@ -4013,12 +4121,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
                 // `false` for `[Z`, `' '` for `[C` — matching JVM default
                 // initialization. `[C`'s slot is a CHAR, not the integer 0, so
                 // `CharArray(2)[0].code` resolves.
-                let zero = match desc.as_str() {
-                    "[D" => Value::Float(0.0),
-                    "[Z" => Value::Bool(false),
-                    "[C" => char_of(0),
-                    _ => Value::Int(0),
-                };
+                let zero = array_zero(&desc);
                 vm.push(alloc(HeapObj::Array {
                     items: vec![zero; n as usize],
                     desc,
@@ -4262,6 +4365,9 @@ fn register_builtins(vm: &mut VM) {
     vm.register_builtin(KT_EXC_STASH, b_exc_stash);
     vm.register_builtin(KT_EXC_UNSTASH, b_exc_unstash);
     vm.register_builtin(KT_EXC_ABORT, b_exc_abort);
+    vm.register_builtin(KT_NLR_RAISE, b_nlr_raise);
+    vm.register_builtin(KT_NLR_MATCH, b_nlr_match);
+    vm.register_builtin(KT_NLR_TAKE, b_nlr_take);
 }
 
 /// Register the debug extension handler on a fresh VM (`kotlin --dap`). Identical
@@ -5766,6 +5872,11 @@ fn b_run_catching(vm: &mut VM, _argc: u8) -> Value {
         return Value::Undef;
     }
     let out = invoke_closure(vm, &clo, &[]);
+    // A non-local `return` out of the block leaves the enclosing function
+    // past `runCatching`, which is inline in Kotlin and catches no jump.
+    if nlr_pending() {
+        return Value::Undef;
+    }
     // A raise inside the block parked itself in the pending slot; taking it is
     // what makes `runCatching` a catch.
     if let Some(err) = PENDING.with(|p| p.borrow_mut().take()) {
@@ -9384,6 +9495,50 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
                 }
             }))
         }
+        // The bit-counting and rotating members, at the receiver's width (the
+        // trailing argument, as for the shifts above).
+        (
+            Value::Int(a),
+            "countOneBits"
+            | "countLeadingZeroBits"
+            | "countTrailingZeroBits"
+            | "takeHighestOneBit"
+            | "takeLowestOneBit"
+            | "rotateLeft"
+            | "rotateRight",
+        ) => {
+            let rotates = matches!(name, "rotateLeft" | "rotateRight");
+            let width = trailing_width(args, usize::from(rotates));
+            let by = args.first().map(|v| v.to_int()).unwrap_or(0);
+            Ok(Value::Int(if width == 64 {
+                match name {
+                    "countOneBits" => i64::from(a.count_ones()),
+                    "countLeadingZeroBits" => i64::from(a.leading_zeros()),
+                    "countTrailingZeroBits" => i64::from(a.trailing_zeros()),
+                    "takeHighestOneBit" => match a.leading_zeros() {
+                        64 => 0,
+                        lz => (1u64 << (63 - lz)) as i64,
+                    },
+                    "takeLowestOneBit" => a & a.wrapping_neg(),
+                    "rotateLeft" => a.rotate_left((by & 63) as u32),
+                    _ => a.rotate_right((by & 63) as u32),
+                }
+            } else {
+                let a = *a as i32;
+                i64::from(match name {
+                    "countOneBits" => a.count_ones() as i32,
+                    "countLeadingZeroBits" => a.leading_zeros() as i32,
+                    "countTrailingZeroBits" => a.trailing_zeros() as i32,
+                    "takeHighestOneBit" => match a.leading_zeros() {
+                        32 => 0,
+                        lz => (1u32 << (31 - lz)) as i32,
+                    },
+                    "takeLowestOneBit" => a & a.wrapping_neg(),
+                    "rotateLeft" => a.rotate_left((by & 31) as u32),
+                    _ => a.rotate_right((by & 31) as u32),
+                })
+            }))
+        }
         // `coerceIn`/`coerceAtLeast`/`coerceAtMost` clamp to a bound. The result
         // stays integral only when receiver and bounds all are.
         (Value::Int(_) | Value::Float(_), "coerceIn" | "coerceAtLeast" | "coerceAtMost") => {
@@ -11716,15 +11871,45 @@ fn sequence_member(
             } else {
                 sort_vm(vm, &mut out, name == "sortedArrayDescending");
             }
-            let desc = recv
-                .and_then(|r| {
-                    with_obj(r, |o| match o {
-                        HeapObj::Array { desc, .. } => Some(desc.clone()),
-                        _ => None,
-                    })
-                    .flatten()
-                })
-                .unwrap_or_else(|| array_desc(&out));
+            let desc = own_array_desc(recv, &out);
+            return Some(Ok(alloc(HeapObj::Array { items: out, desc })));
+        }
+        // `copyOf()` / `copyOf(newSize)` / `copyOfRange(from, to)` — a fresh
+        // array of the receiver's own kind. `copyOf(n)` truncates or pads with
+        // the kind's default (`null` for an object array, so `Array<T?>`), and
+        // the faults are the stdlib's range check followed by
+        // `Arrays.copyOfRange`'s and `System.arraycopy`'s, in that order.
+        "copyOf" if kind == SeqKind::Array && args.len() <= 1 => {
+            let desc = own_array_desc(recv, items);
+            let n = args.first().map_or(items.len() as i64, Value::to_int);
+            if n < 0 {
+                return Some(Err(negative_array_size(n)));
+            }
+            let mut out: Vec<Value> = items.iter().take(n as usize).cloned().collect();
+            out.resize(n as usize, array_zero(&desc));
+            return Some(Ok(alloc(HeapObj::Array { items: out, desc })));
+        }
+        "copyOfRange" if kind == SeqKind::Array && args.len() == 2 => {
+            let desc = own_array_desc(recv, items);
+            let (from, to, len) = (args[0].to_int(), args[1].to_int(), items.len() as i64);
+            if to > len {
+                return Some(Err(format!(
+                    "java.lang.IndexOutOfBoundsException: toIndex ({to}) is greater than size ({len})."
+                )));
+            }
+            if from > to {
+                return Some(Err(format!(
+                    "java.lang.IllegalArgumentException: {from} > {to}"
+                )));
+            }
+            if from < 0 {
+                return Some(Err(format!(
+                    "java.lang.ArrayIndexOutOfBoundsException: arraycopy: source index {from} \
+                     out of bounds for {}[{len}]",
+                    arraycopy_kind(&desc)
+                )));
+            }
+            let out = items[from as usize..to as usize].to_vec();
             return Some(Ok(alloc(HeapObj::Array { items: out, desc })));
         }
         "sorted" | "sortedDescending" => {

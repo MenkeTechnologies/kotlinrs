@@ -99,6 +99,19 @@ pub struct Parser {
     /// `is T ->` header that [`Parser::at_when_is_arm`] looks for. Each `when`
     /// clears it for its own arms and restores it after.
     in_subjectless_cond: bool,
+    /// The function-like bodies the parser is inside, innermost last. A bare
+    /// `return` belongs to the nearest one that is not a lambda: directly in a
+    /// `fun` (or an anonymous `fun(…)`) it is an ordinary return; inside a
+    /// lambda it is Kotlin's non-local return out of the enclosing `fun`.
+    bodies: Vec<BodyKind>,
+}
+
+/// One entry of [`Parser::bodies`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BodyKind {
+    Lambda,
+    Fun,
+    AnonFun,
 }
 
 /// Whether a postfix `(` may apply to this expression as an invocation.
@@ -342,6 +355,7 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
         anon_object: None,
         nested_names: Vec::new(),
         in_subjectless_cond: false,
+        bodies: Vec::new(),
     };
     let mut prog = Program::default();
     while !p.at(&Tok::Eof) {
@@ -1065,12 +1079,17 @@ impl Parser {
         let bodyless = !self.at(&Tok::Assign) && !self.at(&Tok::LBrace);
         let (body, is_expr_body) = if bodyless {
             (Vec::new(), false)
-        } else if self.at(&Tok::Assign) {
-            self.advance();
-            let e = self.expr()?;
-            (vec![Stmt::new(line, StmtKind::Return(Some(e)))], true)
         } else {
-            (self.block()?, false)
+            self.bodies.push(BodyKind::Fun);
+            let body = if self.at(&Tok::Assign) {
+                self.advance();
+                self.expr()
+                    .map(|e| (vec![Stmt::new(line, StmtKind::Return(Some(e)))], true))
+            } else {
+                self.block().map(|b| (b, false))
+            };
+            self.bodies.pop();
+            body?
         };
         // With no explicit return annotation, a block body defaults to `Unit`
         // (its value is discarded); an `= expr` body's type is the expression's,
@@ -2315,6 +2334,7 @@ impl Parser {
             anon_object: None,
             nested_names: Vec::new(),
             in_subjectless_cond: false,
+            bodies: Vec::new(),
         })
     }
 
@@ -2991,18 +3011,42 @@ impl Parser {
                 // carrying that label. Every lambda body here compiles to its
                 // own VM frame, so a local return IS a frame return and the
                 // label needs no lowering of its own; it is consumed and
-                // dropped. (Kotlin's non-local `return` from an inline
-                // function's lambda is a different construct and is unaffected.)
-                if self.at(&Tok::At) {
+                // dropped. A BARE `return` in a lambda is the other construct,
+                // Kotlin's non-local return, handled below.
+                let labelled = self.at(&Tok::At);
+                if labelled {
                     self.advance();
                     self.ident()?;
                 }
                 // A `return` with no expression (Unit) — the next token starts a
                 // new statement or closes the block.
-                if matches!(self.peek(), Tok::RBrace | Tok::Semi | Tok::Eof) {
-                    StmtKind::Return(None)
+                let value = if matches!(self.peek(), Tok::RBrace | Tok::Semi | Tok::Eof) {
+                    None
                 } else {
-                    StmtKind::Return(Some(self.expr()?))
+                    Some(self.expr()?)
+                };
+                // A bare `return` inside a lambda is NON-LOCAL: it leaves the
+                // nearest enclosing `fun`. One leaving an anonymous function
+                // through a lambda is refused rather than sent to the wrong
+                // frame.
+                let owner = self.bodies.iter().rev().find(|k| **k != BodyKind::Lambda);
+                if !labelled && self.bodies.last() == Some(&BodyKind::Lambda) {
+                    match owner {
+                        Some(BodyKind::Fun) => StmtKind::Expr(Expr::Call {
+                            name: NONLOCAL_RETURN.to_string(),
+                            args: value.into_iter().collect(),
+                            line,
+                        }),
+                        Some(BodyKind::AnonFun) => {
+                            return Err(format!(
+                                "a non-local `return` out of an anonymous function is not \
+                                 supported (line {line})"
+                            ))
+                        }
+                        _ => StmtKind::Return(value),
+                    }
+                } else {
+                    StmtKind::Return(value)
                 }
             }
             Tok::While => self.while_stmt(None)?,
@@ -3875,6 +3919,60 @@ impl Parser {
     }
 
     fn lambda(&mut self) -> Result<Expr, String> {
+        self.bodies.push(BodyKind::Lambda);
+        let lam = self.lambda_inner();
+        self.bodies.pop();
+        lam
+    }
+
+    /// `fun(params)[: T] { … }` / `fun(params) = expr` — an anonymous
+    /// function. Unlike a lambda, a bare `return` in it leaves IT, and a block
+    /// body answers `Unit` unless it returns: it is a [`Expr::Lambda`] whose
+    /// block ends in a `return`.
+    fn anonymous_fun(&mut self) -> Result<Expr, String> {
+        let line = self.line();
+        self.eat(&Tok::Fun)?;
+        self.eat(&Tok::LParen)?;
+        let mut params = Vec::new();
+        while !self.at(&Tok::RParen) {
+            let name = self.ident()?;
+            let ty = if self.at(&Tok::Colon) {
+                self.advance();
+                self.type_ref()?.ty
+            } else {
+                Type::Unknown
+            };
+            params.push((name, ty));
+            if self.at(&Tok::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.eat(&Tok::RParen)?;
+        if self.at(&Tok::Colon) {
+            self.advance();
+            self.type_ref()?;
+        }
+        self.bodies.push(BodyKind::AnonFun);
+        let body = if self.at(&Tok::Assign) {
+            self.advance();
+            self.expr()
+                .map(|e| vec![Stmt::new(line, StmtKind::Return(Some(e)))])
+        } else {
+            self.block().map(|mut b| {
+                b.push(Stmt::new(line, StmtKind::Return(None)));
+                b
+            })
+        };
+        self.bodies.pop();
+        Ok(Expr::Lambda {
+            params,
+            body: body?,
+        })
+    }
+
+    fn lambda_inner(&mut self) -> Result<Expr, String> {
         let lam_line = self.line();
         self.eat(&Tok::LBrace)?;
         // Optional parameter list ending in `->`. Speculatively scan a run of
@@ -4225,6 +4323,8 @@ impl Parser {
             // `f({ … })`). Trailing-lambda braces are consumed by `postfix` /
             // `primary`'s call arms before reaching here.
             Tok::LBrace => self.lambda(),
+            // `fun(x: Int): Int { … }` — an anonymous function.
+            Tok::Fun if matches!(self.peek_at(1), Tok::LParen) => self.anonymous_fun(),
             // A LABELLED lambda literal in expression position: `lit@ { … }`,
             // where the label names this lambda for a `return@lit` inside it.
             // The trailing-lambda arms in `postfix`/`primary` consume the
@@ -4693,6 +4793,7 @@ impl Parser {
                         anon_object: None,
                         nested_names: Vec::new(),
                         in_subjectless_cond: false,
+                        bodies: Vec::new(),
                     };
                     let e = sub.expr()?;
                     out.push(StrExpr::Expr(Box::new(e)));

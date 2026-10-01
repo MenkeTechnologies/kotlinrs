@@ -818,6 +818,12 @@ pub enum UnOp {
 /// program can spell.
 pub const REIFY_CALL: &str = "__reify";
 
+/// The intrinsic a bare `return` inside a lambda parses to: Kotlin's
+/// NON-LOCAL return, which leaves the function lexically enclosing the lambda
+/// (the lambda having been inlined into it), not the lambda. Its one optional
+/// argument is the returned value. `$` cannot appear in a Kotlin identifier.
+pub const NONLOCAL_RETURN: &str = "$return";
+
 /// The reserved member name `x::class` lowers to. `class` is a Kotlin keyword,
 /// so no program can spell a member of this name and the two cannot collide.
 pub const CLASS_REF: &str = "class";

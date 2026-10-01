@@ -281,6 +281,20 @@ the reference — a synthetic class name carrying the loader's address and an
 identity hash, both of which change from run to run — so there is nothing there
 to match and nothing that could be frozen in the corpus.
 
+## A closure's `Unit` result prints `null`
+
+| program | kotlinrs | reference |
+| --- | --- | --- |
+| `val f = { x: Int -> println(x) }; println(f(1))` | `1` then `null` | `1` then `kotlin.Unit` |
+| `val g = fun(s: String) { s.length }; println(g("a"))` | `null` | `kotlin.Unit` |
+
+`Unit` and `null` are one runtime value here, and a named function's `Unit`
+result prints `kotlin.Unit` only because the call site knows the declared
+return type. A closure call knows it only from a written annotation
+(`val h: () -> Unit = { 5 }; println(h())` is right); an unannotated lambda or
+anonymous function has none. Telling them apart at run time needs a `Unit`
+value distinct from `null`.
+
 ## `sin` and `cos` — the reference is a platform intrinsic
 
 Measured on the reference JVM (JDK 21.0.12.1 on macOS aarch64, 400 000

@@ -1019,3 +1019,26 @@ against the reference and covered by one of five more corpus records:
   the reference JVM's `Math` answers bit for bit: zero differences over 250 000
   inputs each. `Float.pow` narrows once to a `Float`. `sin`/`cos` stay out:
   BUGS.md has the measurement.
+- **A bare `return` inside a lambda returned from the lambda.** In Kotlin it is
+  a NON-LOCAL return out of the enclosing function (the lambda having been
+  inlined into it): `xs.forEach { if (it == 2) return 10; println(it) }`
+  printed `1`, `3` and fell through where the reference prints `1` and returns
+  `10`. It now raises a marker the exception unwind carries out of the lambda,
+  through `forEach`/`map`/`let`/`apply`/`repeat`/`runCatching`/a nested
+  lambda and any `finally`, to the frame boundary of the function it names,
+  which returns the carried value. No `catch` — not even `catch (e:
+  Throwable)` — and no `runCatching` intercepts it. `return xs.map { … return
+  … }` returns the non-local value, not the half-built list.
+- **Anonymous functions**, `fun(x: Int): Int { … }` and `fun(x: Int) = …`, were
+  a parse error. A bare `return` in one leaves it; a block body answers `Unit`.
+- **The width-dependent bit members** `countOneBits`/`countLeadingZeroBits`/
+  `countTrailingZeroBits`/`takeHighestOneBit`/`takeLowestOneBit`/`rotateLeft`/
+  `rotateRight` on `Int` and `Long`, and the `java.lang.Integer`/`Long` statics
+  that are the same operations (`bitCount`, `numberOfLeadingZeros`,
+  `highestOneBit`, …), plus `Integer.toString(i[, radix])`,
+  `Integer.parseInt(s, radix)`, `Integer.compare`/`max`/`min`/`sum`.
+- **`copyOf()`/`copyOf(n)`/`copyOfRange(from, to)`** on every array kind,
+  padding with the kind's default and raising the stdlib's, `Arrays`' and
+  `System.arraycopy`'s faults in the reference's order.
+
+Six more corpus records cover the last four items.

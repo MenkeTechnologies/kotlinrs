@@ -634,7 +634,10 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
    `val f = lit@ { … }`). The label needs no lowering of its own: every lambda
    body is its own VM frame, so a local return IS a frame return; what it needed
    was to PARSE, and until it did the parser ended the statement at the label and
-   then reported that a label must precede a loop. Blocks are lexically scoped: bindings
+   then reported that a label must precede a loop. A BARE `return` in a lambda is
+   Kotlin's non-local return out of the enclosing `fun`, carried out of the
+   lambda by the exception unwind and claimed by that function's own frame; an
+   anonymous `fun(x: Int): Int { … }` is a closure whose `return` leaves it. Blocks are lexically scoped: bindings
   declared in a nested block (and the `for` variable) drop at the block's end;
   shadowing is restored. A `when` over a `sealed` hierarchy's `is` arms needs no
   `else` — the arms cover every subtype, so the fallthrough is unreachable.
