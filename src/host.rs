@@ -786,6 +786,212 @@ enum ListImpl {
     /// builder's is, and an empty `first`/`last`/`removeFirst`/`removeLast`
     /// is `ArrayDeque is empty.` Measured on kotlinc 2.4.10 / JDK 21.0.12.
     Deque,
+    /// `java.util.PriorityQueue` — a list holding the queue's binary-heap
+    /// ARRAY, so iteration and `toString` show the heap order the JVM does;
+    /// `add`/`poll`/`remove(x)` keep it a heap (see [`pq_member`]).
+    PriorityQueue,
+}
+
+thread_local! {
+    /// A `PriorityQueue`'s comparator, by list handle — absent for the
+    /// natural ordering.
+    static PQ_CMP: RefCell<std::collections::HashMap<u32, Value>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Whether `v` is a `java.util.PriorityQueue` — see [`ListImpl::PriorityQueue`].
+fn is_pq(v: &Value) -> bool {
+    matches!(v, Value::Obj(id)
+        if LIST_IMPL.with(|t| t.borrow().get(id).copied()) == Some(ListImpl::PriorityQueue))
+}
+
+/// `PriorityQueue`'s `compare(a, b)`: the comparator it was built with, or
+/// the elements' natural order.
+fn pq_compare(vm: &mut VM, cmp: &Option<Value>, a: &Value, b: &Value) -> Result<i64, String> {
+    match cmp {
+        Some(c) => compare_with(vm, c, a, b),
+        None => Ok(match compare_vm(vm, a, b) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        }),
+    }
+}
+
+/// `PriorityQueue.siftUp(k, x)` over the heap array `es`.
+fn pq_sift_up(
+    vm: &mut VM,
+    cmp: &Option<Value>,
+    es: &mut [Value],
+    mut k: usize,
+    x: Value,
+) -> Result<(), String> {
+    while k > 0 {
+        let parent = (k - 1) >> 1;
+        let e = es[parent].clone();
+        if pq_compare(vm, cmp, &x, &e)? >= 0 {
+            break;
+        }
+        es[k] = e;
+        k = parent;
+    }
+    es[k] = x;
+    Ok(())
+}
+
+/// `PriorityQueue.siftDown(k, x)` over the first `n` slots of `es`.
+fn pq_sift_down(
+    vm: &mut VM,
+    cmp: &Option<Value>,
+    es: &mut [Value],
+    mut k: usize,
+    x: Value,
+    n: usize,
+) -> Result<(), String> {
+    let half = n >> 1;
+    while k < half {
+        let mut child = (k << 1) + 1;
+        let mut c = es[child].clone();
+        let right = child + 1;
+        if right < n && pq_compare(vm, cmp, &c, &es[right].clone())? > 0 {
+            child = right;
+            c = es[child].clone();
+        }
+        if pq_compare(vm, cmp, &x, &c)? <= 0 {
+            break;
+        }
+        es[k] = c;
+        k = child;
+    }
+    es[k] = x;
+    Ok(())
+}
+
+/// The `PriorityQueue` members that differ from a list's — a port of
+/// `java.util.PriorityQueue`'s `offer`, `poll`, `removeAt` and `heapify`.
+/// `None` for every other member, which the list answers on the heap array.
+fn pq_member(
+    vm: &mut VM,
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    let Value::Obj(id) = recv else { return None };
+    let cmp = PQ_CMP.with(|t| t.borrow().get(id).cloned());
+    let mut es = with_obj(recv, |o| match o {
+        HeapObj::List(items) => Some(items.clone()),
+        _ => None,
+    })
+    .flatten()?;
+    let store = |es: Vec<Value>| {
+        with_obj_mut(recv, |o| {
+            if let HeapObj::List(items) = o {
+                *items = es;
+            }
+        });
+    };
+    let empty = || Err("java.util.NoSuchElementException".to_string());
+    let run = |vm: &mut VM, es: &mut Vec<Value>| -> Result<Value, String> {
+        match (name, args) {
+            // The constructor's half that needs a VM. Its arguments are told
+            // apart by VALUE, as the JDK's overloads are by type: an `Int` is
+            // the initial capacity (which shapes nothing observable), a
+            // closure or `compareBy` chain the comparator, and a collection
+            // the source, heapified in place.
+            ("#pqInit", ctor) => {
+                let mut cmp = None;
+                let mut src = Vec::new();
+                for a in ctor {
+                    let is_cmp = with_obj(a, |o| {
+                        matches!(o, HeapObj::Closure { .. } | HeapObj::Comparator(_))
+                    })
+                    .unwrap_or(false);
+                    if is_cmp {
+                        cmp = Some(a.clone());
+                    } else if let Some(items) = as_iterable(a) {
+                        src = items;
+                    }
+                }
+                if let Some(c) = &cmp {
+                    PQ_CMP.with(|t| t.borrow_mut().insert(*id, c.clone()));
+                }
+                es.extend(src);
+                let n = es.len();
+                for i in (0..n / 2).rev() {
+                    let x = es[i].clone();
+                    pq_sift_down(vm, &cmp, es, i, x, n)?;
+                }
+                Ok(recv.clone())
+            }
+            ("add" | "offer", [x]) => {
+                if matches!(x, Value::Undef) {
+                    return Err("java.lang.NullPointerException".to_string());
+                }
+                es.push(x.clone());
+                let k = es.len() - 1;
+                pq_sift_up(vm, &cmp, es, k, x.clone())?;
+                Ok(Value::Bool(true))
+            }
+            ("addAll", [src]) => {
+                let items = sequence_items(src);
+                let changed = !items.is_empty();
+                for x in items {
+                    es.push(x.clone());
+                    let k = es.len() - 1;
+                    pq_sift_up(vm, &cmp, es, k, x)?;
+                }
+                Ok(Value::Bool(changed))
+            }
+            ("peek", []) => Ok(es.first().cloned().unwrap_or(Value::Undef)),
+            ("element", []) => es.first().cloned().map_or_else(empty, Ok),
+            ("poll" | "remove", []) => {
+                if es.is_empty() {
+                    return if name == "poll" {
+                        Ok(Value::Undef)
+                    } else {
+                        empty()
+                    };
+                }
+                let result = es[0].clone();
+                let x = es.pop().expect("non-empty");
+                let n = es.len();
+                if n > 0 {
+                    pq_sift_down(vm, &cmp, es, 0, x, n)?;
+                }
+                Ok(result)
+            }
+            // `remove(o)`: the first element EQUAL to `o`, then `removeAt`.
+            ("remove", [o]) => {
+                let mut at = None;
+                for (i, e) in es.iter().enumerate() {
+                    if equal_vm(vm, o, e) {
+                        at = Some(i);
+                        break;
+                    }
+                }
+                let Some(i) = at else {
+                    return Ok(Value::Bool(false));
+                };
+                let s = es.len() - 1;
+                let moved = es.pop().expect("non-empty");
+                if i != s {
+                    pq_sift_down(vm, &cmp, es, i, moved.clone(), s)?;
+                    if identical(&es[i], &moved) {
+                        pq_sift_up(vm, &cmp, es, i, moved)?;
+                    }
+                }
+                Ok(Value::Bool(true))
+            }
+            _ => Err(String::new()),
+        }
+    };
+    match run(vm, &mut es) {
+        Err(e) if e.is_empty() => None,
+        r => {
+            store(es);
+            Some(r)
+        }
+    }
 }
 
 /// Whether `v` is an `ArrayDeque` — see [`ListImpl::Deque`].
@@ -3822,6 +4028,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let which = match tag.as_str() {
                 "builder" => ListImpl::Builder,
                 "deque" => ListImpl::Deque,
+                "pq" => ListImpl::PriorityQueue,
                 _ => ListImpl::Literal,
             };
             vm.push(tag_if_list(list, which));
@@ -7519,7 +7726,15 @@ fn coll_hof(
             for it in items {
                 let out = invoke_closure(vm, clo, std::slice::from_ref(&it))?;
                 let (k, v) = if name == "associateBy" {
-                    (out, it)
+                    // `associateBy(keySelector, valueTransform)`: the leading
+                    // argument is the key selector and the trailing lambda the
+                    // value.
+                    match extras.first() {
+                        Some(key_sel) => {
+                            (invoke_closure(vm, key_sel, std::slice::from_ref(&it))?, out)
+                        }
+                        None => (out, it),
+                    }
                 } else {
                     match with_obj(&out, |o| match o {
                         HeapObj::Pair(a, b) => Some((a.clone(), b.clone())),
@@ -7561,13 +7776,22 @@ fn coll_hof(
             key: clo.clone(),
         })),
         "groupBy" => {
-            // key → list of elements, keys in first-appearance order.
+            // key → list of elements, keys in first-appearance order. The
+            // two-lambda form `groupBy(keySelector, valueTransform)` arrives
+            // with the key selector as the leading argument and stores each
+            // element's TRANSFORM rather than the element.
             let mut entries: Vec<(Value, Vec<Value>)> = Vec::new();
             for it in items {
-                let key = invoke_closure(vm, clo, std::slice::from_ref(&it))?;
+                let (key, val) = match extras.first() {
+                    Some(key_sel) => (
+                        invoke_closure(vm, key_sel, std::slice::from_ref(&it))?,
+                        invoke_closure(vm, clo, std::slice::from_ref(&it))?,
+                    ),
+                    None => (invoke_closure(vm, clo, std::slice::from_ref(&it))?, it),
+                };
                 match entries.iter_mut().find(|(k, _)| value_eq(k, &key)) {
-                    Some(slot) => slot.1.push(it),
-                    None => entries.push((key, vec![it])),
+                    Some(slot) => slot.1.push(val),
+                    None => entries.push((key, vec![val])),
                 }
             }
             let entries = entries
@@ -8714,8 +8938,11 @@ fn builder_method(
         }
         // `delete`/`replace` CLAMP their end to the length rather than
         // throwing — `StringBuilder("abc").delete(1, 99)` is `a` — but still
-        // reject a start outside the sequence.
-        "delete" | "deleteRange" | "replace" => {
+        // reject a start outside the sequence. Only the THREE-argument
+        // `replace(start, end, str)` is the builder's own; `replace(old, new)`
+        // and `replace(regex, …)` are `CharSequence` extensions answering a
+        // new `String`, and fall through to the delegation below.
+        "delete" | "deleteRange" | "replace" if name != "replace" || args.len() == 3 => {
             // The JVM clamps `end` to the length BEFORE checking, so the bound
             // the diagnostic reports is the clamped one: `delete(9, 10)` on a
             // 5-unit builder says `Range [9, 5)`, not `Range [9, 10)`.
@@ -10061,6 +10288,11 @@ fn char_method(code: i64, name: &str, args: &[Value]) -> Result<Value, String> {
 /// class's synthesized members). User-defined class methods never reach here —
 /// the compiler lowers those to direct `Op::Call`s on method subs.
 fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    if is_pq(recv) {
+        if let Some(r) = pq_member(vm, recv, name, args) {
+            return r;
+        }
+    }
     // A class object. Its members are reflection's, not a container's.
     if let Some((simple, qualified, java, reified)) = with_obj(recv, |o| match o {
         HeapObj::Klass {

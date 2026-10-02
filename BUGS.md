@@ -288,7 +288,7 @@ Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 | program | kotlinrs | reference |
 | --- | --- | --- |
 | `class S : Iterable<Int> { override fun iterator() = … }; for (x in S()) …` | `unresolved supertype Iterable of class S` | iterates |
-| `java.util.PriorityQueue<Int>()` / `java.util.LinkedList<Int>()` | `unresolved reference: java` | the JDK collections |
+| `java.util.LinkedList<Int>()` | `unresolved reference: java` | the JDK list |
 | `listOf(1, 2).shuffled(java.util.Random(1))` | `unresolved reference: java` | a seeded order |
 | `sortedMapOf("b" to 2, "a" to 1).firstKey()` / `headMap` / `tailMap` | `unresolved reference: firstKey on Map` | `a` / `{a=1}` / … |
 | `generateSequence { x }` (the seedless form) | `unresolved reference: generateSequence` | a sequence calling the block until `null` |
@@ -301,13 +301,16 @@ Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 | --- | --- | --- |
 | `val f = { x: Int -> println(x) }; println(f(1))` | `1` then `null` | `1` then `kotlin.Unit` |
 | `val g = fun(s: String) { s.length }; println(g("a"))` | `null` | `kotlin.Unit` |
+| `val r = x?.let { println(it) }; println(r == null)` | `true` | `false` |
 
 `Unit` and `null` are one runtime value here, and a named function's `Unit`
 result prints `kotlin.Unit` only because the call site knows the declared
 return type. A closure call knows it only from a written annotation
 (`val h: () -> Unit = { 5 }; println(h())` is right); an unannotated lambda or
 anonymous function has none. Telling them apart at run time needs a `Unit`
-value distinct from `null`.
+value distinct from `null`. The one idiom that USED to go wrong through this,
+`x?.let { println(it) } ?: other` running `other` for a non-null `x`, is
+decided statically now (see CHANGELOG, round 16).
 
 ## `sin` and `cos` — the reference is a platform intrinsic
 

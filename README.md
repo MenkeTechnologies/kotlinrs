@@ -204,6 +204,11 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 - **`ArrayDeque`** — `addFirst`/`addLast`/`removeFirst`/`removeLast` and the
   `OrNull` pair over a mutable list, with the deque's own fault wording
   (`ArrayDeque is empty.`, `index: 5, size: 2`).
+- **`java.util.PriorityQueue`** — under `import java.util.PriorityQueue` (or
+  `java.util.*`, or written qualified): natural order, a comparator lambda or
+  `compareBy` chain, or a source collection; `add`/`offer`/`addAll`,
+  `poll`/`remove()`/`peek`/`element`, `remove(x)`. The JDK's sift and heapify
+  are ported, so iterating or printing one shows the JVM's heap order.
 - **`lateinit var`** — a class property, top-level property, or local with no
   initializer whose read before the first write (through the instance, in a
   member, in an `init` block, or from a lambda or local `fun`) is

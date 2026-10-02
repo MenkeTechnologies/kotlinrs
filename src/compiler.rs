@@ -990,6 +990,10 @@ pub struct Compiler {
     /// bare name `Random` in scope. Like `kotlin.math`, `kotlin.random` is not
     /// auto-imported, so without it only the qualified spelling resolves.
     random_imported: bool,
+    /// Whether `java.util.PriorityQueue` is in scope by an `import` (the
+    /// class itself, or `java.util.*`), which is what makes a bare
+    /// `PriorityQueue(…)` resolve.
+    pq_imported: bool,
     /// True when the program contains a `try`/`throw` anywhere. Only then are the
     /// per-statement unwind checks (and the suppressible print builtins) emitted,
     /// so an exception-free program keeps byte-identical bytecode — and its
@@ -1813,6 +1817,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         math_scope: HashMap::new(),
         math_star: false,
         random_imported: false,
+        pq_imported: false,
         has_try: uses_exceptions(program),
         cur_ret: None,
         nlr_target: None,
@@ -1823,6 +1828,9 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         finally_exits: Vec::new(),
     };
     (c.math_scope, c.math_star) = math_scope(&program.imports);
+    c.pq_imported = program.imports.iter().any(|i| {
+        i.alias.is_none() && (i.path == "java.util.PriorityQueue" || i.path == "java.util.*")
+    });
     c.random_imported = program.imports.iter().any(|i| {
         i.alias.is_none() && (i.path == "kotlin.random.Random" || i.path == "kotlin.random.*")
     });
@@ -4276,6 +4284,49 @@ impl Compiler {
     /// Elvis `left ?: right`: evaluate `left`; if it is `null`, discard it and
     /// yield `right`, otherwise keep `left`.
     fn compile_elvis(&mut self, sc: &mut Scope, left: &Expr, right: &Expr) -> Result<Type, String> {
+        // `x?.let { println(it) } ?: other` — a scope block whose value is
+        // `Unit` makes the left side NON-null whenever `x` is, but `Unit` and
+        // `null` are one runtime value here. Decided by the receiver instead:
+        // the right side runs exactly when `x` is null.
+        if let Expr::MethodCall {
+            recv,
+            name,
+            args,
+            safe: true,
+            line,
+        } = left
+        {
+            let unit_block = matches!(name.as_str(), "let" | "run")
+                && matches!(args.as_slice(), [Expr::Lambda { body, .. }]
+                    if body.last().is_some_and(|s| self.infer_stmt(sc, s) == Type::Unit));
+            if unit_block {
+                let mark = sc.enter();
+                let t = self.compile_expr(sc, recv)?;
+                let held = "$elvisRecv";
+                let slot = sc.declare_obj(held, t, false, self.infer_class(sc, recv));
+                self.b.emit(Op::SetSlot(slot), *line);
+                let call = Expr::MethodCall {
+                    recv: Box::new(Expr::Var(held.to_string())),
+                    name: name.clone(),
+                    args: args.clone(),
+                    safe: false,
+                    line: *line,
+                };
+                let lowered = Expr::If(IfExpr {
+                    cond: Box::new(Expr::Binary {
+                        op: BinOp::Eq,
+                        l: Box::new(Expr::Var(held.to_string())),
+                        r: Box::new(Expr::Null),
+                    }),
+                    then: vec![Stmt::new(*line, StmtKind::Expr(right.clone()))],
+                    els: Some(vec![Stmt::new(*line, StmtKind::Expr(call))]),
+                    line: *line,
+                });
+                let ty = self.compile_expr(sc, &lowered);
+                sc.exit(mark);
+                return ty;
+            }
+        }
         let lt = self.compile_expr(sc, left)?; // [L]
         self.b.emit(Op::Dup, 0); // [L, L]
         self.b.emit(Op::Extended(KT_ISNULL, 0), 0); // [L, isNull]
@@ -4830,6 +4881,10 @@ impl Compiler {
                         && args.len() == 1 =>
                 {
                     return self.compile_member(sc, &args[0], name, &[], false, line)
+                }
+                // `java.util.PriorityQueue(…)`, written out instead of imported.
+                "java.util" if name == "PriorityQueue" && args.len() <= 2 => {
+                    return self.compile_priority_queue(sc, args, line);
                 }
                 // The JDK's bit statics on `Integer`/`Long` are the `kotlin`
                 // members on the argument, which carry its width.
@@ -7168,6 +7223,12 @@ impl Compiler {
                 self.compile_expr(sc, &lambda)?;
                 Ok(Type::Obj)
             }
+            // `PriorityQueue()` and its overloads — see `compile_priority_queue`.
+            "PriorityQueue"
+                if args.len() <= 2 && self.pq_imported && self.class_meta(name).is_none() =>
+            {
+                self.compile_priority_queue(sc, args, line)
+            }
             // `ArrayDeque()` / `ArrayDeque(capacity)` / `ArrayDeque(elements)` —
             // a mutable list tagged as the deque class, whose members word
             // their own faults (see `host::ListImpl::Deque`).
@@ -8384,6 +8445,35 @@ impl Compiler {
         let t = self.compile_expr(sc, &lowered);
         sc.exit(mark);
         t.map(|_| Type::Unknown)
+    }
+
+    /// `java.util.PriorityQueue(…)`: an empty list tagged as the queue (see
+    /// `host::ListImpl::PriorityQueue`), then the constructor arguments —
+    /// capacity, comparator, source collection, sorted out by the host — and
+    /// the heapify that needs the VM.
+    fn compile_priority_queue(
+        &mut self,
+        sc: &mut Scope,
+        args: &[Expr],
+        line: u32,
+    ) -> Result<Type, String> {
+        self.b.emit(Op::Extended(KT_LIST, 0), line);
+        let tidx = self.b.add_constant(Value::str("pq"));
+        self.b.emit(Op::LoadConst(tidx), line);
+        self.b.emit(Op::Extended(KT_LIST_TAG, 0), line);
+        for a in args {
+            // A two-parameter lambda is the comparator.
+            if matches!(a, Expr::Lambda { .. }) {
+                self.lambda_hint = Some(vec![(Type::Unknown, Type::Unknown); 2]);
+            }
+            self.compile_expr(sc, a)?;
+            self.lambda_hint = None;
+        }
+        let nidx = self.b.add_constant(Value::str("#pqInit"));
+        self.b.emit(Op::LoadConst(nidx), line);
+        self.b
+            .emit(Op::CallBuiltin(KT_METHOD_VM, args.len() as u8), line);
+        Ok(Type::Obj)
     }
 
     /// Mark `args`' trailing lambda literal, when it has no parameters, as one

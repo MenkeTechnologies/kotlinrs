@@ -1067,3 +1067,22 @@ these; eight more corpus records cover them:
   conversions **`toIntArray()`** … **`toByteArray()`**, a **`vararg` that is
   not the last parameter**, and the `Result` members `onSuccess`/`onFailure`/
   `getOrElse`/`map` on a receiver the compiler could not type.
+
+From a fifth and sixth probe batch, four more corpus records:
+
+- **`StringBuilder.replace(regex, replacement)`** answered the builder
+  unchanged: only the three-argument `replace(start, end, str)` is the
+  builder's own; the two-argument forms are the `CharSequence` extensions and
+  answer a new `String`.
+- **`groupBy(keySelector, valueTransform)` / `associateBy(keySelector,
+  valueTransform)`** used the TRANSFORM as the key.
+- **`x?.let { println(it) } ?: other`** ran `other` for a non-null `x`: the
+  block's `Unit` and `null` are one runtime value. A safe `let`/`run` whose
+  block ends in a statically `Unit` statement now decides the elvis by the
+  receiver.
+- **`java.util.PriorityQueue`** — natural order, a comparator lambda or
+  `compareBy` chain, a source collection (heapified), `add`/`offer`/`addAll`,
+  `poll`/`remove()`/`peek`/`element`, `remove(x)` — a port of the JDK's
+  `siftUp`/`siftDown`/`removeAt`/`heapify`, so iteration and `toString` show
+  the same heap order. Resolved under `import java.util.PriorityQueue` /
+  `java.util.*` or written qualified.
