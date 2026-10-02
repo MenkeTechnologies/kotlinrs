@@ -287,9 +287,8 @@ Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 
 | program | kotlinrs | reference |
 | --- | --- | --- |
-| `class S : Iterable<Int> { override fun iterator() = … }; for (x in S()) …` | `unresolved supertype Iterable of class S` | iterates |
+| `class S : Iterable<Int> { override fun iterator() = … }; S().map { … }` | `unresolved supertype Iterable of class S` | the `Iterable` extensions over `S` |
 | `java.util.LinkedList<Int>()` | `unresolved reference: java` | the JDK list |
-| `listOf(1, 2).shuffled(java.util.Random(1))` | `unresolved reference: java` | a seeded order |
 | `sortedMapOf("b" to 2, "a" to 1).firstKey()` / `headMap` / `tailMap` | `unresolved reference: firstKey on Map` | `a` / `{a=1}` / … |
 | `generateSequence { x }` (the seedless form) | `unresolved reference: generateSequence` | a sequence calling the block until `null` |
 | `(-1).toUInt()` / `5u + 3u` | `unresolved reference: toUInt on Int` / parse error | `4294967295` / `8` |
@@ -340,7 +339,6 @@ Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 | `object : Comparator<String> { override fun compare(a: String, b: String) = a.length - b.length }` | `unresolved supertype Comparator` | a comparator `sortedWith` takes |
 | `val k = 2; object : I { override fun f() = k }` | `unresolved reference: k` | captures `k` |
 | `"hello".encodeToByteArray().size` | `unresolved reference: encodeToByteArray on String` | `5` |
-| `listOf(1, 2).shuffled(java.util.Random(1))` | `unresolved reference: java` | a seeded order |
 | `println(check(true) == Unit)` | `unresolved reference: Unit` | `true` |
 
 The first needs a host-side call into a user `compare` with two arguments; the

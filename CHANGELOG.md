@@ -1086,3 +1086,13 @@ From a fifth and sixth probe batch, four more corpus records:
   `siftUp`/`siftDown`/`removeAt`/`heapify`, so iteration and `toString` show
   the same heap order. Resolved under `import java.util.PriorityQueue` /
   `java.util.*` or written qualified.
+- **`for (x in obj)` over a user class** taking part in the iterator protocol
+  — one declaring `operator fun iterator()`, or one implementing `Iterator`
+  (now accepted as a supertype) — was `for-in over a non-iterable value`. It
+  is lowered to Kotlin's `iterator()`/`hasNext()`/`next()` loop, with
+  destructuring, labels, `break` and `continue`.
+- **`java.util.Random`** (imported or qualified): the JDK's 48-bit LCG, with
+  `nextInt()`/`nextInt(bound)` (its rejection loop included)/`nextLong`/
+  `nextDouble`/`nextFloat`/`nextBoolean`, and as the generator
+  `shuffle`/`shuffled` draw from — the same order `Collections.shuffle`
+  produces. Three more corpus records.

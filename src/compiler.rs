@@ -47,14 +47,24 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 /// `class Op(val v: Int) : Comparable<Op>` compile, where the `compareTo` the
 /// `<` operator resolves against is the class's own override either way.
 ///
-/// The collection interfaces are deliberately absent: declaring `: Iterable<T>`
-/// promises `for (x in c)` over the class, which is dispatch this frontend
-/// would have to route and does not, so accepting one would trade a loud error
-/// for a silent gap.
+/// `Iterator` is here because `for` drives a user iterator through its own
+/// `hasNext`/`next` (see `Compiler::user_iterator_loop`). The collection
+/// interfaces are deliberately absent: declaring `: Iterable<T>` also promises
+/// every `Iterable` extension (`map`, `filter`, `toList`, …) over the class,
+/// which this frontend does not route, so accepting one would trade a loud
+/// error for a silent gap. A class that declares `operator fun iterator()`
+/// without the supertype iterates under `for` all the same.
 fn is_marker_supertype(name: &str) -> bool {
     matches!(
         name,
-        "Comparable" | "Cloneable" | "Serializable" | "Runnable" | "AutoCloseable" | "Closeable"
+        "Comparable"
+            | "Cloneable"
+            | "Serializable"
+            | "Runnable"
+            | "AutoCloseable"
+            | "Closeable"
+            | "Iterator"
+            | "MutableIterator"
     )
 }
 
@@ -69,6 +79,11 @@ fn marker_member(parent: &str, name: &str, arity: usize) -> bool {
         "Comparable" => name == "compareTo" && arity == 1,
         "Runnable" => name == "run" && arity == 0,
         "AutoCloseable" | "Closeable" => name == "close" && arity == 0,
+        // An `Iterator` is driven by `for` through its own two members (see
+        // `Compiler::user_iterator_loop`), so they are all it promises here.
+        "Iterator" | "MutableIterator" => {
+            matches!((name, arity), ("hasNext", 0) | ("next", 0) | ("remove", 0))
+        }
         _ => false,
     }
 }
@@ -990,6 +1005,9 @@ pub struct Compiler {
     /// bare name `Random` in scope. Like `kotlin.math`, `kotlin.random` is not
     /// auto-imported, so without it only the qualified spelling resolves.
     random_imported: bool,
+    /// Whether `java.util.Random` is in scope by an `import` (the class
+    /// itself, or `java.util.*`).
+    jrandom_imported: bool,
     /// Whether `java.util.PriorityQueue` is in scope by an `import` (the
     /// class itself, or `java.util.*`), which is what makes a bare
     /// `PriorityQueue(…)` resolve.
@@ -1818,6 +1836,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         math_star: false,
         random_imported: false,
         pq_imported: false,
+        jrandom_imported: false,
         has_try: uses_exceptions(program),
         cur_ret: None,
         nlr_target: None,
@@ -1828,6 +1847,10 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         finally_exits: Vec::new(),
     };
     (c.math_scope, c.math_star) = math_scope(&program.imports);
+    c.jrandom_imported = program
+        .imports
+        .iter()
+        .any(|i| i.alias.is_none() && (i.path == "java.util.Random" || i.path == "java.util.*"));
     c.pq_imported = program.imports.iter().any(|i| {
         i.alias.is_none() && (i.path == "java.util.PriorityQueue" || i.path == "java.util.*")
     });
@@ -3169,7 +3192,19 @@ impl Compiler {
                 body,
                 label,
             } => {
-                self.compile_for_in(sc, var, parts, iter, body, label)?;
+                // `for (x in obj)` over a user class: Kotlin's iterator
+                // protocol — `obj.iterator()` then `hasNext()`/`next()` —
+                // written out as the loop it is.
+                if let Some(lowered) =
+                    self.user_iterator_loop(sc, var, parts, iter, body, label, s.line)
+                {
+                    let mark = sc.enter();
+                    let r = lowered.iter().try_for_each(|st| self.compile_stmt(sc, st));
+                    sc.exit(mark);
+                    r?;
+                } else {
+                    self.compile_for_in(sc, var, parts, iter, body, label)?;
+                }
             }
             StmtKind::Break(label) => {
                 let j = self.b.emit(Op::Jump(0), 0);
@@ -4885,6 +4920,9 @@ impl Compiler {
                 // `java.util.PriorityQueue(…)`, written out instead of imported.
                 "java.util" if name == "PriorityQueue" && args.len() <= 2 => {
                     return self.compile_priority_queue(sc, args, line);
+                }
+                "java.util" if name == "Random" && args.len() <= 1 => {
+                    return self.compile_jrandom(sc, args, line);
                 }
                 // The JDK's bit statics on `Integer`/`Long` are the `kotlin`
                 // members on the argument, which carry its width.
@@ -7156,6 +7194,16 @@ impl Compiler {
             }
             // `Pair(a, b)` / `Triple(a, b, c)` — the constructor spellings of
             // what `a to b` already builds.
+            // `Random(seed)` / `Random()` under `import java.util.Random` (or
+            // `java.util.*`) — the JDK's generator, not Kotlin's.
+            "Random"
+                if args.len() <= 1
+                    && self.jrandom_imported
+                    && !self.random_imported
+                    && !self.classes.contains_key("Random") =>
+            {
+                self.compile_jrandom(sc, args, line)
+            }
             // `Random(seed)` — the stdlib's seeded `XorWowRandom`.
             "Random"
                 if args.len() == 1
@@ -8447,6 +8495,29 @@ impl Compiler {
         t.map(|_| Type::Unknown)
     }
 
+    /// `java.util.Random(seed)` / `java.util.Random()` — see
+    /// `host::jrandom_method`. The seed (or `null` for an unseeded one) is the
+    /// receiver of the host's constructor member.
+    fn compile_jrandom(
+        &mut self,
+        sc: &mut Scope,
+        args: &[Expr],
+        line: u32,
+    ) -> Result<Type, String> {
+        match args.first() {
+            Some(seed) => {
+                self.compile_expr(sc, seed)?;
+            }
+            None => {
+                self.b.emit(Op::LoadUndef, line);
+            }
+        }
+        let nidx = self.b.add_constant(Value::str("#jrandomNew"));
+        self.b.emit(Op::LoadConst(nidx), line);
+        self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 0), line);
+        Ok(Type::Obj)
+    }
+
     /// `java.util.PriorityQueue(…)`: an empty list tagged as the queue (see
     /// `host::ListImpl::PriorityQueue`), then the constructor arguments —
     /// capacity, comparator, source collection, sorted out by the host — and
@@ -8474,6 +8545,99 @@ impl Compiler {
         self.b
             .emit(Op::CallBuiltin(KT_METHOD_VM, args.len() as u8), line);
         Ok(Type::Obj)
+    }
+
+    /// The statements `for (var in iter) body` stands for when `iter`'s static
+    /// class is a user class taking part in the iterator protocol: one that
+    /// declares `operator fun iterator()`, or one that IS an iterator (it
+    /// implements `Iterator`, whose `iterator()` extension answers the
+    /// receiver). `None` for every other iterable, which `compile_for_in`
+    /// lowers.
+    #[allow(clippy::too_many_arguments)]
+    fn user_iterator_loop(
+        &mut self,
+        sc: &Scope,
+        var: &str,
+        parts: &[String],
+        iter: &Expr,
+        body: &[Stmt],
+        label: &Option<String>,
+        line: u32,
+    ) -> Option<Vec<Stmt>> {
+        let cls = self.infer_class(sc, iter)?;
+        let meta = self.classes.get(&cls)?;
+        let has_iterator = meta.methods.get("iterator").is_some_and(|s| s.arity == 0);
+        let is_iterator = meta.methods.contains_key("hasNext") && meta.methods.contains_key("next");
+        if !has_iterator && !is_iterator {
+            return None;
+        }
+        let id = self.lambdas_seen;
+        self.lambdas_seen += 1;
+        let cursor = format!("$iter{id}");
+        let call = |recv: Expr, name: &str| Expr::MethodCall {
+            recv: Box::new(recv),
+            name: name.to_string(),
+            args: Vec::new(),
+            safe: false,
+            line,
+        };
+        let init = if has_iterator {
+            call(iter.clone(), "iterator")
+        } else {
+            iter.clone()
+        };
+        let next = call(Expr::Var(cursor.clone()), "next");
+        let mut loop_body = vec![if parts.is_empty() {
+            Stmt::new(
+                line,
+                StmtKind::Let {
+                    name: var.to_string(),
+                    ty: None,
+                    class: None,
+                    fn_params: Vec::new(),
+                    fn_ret: None,
+                    type_args: Vec::new(),
+                    init: next,
+                    mutable: false,
+                    lazy: false,
+                    delegated: false,
+                },
+            )
+        } else {
+            Stmt::new(
+                line,
+                StmtKind::Destructure {
+                    names: parts.to_vec(),
+                    init: next,
+                },
+            )
+        }];
+        loop_body.extend(body.iter().cloned());
+        Some(vec![
+            Stmt::new(
+                line,
+                StmtKind::Let {
+                    name: cursor.clone(),
+                    ty: None,
+                    class: None,
+                    fn_params: Vec::new(),
+                    fn_ret: None,
+                    type_args: Vec::new(),
+                    init,
+                    mutable: false,
+                    lazy: false,
+                    delegated: false,
+                },
+            ),
+            Stmt::new(
+                line,
+                StmtKind::While {
+                    cond: call(Expr::Var(cursor), "hasNext"),
+                    body: loop_body,
+                    label: label.clone(),
+                },
+            ),
+        ])
     }
 
     /// Mark `args`' trailing lambda literal, when it has no parameters, as one

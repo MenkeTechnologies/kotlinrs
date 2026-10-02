@@ -1808,6 +1808,10 @@ enum HeapObj {
     /// of state (`x`, `y`, `z`, `w`, `v`, `addend`) are all a seeded generator
     /// is, so a program seeding it draws the reference's exact sequence.
     Random([i32; 6]),
+    /// A `java.util.Random` — the JDK's 48-bit linear congruential generator,
+    /// whose whole state is this (already scrambled) seed. See
+    /// [`jrandom_method`].
+    JRandom(i64),
     /// A `kotlin.text.Regex` — see [`crate::regex`].
     Regex(Rc<KRegex>),
     /// A `MatchResult`: the regex and input it came from (which `next()`
@@ -9039,6 +9043,20 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
     if let Some(r) = random_method(recv, name, args) {
         return r;
     }
+    if let Some(r) = jrandom_method(recv, name, args) {
+        return r;
+    }
+    // `java.util.Random(seed)`, the seed being the receiver; `null` for the
+    // unseeded constructor, which the JDK seeds from the clock.
+    if name == "#jrandomNew" {
+        let seed = match recv {
+            Value::Undef => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos() as i64),
+            v => num_i64(v),
+        };
+        return Ok(jrandom_new(seed));
+    }
     if let Some(r) = regex_method(vm, recv, name, args) {
         return r;
     }
@@ -12473,6 +12491,7 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
         | HeapObj::Closure { .. }
         | HeapObj::Comparator(_)
         | HeapObj::Random(_)
+        | HeapObj::JRandom(_)
         | HeapObj::Regex(_)
         | HeapObj::RegexMatch { .. }
         | HeapObj::MatchGroup { .. }
@@ -13200,6 +13219,7 @@ fn obj_hash(recv: &Value) -> Option<i32> {
         | HeapObj::Closure { .. }
         | HeapObj::Comparator(_)
         | HeapObj::Random(_)
+        | HeapObj::JRandom(_)
         | HeapObj::Regex(_)
         | HeapObj::RegexMatch { .. }
         | HeapObj::MatchGroup { .. }
@@ -13231,6 +13251,7 @@ fn obj_label(recv: &Value) -> String {
         HeapObj::Closure { .. } => "Function".to_string(),
         HeapObj::Comparator(_) => "Comparator".to_string(),
         HeapObj::Random(_) => "Random".to_string(),
+        HeapObj::JRandom(_) => "Random".to_string(),
         HeapObj::Regex(_) => "Regex".to_string(),
         HeapObj::RegexMatch { .. } => "MatchResult".to_string(),
         HeapObj::MatchGroup { .. } => "MatchGroup".to_string(),
@@ -13383,6 +13404,7 @@ fn display_obj(id: u32) -> String {
             // `XorWowRandom` inherits `Object.toString`; the identity hash is the
             // handle, as it is for every other identity-hashed kind.
             HeapObj::Random(_) => format!("kotlin.random.XorWowRandom@{id:x}"),
+            HeapObj::JRandom(_) => format!("java.util.Random@{id:x}"),
             // `Regex.toString()` is its pattern; `MatchResult` inherits
             // `Object.toString`; `MatchGroup` is a data class.
             HeapObj::Regex(re) => re.pattern.clone(),
@@ -14362,6 +14384,83 @@ fn b_random(vm: &mut VM, arg: u8) {
     }
 }
 
+/// The multiplier, increment and 48-bit mask of `java.util.Random`'s LCG.
+const JRANDOM_MULT: i64 = 0x5_DEEC_E66D;
+const JRANDOM_ADD: i64 = 0xB;
+const JRANDOM_MASK: i64 = (1 << 48) - 1;
+
+/// `new java.util.Random(seed)`: the seed is scrambled once, as `setSeed` does.
+fn jrandom_new(seed: i64) -> Value {
+    alloc(HeapObj::JRandom((seed ^ JRANDOM_MULT) & JRANDOM_MASK))
+}
+
+/// `Random.next(bits)` on a `java.util.Random` receiver, advancing it. `None`
+/// for any other receiver.
+fn jrandom_next(rng: &Value, bits: u32) -> Option<i32> {
+    with_obj_mut(rng, |o| match o {
+        HeapObj::JRandom(seed) => {
+            *seed = (seed.wrapping_mul(JRANDOM_MULT).wrapping_add(JRANDOM_ADD)) & JRANDOM_MASK;
+            Some((*seed >> (48 - bits)) as i32)
+        }
+        _ => None,
+    })
+    .flatten()
+}
+
+/// `java.util.Random.nextInt(bound)`, the JDK's rejection loop included.
+/// `None` when `rng` is not a `java.util.Random`.
+fn jrandom_next_int(rng: &Value, bound: i32) -> Option<Result<i32, String>> {
+    let mut r = jrandom_next(rng, 31)?;
+    if bound <= 0 {
+        return Some(Err(
+            "java.lang.IllegalArgumentException: bound must be positive".to_string(),
+        ));
+    }
+    let m = bound - 1;
+    if bound & m == 0 {
+        return Some(Ok(((i64::from(bound) * i64::from(r)) >> 31) as i32));
+    }
+    let mut u = r;
+    loop {
+        r = u % bound;
+        if u.wrapping_sub(r).wrapping_add(m) >= 0 {
+            return Some(Ok(r));
+        }
+        u = jrandom_next(rng, 31)?;
+    }
+}
+
+/// The members of a `java.util.Random` receiver, or `None` for any other.
+fn jrandom_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    if !matches!(
+        with_obj(recv, |o| matches!(o, HeapObj::JRandom(_))),
+        Some(true)
+    ) {
+        return None;
+    }
+    let next = |bits| jrandom_next(recv, bits).unwrap_or(0);
+    Some(Ok(match (name, args) {
+        ("nextInt", []) => Value::Int(i64::from(next(32))),
+        ("nextInt", [b]) => {
+            return jrandom_next_int(recv, b.to_int() as i32)
+                .map(|r| r.map(|i| Value::Int(i64::from(i))))
+        }
+        ("nextLong", []) => {
+            let hi = i64::from(next(32));
+            let lo = i64::from(next(32));
+            box_i64((hi << 32).wrapping_add(lo))
+        }
+        ("nextDouble", []) => {
+            let hi = i64::from(next(26));
+            let lo = i64::from(next(27));
+            Value::Float(((hi << 27) + lo) as f64 * (1.0 / (1u64 << 53) as f64))
+        }
+        ("nextFloat", []) => box_f32(f64::from(next(24) as f32 / (1 << 24) as f32)),
+        ("nextBoolean", []) => Value::Bool(next(1) != 0),
+        _ => return Some(Err(format!("unresolved reference: {name} on Random"))),
+    }))
+}
+
 /// The members of a `Random` receiver, or `None` for any other receiver.
 fn random_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     if !matches!(
@@ -14667,15 +14766,20 @@ fn regex_split(re: &KRegex, input: &str, limit: Option<&Value>) -> Result<Value,
 /// one drawn from `0..=i`. `shuffled` runs it on a copy.
 fn shuffle_with(items: &mut [Value], rng: &Value) -> Result<(), String> {
     for i in (1..items.len()).rev() {
-        let j = with_rng(rng, |st| xorwow_int_in(st, 0, i as i32 + 1))
-            .ok_or_else(|| format!("unresolved reference: shuffle on {}", obj_label(rng)))??;
-        items.swap(i, j as usize);
+        let j = random_index(rng, i + 1)
+            .map_err(|_| format!("unresolved reference: shuffle on {}", obj_label(rng)))?;
+        items.swap(i, j);
     }
     Ok(())
 }
 
 /// `random(random)` over a receiver of `n` elements: the index the draw picks.
 fn random_index(rng: &Value, n: usize) -> Result<usize, String> {
+    // A `java.util.Random` draws with its own `nextInt(bound)` — the draw
+    // `Collections.shuffle(list, rnd)` makes, over the same descending walk.
+    if let Some(r) = jrandom_next_int(rng, n as i32) {
+        return r.map(|i| i as usize);
+    }
     with_rng(rng, |st| xorwow_int_in(st, 0, n as i32))
         .ok_or_else(|| format!("unresolved reference: random on {}", obj_label(rng)))?
         .map(|i| i as usize)
