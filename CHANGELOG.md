@@ -944,9 +944,10 @@ on the previous release and passes now.
 
 Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1 through `scripts/capture-parity.sh`.
 The baseline was a clean corpus replay and a clean 480-probe `parity-fuzz` run
-(seed 4242001), so the round worked from 270 hand-written probes compared one
-by one against the reference. Nine corpus records cover what changed; each
-fails on the round's starting commit and passes now.
+(seed 4242001), so the round worked from 272 hand-written one-line probes compared one
+by one against the reference, then from 161 whole small programs in five
+more batches. Thirty-eight corpus records (1050 → 1088) cover what changed; each
+fails on the round's starting commit (`9ffc7c959b`) and passes now.
 
 - **A user method named like a stdlib extension was never called.** A class
   declaring `fun <R> map(f: (T) -> R)` — or `filter`, `let`, `thenBy`, any of
