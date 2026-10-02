@@ -3976,9 +3976,14 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             // Stack: [obj, nameStr].
             let name = vm.pop().to_str();
             let obj = vm.pop();
+            // The LAST field of the name: a subclass's `override val` is
+            // appended after the base's field of the same name (the record is
+            // base-most first), and the override is what every read means —
+            // through the base's own methods too.
             let got = with_obj(&obj, |o| match o {
                 HeapObj::Instance { fields, .. } => fields
                     .iter()
+                    .rev()
                     .find(|(n, _)| *n == name)
                     .map(|(_, v)| v.clone()),
                 _ => None,
@@ -4003,7 +4008,8 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let obj = vm.pop();
             let ok = with_obj_mut(&obj, |o| match o {
                 HeapObj::Instance { fields, .. } => {
-                    if let Some(slot) = fields.iter_mut().find(|(n, _)| *n == name) {
+                    // The most-derived field of the name, as the read above.
+                    if let Some(slot) = fields.iter_mut().rev().find(|(n, _)| *n == name) {
                         slot.1 = value;
                         true
                     } else {
@@ -4174,6 +4180,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let set = with_obj(&obj, |o| match o {
                 HeapObj::Instance { fields, .. } => fields
                     .iter()
+                    .rev()
                     .find(|(n, _)| *n == name)
                     .is_some_and(|(_, v)| !is_lateinit_unset(v)),
                 _ => false,
@@ -11453,6 +11460,7 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // statically resolve the receiver's class, e.g. `list[i].field`) ──
         (HeapObj::Instance { fields, .. }, _) => fields
             .iter()
+            .rev()
             .find(|(n, _)| n == name)
             .map(|(_, v)| v.clone()),
         _ => None,

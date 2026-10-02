@@ -1096,3 +1096,11 @@ From a fifth and sixth probe batch, four more corpus records:
   `nextDouble`/`nextFloat`/`nextBoolean`, and as the generator
   `shuffle`/`shuffled` draw from — the same order `Collections.shuffle`
   produces. Three more corpus records.
+- **An overridden property read through the base answered the base's
+  value.** `open val kind = "vehicle"` overridden by `override val kind =
+  "bike"` printed `vehicle` from the base's own methods and even from
+  `Bike().kind`: the record holds the base's field first and the subclass's
+  after it, and every read took the first. Reads and writes now take the
+  most-derived field. An override by a GETTER (`override val kind: String
+  get() = …`) was refused as overriding nothing; it is accepted, and a read
+  through the base dispatches on the runtime class. Two more corpus records.

@@ -1323,12 +1323,23 @@ fn check_modifiers(
     // satisfy it either with a stored `override val` or with a getter — which
     // lowers to a zero-argument method. So a zero-argument `override` also
     // counts as overriding a declared property of that name.
+    //
+    // A STORED property of an open supertype is overridable the same way:
+    // `open val kind = "vehicle"` in the base, `override val kind: String
+    // get() = "car"` in the subclass. Reads through the base then dispatch
+    // virtually (see the stored-property read in `compile_member`).
     let inherited_prop = |name: &str, arity: usize| -> bool {
         arity == 0
             && mro[1..]
                 .iter()
                 .filter_map(|a| by_name.get(a.as_str()))
-                .any(|d| d.abstract_props.iter().any(|p| p.name == name))
+                .any(|d| {
+                    d.abstract_props.iter().any(|p| p.name == name)
+                        || d.obj_props.iter().any(|p| p.name == name)
+                        || d.params
+                            .iter()
+                            .any(|p| p.name == name && p.kind != PropKind::None)
+                })
     };
     for m in &cd.methods {
         let found = inherited(&m.name, m.params.len());
@@ -5219,6 +5230,22 @@ impl Compiler {
                 }
                 // A stored property read.
                 if args.is_empty() {
+                    // …unless a subclass overrides it with a GETTER, a
+                    // zero-argument method: the instance may be of that
+                    // subclass, so the read resolves by runtime class, falling
+                    // back to the field for every other one.
+                    let overriders = self.candidates(Some(cls), name, 0);
+                    if meta.prop(name).is_some() && !overriders.is_empty() {
+                        self.emit_virtual_call(
+                            sc,
+                            recv,
+                            name,
+                            &[],
+                            Targets::dynamic(&overriders),
+                            line,
+                        )?;
+                        return Ok(Type::Unknown);
+                    }
                     if let Some(p) = meta.prop(name).cloned() {
                         // A delegated property has no storage: the read is the
                         // delegate's `getValue(thisRef, property)`.
