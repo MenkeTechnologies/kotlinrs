@@ -32,9 +32,10 @@ use crate::host::{
     KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_ITER_SRC, KT_JOIN, KT_LATEINIT,
     KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO, KT_LIST_TAG, KT_MAKE_CLOSURE, KT_MAP_VM,
     KT_MATH, KT_METHOD_VM, KT_NEW, KT_NLR_MATCH, KT_NLR_RAISE, KT_NLR_TAKE, KT_NOTNULL,
-    KT_OBJEQ_VM, KT_OBSERVE, KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANDOM,
-    KT_RANGE, KT_RANGE_STEP, KT_REIFIED, KT_REIFY, KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN,
-    KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG, KT_YIELD,
+    KT_OBJEQ_VM, KT_OBSERVE, KT_OPER_REG, KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN,
+    KT_RANDOM, KT_RANGE, KT_RANGE_STEP, KT_REIFIED, KT_REIFY, KT_RESULT_HOF, KT_RUN_CATCHING,
+    KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG,
+    KT_YIELD,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
@@ -970,6 +971,12 @@ pub struct Compiler {
     /// function — and what lets the block name the receiver's members with no
     /// qualifier.
     lambda_recv: Option<(Type, Option<String>)>,
+    /// The BODY of a lambda literal passed where the expected function type
+    /// has NO parameters (`runCatching { … }`, `getOrPut(k) { … }`), which
+    /// therefore declares no implicit `it` — a bare `it` in it is the
+    /// enclosing lambda's. Identified by the body slice's address, which is
+    /// the literal's own and unique while it is being lowered.
+    zero_arity_body: Option<*const Stmt>,
     /// The `kotlin.math` names the program's imports brought into scope, as
     /// *visible spelling* → *runtime name*. Kotlin does NOT auto-import
     /// `kotlin.math`, so `abs`/`sqrt`/`PI` are compile errors without an import,
@@ -1802,6 +1809,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         boxed_vars: HashSet::new(),
         lambda_hint: None,
         lambda_recv: None,
+        zero_arity_body: None,
         math_scope: HashMap::new(),
         math_star: false,
         random_imported: false,
@@ -2340,6 +2348,19 @@ impl Compiler {
             };
             self.emit_member_registry(name, op);
         }
+        // The arithmetic conventions, for an operand that reaches `+` with no
+        // static type — a lambda parameter over a list of a user class.
+        for name in ["plus", "minus", "times", "div", "rem"] {
+            for (tag, owner) in self.method_index.get(name).cloned().unwrap_or_default() {
+                let t = self.b.add_constant(Value::str(tag));
+                self.b.emit(Op::LoadConst(t), 0);
+                let n = self.b.add_constant(Value::str(name));
+                self.b.emit(Op::LoadConst(n), 0);
+                let sub = self.b.add_name(&method_sub_name(&owner, name));
+                self.b.emit(Op::LoadInt(sub as i64), 0);
+                self.b.emit(Op::Extended(KT_OPER_REG, 0), 0);
+            }
+        }
     }
 
     /// Emit one `tag → subroutine` publication per class that declares `name`.
@@ -2742,10 +2763,14 @@ impl Compiler {
                 }
                 // `val x: Any = 1.0f` is an erased position as much as a list
                 // element is: the declaration throws the width away, so the
-                // value has to carry it. A `val x: Float` or an unannotated
-                // one keeps the static type and needs no box.
+                // value has to carry it. A `val x: Float` / `val x: Long` or an
+                // unannotated one keeps the static type and needs no box — and
+                // must not get one: a BOXED `Long` in a `Long`-typed slot reached
+                // the integer division as a handle, and `x / 2` answered `0.0`.
                 let it = match ty {
-                    Some(t) if *t != Type::Float => self.compile_erased(sc, init)?,
+                    Some(t) if !matches!(t, Type::Float | Type::Long) => {
+                        self.compile_erased(sc, init)?
+                    }
                     _ => self.compile_expr(sc, init)?,
                 };
                 let mut vty = ty.unwrap_or(it);
@@ -4277,6 +4302,10 @@ impl Compiler {
         safe: bool,
         line: u32,
     ) -> Result<Type, String> {
+        // A lambda passed as a `() -> R` declares no implicit `it`.
+        if zero_arity_member(name) {
+            self.mark_zero_arity_lambda(args);
+        }
         // `String.CASE_INSENSITIVE_ORDER` — the JDK comparator, which is
         // `compareToIgnoreCase` and therefore Kotlin's
         // `a.compareTo(b, ignoreCase = true)`. Lowered to that lambda, so every
@@ -4555,6 +4584,27 @@ impl Compiler {
             if let Some(e) = rewritten {
                 return self.compile_expr(sc, &e);
             }
+        }
+        // `x.toSortedSet()` — a `TreeSet` of the receiver's elements (a
+        // `String`'s characters), built by the same constructor the program
+        // could have written.
+        if name == "toSortedSet" && args.is_empty() && !safe && self.class_meta("TreeSet").is_none()
+        {
+            let elems = Expr::MethodCall {
+                recv: Box::new(recv.clone()),
+                name: "toList".to_string(),
+                args: Vec::new(),
+                safe: false,
+                line,
+            };
+            return self.compile_expr(
+                sc,
+                &Expr::Call {
+                    name: "TreeSet".to_string(),
+                    args: vec![elems],
+                    line,
+                },
+            );
         }
         // `x.orEmpty()` — the nullable-receiver extension, lowered as the elvis
         // it is defined to be. The EMPTY it falls back to depends on the
@@ -5644,8 +5694,10 @@ impl Compiler {
         // A receiver-scope block (`x.apply { … }`) takes the receiver as `this`
         // rather than as `it`, so it gets no implicit `it` at all.
         let recv = self.lambda_recv.take();
-        // An unparameterized lambda has the single implicit parameter `it`.
-        let declared: Vec<(String, Type)> = if params.is_empty() && recv.is_none() {
+        let zero_arity = self.zero_arity_body.take() == Some(body.as_ptr());
+        // An unparameterized lambda has the single implicit parameter `it` —
+        // unless the function type it is passed as takes none.
+        let declared: Vec<(String, Type)> = if params.is_empty() && recv.is_none() && !zero_arity {
             vec![("it".to_string(), Type::Unknown)]
         } else {
             params.to_vec()
@@ -6436,6 +6488,12 @@ impl Compiler {
                         self.infer_class(sc, l).as_deref(),
                         Some("List" | "Set" | "Map")
                     ))
+                // An untyped operand in a program where some user class
+                // declares this operator: only the value knows whether it is
+                // one of those instances or a number.
+                || (lt == Type::Unknown
+                    && matches!(fname, "plus" | "minus" | "times" | "div" | "rem")
+                    && self.method_index.get(fname).is_some_and(|v| !v.is_empty()))
             {
                 self.emit_operator_call(sc, l, r, fname)?;
                 return Ok(Type::Obj);
@@ -6725,6 +6783,10 @@ impl Compiler {
         args: &[Expr],
         line: u32,
     ) -> Result<Type, String> {
+        // A lambda passed as a `() -> R` declares no implicit `it`.
+        if zero_arity_free_fun(name) {
+            self.mark_zero_arity_lambda(args);
+        }
         // A bare `In(args)` naming an `inner class` passes the enclosing
         // instance in scope as the hidden first argument. `outer_supplied`
         // marks the call that already carries it (this rewrite, or the
@@ -6778,6 +6840,33 @@ impl Compiler {
         // call's type argument, run the call, unbind. The bind is a no-op for
         // every callee that is not `reified`, which is why the parser can wrap
         // every generic call without knowing which is which.
+        // `xs.filterIsInstance<T>()` — the type argument is the whole meaning,
+        // so it becomes the member's argument: the class name the host tests
+        // each element against.
+        if name == REIFY_CALL && args.len() == 2 {
+            if let (
+                Some(ty),
+                Expr::MethodCall {
+                    recv,
+                    name: member,
+                    args: margs,
+                    safe,
+                    line: mline,
+                },
+            ) = (reify_arg_name(&args[0]), &args[1])
+            {
+                if member == "filterIsInstance" && margs.is_empty() {
+                    let call = Expr::MethodCall {
+                        recv: recv.clone(),
+                        name: member.clone(),
+                        args: vec![Expr::Str(vec![StrExpr::Text(self.canon_class(&ty))])],
+                        safe: *safe,
+                        line: *mline,
+                    };
+                    return self.compile_expr(sc, &call);
+                }
+            }
+        }
         if name == REIFY_CALL && args.len() == 2 {
             // `tagged<U>(x)` inside a `reified U` body passes U's OWN binding
             // on, not the four characters `U`. The type argument is a literal
@@ -7659,14 +7748,11 @@ impl Compiler {
         params: &[Param],
         args: &[Expr],
     ) -> Result<Vec<Expr>, String> {
+        // A `vararg` need not be last: the parameters after it are then
+        // reachable only by NAME (or as the trailing lambda), which is exactly
+        // how the collection below treats them.
         let vararg_at = params.iter().position(|p| p.vararg.is_some());
-        if let Some(v) = vararg_at {
-            if v + 1 != params.len() {
-                return Err(format!(
-                    "{callee}: a `vararg` parameter is only supported as the last one"
-                ));
-            }
-        }
+        let vararg_not_last = vararg_at.is_some_and(|v| v + 1 < params.len());
         // A TRAILING lambda binds the LAST parameter — Kotlin's rule — so
         // `f { … }` against `fun f(n: Int = 1, g: (Int) -> String)` fills `g`,
         // not `n`. The parser does not record whether a lambda sat inside the
@@ -7675,8 +7761,7 @@ impl Compiler {
         // parameter is function-typed, is the trailing one, and is bound by name.
         let mut args: Vec<Expr> = args.to_vec();
         if let (Some(Expr::Lambda { .. }), Some(last)) = (args.last(), params.last()) {
-            if vararg_at.is_none()
-                && args.len() < params.len()
+            if ((vararg_at.is_none() && args.len() < params.len()) || vararg_not_last)
                 && last.class.as_deref() == Some("Function")
                 && !args
                     .iter()
@@ -8299,6 +8384,16 @@ impl Compiler {
         let t = self.compile_expr(sc, &lowered);
         sc.exit(mark);
         t.map(|_| Type::Unknown)
+    }
+
+    /// Mark `args`' trailing lambda literal, when it has no parameters, as one
+    /// passed where a `() -> R` is expected (see [`Compiler::zero_arity_body`]).
+    fn mark_zero_arity_lambda(&mut self, args: &[Expr]) {
+        if let Some(Expr::Lambda { params, body }) = args.last() {
+            if params.is_empty() {
+                self.zero_arity_body = Some(body.as_ptr());
+            }
+        }
     }
 
     /// Push a folded [`primitive_const`] value. A `Char` is a tagged handle
@@ -10825,6 +10920,20 @@ fn jdk_bit_static(name: &str) -> Option<&'static str> {
         "rotateRight" => "rotateRight",
         _ => return None,
     })
+}
+
+/// The free functions whose trailing function parameter takes NO arguments,
+/// so a lambda passed to one has no implicit `it`.
+fn zero_arity_free_fun(name: &str) -> bool {
+    matches!(
+        name,
+        "runCatching" | "run" | "lazy" | "require" | "check" | "requireNotNull" | "checkNotNull"
+    )
+}
+
+/// The members whose trailing function parameter takes NO arguments.
+fn zero_arity_member(name: &str) -> bool {
+    matches!(name, "getOrPut" | "ifEmpty" | "ifBlank")
 }
 
 fn primitive_const(ty: &str, name: &str) -> Option<(Value, Type)> {

@@ -913,7 +913,10 @@ impl Parser {
     /// which are exactly the forms a class body may nest.
     fn at_class_kw(&self) -> bool {
         match self.peek() {
-            Tok::Class | Tok::Data | Tok::Object => true,
+            Tok::Class | Tok::Object => true,
+            // `data` is a soft keyword: only `data class` / `data object` opens
+            // a declaration, and a property named `data` is an ordinary name.
+            Tok::Data => matches!(self.peek_at(1), Tok::Class | Tok::Object),
             Tok::Ident(w) if w == "interface" => true,
             Tok::Ident(w) if w == "value" || w == "enum" => matches!(self.peek_at(1), Tok::Class),
             _ => false,
@@ -923,7 +926,8 @@ impl Parser {
     /// True when the parser is positioned on a declaration keyword — `fun`,
     /// `class`, `data`, `object`, or the soft keyword `interface`.
     fn at_decl_kw(&self) -> bool {
-        matches!(self.peek(), Tok::Fun | Tok::Class | Tok::Data | Tok::Object)
+        matches!(self.peek(), Tok::Fun | Tok::Class | Tok::Object)
+            || (self.at(&Tok::Data) && matches!(self.peek_at(1), Tok::Class | Tok::Object))
             || matches!(self.peek(), Tok::Ident(w) if w == "interface")
     }
 
@@ -2988,7 +2992,12 @@ impl Parser {
             // `unresolved reference` when the class body is compiled — rather
             // than silently reading something else, unless a top-level property
             // of the same name exists.
-            Tok::Class | Tok::Data | Tok::Object => {
+            Tok::Class | Tok::Object => {
+                let decl = self.class_decl()?;
+                self.pending_classes.push(decl);
+                StmtKind::Empty
+            }
+            Tok::Data if matches!(self.peek_at(1), Tok::Class | Tok::Object) => {
                 let decl = self.class_decl()?;
                 self.pending_classes.push(decl);
                 StmtKind::Empty
@@ -3337,6 +3346,40 @@ impl Parser {
                 op: binop,
                 value,
             }),
+            // `m[i, j] (op)= v` — the `set` operator with the indices then the
+            // value; a compound form reads through `get` first. (The receiver
+            // and indices are evaluated once per operator call.)
+            Expr::MethodCall {
+                recv,
+                name,
+                args,
+                safe: false,
+                line,
+            } if name == "get" && args.len() >= 2 => {
+                let value = match binop {
+                    None => value,
+                    Some(op) => Expr::Binary {
+                        op,
+                        l: Box::new(Expr::MethodCall {
+                            recv: recv.clone(),
+                            name,
+                            args: args.clone(),
+                            safe: false,
+                            line,
+                        }),
+                        r: Box::new(value),
+                    },
+                };
+                let mut set_args = args;
+                set_args.push(value);
+                Ok(StmtKind::Expr(Expr::MethodCall {
+                    recv,
+                    name: "set".to_string(),
+                    args: set_args,
+                    safe: false,
+                    line,
+                }))
+            }
             _ => Err(format!("invalid assignment target (line {})", self.line())),
         }
     }
@@ -3791,6 +3834,24 @@ impl Parser {
                 let line = self.line();
                 self.advance();
                 let index = self.expr()?;
+                // `m[i, j]` — more than one index is the `get` operator with
+                // that many arguments, which only a user class declares.
+                if self.at(&Tok::Comma) {
+                    let mut args = vec![index];
+                    while self.at(&Tok::Comma) {
+                        self.advance();
+                        args.push(self.expr()?);
+                    }
+                    self.eat(&Tok::RBracket)?;
+                    e = Expr::MethodCall {
+                        recv: Box::new(e),
+                        name: "get".to_string(),
+                        args,
+                        safe: false,
+                        line,
+                    };
+                    continue;
+                }
                 self.eat(&Tok::RBracket)?;
                 e = Expr::Index {
                     recv: Box::new(e),

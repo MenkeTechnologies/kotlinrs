@@ -281,6 +281,20 @@ the reference — a synthetic class name carrying the loader's address and an
 identity hash, both of which change from run to run — so there is nothing there
 to match and nothing that could be frozen in the corpus.
 
+## Round 16: measured and still missing
+
+Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
+
+| program | kotlinrs | reference |
+| --- | --- | --- |
+| `class S : Iterable<Int> { override fun iterator() = … }; for (x in S()) …` | `unresolved supertype Iterable of class S` | iterates |
+| `java.util.PriorityQueue<Int>()` / `java.util.LinkedList<Int>()` | `unresolved reference: java` | the JDK collections |
+| `listOf(1, 2).shuffled(java.util.Random(1))` | `unresolved reference: java` | a seeded order |
+| `sortedMapOf("b" to 2, "a" to 1).firstKey()` / `headMap` / `tailMap` | `unresolved reference: firstKey on Map` | `a` / `{a=1}` / … |
+| `generateSequence { x }` (the seedless form) | `unresolved reference: generateSequence` | a sequence calling the block until `null` |
+| `(-1).toUInt()` / `5u + 3u` | `unresolved reference: toUInt on Int` / parse error | `4294967295` / `8` |
+| `listOf(1, 2, 3).stream().count()` | `unresolved reference: stream on List` | `3` |
+
 ## A closure's `Unit` result prints `null`
 
 | program | kotlinrs | reference |

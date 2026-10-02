@@ -545,6 +545,11 @@ pub const KT_NLR_MATCH: u16 = 146;
 /// the in-flight marker and pushes the parked value, which the function then
 /// returns.
 pub const KT_NLR_TAKE: u16 = 147;
+/// Extension op publishing one class's arithmetic operator convention
+/// (`plus`/`minus`/`times`/`div`/`rem`). Stack: `[tagStr, nameStr,
+/// subNameIdx]`. Consulted by [`KT_OPER_VM`] when an operand reached the
+/// operator with no static type: `xs.fold(P(0)) { a, b -> a + b }`.
+pub const KT_OPER_REG: u16 = 148;
 /// Builtin id for `throw e`: pops the throwable and makes it the in-flight
 /// exception. Returns `Undef` (a `throw` expression's value is never observed).
 pub const KT_EXC_THROW: u16 = 111;
@@ -649,6 +654,11 @@ thread_local! {
         RefCell::new(std::collections::HashMap::new());
 
     static HASHCODE_SUBS: RefCell<std::collections::HashMap<String, u16>> =
+        RefCell::new(std::collections::HashMap::new());
+
+    /// `(class tag, operator name)` → the subroutine index of that class's
+    /// operator, as published by [`KT_OPER_REG`].
+    static OPER_SUBS: RefCell<std::collections::HashMap<(String, String), u16>> =
         RefCell::new(std::collections::HashMap::new());
 
     /// Class tag → one character per OWN property, `'l'` where that property is
@@ -1806,8 +1816,10 @@ fn reset_heap() {
     EQUALS_SUBS.with(|t| t.borrow_mut().clear());
     HASHCODE_SUBS.with(|t| t.borrow_mut().clear());
     COMPARE_SUBS.with(|t| t.borrow_mut().clear());
+    OPER_SUBS.with(|t| t.borrow_mut().clear());
     REIFIED.with(|r| r.borrow_mut().clear());
     PENDING.with(|p| *p.borrow_mut() = None);
+    NLR.with(|n| *n.borrow_mut() = None);
     STASH.with(|s| s.borrow_mut().clear());
 }
 
@@ -3737,6 +3749,13 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let tag = vm.pop().to_str();
             COMPARE_SUBS.with(|t| t.borrow_mut().insert(tag, idx));
         }
+        KT_OPER_REG => {
+            // Stack: [tagStr, nameStr, subNameIdx].
+            let idx = vm.pop().to_int() as u16;
+            let name = vm.pop().to_str();
+            let tag = vm.pop().to_str();
+            OPER_SUBS.with(|t| t.borrow_mut().insert((tag, name), idx));
+        }
         KT_BUILDER => {
             // Stack: [] or [arg]; `arg` is the argument count.
             let init = (arg == 1).then(|| vm.pop());
@@ -4149,7 +4168,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let a = vm.pop();
             vm.push(match float32_div(&a, &b, false) {
                 Some(v) => v,
-                None => Value::Float(a.to_float() / b.to_float()),
+                None => Value::Float(num_f64(&a) / num_f64(&b)),
             });
         }
         // Both operands narrowed BEFORE the operation and the result taken
@@ -4258,6 +4277,17 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             // carries no static type and only the value knows it is 32-bit.
             if let Some(v) = float32_div(&a, &b, false) {
                 vm.push(v);
+            } else if i64_box(&a).is_some() || i64_box(&b).is_some() {
+                // A boxed `Long` — a parameter, a field, a collection element —
+                // divides as the native ops treat it (see [`num_hook`]); read
+                // through `to_float` its HANDLE answered `0.0`.
+                match num_hook(NumOp::Div, &a, &b) {
+                    Ok(v) => vm.push(v),
+                    Err(e) => {
+                        fault(vm, &e);
+                        vm.push(Value::Undef);
+                    }
+                }
             } else if is_int(&a) && is_int(&b) {
                 let d = b.to_int();
                 if d == 0 {
@@ -4275,6 +4305,14 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let a = vm.pop();
             if let Some(v) = float32_mod(&a, &b) {
                 vm.push(v);
+            } else if i64_box(&a).is_some() || i64_box(&b).is_some() {
+                match num_hook(NumOp::Mod, &a, &b) {
+                    Ok(v) => vm.push(v),
+                    Err(e) => {
+                        fault(vm, &e);
+                        vm.push(Value::Undef);
+                    }
+                }
             } else if is_int(&a) && is_int(&b) {
                 let d = b.to_int();
                 if d == 0 {
@@ -4837,6 +4875,63 @@ fn run_override(
     run_sub(vm, entry, base).ok()
 }
 
+/// Run the arithmetic operator `name` a user class declared, when `lhs` is an
+/// instance of one (see [`KT_OPER_REG`]). `None` when it is not.
+fn run_operator(vm: &mut VM, name: &str, lhs: &Value, rhs: &Value) -> Option<Value> {
+    let tag = instance_tag(lhs)?;
+    let idx = OPER_SUBS.with(|t| t.borrow().get(&(tag, name.to_string())).copied())?;
+    let entry = vm.chunk.find_sub(idx)?;
+    let base = vm.stack.len();
+    vm.stack.push(lhs.clone());
+    vm.stack.push(rhs.clone());
+    run_sub(vm, entry, base).ok()
+}
+
+/// `a op b` for two non-heap values that reached the operator untyped: the
+/// integral ops truncate and fault on zero as [`KT_IDIV`]/[`KT_IMOD`] do, a
+/// floating side widens, and boxes, `Char`s and `String`s take the native
+/// operators' own rules ([`num_hook`]). `None` for a heap receiver.
+fn untyped_arith(name: &str, a: &Value, b: &Value) -> Option<Result<Value, String>> {
+    let op = match name {
+        "plus" => NumOp::Add,
+        "minus" => NumOp::Sub,
+        "times" => NumOp::Mul,
+        "div" => NumOp::Div,
+        "rem" => NumOp::Mod,
+        _ => return None,
+    };
+    let scalar = |v: &Value| {
+        matches!(v, Value::Int(_) | Value::Float(_) | Value::Str(_))
+            || is_char(v)
+            || f32_box(v).is_some()
+            || i64_box(v).is_some()
+    };
+    if !scalar(a) || !scalar(b) {
+        return None;
+    }
+    Some(match (a, b) {
+        (Value::Int(x), Value::Int(y)) => match op {
+            NumOp::Add => Ok(Value::Int(x.wrapping_add(*y))),
+            NumOp::Sub => Ok(Value::Int(x.wrapping_sub(*y))),
+            NumOp::Mul => Ok(Value::Int(x.wrapping_mul(*y))),
+            _ if *y == 0 => Err("java.lang.ArithmeticException: / by zero".to_string()),
+            NumOp::Div => Ok(Value::Int(x.wrapping_div(*y))),
+            _ => Ok(Value::Int(x.wrapping_rem(*y))),
+        },
+        (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => {
+            let (x, y) = (a.to_float(), b.to_float());
+            Ok(Value::Float(match op {
+                NumOp::Add => x + y,
+                NumOp::Sub => x - y,
+                NumOp::Mul => x * y,
+                NumOp::Div => x / y,
+                _ => x % y,
+            }))
+        }
+        _ => num_hook(op, a, b),
+    })
+}
+
 /// Which registry [`run_override`] should consult.
 #[derive(Clone, Copy)]
 enum SubRegistry {
@@ -5359,6 +5454,22 @@ fn b_operator(vm: &mut VM, _argc: u8) -> Value {
     // insertion sequence to the new map.
     ensure_ordered(vm, &lhs);
     ensure_ordered(vm, &rhs);
+    // A user class's own operator, reached with no static type on the left.
+    if let Some(r) = run_operator(vm, &name, &lhs, &rhs) {
+        return r;
+    }
+    // Numbers, `Char`s and `String`s reach here from the same untyped site
+    // (`a + b` in a lambda over values of no tracked type); they keep the
+    // arithmetic the native operators and `KT_IDIV`/`KT_IMOD` give them.
+    if let Some(r) = untyped_arith(&name, &lhs, &rhs) {
+        return match r {
+            Ok(v) => v,
+            Err(e) => {
+                fault(vm, e);
+                Value::Undef
+            }
+        };
+    }
     match operator_apply(vm, &lhs, &name, &rhs) {
         Ok(v) => v,
         Err(e) => {
@@ -6486,11 +6597,25 @@ fn b_result_hof(vm: &mut VM, _argc: u8) -> Value {
     let name = vm.pop().to_str();
     let clo = vm.pop();
     let recv = vm.pop();
+    match result_hof(vm, &recv, &name, &clo) {
+        Ok(v) => v,
+        Err(e) => {
+            fault(vm, e);
+            Value::Undef
+        }
+    }
+}
+
+/// The lambda-taking `Result` members, shared by [`KT_RESULT_HOF`] (a
+/// receiver statically known to be a `Result`) and the member dispatch (one
+/// that is not: `results.forEach { r -> r.onSuccess { … } }`).
+fn result_hof(vm: &mut VM, recv: &Value, name: &str, clo: &Value) -> Result<Value, String> {
+    let recv = recv.clone();
+    let clo = clo.clone();
     let Some((value, err)) = result_parts(&recv) else {
-        fault(vm, format!("unresolved reference: {name}"));
-        return Value::Undef;
+        return Err(format!("unresolved reference: {name}"));
     };
-    let res = match (name.as_str(), &err) {
+    match (name, &err) {
         // `getOrElse` hands the FAILURE to the block; a success skips it.
         ("getOrElse", Some(e)) => invoke_closure(vm, &clo, std::slice::from_ref(e)),
         ("getOrElse", None) => Ok(value),
@@ -6507,13 +6632,6 @@ fn b_result_hof(vm: &mut VM, _argc: u8) -> Value {
         }),
         ("map", Some(_)) => Ok(recv),
         _ => Err(format!("unresolved reference: {name}")),
-    };
-    match res {
-        Ok(v) => v,
-        Err(e) => {
-            fault(vm, e);
-            Value::Undef
-        }
     }
 }
 
@@ -11011,6 +11129,15 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         };
     }
 
+    // A `Result`'s lambda-taking members, reached through a receiver the
+    // compiler could not type.
+    if matches!(name, "onSuccess" | "onFailure" | "getOrElse" | "map")
+        && args.len() == 1
+        && result_parts(recv).is_some()
+    {
+        return result_hof(vm, recv, name, &args[0]);
+    }
+
     // `Pair.toList()` / `Triple.toList()` — the tuple's components in order,
     // and the only way either becomes a collection. It sits OUTSIDE the
     // read-only block below because it ALLOCATES, and that block runs under a
@@ -11697,6 +11824,27 @@ fn sequence_member(
         // by definition and the `as…` views wrap the receiver. Same elements,
         // different class, and the difference shows in an out-of-range message.
         "toList" => return Some(Ok(alloc_ro_list(items.to_vec()))),
+        // `toIntArray()` and the other primitive-array conversions: the same
+        // elements in an array of that descriptor.
+        "toIntArray" | "toLongArray" | "toDoubleArray" | "toFloatArray" | "toBooleanArray"
+        | "toCharArray" | "toShortArray" | "toByteArray"
+            if args.is_empty() && kind != SeqKind::CharSeq =>
+        {
+            let desc = match name {
+                "toIntArray" => "[I",
+                "toLongArray" => "[J",
+                "toDoubleArray" => "[D",
+                "toFloatArray" => "[F",
+                "toBooleanArray" => "[Z",
+                "toCharArray" => "[C",
+                "toShortArray" => "[S",
+                _ => "[B",
+            };
+            return Some(Ok(alloc(HeapObj::Array {
+                items: items.to_vec(),
+                desc: desc.to_string(),
+            })));
+        }
         "toMutableList" | "toTypedArray" | "asList" | "asIterable" => {
             return Some(Ok(alloc(HeapObj::List(items.to_vec()))))
         }
@@ -11804,6 +11952,19 @@ fn sequence_member(
                     .cloned()
                     .collect(),
             ))))
+        }
+        // `filterIsInstance<T>()` — the compiler passes `T`'s name (see the
+        // reification arm in `compile_call`), and each element is tested as
+        // `is T` tests it. `null` is an instance of nothing.
+        "filterIsInstance" if args.len() == 1 => {
+            let ty = args[0].to_str();
+            return Some(Ok(alloc(HeapObj::List(
+                items
+                    .iter()
+                    .filter(|v| !matches!(v, Value::Undef) && value_is_type(v, &ty))
+                    .cloned()
+                    .collect(),
+            ))));
         }
         // The set operators are defined on any `Iterable` and all return a
         // `Set`, whichever kind the receiver was.

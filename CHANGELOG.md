@@ -1042,3 +1042,28 @@ against the reference and covered by one of five more corpus records:
   `System.arraycopy`'s faults in the reference's order.
 
 Six more corpus records cover the last four items.
+
+A fourth probe batch, of whole small programs rather than one-liners, found
+these; eight more corpus records cover them:
+
+- **`val x: Long = 7L; x / 2` answered `0.0`.** A `Long`-annotated binding
+  stored its value BOXED (the box is for erased positions such as `Any`), and
+  `/` and `%` read the box's handle as a number. The binding no longer boxes,
+  and `/`/`%` — which, unlike `+`, bypassed the operators' box handling —
+  divide a boxed `Long` (a parameter, a field, a collection element)
+  integrally, faulting on zero.
+- **`a + b` on a user class with no static type** — `xs.fold(P(0)) { a, b ->
+  a + b }` — was `unresolved reference: plus on P`. The arithmetic operator
+  conventions are now published per class and dispatched at run time, with
+  numbers, `Char`s and `String`s keeping their own arithmetic there.
+- **`m[i, j]` / `m[i, j] = v` / `m[i, j] += v`**, the `get`/`set` operators
+  with several indices, were a parse error.
+- **A property named `data`** (`data[r][c] = v`) parsed as the start of a
+  `data class` declaration.
+- **`it` inside a `() -> R` lambda** (`runCatching { … }`, `run { … }`,
+  `lazy`, `getOrPut`, `ifEmpty`, `require`/`check` messages) was a fresh,
+  unbound implicit parameter; it is the enclosing lambda's `it`, as in Kotlin.
+- **`filterIsInstance<T>()`**, **`toSortedSet()`**, the primitive-array
+  conversions **`toIntArray()`** … **`toByteArray()`**, a **`vararg` that is
+  not the last parameter**, and the `Result` members `onSuccess`/`onFailure`/
+  `getOrElse`/`map` on a receiver the compiler could not type.
