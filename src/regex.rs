@@ -70,9 +70,11 @@ fn run_error(e: impl std::fmt::Display) -> String {
 impl KRegex {
     pub fn new(pattern: &str) -> Result<KRegex, String> {
         let find = Engine::new(pattern).map_err(syntax_error)?;
-        let entire =
-            Engine::new(&format!(r"\A(?:{pattern})\z")).map_err(syntax_error)?;
-        let names = find.capture_names().map(|n| n.map(str::to_string)).collect();
+        let entire = Engine::new(&format!(r"\A(?:{pattern})\z")).map_err(syntax_error)?;
+        let names = find
+            .capture_names()
+            .map(|n| n.map(str::to_string))
+            .collect();
         Ok(KRegex {
             pattern: pattern.to_string(),
             find,
@@ -145,7 +147,8 @@ impl KRegex {
                         Some('{') => {
                             chars.next();
                             let mut name = String::new();
-                            while let Some(ch) = chars.peek().filter(|c| c.is_ascii_alphanumeric()) {
+                            while let Some(ch) = chars.peek().filter(|c| c.is_ascii_alphanumeric())
+                            {
                                 name.push(*ch);
                                 chars.next();
                             }
