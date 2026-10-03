@@ -436,9 +436,9 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "fusevm"
-version = "0.26.7"
+version = "0.26.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93e134c61a2f7365207bc23a2324c7f5c9768f42a123759400ac0718f68956b1"
+checksum = "52e9c630b03b4cd39bdec854806a9f6b93f24e29c9e0c7008a9d80b67c291d32"
 dependencies = [
  "base64",
  "bincode",
@@ -593,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "kotlinrs"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "fancy-regex",
  "fusevm",
