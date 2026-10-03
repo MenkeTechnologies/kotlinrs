@@ -487,7 +487,7 @@ pub const KT_OBJEQ_VM: u16 = 109;
 /// types pick no native compare — a generic `T : Comparable<T>`, a user
 /// `Comparable` reached through `Any`. Stack: `[a, b]`; pushes the sign of the
 /// comparison as an `Int` (-1, 0, 1). A builtin for [`KT_OBJEQ_VM`]'s reason:
-/// a user `compareTo` runs re-entrantly. See [`compare_vm`].
+/// a user `compareTo` runs re-entrantly. See `compare_vm`.
 pub const KT_COMPARE_VM: u16 = 140;
 
 /// `maxOf`/`minOf` over arguments that are not all statically numeric.
