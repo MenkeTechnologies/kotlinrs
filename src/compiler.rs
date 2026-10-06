@@ -7787,6 +7787,20 @@ impl Compiler {
                 self.b.emit(Op::Extended(KT_ARRAY, 0), line);
                 Ok(Type::Obj)
             }
+            // `arrayOfNulls<T>(n)` — an `Array<T?>` of `n` nulls: the generic
+            // `Array(n) { null }`, which shares its size check and descriptor.
+            "arrayOfNulls" if args.len() == 1 && !self.fun_sig.contains_key(name) => {
+                let fill = Expr::Lambda {
+                    params: Vec::new(),
+                    body: vec![Stmt::new(line, StmtKind::Expr(Expr::Null))],
+                };
+                self.compile_expr(sc, &args[0])?;
+                let didx = self.b.add_constant(Value::str(""));
+                self.b.emit(Op::LoadConst(didx), line);
+                self.compile_expr(sc, &fill)?;
+                self.b.emit(Op::CallBuiltin(KT_ARRAY_INIT, 0), line);
+                Ok(Type::Obj)
+            }
             // `Char(code)` — the checked constructor. Unlike `code.toChar()`,
             // which truncates, a code outside `0..0xFFFF` is refused.
             "Char" if args.len() == 1 && self.class_meta(name).is_none() => {
@@ -9537,10 +9551,10 @@ impl Compiler {
                 | "mutableSetOf" | "hashSetOf" | "linkedSetOf" | "sortedSetOf" | "emptySet"
                 | "HashSet" | "LinkedHashSet" | "TreeSet" | "HashMap" | "LinkedHashMap"
                 | "linkedMapOf" | "sortedMapOf" | "TreeMap" | "arrayOf" | "emptyArray"
-                | "intArrayOf" | "longArrayOf" | "doubleArrayOf" | "floatArrayOf"
-                | "booleanArrayOf" | "charArrayOf" | "shortArrayOf" | "byteArrayOf"
-                | "IntArray" | "DoubleArray" | "BooleanArray" | "CharArray" | "LongArray"
-                | "FloatArray" | "ShortArray" | "ByteArray" | "Array" => Type::Obj,
+                | "arrayOfNulls" | "intArrayOf" | "longArrayOf" | "doubleArrayOf"
+                | "floatArrayOf" | "booleanArrayOf" | "charArrayOf" | "shortArrayOf"
+                | "byteArrayOf" | "IntArray" | "DoubleArray" | "BooleanArray" | "CharArray"
+                | "LongArray" | "FloatArray" | "ShortArray" | "ByteArray" | "Array" => Type::Obj,
                 // `Pair`/`Triple`/`Result` are heap objects, and saying so is
                 // what routes `==` on them to STRUCTURAL equality: the native
                 // compare would coerce two handles to numbers and answer `true`

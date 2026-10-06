@@ -11634,6 +11634,28 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         }
     }
 
+    // The `kotlin.collections` extensions declared on `Map` itself that walk
+    // its ENTRIES the way the `Iterable` ones walk elements: `count()` is
+    // `size`, `asSequence()`/`asIterable()` view `entries`, and the bare
+    // `any()`/`none()` test emptiness.
+    if args.is_empty()
+        && matches!(name, "count" | "asSequence" | "asIterable" | "any" | "none")
+        && with_obj(recv, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false)
+    {
+        let entries = list_snapshot(recv).unwrap_or_default();
+        if let Some(v) = sequence_member(
+            vm,
+            &entries,
+            Some(recv),
+            seq_kind_of(recv),
+            None,
+            name,
+            args,
+        ) {
+            return v;
+        }
+    }
+
     // `Map` key lookup runs BEFORE the read-only block: locating a key uses the
     // hash-gated container equality, which re-enters the VM for a user
     // `equals`/`hashCode` and so cannot run under the heap borrow that block
@@ -12195,6 +12217,10 @@ fn sequence_member(
         }
         "isEmpty" => Value::Bool(items.is_empty()),
         "isNotEmpty" => Value::Bool(!items.is_empty()),
+        // The no-predicate `any()`/`none()`: whether there is an element at
+        // all (`Iterable.any()` is `iterator().hasNext()`).
+        "any" if args.is_empty() => Value::Bool(!items.is_empty()),
+        "none" if args.is_empty() => Value::Bool(items.is_empty()),
         "first" => match range {
             Some((first, _)) => first,
             None => return Some(need(items.first().cloned())),
@@ -12813,6 +12839,14 @@ fn sequence_member(
                     .collect::<Vec<_>>()
                     .join(", ")
             ))))
+        }
+        // `contentDeepToString` is `java.util.Arrays.deepToString`: an element
+        // that is itself an array renders through the same walk, and one that
+        // is an array already being rendered prints `[...]`.
+        "contentDeepToString" if recv.is_some() => {
+            let mut out = String::new();
+            deep_to_string(recv.unwrap(), &mut Vec::new(), &mut out);
+            return Some(Ok(Value::str(out)));
         }
         // `contentEquals` compares two arrays ELEMENT-WISE with `equals`, where
         // `==` on arrays is identity. A null argument is unequal.
@@ -15184,4 +15218,34 @@ fn random_index(rng: &Value, n: usize) -> Result<usize, String> {
     with_rng(rng, |st| xorwow_int_in(st, 0, n as i32))
         .ok_or_else(|| format!("unresolved reference: random on {}", obj_label(rng)))?
         .map(|i| i as usize)
+}
+
+/// `java.util.Arrays.deepToString`, ported from its recursive helper: elements
+/// joined by `", "` inside `[` `]`, an element that is an array (object or
+/// primitive) rendered recursively, and an array already on the rendering
+/// path — a self-reference — written as `[...]`. `null` is `"null"`.
+fn deep_to_string(a: &Value, seen: &mut Vec<u32>, out: &mut String) {
+    let Value::Obj(id) = a else { return };
+    let Some(items) = with_obj(a, |o| match o {
+        HeapObj::Array { items, .. } => Some(items.clone()),
+        _ => None,
+    })
+    .flatten() else {
+        return;
+    };
+    seen.push(*id);
+    out.push('[');
+    for (i, e) in items.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let is_array = with_obj(e, |o| matches!(o, HeapObj::Array { .. })).unwrap_or(false);
+        match e {
+            Value::Obj(eid) if is_array && seen.contains(eid) => out.push_str("[...]"),
+            _ if is_array => deep_to_string(e, seen, out),
+            _ => out.push_str(&kotlin_string(e)),
+        }
+    }
+    out.push(']');
+    seen.pop();
 }

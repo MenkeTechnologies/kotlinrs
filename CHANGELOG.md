@@ -1183,3 +1183,17 @@ on JRE 21.0.12.1) from a probe that diverged:
   already was, and `Delegates.observable`/`vetoable` handlers receive it too.
 - **A top-level `by Delegates.observable`/`vetoable`** silently became a plain
   variable: the handler never ran and the veto never applied.
+
+### Round 18, second batch
+
+- **`Map.count()`, `Map.asSequence()`, `Map.asIterable()`** were unresolved;
+  they walk the entries as the `kotlin.collections` extensions on `Map` do.
+- **The no-predicate `any()`/`none()`** were unresolved on every collection,
+  array, range, sequence and `Map`.
+- **`arrayOfNulls<T>(n)`** was unresolved.
+- **`contentDeepToString()`** was unresolved; it is `Arrays.deepToString`,
+  nested primitive arrays and the `[...]` self-reference included.
+- **`fun ((Int) -> Int).name(…)`** — an extension on a function type — was a
+  parse error, and so was an `infix fun` declared on one.
+- **`{ f: (Int) -> Int, x: Int -> … }`** — a lambda parameter annotated with a
+  function type — ended the parameter list at the type's own arrow.

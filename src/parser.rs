@@ -731,19 +731,27 @@ fn infix_fun_names(toks: &[Spanned]) -> HashSet<String> {
         if !matches!(toks.get(j).map(|s| &s.tok), Some(Tok::Fun)) {
             continue;
         }
+        // The parameter list is the first `(` at depth 0 that follows an
+        // identifier; any other `(` opens a parenthesized receiver type —
+        // `infix fun ((Int) -> Int).then(…)` — and is skipped with its `<…>`s.
         let mut depth = 0i32;
-        let mut name = None;
+        let mut prev: Option<&String> = None;
         for s in &toks[j + 1..] {
             match &s.tok {
-                Tok::Lt => depth += 1,
-                Tok::Gt => depth -= 1,
-                Tok::LParen if depth == 0 => break,
-                Tok::Ident(w) => name = Some(w.clone()),
+                Tok::LParen if depth == 0 && prev.is_some() => {
+                    out.extend(prev.cloned());
+                    break;
+                }
+                Tok::Lt | Tok::LParen => depth += 1,
+                Tok::Gt | Tok::RParen => depth -= 1,
                 Tok::LBrace | Tok::Assign | Tok::Eof => break,
                 _ => {}
             }
+            prev = match &s.tok {
+                Tok::Ident(w) => Some(w),
+                _ => None,
+            };
         }
-        out.extend(name);
     }
     out
 }
@@ -997,32 +1005,59 @@ impl Parser {
         tps.extend(declared);
         let outer_tps = std::mem::replace(&mut self.type_params, tps);
         let outer_reified = std::mem::replace(&mut self.reified_params, reified.clone());
-        // `fun Recv.name(…)` — an extension. The first identifier is the
-        // receiver type only when a `.` follows it.
-        let first = self.ident()?;
+        // `fun ((Int) -> Int).name(…)` — an extension on a FUNCTION type, which
+        // Kotlin's grammar requires to be parenthesized as a receiver. The
+        // receiver names no class; a call resolves it as the sole extension
+        // of that name, the path every untyped receiver takes.
         let mut recv = None;
-        let name = if self.at(&Tok::Dot) {
-            self.advance();
-            let (ty, class) = (Type::from_name(&first), None);
-            let class = if ty == Type::Unknown {
-                Some(first.clone())
-            } else {
-                class
-            };
-            recv = Some((
-                first,
-                if ty == Type::Unknown { Type::Obj } else { ty },
-                class,
-            ));
-            self.ident()?
-        } else if self.at(&Tok::Lt) {
-            // `fun List<Int>.sum2()` — a generic receiver keeps its head name.
-            self.skip_type_args();
+        let name = if self.at(&Tok::LParen) {
+            let mut depth = 0i32;
+            loop {
+                match self.bump() {
+                    Tok::LParen => depth += 1,
+                    Tok::RParen => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    Tok::Eof => return Err("unterminated receiver type".into()),
+                    _ => {}
+                }
+            }
+            if self.at(&Tok::Question) {
+                self.advance();
+            }
             self.eat(&Tok::Dot)?;
-            recv = Some((first.clone(), Type::Obj, None));
+            recv = Some(("Function".to_string(), Type::Obj, None));
             self.ident()?
         } else {
-            first
+            // `fun Recv.name(…)` — an extension. The first identifier is
+            // the receiver type only when a `.` follows it.
+            let first = self.ident()?;
+            if self.at(&Tok::Dot) {
+                self.advance();
+                let (ty, class) = (Type::from_name(&first), None);
+                let class = if ty == Type::Unknown {
+                    Some(first.clone())
+                } else {
+                    class
+                };
+                recv = Some((
+                    first,
+                    if ty == Type::Unknown { Type::Obj } else { ty },
+                    class,
+                ));
+                self.ident()?
+            } else if self.at(&Tok::Lt) {
+                // `fun List<Int>.sum2()` — a generic receiver keeps its head name.
+                self.skip_type_args();
+                self.eat(&Tok::Dot)?;
+                recv = Some((first.clone(), Type::Obj, None));
+                self.ident()?
+            } else {
+                first
+            }
         };
         self.eat(&Tok::LParen)?;
         let mut params = Vec::new();
@@ -4265,8 +4300,17 @@ impl Parser {
                     self.advance();
                 }
                 Tok::Gt | Tok::RParen | Tok::RBracket => {
+                    let closes_paren = matches!(self.peek(), Tok::RParen);
                     depth -= 1;
                     self.advance();
+                    // `(Int) -> Int` — a `->` right after a top-level `(…)` is
+                    // the FUNCTION TYPE's arrow, taken greedily as kotlinc's
+                    // grammar does, so `{ f: (Int) -> Int, x: Int -> … }` keeps
+                    // scanning the result type instead of ending the list.
+                    if closes_paren && depth == 0 && self.at(&Tok::Arrow) {
+                        self.advance();
+                        consumed_simple = false;
+                    }
                 }
                 Tok::RBrace | Tok::Eof => return None,
                 Tok::Ident(_) if depth == 0 && !consumed_simple => {
