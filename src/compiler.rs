@@ -4880,14 +4880,15 @@ impl Compiler {
                 .emit(Op::Extended(KT_CLASS_REF, u8::from(java)), line);
             return Ok(Type::Obj);
         }
-        // `"%b".format(null)` — a literal `null` in a `vararg args: Any?`
-        // position is the ARRAY and not an element, so the call has NO
-        // arguments and the first specifier faults with
-        // `MissingFormatArgumentException`. Packing it as a one-element array
-        // instead made `%b` render an absent value, which is `false` — the
-        // right answer for a call nobody wrote.
-        if name == "format" && args.len() == 1 && matches!(args[0], Expr::Null) {
-            return self.compile_member(sc, recv, name, &[], false, line);
+        // `"%b %b".format(null, "x")` — a literal `null` FIRST resolves to the
+        // `format(locale: Locale?, vararg args: Any?)` overload, so it is the
+        // locale (null: no localization) and not an argument. The call then
+        // has one argument fewer and the last specifier faults with
+        // `MissingFormatArgumentException`; `"%b".format(null)` has none.
+        // Packing the `null` as an element instead made `%b` render an absent
+        // value, which is `false` — the right answer for a call nobody wrote.
+        if name == "format" && matches!(args.first(), Some(Expr::Null)) {
+            return self.compile_member(sc, recv, name, &args[1..], false, line);
         }
         // A `Float` or a `Long` handed to a member that stores it or looks it UP
         // by value is in an erased position, so it is boxed like a collection
@@ -6244,8 +6245,18 @@ impl Compiler {
         // itself is. `xs.map { it / 3.0f }` over a `List<Float>` is the shape:
         // the division is single-precision because both operands are typed, and
         // the box is what carries that into the list it lands in.
-        if res.as_ref().is_ok_and(|t| *t == Type::Float) {
-            self.b.emit(Op::Extended(KT_BOX_F32, 0), 0);
+        //
+        // A `Long` result boxes for the same reason, as every other erased
+        // position's does: unboxed, `{ -1L }()` reached `"%x".format(…)` as an
+        // `Int` and printed `ffffffff`.
+        match res.as_ref() {
+            Ok(Type::Float) => {
+                self.b.emit(Op::Extended(KT_BOX_F32, 0), 0);
+            }
+            Ok(Type::Long) => {
+                self.b.emit(Op::Extended(KT_BOX_I64, 0), 0);
+            }
+            _ => {}
         }
         res?;
         self.b.emit(Op::ReturnValue, 0);
@@ -6660,8 +6671,11 @@ impl Compiler {
                 Type::Int | Type::Long | Type::Float | Type::Double | Type::Char | Type::Boolean
             ));
         if matches!(op, BinOp::Eq | BinOp::Ne) && !native_eq {
-            self.compile_expr(sc, l)?;
-            self.compile_expr(sc, r)?;
+            // Erased, because `equals` sees the BOXED operand: a statically
+            // `Long` side is a `java.lang.Long`, equal to a boxed `Long` of the
+            // same value — `{ 5L }() == 5L` — and never to an `Int`.
+            self.compile_erased(sc, l)?;
+            self.compile_erased(sc, r)?;
             // A builtin rather than the `KT_OBJEQ` extension op: a user `equals`
             // override runs re-entrantly, which an extension handler cannot host
             // (see `KT_OBJEQ_VM`).
@@ -7348,11 +7362,13 @@ impl Compiler {
                 Ok(Type::Obj)
             }
             // `String(chars)` — the `CharArray` constructor, which is
-            // `chars.concatToString()`.
+            // `chars.concatToString()` — and `String(bytes)`, the `ByteArray`
+            // one, which decodes UTF-8. The host tells them apart by the
+            // array's descriptor (`#stringOf`).
             "String" if args.len() == 1 && !self.classes.contains_key("String") => {
                 let call = Expr::MethodCall {
                     recv: Box::new(args[0].clone()),
-                    name: "concatToString".to_string(),
+                    name: "#stringOf".to_string(),
                     args: Vec::new(),
                     safe: false,
                     line,
@@ -7640,7 +7656,7 @@ impl Compiler {
             // infer (see `crate::host::array_desc`), because its element type
             // is a static type argument this call does not carry.
             "arrayOf" | "intArrayOf" | "longArrayOf" | "doubleArrayOf" | "floatArrayOf"
-            | "booleanArrayOf" | "charArrayOf" => {
+            | "booleanArrayOf" | "charArrayOf" | "shortArrayOf" | "byteArrayOf" => {
                 for a in args {
                     self.compile_erased(sc, a)?;
                 }
@@ -7655,9 +7671,14 @@ impl Compiler {
             // generic `Array(n) { … }` exists only in the initializer form
             // (Kotlin has no zero-filled `Array(n)`), so its descriptor is
             // inferred from the elements the lambda produced.
-            "IntArray" | "DoubleArray" | "BooleanArray" | "CharArray" | "Array" => {
+            "IntArray" | "DoubleArray" | "BooleanArray" | "CharArray" | "LongArray" | "FloatArray"
+            | "ShortArray" | "ByteArray" | "Array" => {
                 let desc = match name {
                     "DoubleArray" => "[D",
+                    "LongArray" => "[J",
+                    "FloatArray" => "[F",
+                    "ShortArray" => "[S",
+                    "ByteArray" => "[B",
                     "BooleanArray" => "[Z",
                     "CharArray" => "[C",
                     "Array" => "",
@@ -9203,6 +9224,23 @@ impl Compiler {
                     self.b.emit(Op::LogNot, 0);
                 }
             }
+            WhenCond::In { negated, container } => {
+                let (slot, sty) = subj.ok_or("`in` condition requires a `when` subject")?;
+                // The subject is bound to a hidden name so the arm lowers as
+                // the `in` expression it is, user `contains` operator included.
+                const SUBJ: &str = "$when_in_subject";
+                let mark = sc.enter();
+                let hidden = sc.declare(SUBJ, sty, false);
+                self.b.emit(Op::GetSlot(slot), 0);
+                self.b.emit(Op::SetSlot(hidden), 0);
+                let test = Expr::In {
+                    value: Box::new(Expr::Var(SUBJ.to_string())),
+                    container: Box::new(container.clone()),
+                    negated: *negated,
+                };
+                self.compile_expr(sc, &test)?;
+                sc.exit(mark);
+            }
             WhenCond::Is {
                 negated,
                 ty,
@@ -9439,8 +9477,9 @@ impl Compiler {
                 | "HashSet" | "LinkedHashSet" | "TreeSet" | "HashMap" | "LinkedHashMap"
                 | "linkedMapOf" | "sortedMapOf" | "TreeMap" | "arrayOf" | "emptyArray"
                 | "intArrayOf" | "longArrayOf" | "doubleArrayOf" | "floatArrayOf"
-                | "booleanArrayOf" | "charArrayOf" | "IntArray" | "DoubleArray"
-                | "BooleanArray" | "CharArray" | "Array" => Type::Obj,
+                | "booleanArrayOf" | "charArrayOf" | "shortArrayOf" | "byteArrayOf" | "IntArray"
+                | "DoubleArray" | "BooleanArray" | "CharArray" | "LongArray" | "FloatArray"
+                | "ShortArray" | "ByteArray" | "Array" => Type::Obj,
                 // `Pair`/`Triple`/`Result` are heap objects, and saying so is
                 // what routes `==` on them to STRUCTURAL equality: the native
                 // compare would coerce two handles to numbers and answer `true`
@@ -9740,7 +9779,10 @@ impl Compiler {
             return Type::Char;
         }
         match self.infer_class(sc, recv).as_deref() {
-            Some("IntArray") => Type::Int,
+            // `Short`/`Byte` arithmetic promotes to `Int`, so their elements
+            // take part at `Int` width.
+            Some("IntArray" | "ShortArray" | "ByteArray") => Type::Int,
+            Some("LongArray") => Type::Long,
             Some("DoubleArray") => Type::Double,
             Some("FloatArray") => Type::Float,
             Some("CharArray") => Type::Char,
@@ -9853,7 +9895,7 @@ impl Compiler {
                 | "listOfNotNull" | "sequenceOf" => {
                     elem_of_args(&args.iter().map(|a| self.infer(sc, a)).collect::<Vec<_>>())
                 }
-                "intArrayOf" => Type::Int,
+                "intArrayOf" | "shortArrayOf" | "byteArrayOf" => Type::Int,
                 "longArrayOf" => Type::Long,
                 "doubleArrayOf" => Type::Double,
                 "floatArrayOf" => Type::Float,
@@ -10482,6 +10524,9 @@ impl Compiler {
                     "Pair" => return Some("Pair".to_string()),
                     "Triple" => return Some("Triple".to_string()),
                     "intArrayOf" | "IntArray" => return Some("IntArray".to_string()),
+                    "longArrayOf" | "LongArray" => return Some("LongArray".to_string()),
+                    "shortArrayOf" | "ShortArray" => return Some("ShortArray".to_string()),
+                    "byteArrayOf" | "ByteArray" => return Some("ByteArray".to_string()),
                     "doubleArrayOf" | "DoubleArray" => return Some("DoubleArray".to_string()),
                     "floatArrayOf" | "FloatArray" => return Some("FloatArray".to_string()),
                     "charArrayOf" | "CharArray" => return Some("CharArray".to_string()),
@@ -11030,6 +11075,8 @@ fn array_literal_desc(name: &str) -> &'static str {
         "floatArrayOf" => "[F",
         "booleanArrayOf" => "[Z",
         "charArrayOf" => "[C",
+        "shortArrayOf" => "[S",
+        "byteArrayOf" => "[B",
         _ => "",
     }
 }
@@ -11937,6 +11984,7 @@ fn when_any(w: &WhenExpr, f: &dyn Fn(&Expr) -> bool) -> bool {
                         WhenCond::InRange { start, end, .. } => {
                             expr_any(start, f) || expr_any(end, f)
                         }
+                        WhenCond::In { container, .. } => expr_any(container, f),
                         WhenCond::Is { .. } => false,
                     }),
                 }

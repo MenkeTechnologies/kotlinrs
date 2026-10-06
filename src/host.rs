@@ -8333,6 +8333,140 @@ fn arg_str(args: &[Value], i: usize) -> String {
     args.get(i).map(kotlin_string).unwrap_or_default()
 }
 
+/// The shortest round-tripping decimal digits of `|x|` and its decimal
+/// exponent, read so that `|x| = 0.d₁d₂… × 10^exp` — the pair `FloatingDecimal`
+/// hands `java.util.Formatter`'s `FormattedFloatingDecimal`. Zero is `([0], 1)`.
+fn shortest_digits(x: f64) -> (Vec<u8>, i32) {
+    let s = format!("{:e}", x.abs());
+    let (m, e) = s.split_once('e').expect("`{:e}` always writes an exponent");
+    let digits = m.bytes().filter(|b| *b != b'.').collect();
+    (digits, e.parse::<i32>().expect("decimal exponent") + 1)
+}
+
+/// `FormattedFloatingDecimal.applyPrecision`: round `digits` to `prec`
+/// significant digits HALF_UP, answering the exponent — one higher when the
+/// rounding carries out of the leading digit (`9.99` to two digits is `10`).
+fn apply_precision(digits: &mut Vec<u8>, exp: i32, prec: usize) -> i32 {
+    if prec >= digits.len() {
+        return exp;
+    }
+    if prec == 0 {
+        let up = digits[0] >= b'5';
+        *digits = vec![if up { b'1' } else { b'0' }];
+        return exp + i32::from(up);
+    }
+    let up = digits[prec] >= b'5';
+    digits.truncate(prec);
+    if up {
+        for i in (0..prec).rev() {
+            if digits[i] == b'9' {
+                digits[i] = b'0';
+            } else {
+                digits[i] += 1;
+                return exp;
+            }
+        }
+        *digits = vec![b'1'];
+        return exp + 1;
+    }
+    exp
+}
+
+/// `digits × 10^(exp - len)` written positionally with exactly `frac`
+/// fraction digits — `FormattedFloatingDecimal.fillDecimal` followed by the
+/// zero padding `Formatter.addZeros` applies.
+fn fill_decimal(digits: &[u8], exp: i32, frac: usize) -> String {
+    let d = |i: i32| -> char {
+        usize::try_from(i)
+            .ok()
+            .and_then(|i| digits.get(i))
+            .map_or('0', |b| *b as char)
+    };
+    let mut s: String = if exp <= 0 {
+        "0".to_string()
+    } else {
+        (0..exp).map(d).collect()
+    };
+    if frac > 0 {
+        s.push('.');
+        s.extend((0..frac as i32).map(|k| d(exp + k)));
+    }
+    s
+}
+
+/// `x` the way `%e` writes it: `prec` fraction digits of a one-digit mantissa,
+/// HALF_UP on the shortest decimal form (as [`format_fixed`] rounds), and an
+/// exponent of at least two digits — `1.234568e+04`.
+fn format_scientific(x: f64, prec: usize) -> String {
+    if !x.is_finite() {
+        return format_double(x);
+    }
+    let (mut digits, exp) = shortest_digits(x);
+    let exp = apply_precision(&mut digits, exp, prec + 1);
+    let mut s = fill_decimal(&digits, 1, prec);
+    let e = if digits == [b'0'] { 0 } else { exp - 1 };
+    s.push_str(&format!("e{}{:02}", if e < 0 { '-' } else { '+' }, e.abs()));
+    if x.is_sign_negative() {
+        s.insert(0, '-');
+    }
+    s
+}
+
+/// `x` the way `%g` writes it: `prec` SIGNIFICANT digits (6 when absent, 1
+/// for 0), positional when the rounded value's exponent lies in
+/// `-4 ..< prec` and scientific otherwise. Unlike C's `%g`, trailing zeros
+/// are kept: `"%g".format(0.0001234)` is `0.000123400`.
+fn format_general(x: f64, prec: Option<usize>) -> String {
+    if !x.is_finite() {
+        return format_double(x);
+    }
+    let p = match prec {
+        None => 6,
+        Some(0) => 1,
+        Some(p) => p,
+    };
+    if x == 0.0 {
+        let s = fill_decimal(&[b'0'], 1, p - 1);
+        return if x.is_sign_negative() { format!("-{s}") } else { s };
+    }
+    let (mut digits, exp) = shortest_digits(x);
+    let exp = apply_precision(&mut digits, exp, p);
+    if exp - 1 < -4 || exp - 1 >= p as i32 {
+        return format_scientific(x, p - 1);
+    }
+    let s = fill_decimal(&digits, exp, (p as i32 - exp) as usize);
+    if x.is_sign_negative() {
+        format!("-{s}")
+    } else {
+        s
+    }
+}
+
+/// `Double.toHexString` — `%a` with no precision: `0x1.0p0`, `-0x1.8p1`,
+/// `0x0.0000000000001p-1022` for the smallest subnormal, and the mantissa's
+/// trailing zero nibbles dropped down to one digit.
+fn java_hex_double(x: f64) -> String {
+    if !x.is_finite() {
+        return format_double(x);
+    }
+    let sign = if x.is_sign_negative() { "-" } else { "" };
+    if x == 0.0 {
+        return format!("{sign}0x0.0p0");
+    }
+    let bits = x.to_bits();
+    let frac = bits & ((1u64 << 52) - 1);
+    let biased = ((bits >> 52) & 0x7ff) as i64;
+    let mut hex = format!("{frac:013x}");
+    while hex.len() > 1 && hex.ends_with('0') {
+        hex.pop();
+    }
+    if biased == 0 {
+        format!("{sign}0x0.{hex}p-1022")
+    } else {
+        format!("{sign}0x1.{hex}p{}", biased - 1023)
+    }
+}
+
 /// `x` with exactly `prec` fraction digits, rounded the way
 /// `java.util.Formatter`'s `%f` rounds: HALF_UP applied to the value's SHORTEST
 /// round-tripping decimal form, not to the exact binary value.
@@ -8501,7 +8635,9 @@ fn conversion_accepts(conv: char, arg: &Value) -> bool {
         }
         // A boxed `Float` is a `java.lang.Float`, which the floating
         // conversions take exactly as they take a `Double`.
-        'f' | 'e' | 'E' => matches!(arg, Value::Float(_)) || f32_box(arg).is_some(),
+        'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A' => {
+            matches!(arg, Value::Float(_)) || f32_box(arg).is_some()
+        }
         'c' => is_char || matches!(arg, Value::Int(_)),
         _ => true,
     }
@@ -8561,8 +8697,11 @@ fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
         let (mut left, mut zero, mut plus, mut space) = (false, false, false, false);
         let mut relative = false;
         let mut group = false;
+        let (mut paren, mut alt) = (false, false);
         while let Some(f) = it.peek() {
             match f {
+                '(' => paren = true,
+                '#' => alt = true,
                 '<' => relative = true,
                 '-' => left = true,
                 '0' => zero = true,
@@ -8684,19 +8823,26 @@ fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
             // and `to_float` would format its handle.
             'f' => format_fixed(num_f64(&arg), prec.unwrap_or(6)),
             'e' | 'E' => {
-                let s = format!("{:.*e}", prec.unwrap_or(6), num_f64(&arg));
-                // Rust writes `1.5e2`; the JVM writes `1.500000e+02`.
-                let s = match s.split_once('e') {
-                    Some((m, x)) => {
-                        let (sign, digits) = match x.strip_prefix('-') {
-                            Some(d) => ('-', d),
-                            None => ('+', x),
-                        };
-                        format!("{m}e{sign}{digits:0>2}")
-                    }
-                    None => s,
-                };
+                let s = format_scientific(num_f64(&arg), prec.unwrap_or(6));
                 if conv == 'E' {
+                    s.to_uppercase()
+                } else {
+                    s
+                }
+            }
+            'g' | 'G' => {
+                let s = format_general(num_f64(&arg), prec);
+                if conv == 'G' {
+                    s.to_uppercase()
+                } else {
+                    s
+                }
+            }
+            // `%a` is `Double.toHexString`. A precision rounds the hex
+            // mantissa, which is not modelled, so it fails loudly.
+            'a' | 'A' if prec.is_none() => {
+                let s = java_hex_double(num_f64(&arg));
+                if conv == 'A' {
                     s.to_uppercase()
                 } else {
                     s
@@ -8736,6 +8882,9 @@ fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
         if group {
             match conv {
                 'd' | 'f' => body = group_thousands(&body),
+                // `%g` groups only in its positional form.
+                'g' | 'G' if !body.contains(['e', 'E']) => body = group_thousands(&body),
+                'g' | 'G' => {}
                 other => {
                     return Err(format!(
                         "java.util.FormatFlagsConversionMismatchException: \
@@ -8746,11 +8895,46 @@ fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
         }
         // The sign flags apply to the numeric conversions only, and `+` wins
         // over ` ` when both are given (as in the JVM).
-        if matches!(conv, 'd' | 'f' | 'e' | 'E') && !body.starts_with('-') {
+        if matches!(conv, 'd' | 'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A') && !body.starts_with('-') {
             if plus {
                 body.insert(0, '+');
             } else if space {
                 body.insert(0, ' ');
+            }
+        }
+        // `(` encloses a NEGATIVE number in parentheses in place of its `-`.
+        // `java.util.Formatter` takes it on the decimal conversions only; an
+        // `Int`/`Long` under `%x`/`%o` is a mismatch (it is `BigInteger`'s).
+        if paren {
+            if !matches!(conv, 'd' | 'f' | 'e' | 'E' | 'g' | 'G') {
+                return Err(format!(
+                    "java.util.FormatFlagsConversionMismatchException: \
+                     Conversion = {conv}, Flags = ("
+                ));
+            }
+            if let Some(mag) = body.strip_prefix('-') {
+                body = format!("({mag})");
+            }
+        }
+        // `#` is the ALTERNATE form: a `0x`/`0X` radix prefix for `%x`/`%X`, a
+        // leading `0` for `%o`, and a decimal point `%f`/`%e` keep even at
+        // precision 0 (`3.`, `3.e+00`). The other conversions refuse it.
+        if alt {
+            match conv {
+                'x' => body.insert_str(0, "0x"),
+                'X' => body.insert_str(0, "0X"),
+                'o' => body.insert(0, '0'),
+                'f' | 'e' | 'E' if !body.contains('.') && body.ends_with(|c: char| c.is_ascii_digit()) => {
+                    let at = body.find(['e', 'E']).unwrap_or(body.len());
+                    body.insert(at, '.');
+                }
+                'f' | 'e' | 'E' => {}
+                _ => {
+                    return Err(format!(
+                        "java.util.FormatFlagsConversionMismatchException: \
+                         Conversion = {conv}, Flags = #"
+                    ))
+                }
             }
         }
         out.push_str(&pad(body, width, left, zero, conv));
@@ -8767,9 +8951,14 @@ fn pad(mut body: String, width: usize, left: bool, zero: bool, conv: char) -> St
     if n > 0 {
         if left {
             body.push_str(&" ".repeat(n));
-        } else if zero && matches!(conv, 'd' | 'f' | 'e' | 'E' | 'x' | 'X' | 'o') {
-            // Zero padding goes after any sign, not before it.
-            let at = usize::from(body.starts_with(['-', '+', ' ']));
+        } else if zero && matches!(conv, 'd' | 'f' | 'e' | 'E' | 'g' | 'G' | 'x' | 'X' | 'o') {
+            // Zero padding goes after any sign, `(` or `0x` prefix, not before
+            // it: `%(06d` of -7 is `(0007)`, `%#06x` of 255 is `0x00ff`.
+            let at = if body.starts_with("0x") || body.starts_with("0X") {
+                2
+            } else {
+                usize::from(body.starts_with(['-', '+', ' ', '(']))
+            };
             body.insert_str(at, &"0".repeat(n));
         } else {
             body.insert_str(0, &" ".repeat(n));
@@ -9759,6 +9948,15 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
                 .map(|_| arg_str(args, 1))
                 .unwrap_or_else(|| "|".into());
             kotlin_replace_indent_by_margin(s, &indent, &margin).map(Value::str)
+        }
+        // `String.toByteArray()` / `encodeToByteArray()` — the UTF-8 encoding,
+        // each byte a signed `Byte`.
+        (Value::Str(s), "toByteArray" | "encodeToByteArray") if args.is_empty() => {
+            let items = s.bytes().map(|b| Value::Int(b as i8 as i64)).collect();
+            Ok(alloc(HeapObj::Array {
+                items,
+                desc: "[B".to_string(),
+            }))
         }
         (Value::Str(s), "toCharArray") => {
             let items: Vec<Value> = s.encode_utf16().map(|u| char_of(u as i64)).collect();
@@ -10952,6 +11150,27 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 ),
                 None => format!("unresolved reference: removeAt on {}", obj_label(recv)),
             });
+        }
+        // `ByteArray.decodeToString()`, and `String(bytes)` — the JVM constructor,
+        // decoding with the default charset, UTF-8 everywhere kotlinrs runs. A
+        // `String(chars)` reaches here too (`#stringOf` is the frontend's
+        // lowering of the one-argument `String(…)`) and is `concatToString`.
+        "decodeToString" | "#stringOf" if args.is_empty() => {
+            let bytes = with_obj(recv, |o| match o {
+                HeapObj::Array { items, desc } if desc == "[B" => {
+                    Some(items.iter().map(|b| b.to_int() as u8).collect::<Vec<u8>>())
+                }
+                _ => None,
+            })
+            .flatten();
+            return match bytes {
+                Some(b) => Ok(Value::str(String::from_utf8_lossy(&b).into_owned())),
+                None if name == "#stringOf" => obj_method(vm, recv, "concatToString", &[]),
+                None => Err(format!(
+                    "unresolved reference: decodeToString on {}",
+                    obj_label(recv)
+                )),
+            };
         }
         // `CharArray.concatToString()` — and `String(chars)`, which lowers to
         // it. The array holds UTF-16 code units, so a surrogate pair split
@@ -14061,6 +14280,10 @@ fn is_builtin_type_name(ty: &str) -> bool {
             | "DoubleArray"
             | "CharArray"
             | "BooleanArray"
+            | "LongArray"
+            | "FloatArray"
+            | "ShortArray"
+            | "ByteArray"
     )
 }
 
@@ -14111,7 +14334,8 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         "Map" | "MutableMap" => with_obj(v, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false),
         "Pair" => with_obj(v, |o| matches!(o, HeapObj::Pair(_, _))).unwrap_or(false),
         "Triple" => with_obj(v, |o| matches!(o, HeapObj::Triple(_, _, _))).unwrap_or(false),
-        "Array" | "IntArray" | "DoubleArray" | "CharArray" | "BooleanArray" => {
+        "Array" | "IntArray" | "DoubleArray" | "CharArray" | "BooleanArray" | "LongArray"
+        | "FloatArray" | "ShortArray" | "ByteArray" => {
             with_obj(v, |o| matches!(o, HeapObj::Array { .. })).unwrap_or(false)
         }
         other => {

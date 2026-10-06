@@ -778,6 +778,10 @@ pub enum WhenCond {
         end: Expr,
         kind: RangeKind,
     },
+    /// `in container` (or `!in …`) over anything else — a range value, a
+    /// collection, a string, a user type declaring `operator fun contains`:
+    /// `container.contains(subject)`.
+    In { negated: bool, container: Expr },
     /// `is Type` (or `!is …`) — subject-form runtime type check.
     Is {
         negated: bool,

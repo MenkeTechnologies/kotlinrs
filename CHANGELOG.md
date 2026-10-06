@@ -1140,3 +1140,26 @@ wrong answer or a stopped program; ten corpus records cover them, captured with
   **`SIZE_BITS`/`SIZE_BYTES`** on every primitive were unresolved.
 - **`Long.MIN_VALUE.floorDiv(-1L)`** panicked on overflow; it wraps, as the
   JVM's `long` division does.
+
+### Round 17, second batch
+
+Ten more corpus records, each from a probe diffed against `kotlinc`:
+
+- **`when (x) { in xs -> … }`** accepted only a literal `a..b`/`until`/
+  `downTo`; any container is now accepted (a collection, a string, a range
+  value, `1..9 step 2`, a type declaring `operator fun contains`).
+- **An `in`/`is` opening a line** was read as an operator on the previous
+  line's expression, so a `when` arm `in listOf(…) ->` after an expression arm
+  was a parse error. Kotlin's grammar admits a newline only after `in`/`is`.
+- **`Formatter`**: `%g`/`%G`, `%a`/`%A` (no precision), the `(` and `#`
+  flags; `%e` now rounds HALF_UP over the shortest decimal form as `%f`
+  already did (`"%.0e".format(2.5)` is `3e+00`), and prints `NaN`/`Infinity`.
+- **`"%b %b".format(null, "x")`** resolves to the `format(locale, …)`
+  overload, as Kotlin does, so the `null` is the locale.
+- **A `Long` lambda result** is boxed like every erased `Long`
+  (`"%x".format({ -1L }())` is sixteen `f`s), and `==`/`!=` that reaches
+  object equality boxes a statically `Long` operand, so `{ -1L }() == -1L`
+  is `true`.
+- **`ByteArray`/`ShortArray`/`LongArray`/`FloatArray`** constructors and
+  `byteArrayOf`/`shortArrayOf`; `String.toByteArray()`/`encodeToByteArray()`,
+  `ByteArray.decodeToString()` and `String(bytes)` (UTF-8).

@@ -3537,6 +3537,13 @@ impl Parser {
             if self.at_when_is_arm() {
                 break;
             }
+            // Kotlin's `infixOperation` admits a newline AFTER `in`/`is`, never
+            // before: an `in`/`is` that opens a line starts a new statement or
+            // `when` arm (`in listOf("a") -> …`), not an operator on the
+            // previous line's expression.
+            if !self.glued_to_prev() {
+                break;
+            }
             if self.at(&Tok::Is) || (self.at(&Tok::Not) && matches!(self.peek_at(1), Tok::Is)) {
                 let negated = self.at(&Tok::Not);
                 if negated {
@@ -4798,6 +4805,25 @@ impl Parser {
     /// The range after `in`/`!in` in a `when` arm — `a..b`, `a until b`, or
     /// `a downTo b`.
     fn when_range(&mut self, negated: bool) -> Result<WhenCond, String> {
+        // A literal `a..b` / `until` / `downTo` that ends the condition is the
+        // inline range test; anything else — `in xs`, `in 1..9 step 2`,
+        // `in "abc"` — is the general `contains` form.
+        let at = self.pos;
+        if let Ok(Some(c)) = self.when_literal_range(negated) {
+            if matches!(self.peek(), Tok::Arrow | Tok::Comma) {
+                return Ok(c);
+            }
+        }
+        self.pos = at;
+        Ok(WhenCond::In {
+            negated,
+            container: self.expr()?,
+        })
+    }
+
+    /// The `a..b` / `a until b` / `a downTo b` form of a `when` `in` arm, or
+    /// `None` when the bound is not followed by one of the three.
+    fn when_literal_range(&mut self, negated: bool) -> Result<Option<WhenCond>, String> {
         let start = self.range_bound()?;
         let (kind, end) = match self.peek() {
             Tok::DotDot => {
@@ -4812,18 +4838,14 @@ impl Parser {
                 self.advance();
                 (RangeKind::DownTo, self.range_bound()?)
             }
-            other => {
-                return Err(format!(
-                "`in` condition needs a range (`a..b`, `a until b`, `a downTo b`), found {other:?}"
-            ))
-            }
+            _ => return Ok(None),
         };
-        Ok(WhenCond::InRange {
+        Ok(Some(WhenCond::InRange {
             negated,
             start,
             end,
             kind,
-        })
+        }))
     }
 
     /// An `if`/`else`/`when` branch body: either a `{ … }` block or a single

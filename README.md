@@ -272,8 +272,8 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
    `"300".toByte()` is a `NumberFormatException` and not `44`, and each taking
    an optional radix whose own `2..36` check is an `IllegalArgumentException`
    that even the `…OrNull` forms raise — and
-  `.format(args…)` — the `java.util.Formatter` conversions `%d %s %f %e %x %X
-  %o %c %b %%` with the `-`/`0`/`+`/space/`,` flags, a width and a precision,
+  `.format(args…)` — the `java.util.Formatter` conversions `%d %s %f %e %g %a %x %X
+  %o %c %b %%` with the `-`/`0`/`+`/space/`,`/`(`/`#` flags (`%e`/`%g` round HALF_UP over the shortest decimal form like `%f`; `%a` takes no precision), a width and a precision,
   where `%f` rounds HALF_UP over the value's shortest decimal form exactly as
   the JVM does (so `"%.0f".format(2.5)` is `3`, not `2`). The `,` grouping flag
   separates the integer part in threes and reaches `%d` and `%f` only —
@@ -622,7 +622,7 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   failure rather than answering it), `map { }`, `onSuccess { }`/`onFailure { }`.
 - **Control flow** — `if`/`else` (statement **and** expression, incl.
   `else if`); `when` (statement **and** expression) in subject and subjectless
-  forms, with literal, comma-grouped, `in`/`!in` range, `is`/`!is` type (incl.
+  forms, with literal, comma-grouped, `in`/`!in` (a literal range, or any container — a collection, a string, a range value, a type declaring `operator fun contains`), `is`/`!is` type (incl.
   the erased generic form `is List<*>`), and `else` arms; the subject may name
   itself for the arm bodies (`when (val n = f()) { … }`). `while`,
   `do { … } while (cond)` — whose body always runs once and whose `continue`
