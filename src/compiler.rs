@@ -5256,7 +5256,10 @@ impl Compiler {
         // because `map`/`getOrElse` are spelled the same there and mean
         // something else — the receiver's static class is what tells them apart.
         if !member_wins
-            && matches!(name, "getOrElse" | "onSuccess" | "onFailure" | "map")
+            && matches!(
+                name,
+                "getOrElse" | "onSuccess" | "onFailure" | "map" | "recover"
+            )
             && args.len() == 1
             && self.infer_class(sc, recv).as_deref() == Some("Result")
         {

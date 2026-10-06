@@ -6933,6 +6933,14 @@ fn result_hof(vm: &mut VM, recv: &Value, name: &str, clo: &Value) -> Result<Valu
             })
         }),
         ("map", Some(_)) => Ok(recv),
+        // `recover` maps a failure to a success and passes a success through.
+        ("recover", Some(e)) => invoke_closure(vm, &clo, std::slice::from_ref(e)).map(|v| {
+            alloc(HeapObj::Res {
+                value: v,
+                err: None,
+            })
+        }),
+        ("recover", None) => Ok(recv),
         _ => Err(format!("unresolved reference: {name}")),
     }
 }
@@ -7300,6 +7308,28 @@ fn coll_hof(
     // neither is the type whose diagnostics Kotlin spells.
     kind: SeqKind,
 ) -> Result<Value, String> {
+    // A `Result` whose static type was lost — `runCatching { … }.map { … }
+    // .getOrElse { … }` — reaches here because `map`/`getOrElse` are also
+    // collection members; its own lambda members answer.
+    if extras.is_empty()
+        && matches!(
+            name,
+            "onSuccess" | "onFailure" | "getOrElse" | "map" | "recover"
+        )
+        && result_parts(recv).is_some()
+    {
+        return result_hof(vm, recv, name, clo);
+    }
+    // `Result.fold(onSuccess, onFailure)`: the first lambda arrives as the
+    // extra argument, the second as the closure.
+    if name == "fold" && extras.len() == 1 {
+        if let Some((value, err)) = result_parts(recv) {
+            return match err {
+                None => invoke_closure(vm, &extras[0], &[value]),
+                Some(e) => invoke_closure(vm, clo, &[e]),
+            };
+        }
+    }
     // A lazy sequence receiver. The four stages that can be applied one element
     // at a time stay lazy — that is what keeps `generateSequence(1) { it * 2 }
     // .map { … }.take(5)` finite. The short-circuiting searches pull only as far
@@ -8655,7 +8685,13 @@ fn conversion_accepts(conv: char, arg: &Value) -> bool {
     }
 }
 
-fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
+/// `hash` answers `hashCode()` for `%h`, which can re-enter the VM for a user
+/// override.
+fn format_string(
+    fmt: &str,
+    args: &[Value],
+    hash: &mut dyn FnMut(&Value) -> i32,
+) -> Result<String, String> {
     let mut out = String::new();
     let mut argi = 0usize;
     // The argument the previous specifier consumed, which `%<s` reuses.
@@ -8878,6 +8914,21 @@ fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
                     None => s,
                 };
                 if conv == 'S' {
+                    s.to_uppercase()
+                } else {
+                    s
+                }
+            }
+            // `%h` is `Integer.toHexString(arg.hashCode())`; a null argument
+            // already printed `null` above.
+            'h' | 'H' => {
+                let s = format!("{:x}", hash(&arg) as u32);
+                // A precision caps the length, as for every general conversion.
+                let s: String = match prec {
+                    Some(p) => s.chars().take(p).collect(),
+                    None => s,
+                };
+                if conv == 'H' {
                     s.to_uppercase()
                 } else {
                     s
@@ -10093,13 +10144,15 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
             Ok(Value::Int(d))
         }
         // `String.format(args…)` — the receiver is the format string.
-        (Value::Str(s), "format") => format_string(s, args).map(Value::str),
+        (Value::Str(s), "format") => {
+            format_string(s, args, &mut |v| hash_vm(vm, v, false)).map(Value::str)
+        }
         // `fmt.format(*args)` — the compiler packs a spread argument list into one
         // array (see `spread_concat`) and names the member `format*`, whose
         // single argument is that array's elements.
         (Value::Str(s), "format*") => {
             let items = args.first().map(sequence_items).unwrap_or_default();
-            format_string(s, &items).map(Value::str)
+            format_string(s, &items, &mut |v| hash_vm(vm, v, false)).map(Value::str)
         }
         // Numeric parses. The `…OrNull` forms answer null where the plain ones
         // throw, which is the only difference between the pairs.
@@ -11782,8 +11835,10 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
 
     // A `Result`'s lambda-taking members, reached through a receiver the
     // compiler could not type.
-    if matches!(name, "onSuccess" | "onFailure" | "getOrElse" | "map")
-        && args.len() == 1
+    if matches!(
+        name,
+        "onSuccess" | "onFailure" | "getOrElse" | "map" | "recover"
+    ) && args.len() == 1
         && result_parts(recv).is_some()
     {
         return result_hof(vm, recv, name, &args[0]);

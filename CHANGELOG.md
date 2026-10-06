@@ -1197,3 +1197,14 @@ on JRE 21.0.12.1) from a probe that diverged:
   parse error, and so was an `infix fun` declared on one.
 - **`{ f: (Int) -> Int, x: Int -> … }`** — a lambda parameter annotated with a
   function type — ended the parameter list at the type's own arrow.
+
+### Round 18, third batch
+
+- **`Result` members after a `map`** (`runCatching { … }.map { … }.getOrElse
+  { … }`) lost the receiver's type and resolved as collection members, which
+  answered `unresolved reference: getOrElse on Result`.
+- **`Result.fold(onSuccess, onFailure)`** and **`Result.recover { }`** were
+  unresolved.
+- **`%h`/`%H`** were `UnknownFormatConversionException`; they are
+  `Integer.toHexString(arg.hashCode())`, a user `hashCode` included, with the
+  precision capping the length.
