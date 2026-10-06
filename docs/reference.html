@@ -1517,7 +1517,7 @@ fun main() { try { Conn().host } catch (e: UninitializedPropertyAccessException)
         <article class="doc-entry" id="doc-string-members-6">
           <h3><a class="doc-anchor" href="#doc-string-members-6">#</a> <code>trim</code></h3>
           <pre><code class="lang-kotlin">String.trim(): String</code></pre>
-          <p>Strips leading and trailing whitespace, by Unicode's whitespace definition. There is no predicate or char-set overload, and no <code>trimStart</code>/<code>trimEnd</code>/<code>trimIndent</code>.</p>
+          <p>Strips leading and trailing whitespace by Kotlin's <code>isWhitespace</code>. <code>trim { pred }</code> trims by a predicate and <code>trim(vararg chars)</code> by a character set; <code>trimStart</code>/<code>trimEnd</code> take the same three forms one-sided.</p>
           <pre><code class="lang-kotlin">println("  hi  ".trim())   // hi</code></pre>
         </article>
         <article class="doc-entry" id="doc-string-members-7">

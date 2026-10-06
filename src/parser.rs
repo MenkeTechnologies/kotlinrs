@@ -157,6 +157,8 @@ struct Mods {
     /// a nested declaration rejects it, because there the outer reference is
     /// exactly what the hoist cannot reproduce.
     inner: bool,
+    /// `final` — see [`FunDecl::is_final`].
+    final_: bool,
     /// `lateinit var` — a class property with no initializer, whose read
     /// before its first write is `UninitializedPropertyAccessException`.
     lateinit: bool,
@@ -654,6 +656,7 @@ fn expand_interface_delegation(prog: &mut Program) -> Result<(), String> {
                     is_abstract: false,
                     is_open: true,
                     is_override: true,
+                    is_final: false,
                 });
             }
         }
@@ -883,8 +886,9 @@ impl Parser {
                 "sealed" => m.sealed = true,
                 "inner" => m.inner = true,
                 "lateinit" => m.lateinit = true,
-                "final" | "public" | "private" | "internal" | "protected" | "inline"
-                | "noinline" | "crossinline" | "tailrec" | "operator" | "infix" | "const" => {}
+                "final" => m.final_ = true,
+                "public" | "private" | "internal" | "protected" | "inline" | "noinline"
+                | "crossinline" | "tailrec" | "operator" | "infix" | "const" => {}
                 _ => break,
             }
             self.advance();
@@ -1121,6 +1125,7 @@ impl Parser {
             is_abstract: bodyless,
             is_open: mods.open,
             is_override: mods.override_,
+            is_final: mods.final_,
         })
     }
 
@@ -1584,6 +1589,7 @@ impl Parser {
                 is_abstract: false,
                 is_open: false,
                 is_override: true,
+                is_final: false,
             });
         }
         Ok(ClassDecl {
@@ -1871,6 +1877,7 @@ impl Parser {
             is_abstract: false,
             is_open: false,
             is_override: false,
+            is_final: false,
         });
 
         // `fun valueOf(value: String) = when (value) { "RED" -> E.RED; …
@@ -1937,6 +1944,7 @@ impl Parser {
             is_abstract: false,
             is_open: false,
             is_override: false,
+            is_final: false,
         });
 
         Ok(comp)
@@ -2161,6 +2169,7 @@ impl Parser {
             is_abstract: false,
             is_open: mods.open,
             is_override: mods.override_,
+            is_final: mods.final_,
         }))
     }
 
@@ -2478,6 +2487,7 @@ impl Parser {
             is_abstract: false,
             is_open: false,
             is_override: false,
+            is_final: false,
         };
         let (get_name, set_name) = (format!("<get-{}>", p.name), format!("<set-{}>", p.name));
         let get_body = match getter {

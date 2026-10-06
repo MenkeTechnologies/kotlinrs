@@ -1105,3 +1105,38 @@ From a fifth and sixth probe batch, four more corpus records:
   most-derived field. An override by a GETTER (`override val kind: String
   get() = …`) was refused as overriding nothing; it is accepted, and a read
   through the base dispatches on the runtime class. Two more corpus records.
+
+## Round 17 — virtual properties both ways, `data` members over a supertype, UTF-16 order
+
+Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1. Each item below was a silent
+wrong answer or a stopped program; ten corpus records cover them, captured with
+`scripts/capture-parity.sh`.
+
+- **A stored `override val` over a GETTER** (`open val g: String get() = "G"`
+  overridden by `override val g = "H"`, or an interface's default getter
+  overridden by an implementor's stored property) still dispatched to the
+  getter: the subclass inherited the getter as a method and the dispatch index
+  sent every read there. A stored property now shadows a supertype getter of
+  the same name, and a call site whose static class has such a subtype keeps
+  the runtime class test with its field-read fallback.
+- **A `data class` under a supertype that overrides `toString`/`equals`/
+  `hashCode`** inherited them. Kotlin regenerates the three unless the
+  supertype's is `final`; `final override fun` is now parsed as such, kept by
+  a data subclass, and refused as an override target.
+- **`class Sub(x: Int) : Base(x * 2) { val y = x }`** read the base's stored
+  `x` instead of the constructor parameter: an inherited property that the
+  subclass shadows with a parameter or its own property is no longer bound
+  over it in the constructor.
+- **`String` `<`/`>`/`<=`/`>=`, `sorted`, `maxOrNull`, `sortedSetOf`**
+  compared UTF-8 bytes; they compare UTF-16 code units, as `String.compareTo`
+  does (`"￿" < "😀"` is `false`).
+- **`"%x"`/`"%o"`/`"%X"` of a negative `Int`** printed the 64-bit pattern
+  (`ffffffffffffffff` for `-1`); an `Int` prints at 32 bits, a `Long` at 64.
+- **`slice(range)` on a `List` or an array** faulted with a per-index message;
+  it is one `subList`/`copyOfRange` of the span, as the stdlib writes it, and
+  raises that call's fault. A per-index `slice` faults as the list's or array's
+  own `get` does.
+- **`sliceArray`**, **`prependIndent`**, **`Double.mod`**, and
+  **`SIZE_BITS`/`SIZE_BYTES`** on every primitive were unresolved.
+- **`Long.MIN_VALUE.floorDiv(-1L)`** panicked on overflow; it wraps, as the
+  JVM's `long` division does.

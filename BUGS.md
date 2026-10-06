@@ -124,12 +124,6 @@ the next round starts from a measurement rather than a guess.
 
 The `infix` row is a parser gap.
 
-`Double.MIN_VALUE` is absent deliberately and for a different reason: it is the
-shortest decimal that round-trips a subnormal, and this frontend carries every
-floating value as an `f64`, so it would print `5.0E-324` where Kotlin prints
-`4.9E-324`. Leaving it unresolved keeps that divergence out of running programs
-(see `primitive_const` in `src/compiler.rs`).
-
 ## `Regex` — what is not modelled
 
 `Regex` runs on `fancy-regex`, not `java.util.regex.Pattern`, and three parts of

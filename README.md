@@ -128,12 +128,12 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `f`/`F` suffix, rounded to 32 bits at the literal; and the companion constants
   `Int.MAX_VALUE`/`MIN_VALUE` (likewise `Long`/`Short`/`Byte`),
   `Double`/`Float` `MAX_VALUE`/`MIN_VALUE` and `POSITIVE_INFINITY`/
-  `NEGATIVE_INFINITY`/`NaN`.
+  `NEGATIVE_INFINITY`/`NaN`, and `SIZE_BITS`/`SIZE_BYTES` on every primitive.
 - **Strings** — literals with `\n`/`\t`/`\\`/`\"`/`\$` escapes and `$name` /
   `${expr}` templates; `+` concatenates when either side is a `String`.
   Raw `"""…"""` strings take no escapes, span lines and keep their templates;
-  `trimIndent`, `trimMargin`, `replaceIndent` and `replaceIndentByMargin` are
-  ports of the stdlib's `Indent.kt`, and `lines()` splits at `\r\n`, `\n`
+  `trimIndent`, `trimMargin`, `replaceIndent`, `replaceIndentByMargin` and
+  `prependIndent` are ports of the stdlib's `Indent.kt`, and `lines()` splits at `\r\n`, `\n`
   and a lone `\r`.
 - **Call arguments** — positional and named (`f(count = 3)`, `p.copy(y = 2)`)
   for user functions, constructors and the `data class` `copy`, with Kotlin's
@@ -287,7 +287,7 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `<` on `%n`/`%%` is `IllegalFormatFlagsException`. Numerically,
   `.coerceIn()`/`.coerceAtLeast()`/`.coerceAtMost()`, `.pow()`,
   `.absoluteValue`, `.roundToInt()`, `.mod()`/`.floorDiv()` (which round toward negative
-  infinity, narrowed to `Int` for an `Int` receiver), the IEEE classifiers
+  infinity, narrowed to `Int` for an `Int` receiver; `Double.mod` takes the divisor's sign), the IEEE classifiers
   `.isNaN()`/`.isInfinite()`/`.isFinite()`, and the unsigned 32-bit renderers
   `Integer.toBinaryString`/`toHexString`/`toOctalString` — which differ from
   `toString(radix)` only for a negative value (`Integer.toHexString(-1)` is

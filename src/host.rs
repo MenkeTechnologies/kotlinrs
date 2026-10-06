@@ -550,6 +550,14 @@ pub const KT_NLR_TAKE: u16 = 147;
 /// subNameIdx]`. Consulted by [`KT_OPER_VM`] when an operand reached the
 /// operator with no static type: `xs.fold(P(0)) { a, b -> a + b }`.
 pub const KT_OPER_REG: u16 = 148;
+/// `a < b` / `a > b` / `a <= b` / `a >= b` with a `String` operand — Kotlin's
+/// `String.compareTo`, which orders by UTF-16 CODE UNIT. The native string ops
+/// order a Rust `str` by UTF-8 byte, and the two disagree exactly where a
+/// character in `U+E000..=U+FFFF` meets a supplementary one: `"\u{ffff}" <
+/// "😀"` is `false` in Kotlin (`0xFFFF` against the high surrogate `0xD83D`)
+/// and `true` by bytes. Stack: `[a, b]`; the payload picks the operator
+/// (0 `<`, 1 `>`, 2 `<=`, 3 `>=`); pushes a `Bool`.
+pub const KT_STR_ORDER: u16 = 149;
 /// Builtin id for `throw e`: pops the throwable and makes it the in-flight
 /// exception. Returns `Undef` (a `throw` expression's value is never observed).
 pub const KT_EXC_THROW: u16 = 111;
@@ -3370,6 +3378,60 @@ fn arraycopy_kind(desc: &str) -> &'static str {
     }
 }
 
+/// The fault `Array.copyOfRange(from, to)` raises over an array of `len`
+/// elements, or `None` when the span is in bounds: the stdlib's own `toIndex`
+/// check, then `Arrays.copyOfRange`'s crossed-bounds check, then
+/// `System.arraycopy`'s on the source index — in that order.
+fn copy_range_fault(desc: &str, from: i64, to: i64, len: usize) -> Option<String> {
+    let len = len as i64;
+    if to > len {
+        return Some(format!(
+            "java.lang.IndexOutOfBoundsException: toIndex ({to}) is greater than size ({len})."
+        ));
+    }
+    if from > to {
+        return Some(format!("java.lang.IllegalArgumentException: {from} > {to}"));
+    }
+    if from < 0 {
+        return Some(format!(
+            "java.lang.ArrayIndexOutOfBoundsException: arraycopy: source index {from} \
+             out of bounds for {}[{len}]",
+            arraycopy_kind(desc)
+        ));
+    }
+    None
+}
+
+/// The fault `List.subList(from, to)` raises over a list of `len` elements, or
+/// `None` when the span is in bounds. `AbstractList.subListRangeCheck` reports
+/// ONE bound per fault, in this order, and a crossed pair is not out of bounds
+/// at all — it is an `IllegalArgumentException` naming both.
+fn sublist_fault(from: i64, to: i64, len: usize) -> Option<String> {
+    if from < 0 {
+        return Some(format!("java.lang.IndexOutOfBoundsException: fromIndex = {from}"));
+    }
+    if to > len as i64 {
+        return Some(format!("java.lang.IndexOutOfBoundsException: toIndex = {to}"));
+    }
+    if from > to {
+        return Some(format!(
+            "java.lang.IllegalArgumentException: fromIndex({from}) > toIndex({to})"
+        ));
+    }
+    None
+}
+
+/// `(first, last)` when `v` is an `IntRange` — not a stepped or reversed
+/// progression, which the members that take one read as a plain
+/// `Iterable<Int>`.
+fn int_range_span(v: &Value) -> Option<(i64, i64)> {
+    with_obj(v, |o| match o {
+        HeapObj::Range(r) if !r.progression && !r.is_char => Some((r.first, r.end)),
+        _ => None,
+    })
+    .flatten()
+}
+
 /// `KT_ARRAY_INIT` — see [`KT_ARRAY_INIT`]. An empty `desc` means the generic
 /// `Array(n) { … }`, whose descriptor comes from the produced elements.
 fn b_array_init(vm: &mut VM, _argc: u8) -> Value {
@@ -4174,6 +4236,17 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
                 vm.push(v);
             }
         }
+        KT_STR_ORDER => {
+            let b = vm.pop().to_str();
+            let a = vm.pop().to_str();
+            let ord = utf16_cmp(&a, &b);
+            vm.push(Value::Bool(match arg {
+                0 => ord.is_lt(),
+                1 => ord.is_gt(),
+                2 => ord.is_le(),
+                _ => ord.is_ge(),
+            }));
+        }
         KT_LATEINIT => {
             let name = vm.pop().to_str();
             let obj = vm.pop();
@@ -4854,10 +4927,13 @@ fn math_call(name: &str, args: &[Value]) -> Result<Value, String> {
             if y == 0 {
                 return Err("java.lang.ArithmeticException: / by zero".to_string());
             }
+            // Wrapping, as the JVM's `long` division is: `Long.MIN_VALUE`
+            // floor-divided by -1 is itself, not an overflow.
+            let q = x.wrapping_div_euclid(y) - i64::from(x.wrapping_rem_euclid(y) != 0 && y < 0);
             Ok(Value::Int(if name == "floorDiv" {
-                x.div_euclid(y) - i64::from(x.rem_euclid(y) != 0 && y < 0)
+                q
             } else {
-                x - y * (x.div_euclid(y) - i64::from(x.rem_euclid(y) != 0 && y < 0))
+                x.wrapping_sub(y.wrapping_mul(q))
             }))
         }
         // `kotlin.math.sign` — the SIGN as a `Double`, which keeps the sign of a
@@ -7024,9 +7100,17 @@ fn sort_vm(vm: &mut VM, items: &mut [Value], descending: bool) {
     }
 }
 
+/// `String.compareTo`'s order: lexicographic over UTF-16 code units. Rust's
+/// `str` order is over UTF-8 bytes, which is the same order except where a
+/// character in `U+E000..=U+FFFF` meets a supplementary one — see
+/// [`KT_STR_ORDER`].
+pub fn utf16_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    a.encode_utf16().cmp(b.encode_utf16())
+}
+
 fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
     match (a, b) {
-        (Value::Str(x), Value::Str(y)) => x.cmp(y),
+        (Value::Str(x), Value::Str(y)) => utf16_cmp(x, y),
         // Every enum is `Comparable` by DECLARATION order, which is exactly what
         // `ordinal` records — so `sorted()` on a `List<E>` restores the order the
         // constants were written in, whatever their names sort like.
@@ -8579,9 +8663,23 @@ fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
             // kotlinrs builds.
             'n' => "\n".to_string(),
             'd' => format!("{}", num_i64(&arg)),
-            'x' => format!("{:x}", num_i64(&arg)),
-            'X' => format!("{:X}", num_i64(&arg)),
-            'o' => format!("{:o}", num_i64(&arg)),
+            // `%x`/`%o` print a NEGATIVE value as its two's-complement bit
+            // pattern at the argument's own width. A `Long` reaches a vararg
+            // boxed, so an unboxed integer is an `Int`: `"%x".format(-1)` is
+            // `ffffffff`, `"%x".format(-1L)` sixteen `f`s.
+            'x' | 'X' | 'o' => {
+                let n = num_i64(&arg);
+                let bits = if i64_box(&arg).is_some() {
+                    n as u64
+                } else {
+                    u64::from(n as i32 as u32)
+                };
+                match conv {
+                    'x' => format!("{bits:x}"),
+                    'X' => format!("{bits:X}"),
+                    _ => format!("{bits:o}"),
+                }
+            }
             // `num_f64` throughout: a boxed `Float` argument is a `Value::Obj`,
             // and `to_float` would format its handle.
             'f' => format_fixed(num_f64(&arg), prec.unwrap_or(6)),
@@ -9632,6 +9730,28 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
                 .unwrap_or_else(|| "|".into());
             kotlin_replace_indent_by_margin(s, "", &margin).map(Value::str)
         }
+        // Indent.kt's `prependIndent`: a non-blank line gains `indent`; a blank
+        // one becomes `indent` when it is SHORTER (in UTF-16 units) and is kept
+        // as it was otherwise.
+        (Value::Str(s), "prependIndent") if args.len() <= 1 => {
+            let indent = args.first().map(|_| arg_str(args, 0));
+            let indent = indent.as_deref().unwrap_or("    ");
+            let blank = |l: &str| kotlin_trim(l, true, true).is_empty();
+            let units = |l: &str| l.encode_utf16().count();
+            let out: Vec<String> = kotlin_lines(s)
+                .into_iter()
+                .map(|line| {
+                    if !blank(line) {
+                        format!("{indent}{line}")
+                    } else if units(line) < units(indent) {
+                        indent.to_string()
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect();
+            Ok(Value::str(out.join("\n")))
+        }
         (Value::Str(s), "replaceIndentByMargin") => {
             let indent = args.first().map(|_| arg_str(args, 0)).unwrap_or_default();
             let margin = args
@@ -9984,6 +10104,19 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
             "floorMod",
             &[recv.clone(), args.first().cloned().unwrap_or(Value::Int(0))],
         ),
+        // `Double.mod(Double)` — Kotlin's `val r = this % other; if (r != 0.0 &&
+        // r.sign != other.sign) r + other else r`, so the result takes the
+        // DIVISOR's sign: `(-5.0).mod(3.0)` is 1.0 where `-5.0 % 3.0` is -2.0.
+        (Value::Float(x), "mod") => {
+            let other = args.first().map(num_f64).unwrap_or(f64::NAN);
+            let r = x % other;
+            let sign = |v: f64| if v == 0.0 || v.is_nan() { v } else { v.signum() };
+            Ok(Value::Float(if r != 0.0 && sign(r) != sign(other) {
+                r + other
+            } else {
+                r
+            }))
+        }
         // `Int.floorDiv(Int)` — the quotient rounded toward NEGATIVE infinity,
         // `mod`'s partner: `(-7).floorDiv(2)` is -4 where `-7 / 2` is -3.
         (Value::Int(_), "floorDiv") => math_call(
@@ -11865,23 +11998,68 @@ fn sequence_member(
         // and picks those positions, where `subList(from, to)` takes two bounds.
         // Sharing an arm read the range as `from` and dropped the upper bound,
         // so `slice(0..1)` answered the whole receiver.
-        "slice" => {
-            let idx = args.first().map(sequence_items).unwrap_or_default();
+        //
+        // The stdlib writes the `IntRange` overload as ONE span copy —
+        // `subList(start, endInclusive + 1)` on a `List`, `copyOfRange` on an
+        // array — so a bad range raises that call's fault, naming the span's
+        // END. Every other index collection is one `get` per index and faults
+        // as that read does.
+        "slice" if args.len() == 1 => {
+            if let Some((first, last)) = int_range_span(&args[0]) {
+                if first > last {
+                    return Some(Ok(alloc_ro_list(Vec::new())));
+                }
+                let to = last.wrapping_add(1);
+                let fault = if kind == SeqKind::Array {
+                    copy_range_fault(&own_array_desc(recv, items), first, to, items.len())
+                } else {
+                    sublist_fault(first, to, items.len())
+                };
+                if let Some(e) = fault {
+                    return Some(Err(e));
+                }
+                return Some(Ok(alloc_ro_list(
+                    items[first as usize..to as usize].to_vec(),
+                )));
+            }
+            let idx = sequence_items(&args[0]);
             let mut out = Vec::with_capacity(idx.len());
             for i in idx {
                 let i = i.to_int();
                 match usize::try_from(i).ok().and_then(|i| items.get(i)) {
                     Some(v) => out.push(v.clone()),
-                    None => {
-                        return Some(Err(format!(
-                            "java.lang.IndexOutOfBoundsException: \
-                             Index: {i}, Size: {}",
-                            items.len()
-                        )))
-                    }
+                    None => return Some(Err(index_fault(kind, recv, i, items.len()))),
                 }
             }
             return Some(Ok(alloc_ro_list(out)));
+        }
+        // `sliceArray` — `slice`'s array-valued twin: an `IntRange` is
+        // `copyOfRange(start, endInclusive + 1)` (an empty range copies
+        // nothing), any other index collection one array read per index.
+        "sliceArray" if kind == SeqKind::Array && args.len() == 1 => {
+            let desc = own_array_desc(recv, items);
+            let out = match int_range_span(&args[0]) {
+                Some((first, last)) if first > last => Vec::new(),
+                Some((first, last)) => {
+                    let to = last.wrapping_add(1);
+                    if let Some(e) = copy_range_fault(&desc, first, to, items.len()) {
+                        return Some(Err(e));
+                    }
+                    items[first as usize..to as usize].to_vec()
+                }
+                None => {
+                    let mut out = Vec::new();
+                    for i in sequence_items(&args[0]) {
+                        let i = i.to_int();
+                        match usize::try_from(i).ok().and_then(|i| items.get(i)) {
+                            Some(v) => out.push(v.clone()),
+                            None => return Some(Err(index_fault(kind, recv, i, items.len()))),
+                        }
+                    }
+                    out
+                }
+            };
+            return Some(Ok(alloc(HeapObj::Array { items: out, desc })));
         }
         "subList" => {
             let from = args.first().map(|v| v.to_int()).unwrap_or(0);
@@ -11889,23 +12067,8 @@ fn sequence_member(
                 .get(1)
                 .map(|v| v.to_int())
                 .unwrap_or(items.len() as i64);
-            // `AbstractList.subListRangeCheck` reports ONE bound per fault, in
-            // this order, and a crossed pair is not out of bounds at all — it
-            // is an `IllegalArgumentException` naming both.
-            if from < 0 {
-                return Some(Err(format!(
-                    "java.lang.IndexOutOfBoundsException: fromIndex = {from}"
-                )));
-            }
-            if to > items.len() as i64 {
-                return Some(Err(format!(
-                    "java.lang.IndexOutOfBoundsException: toIndex = {to}"
-                )));
-            }
-            if from > to {
-                return Some(Err(format!(
-                    "java.lang.IllegalArgumentException: fromIndex({from}) > toIndex({to})"
-                )));
+            if let Some(e) = sublist_fault(from, to, items.len()) {
+                return Some(Err(e));
             }
             return Some(Ok(alloc(HeapObj::List(
                 items[from as usize..to as usize].to_vec(),
@@ -12310,23 +12473,9 @@ fn sequence_member(
         }
         "copyOfRange" if kind == SeqKind::Array && args.len() == 2 => {
             let desc = own_array_desc(recv, items);
-            let (from, to, len) = (args[0].to_int(), args[1].to_int(), items.len() as i64);
-            if to > len {
-                return Some(Err(format!(
-                    "java.lang.IndexOutOfBoundsException: toIndex ({to}) is greater than size ({len})."
-                )));
-            }
-            if from > to {
-                return Some(Err(format!(
-                    "java.lang.IllegalArgumentException: {from} > {to}"
-                )));
-            }
-            if from < 0 {
-                return Some(Err(format!(
-                    "java.lang.ArrayIndexOutOfBoundsException: arraycopy: source index {from} \
-                     out of bounds for {}[{len}]",
-                    arraycopy_kind(&desc)
-                )));
+            let (from, to) = (args[0].to_int(), args[1].to_int());
+            if let Some(e) = copy_range_fault(&desc, from, to, items.len()) {
+                return Some(Err(e));
             }
             let out = items[from as usize..to as usize].to_vec();
             return Some(Ok(alloc(HeapObj::Array { items: out, desc })));

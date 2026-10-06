@@ -265,6 +265,10 @@ pub struct FunDecl {
     /// member the base left final, and a redeclaration that omits `override`.
     pub is_open: bool,
     pub is_override: bool,
+    /// `final override fun` — closes an override to further overriding. Read
+    /// where finality changes a result: a `data class` keeps a supertype's
+    /// `final` `toString`/`equals`/`hashCode` instead of generating its own.
+    pub is_final: bool,
 }
 
 /// Whether a primary-constructor parameter also declares a stored property.

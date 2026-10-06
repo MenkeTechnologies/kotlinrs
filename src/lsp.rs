@@ -1247,7 +1247,7 @@ const CORPUS: &[Entry] = &[
         "trim",
         "String Members",
         "String.trim(): String",
-        "Strips leading and trailing whitespace, by Unicode's whitespace definition. There is no predicate or char-set overload, and no `trimStart`/`trimEnd`/`trimIndent`.",
+        "Strips leading and trailing whitespace by Kotlin's `isWhitespace`. `trim { pred }` trims by a predicate and `trim(vararg chars)` by a character set; `trimStart`/`trimEnd` take the same three forms one-sided.",
         "println(\"  hi  \".trim())   // hi",
     ),
     (

@@ -34,7 +34,7 @@ use crate::host::{
     KT_MATH, KT_METHOD_VM, KT_NEW, KT_NLR_MATCH, KT_NLR_RAISE, KT_NLR_TAKE, KT_NOTNULL,
     KT_OBJEQ_VM, KT_OBSERVE, KT_OPER_REG, KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN,
     KT_RANDOM, KT_RANGE, KT_RANGE_STEP, KT_REIFIED, KT_REIFY, KT_RESULT_HOF, KT_RUN_CATCHING,
-    KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG,
+    KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_STR_ORDER, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG,
     KT_YIELD,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
@@ -1365,8 +1365,10 @@ fn check_modifiers(
                 ));
             }
             (true, Some((owner, base))) => {
-                let overridable =
-                    owner.is_interface || base.is_abstract || base.is_open || base.is_override;
+                let overridable = owner.is_interface
+                    || base.is_abstract
+                    || base.is_open
+                    || (base.is_override && !base.is_final);
                 if !overridable {
                     return Err(format!(
                         "class {}: `{}` in {} is final and cannot be overridden (line {})",
@@ -1378,6 +1380,34 @@ fn check_modifiers(
         }
     }
     Ok(())
+}
+
+/// Whether `data class` `cd` generates its own `m` rather than inheriting the
+/// one supertype `owner` declares. Kotlin derives `toString`/`equals`/
+/// `hashCode` for a data class unless the class body declares the member
+/// itself or the supertype's is `final` — an inherited `override` is not
+/// enough, so `data class Cat(…) : Animal(…)` prints `Cat(name=…)` even when
+/// `Animal` overrides `toString`.
+fn data_regenerates(cd: &ClassDecl, owner: &ClassDecl, m: &FunDecl) -> bool {
+    cd.is_data
+        && owner.name != cd.name
+        && !m.is_final
+        && match m.name.as_str() {
+            "toString" | "hashCode" => m.params.is_empty(),
+            "equals" => m.params.len() == 1,
+            _ => false,
+        }
+}
+
+/// The properties `d` gives STORAGE: its `val`/`var` constructor parameters and
+/// its body properties. A property with a custom getter is not among them — it
+/// lowers to a zero-argument method.
+fn stored_prop_names(d: &ClassDecl) -> impl Iterator<Item = &str> {
+    d.params
+        .iter()
+        .filter(|p| p.kind != PropKind::None)
+        .map(|p| p.name.as_str())
+        .chain(d.obj_props.iter().map(|p| p.name.as_str()))
 }
 
 /// Index every declared `class`/`object`/`interface`: its linearized ancestry,
@@ -1626,12 +1656,26 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
 
         // Methods, own first: the class's own declaration shadows an inherited
         // one, and an earlier-listed supertype shadows a later one.
+        //
+        // A STORED property shadows a supertype's getter of the same name the
+        // way a method would: `override val name = "sq"` over an interface's
+        // `val name get() = "shape"` leaves the instance with storage and no
+        // getter to call. And a `data class` regenerates the `Any` members a
+        // supertype overrode without closing (see [`data_regenerates`]).
         let mut methods: HashMap<String, FnSig> = HashMap::new();
+        let mut stored: HashSet<&str> = HashSet::new();
         for anc in &mro {
             let Some(d) = by_name.get(anc.as_str()) else {
                 continue;
             };
+            stored.extend(stored_prop_names(d));
             for m in &d.methods {
+                if m.params.is_empty() && stored.contains(m.name.as_str()) {
+                    continue;
+                }
+                if data_regenerates(cd, d, m) {
+                    continue;
+                }
                 methods
                     .entry(m.name.clone())
                     .or_insert_with(|| FnSig::of(m));
@@ -1696,12 +1740,26 @@ fn build_method_index(
         if meta.is_interface || meta.is_abstract {
             continue;
         }
+        let Some(own) = by_name.get(tag.as_str()) else {
+            continue;
+        };
         let mut seen: HashSet<&str> = HashSet::new();
+        // A stored property reserves its name against a supertype's getter, and
+        // a data class against the `Any` members it regenerates, exactly as in
+        // `build_class_meta`.
+        let mut stored: HashSet<&str> = HashSet::new();
         for owner in &meta.mro {
             let Some(d) = by_name.get(owner.as_str()) else {
                 continue;
             };
+            stored.extend(stored_prop_names(d));
             for m in &d.methods {
+                if m.params.is_empty() && stored.contains(m.name.as_str()) {
+                    continue;
+                }
+                if data_regenerates(own, d, m) {
+                    continue;
+                }
                 // An `abstract` declaration reserves the name so a later
                 // supertype's stale implementation cannot shadow the override
                 // that a nearer type supplied.
@@ -2107,11 +2165,26 @@ impl Compiler {
             // instance does not exist yet, so there is no `this` to read them
             // through. The base instance is left back on the stack for the
             // `KT_EXTEND` at the end.
-            let inherited = meta.props.len() - meta.own_props.len();
-            if inherited > 0 {
+            //
+            // Not every name in the record, though: one this class redeclares
+            // (`override val name`) or takes as a constructor parameter already
+            // means that declaration inside the constructor, and binding the
+            // base's value over it would shadow it — `class Sub(x: Int) :
+            // Base(x * 2) { val y = x }` reads the PARAMETER.
+            let inherited: Vec<PropMeta> = meta
+                .props
+                .iter()
+                .take(meta.props.len() - meta.own_props.len())
+                .filter(|p| {
+                    !meta.own_props.iter().any(|o| o.name == p.name)
+                        && !meta.ctor_params.iter().any(|c| c.name == p.name)
+                })
+                .cloned()
+                .collect();
+            if !inherited.is_empty() {
                 let base_slot = sc.declare_obj("$base", Type::Obj, false, Some(base.clone()));
                 self.b.emit(Op::SetSlot(base_slot), cd.line);
-                for p in &meta.props[..inherited] {
+                for p in &inherited {
                     self.b.emit(Op::GetSlot(base_slot), cd.line);
                     let nidx = self.b.add_constant(Value::str(p.name.clone()));
                     self.b.emit(Op::LoadConst(nidx), cd.line);
@@ -5214,14 +5287,15 @@ impl Compiler {
                         self.expand_args(&format!("method {name} on {cls}"), &sig.params, args)?;
                     let cands = self.candidates(Some(cls), name, sig.arity);
                     if !cands.is_empty() {
-                        self.emit_virtual_call(
-                            sc,
-                            recv,
-                            name,
-                            &full,
-                            Targets::statik(&cands),
-                            line,
-                        )?;
+                        // A subclass that overrides this getter with STORAGE
+                        // has no method to land in, so the tag test — and its
+                        // host field-read fallback — must stay.
+                        let targets = if sig.arity == 0 && self.stored_override_below(cls, name) {
+                            Targets::dynamic(&cands)
+                        } else {
+                            Targets::statik(&cands)
+                        };
+                        self.emit_virtual_call(sc, recv, name, &full, targets, line)?;
                         // The result's width has to be the one `Compiler::infer`
                         // reports for the same node, or a type-variable result
                         // would narrow on one path and not the other.
@@ -5411,6 +5485,19 @@ impl Compiler {
     /// static class `cls` may land in: every instantiable type that is `cls` or
     /// a subtype of it and implements `name` at the requested arity. `cls` of
     /// `None` means "receiver type unknown" — every implementor is a candidate.
+    /// Whether some instantiable subtype of `cls` stores a property `name` in
+    /// place of the getter `cls` sees — `override val tag = "x"` over an
+    /// `open val tag: String get() = …`.
+    fn stored_override_below(&self, cls: &str, name: &str) -> bool {
+        self.classes.values().any(|m| {
+            !m.is_interface
+                && !m.is_abstract
+                && m.mro.iter().any(|a| a == cls)
+                && !m.methods.contains_key(name)
+                && m.prop(name).is_some()
+        })
+    }
+
     fn candidates(&self, cls: Option<&str>, name: &str, argc: usize) -> Vec<(String, String)> {
         let Some(all) = self.method_index.get(name) else {
             return Vec::new();
@@ -6766,20 +6853,23 @@ impl Compiler {
                 self.b.emit(if both_str { Op::StrNe } else { Op::NumNe }, 0);
                 Type::Boolean
             }
-            BinOp::Lt => {
-                self.b.emit(if str_cmp { Op::StrLt } else { Op::NumLt }, 0);
-                Type::Boolean
-            }
-            BinOp::Gt => {
-                self.b.emit(if str_cmp { Op::StrGt } else { Op::NumGt }, 0);
-                Type::Boolean
-            }
-            BinOp::Le => {
-                self.b.emit(if str_cmp { Op::StrLe } else { Op::NumLe }, 0);
-                Type::Boolean
-            }
-            BinOp::Ge => {
-                self.b.emit(if str_cmp { Op::StrGe } else { Op::NumGe }, 0);
+            // A `String` orders by UTF-16 code unit — see `KT_STR_ORDER` — which
+            // the native string ops, ordering UTF-8 bytes, do not.
+            BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
+                let (code, native) = match op {
+                    BinOp::Lt => (0, Op::NumLt),
+                    BinOp::Gt => (1, Op::NumGt),
+                    BinOp::Le => (2, Op::NumLe),
+                    _ => (3, Op::NumGe),
+                };
+                self.b.emit(
+                    if str_cmp {
+                        Op::Extended(KT_STR_ORDER, code)
+                    } else {
+                        native
+                    },
+                    0,
+                );
                 Type::Boolean
             }
             BinOp::And | BinOp::Or | BinOp::RefEq | BinOp::RefNe => {
@@ -11247,6 +11337,18 @@ fn primitive_const(ty: &str, name: &str) -> Option<(Value, Type)> {
         // pair are ordinary `Char`s below it.
         ("Char", "MIN_VALUE") => (crate::host::char_of(0), Type::Char),
         ("Char", "MAX_VALUE") => (crate::host::char_of(0xFFFF), Type::Char),
+        // `SIZE_BITS`/`SIZE_BYTES` — an `Int` on every primitive that has them.
+        (_, "SIZE_BITS" | "SIZE_BYTES") => {
+            let bits = match ty {
+                "Byte" => 8,
+                "Short" | "Char" => 16,
+                "Int" | "Float" => 32,
+                "Long" | "Double" => 64,
+                _ => return None,
+            };
+            let n = if name == "SIZE_BITS" { bits } else { bits / 8 };
+            (Value::Int(n), Type::Int)
+        }
         _ => return None,
     };
     Some(v)
