@@ -173,6 +173,9 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   are equal under it. `Char.MIN_VALUE`/`MAX_VALUE`
   bound the UTF-16 code unit, so the top is `￿` and not the highest code
   point.
+- **User `infix fun`s** — `a name b` for any `infix fun` the program declares
+  (member or extension, declared before or after the use), on the left
+  operand's line as Kotlin's grammar requires.
 - **Lazy sequences** — `sequence { yield(…) }` is a real coroutine: the block
   SUSPENDS at every `yield`, its frames and operand stack are parked off the VM
   and put back on the next pull, so `sequence { while (true) yield(i++) }
@@ -182,8 +185,10 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `x as T`, including from inside a lambda in the body and with one reified
   parameter passed on to another.
 - **Delegated properties** — `by lazy`, a user delegate declaring
-  `operator fun getValue`/`setValue` (on a class property or a local), and
-  `Delegates.observable`/`vetoable`.
+  `operator fun getValue`/`setValue` (on a class, top-level or local
+  property, handed the property's `KProperty` so `property.name` reads), and
+  `Delegates.observable`/`vetoable` on a top-level or local property (a class
+  property still refuses them; see BUGS.md).
 - **Property accessors with a backing field** — `var x = 0 get() = … set(v)
   { field = … }` on a class property, `field` included; a bodyless `private
   set` is accepted. The accessors compile as methods of the owner and the

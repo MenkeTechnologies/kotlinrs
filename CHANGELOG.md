@@ -1163,3 +1163,23 @@ Ten more corpus records, each from a probe diffed against `kotlinc`:
 - **`ByteArray`/`ShortArray`/`LongArray`/`FloatArray`** constructors and
   `byteArrayOf`/`shortArrayOf`; `String.toByteArray()`/`encodeToByteArray()`,
   `ByteArray.decodeToString()` and `String(bytes)` (UTF-8).
+
+## Round 18 — user infix calls, delegates outside a class
+
+Each record below was captured with `scripts/capture-parity.sh` (kotlinc 2.4.20
+on JRE 21.0.12.1) from a probe that diverged:
+
+- **`a pow b` over a user `infix fun`** was a parse error; any `infix fun` the
+  program declares (member or extension, before or after its use) is now an
+  infix call when its name sits on the left operand's line.
+- **`fun Int.pow(…)`** was `unresolved reference: pow` without a
+  `kotlin.math` import: the import gate for the math extensions now lets a
+  program's own extension of that name resolve.
+- **A top-level `var x by D()`** stored the delegate and never called
+  `getValue`/`setValue` — `x = 5; x + 1` printed `6` with no accessor run.
+  Reads and writes now go through the delegate with a null `thisRef`.
+- **A local or top-level delegate's `property`** was null, so `property.name`
+  failed to compile; it is the property's `KProperty`, as a class property's
+  already was, and `Delegates.observable`/`vetoable` handlers receive it too.
+- **A top-level `by Delegates.observable`/`vetoable`** silently became a plain
+  variable: the handler never ran and the veto never applied.

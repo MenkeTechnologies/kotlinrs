@@ -34,8 +34,8 @@ use crate::host::{
     KT_MATH, KT_METHOD_VM, KT_NEW, KT_NLR_MATCH, KT_NLR_RAISE, KT_NLR_TAKE, KT_NOTNULL,
     KT_OBJEQ_VM, KT_OBSERVE, KT_OPER_REG, KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN,
     KT_RANDOM, KT_RANGE, KT_RANGE_STEP, KT_REIFIED, KT_REIFY, KT_RESULT_HOF, KT_RUN_CATCHING,
-    KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_STR_ORDER, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG,
-    KT_YIELD,
+    KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_STR_ORDER, KT_TOSTRING_REG, KT_TO_STRING,
+    KT_TYPE_REG, KT_YIELD,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
@@ -791,12 +791,22 @@ fn body_prop_class(p: &BodyProp, by_name: &HashMap<&str, &ClassDecl>) -> Option<
 /// Only a direct constructor call names it — anything else leaves the delegate
 /// unresolvable at compile time, which is reported where the access is emitted
 /// rather than here.
+///
+/// `Delegates.observable`/`vetoable` answer [`HOST_DELEGATE`]: a stdlib factory
+/// names no user class, and the delegate it builds is the host's own
+/// `ObservableProperty`, read and written through `KT_DELEG_GET`/`KT_DELEG_SET`.
 fn delegate_class_of(init: &Expr) -> Option<String> {
     match init {
         Expr::Call { name, .. } => Some(name.clone()),
+        _ if is_observable_delegate(init) => Some(HOST_DELEGATE.to_string()),
         _ => None,
     }
 }
+
+/// The pseudo-class [`delegate_class_of`] records for a delegate the host
+/// supplies rather than a user class. `$` cannot start a Kotlin identifier, so
+/// it never names a declared class.
+const HOST_DELEGATE: &str = "$ObservableProperty";
 
 /// The `KProperty` argument a delegated access passes: a one-field data
 /// instance carrying the property's name, which is what `property.name` reads.
@@ -1457,11 +1467,18 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
         // A `by <delegate>` whose class cannot be named at compile time has no
         // `getValue` to call. Rejected here rather than left to become a plain
         // stored field, which would silently print the DELEGATE where the
-        // property's value belongs. `kotlin.properties.Delegates.observable` /
-        // `vetoable` land here: they are stdlib factory calls, not constructor
-        // calls, and no host-side delegate object backs them yet.
+        // property's value belongs.
+        //
+        // `kotlin.properties.Delegates.observable` / `vetoable` are still
+        // rejected on a CLASS property although the access lowering below
+        // handles their [`HOST_DELEGATE`] (as it does for a local and a
+        // top-level property): tests/lang.rs
+        // `property_delegate_without_a_resolvable_class_is_rejected` pins this
+        // rejection, and changing a pinned expectation is the owner's call.
         for p in cd.obj_props.iter().filter(|p| p.delegate) {
-            if !delegate_class_of(&p.init).is_some_and(|c| by_name.contains_key(c.as_str())) {
+            if !delegate_class_of(&p.init)
+                .is_some_and(|c| c != HOST_DELEGATE && by_name.contains_key(c.as_str()))
+            {
                 return Err(format!(
                     "class {}: property {} delegates to a value whose class is not a \
                      user class declaring `operator fun getValue`; only that form of \
@@ -1983,6 +2000,23 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         let t = c.compile_expr(&mut sc, &p.init)?;
         if p.lazy {
             c.b.emit(Op::Extended(KT_LAZY_NEW, 0), 0);
+        } else if p.delegate {
+            // The global holds the DELEGATE; the property's type is what
+            // `getValue` answers, never the delegate's own.
+            let dc = c.globals[&p.name].delegate.clone();
+            if !dc.as_deref().is_some_and(|d| {
+                d == HOST_DELEGATE
+                    || c.classes
+                        .get(d)
+                        .is_some_and(|m| m.methods.contains_key("getValue"))
+            }) {
+                return Err(format!(
+                    "top-level {}: delegates to a value whose class is not a user class \
+                     declaring `operator fun getValue`; only that form of `by` is \
+                     supported (besides `by lazy`)",
+                    p.name
+                ));
+            }
         } else if c.globals[&p.name].ty == Type::Unknown {
             // An unannotated global takes the initializer's type.
             if let Some(g) = c.globals.get_mut(&p.name) {
@@ -3001,12 +3035,7 @@ impl Compiler {
                     };
                     let dc = sc.class_of(name);
                     self.b.emit(Op::GetSlot(slot), 0);
-                    // A user delegate's `setValue` takes `(thisRef, property,
-                    // value)`; the host one takes the value alone.
-                    if dc.is_some() {
-                        self.b.emit(Op::LoadUndef, 0);
-                        self.b.emit(Op::LoadUndef, 0);
-                    }
+                    self.emit_receiverless_delegate_args(name);
                     self.compile_expr(sc, &full)?;
                     self.emit_delegate_set(dc)?;
                     return Ok(());
@@ -3052,8 +3081,17 @@ impl Compiler {
                                 r: Box::new(value.clone()),
                             },
                         };
-                        self.compile_expr(sc, &full)?;
                         let g = self.b.add_name(name);
+                        // A delegated top-level property: the global holds the
+                        // delegate, and the write is its `setValue(null,
+                        // property, value)`.
+                        if p.delegate.is_some() {
+                            self.b.emit(Op::GetVar(g), 0);
+                            self.emit_receiverless_delegate_args(name);
+                            self.compile_expr(sc, &full)?;
+                            return self.emit_delegate_set(p.delegate);
+                        }
+                        self.compile_expr(sc, &full)?;
                         self.b.emit(Op::SetVar(g), 0);
                         return Ok(());
                     }
@@ -3690,7 +3728,7 @@ impl Compiler {
                     // one is handed carries only reflection this frontend has no
                     // value for.
                     if sc.is_delegated(name) {
-                        self.emit_delegate_get(sc.class_of(name))?;
+                        self.emit_delegate_get(sc.class_of(name), name)?;
                     }
                     return Ok(sc.ty(name));
                 }
@@ -3741,6 +3779,9 @@ impl Compiler {
                     self.b.emit(Op::GetVar(g), 0);
                     if p.lazy {
                         self.b.emit(Op::CallBuiltin(KT_LAZY_GET, 0), 0);
+                    }
+                    if p.delegate.is_some() {
+                        self.emit_delegate_get(p.delegate, name)?;
                     }
                     if self.lateinit_globals.contains(name) {
                         self.emit_lateinit_check(name, 0);
@@ -4597,6 +4638,10 @@ impl Compiler {
                     alias_rt = rt;
                     alias_rt.as_str()
                 }
+                // No import puts the `kotlin.math` extension in scope, so a
+                // program's own extension of that name on the receiver's type
+                // is the only candidate and resolves — `infix fun Int.pow(…)`.
+                None if self.resolve_ext(sc, recv, name).is_some() => name,
                 None => return Err(format!("unresolved reference: {name}")),
             }
         };
@@ -5325,15 +5370,14 @@ impl Compiler {
                         // A delegated property has no storage: the read is the
                         // delegate's `getValue(thisRef, property)`.
                         if let Some(dc) = &p.delegate {
-                            if !self.classes.contains_key(dc) {
+                            if dc != HOST_DELEGATE && !self.classes.contains_key(dc) {
                                 return Err(format!(
                                     "property {name}: delegate {dc} is not a class declaring \
                                      `operator fun getValue`"
                                 ));
                             }
                             self.emit_delegate_head(sc, recv, name, line)?;
-                            let idx = self.b.add_name(&method_sub_name(dc, "getValue"));
-                            self.b.emit(Op::Call(idx, 3), line);
+                            self.emit_delegate_get_call(Some(dc), line);
                             return Ok(p.ty);
                         }
                         // Resolved before the receiver is lowered, so the answer
@@ -6321,11 +6365,7 @@ impl Compiler {
         self.b.emit(Op::LoadConst(fidx), line);
         self.b.emit(Op::Extended(KT_GETFIELD, 0), line); // [delegate]
         self.compile_expr(sc, recv)?; // [delegate, thisRef]
-        let midx = self.b.add_constant(Value::str(kproperty_meta()));
-        self.b.emit(Op::LoadConst(midx), line);
-        let nidx = self.b.add_constant(Value::str(name.to_string()));
-        self.b.emit(Op::LoadConst(nidx), line);
-        self.b.emit(Op::Extended(KT_NEW, 1), line); // [delegate, thisRef, property]
+        self.emit_kproperty(name, line); // [delegate, thisRef, property]
         Ok(())
     }
 
@@ -6389,7 +6429,7 @@ impl Compiler {
             .and_then(|c| self.classes.get(&c).and_then(|m| m.prop(name)).cloned())
             .and_then(|p| p.delegate)
         {
-            if !self.classes.contains_key(&dc) {
+            if dc != HOST_DELEGATE && !self.classes.contains_key(&dc) {
                 return Err(format!(
                     "property {name}: delegate {dc} is not a class declaring \
                      `operator fun setValue`"
@@ -6398,10 +6438,8 @@ impl Compiler {
             self.emit_delegate_head(sc, recv, name, 0)?;
             let store = self.compound_value(recv, name, None, op, value);
             self.compile_expr(sc, &store)?; // [delegate, thisRef, property, value]
-            let idx = self.b.add_name(&method_sub_name(&dc, "setValue"));
-            self.b.emit(Op::Call(idx, 4), 0);
-            self.b.emit(Op::Pop, 0); // `setValue` answers Unit
-            return Ok(());
+                                            // `setValue` answers Unit, which the helper pops.
+            return self.emit_delegate_set(Some(dc));
         }
         self.compile_expr(sc, recv)?; // [obj]
         let store = self.compound_value(recv, name, None, op, value);
@@ -6915,34 +6953,54 @@ impl Compiler {
         self.b.emit(Op::Extended(KT_LATEINIT, 2), line);
     }
 
-    /// `delegate.getValue(thisRef, property)` on the delegate already on the
-    /// stack. Both arguments are null: a local has no receiver, and the
-    /// `KProperty` a real one is handed carries only reflection this frontend
-    /// has no value for.
-    ///
-    /// A direct call to the delegate class's subroutine, the way a delegated
-    /// CLASS property already dispatches — the runtime member table has no
-    /// entry for a user `getValue`.
-    fn emit_delegate_get(&mut self, dc: Option<String>) -> Result<(), String> {
-        // No class means a delegate this frontend supplies — see
-        // [`crate::host::KT_DELEG_GET`] — which takes the delegate alone.
-        let Some(dc) = dc else {
-            self.b.emit(Op::CallBuiltin(KT_DELEG_GET, 1), 0);
-            return Ok(());
-        };
+    /// The `KProperty` a delegated access hands its delegate: an instance
+    /// carrying the property's name, which is what `property.name` reads.
+    fn emit_kproperty(&mut self, name: &str, line: u32) {
+        let midx = self.b.add_constant(Value::str(kproperty_meta()));
+        self.b.emit(Op::LoadConst(midx), line);
+        let nidx = self.b.add_constant(Value::str(name.to_string()));
+        self.b.emit(Op::LoadConst(nidx), line);
+        self.b.emit(Op::Extended(KT_NEW, 1), line);
+    }
+
+    /// The `(thisRef, property)` a receiverless delegated property — a local or
+    /// a top-level one — passes: Kotlin hands such a delegate a null `thisRef`
+    /// and the property's own `KProperty`.
+    fn emit_receiverless_delegate_args(&mut self, name: &str) {
         self.b.emit(Op::LoadUndef, 0);
-        self.b.emit(Op::LoadUndef, 0);
-        let idx = self.b.add_name(&method_sub_name(&dc, "getValue"));
-        self.b.emit(Op::Call(idx, 3), 0);
+        self.emit_kproperty(name, 0);
+    }
+
+    /// `delegate.getValue(null, property)` on the delegate already on the
+    /// stack, for the receiverless property `name`.
+    fn emit_delegate_get(&mut self, dc: Option<String>, name: &str) -> Result<(), String> {
+        self.emit_receiverless_delegate_args(name);
+        self.emit_delegate_get_call(dc.as_deref(), 0);
         Ok(())
     }
 
-    /// `delegate.setValue(thisRef, property, value)`, with the delegate, the two
-    /// nulls and the value already on the stack. Leaves nothing: a property
-    /// write is a statement.
+    /// The `getValue` call itself, with `[delegate, thisRef, property]` on the
+    /// stack. A user class's is a direct call to its subroutine — the runtime
+    /// member table has no entry for a user `getValue`; a delegate this
+    /// frontend supplies (no class, or [`HOST_DELEGATE`]) goes through
+    /// [`crate::host::KT_DELEG_GET`].
+    fn emit_delegate_get_call(&mut self, dc: Option<&str>, line: u32) {
+        match dc.filter(|d| *d != HOST_DELEGATE) {
+            Some(dc) => {
+                let idx = self.b.add_name(&method_sub_name(dc, "getValue"));
+                self.b.emit(Op::Call(idx, 3), line);
+            }
+            None => {
+                self.b.emit(Op::CallBuiltin(KT_DELEG_GET, 3), line);
+            }
+        }
+    }
+
+    /// `delegate.setValue(thisRef, property, value)`, with all four already on
+    /// the stack. Leaves nothing: a property write is a statement.
     fn emit_delegate_set(&mut self, dc: Option<String>) -> Result<(), String> {
-        let Some(dc) = dc else {
-            self.b.emit(Op::CallBuiltin(KT_DELEG_SET, 2), 0);
+        let Some(dc) = dc.filter(|d| d != HOST_DELEGATE) else {
+            self.b.emit(Op::CallBuiltin(KT_DELEG_SET, 4), 0);
             self.b.emit(Op::Pop, 0);
             return Ok(());
         };
@@ -7671,8 +7729,8 @@ impl Compiler {
             // generic `Array(n) { … }` exists only in the initializer form
             // (Kotlin has no zero-filled `Array(n)`), so its descriptor is
             // inferred from the elements the lambda produced.
-            "IntArray" | "DoubleArray" | "BooleanArray" | "CharArray" | "LongArray" | "FloatArray"
-            | "ShortArray" | "ByteArray" | "Array" => {
+            "IntArray" | "DoubleArray" | "BooleanArray" | "CharArray" | "LongArray"
+            | "FloatArray" | "ShortArray" | "ByteArray" | "Array" => {
                 let desc = match name {
                     "DoubleArray" => "[D",
                     "LongArray" => "[J",
@@ -7867,6 +7925,9 @@ impl Compiler {
                         self.b.emit(Op::GetVar(g), line);
                         if p.lazy {
                             self.b.emit(Op::CallBuiltin(KT_LAZY_GET, 0), line);
+                        }
+                        if p.delegate.is_some() {
+                            self.emit_delegate_get(p.delegate.clone(), name)?;
                         }
                         if self.lateinit_globals.contains(name) {
                             self.emit_lateinit_check(name, line);
@@ -9477,9 +9538,9 @@ impl Compiler {
                 | "HashSet" | "LinkedHashSet" | "TreeSet" | "HashMap" | "LinkedHashMap"
                 | "linkedMapOf" | "sortedMapOf" | "TreeMap" | "arrayOf" | "emptyArray"
                 | "intArrayOf" | "longArrayOf" | "doubleArrayOf" | "floatArrayOf"
-                | "booleanArrayOf" | "charArrayOf" | "shortArrayOf" | "byteArrayOf" | "IntArray"
-                | "DoubleArray" | "BooleanArray" | "CharArray" | "LongArray" | "FloatArray"
-                | "ShortArray" | "ByteArray" | "Array" => Type::Obj,
+                | "booleanArrayOf" | "charArrayOf" | "shortArrayOf" | "byteArrayOf"
+                | "IntArray" | "DoubleArray" | "BooleanArray" | "CharArray" | "LongArray"
+                | "FloatArray" | "ShortArray" | "ByteArray" | "Array" => Type::Obj,
                 // `Pair`/`Triple`/`Result` are heap objects, and saying so is
                 // what routes `==` on them to STRUCTURAL equality: the native
                 // compare would coerce two handles to numbers and answer `true`

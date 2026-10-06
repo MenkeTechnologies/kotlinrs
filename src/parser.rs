@@ -31,7 +31,7 @@
 use crate::ast::*;
 use crate::lexer::Lexer;
 use crate::token::{Spanned, StrPart, Tok};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub struct Parser {
     toks: Vec<Spanned>,
@@ -104,6 +104,12 @@ pub struct Parser {
     /// `fun` (or an anonymous `fun(…)`) it is an ordinary return; inside a
     /// lambda it is Kotlin's non-local return out of the enclosing `fun`.
     bodies: Vec<BodyKind>,
+    /// The names of every `infix fun` the program declares, collected by
+    /// [`infix_fun_names`] before parsing starts so a call may precede the
+    /// declaration. `a name b` is an infix call only for one of these (or a
+    /// stdlib infix function) and only when `name` sits on `a`'s line —
+    /// Kotlin's `infixFunctionCall` admits no newline before the identifier.
+    infix_names: std::rc::Rc<std::collections::HashSet<String>>,
 }
 
 /// One entry of [`Parser::bodies`].
@@ -358,7 +364,9 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
         nested_names: Vec::new(),
         in_subjectless_cond: false,
         bodies: Vec::new(),
+        infix_names: std::rc::Rc::new(HashSet::new()),
     };
+    p.infix_names = std::rc::Rc::new(infix_fun_names(&p.toks));
     let mut prog = Program::default();
     while !p.at(&Tok::Eof) {
         // A modifier run only starts a declaration; anything else keeps its
@@ -703,6 +711,41 @@ fn is_bitwise_infix(w: &str) -> bool {
 /// before the identifier), so the gate is the spec, not a workaround.
 fn is_set_infix(w: &str) -> bool {
     matches!(w, "union" | "intersect" | "subtract")
+}
+
+/// The names declared by an `infix fun` anywhere in the token stream: the
+/// identifier just before the parameter list, past any type parameters and
+/// receiver type (`infix fun <T> Pair<T, T>.swapWith(…)` names `swapWith`).
+/// A scan rather than a parse, so a use may come before the declaration —
+/// which Kotlin allows at the top level and between members.
+fn infix_fun_names(toks: &[Spanned]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for (i, t) in toks.iter().enumerate() {
+        if !matches!(&t.tok, Tok::Ident(w) if w == "infix") {
+            continue;
+        }
+        let mut j = i + 1;
+        while matches!(toks.get(j).map(|s| &s.tok), Some(Tok::Ident(w)) if is_modifier_word(w)) {
+            j += 1;
+        }
+        if !matches!(toks.get(j).map(|s| &s.tok), Some(Tok::Fun)) {
+            continue;
+        }
+        let mut depth = 0i32;
+        let mut name = None;
+        for s in &toks[j + 1..] {
+            match &s.tok {
+                Tok::Lt => depth += 1,
+                Tok::Gt => depth -= 1,
+                Tok::LParen if depth == 0 => break,
+                Tok::Ident(w) => name = Some(w.clone()),
+                Tok::LBrace | Tok::Assign | Tok::Eof => break,
+                _ => {}
+            }
+        }
+        out.extend(name);
+    }
+    out
 }
 
 /// Whether an identifier is one of the declaration modifiers (see [`Mods`]).
@@ -2348,6 +2391,7 @@ impl Parser {
             nested_names: Vec::new(),
             in_subjectless_cond: false,
             bodies: Vec::new(),
+            infix_names: Default::default(),
         })
     }
 
@@ -3615,7 +3659,9 @@ impl Parser {
                 // sit at this precedence level with the other named infix
                 // functions.
                 Tok::Ident(n)
-                    if is_bitwise_infix(n) || (is_set_infix(n) && self.glued_to_prev()) =>
+                    if is_bitwise_infix(n)
+                        || ((is_set_infix(n) || self.infix_names.contains(n.as_str()))
+                            && self.glued_to_prev()) =>
                 {
                     let name = self.ident()?;
                     let r = self.range_expr()?;
@@ -4887,6 +4933,7 @@ impl Parser {
                         nested_names: Vec::new(),
                         in_subjectless_cond: false,
                         bodies: Vec::new(),
+                        infix_names: self.infix_names.clone(),
                     };
                     let e = sub.expr()?;
                     out.push(StrExpr::Expr(Box::new(e)));

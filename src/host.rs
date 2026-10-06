@@ -267,8 +267,8 @@ pub const KT_YIELD: u16 = 48;
 
 /// `KT_DELEG_GET` / `KT_DELEG_SET`: read and write a delegate this frontend
 /// supplies rather than one a user class declares — currently the
-/// `Delegates.observable`/`vetoable` pair. Stack `[delegate]` and
-/// `[delegate, value]`.
+/// `Delegates.observable`/`vetoable` pair. Stack `[delegate, thisRef, property]`
+/// and `[delegate, thisRef, property, value]`, the `getValue`/`setValue` operands.
 ///
 /// BUILTINS and not extension ops, for the reason [`KT_ITER_SRC`] gives: the
 /// write runs the user's handler through a nested `vm.run()`, and an extension
@@ -3408,10 +3408,14 @@ fn copy_range_fault(desc: &str, from: i64, to: i64, len: usize) -> Option<String
 /// at all — it is an `IllegalArgumentException` naming both.
 fn sublist_fault(from: i64, to: i64, len: usize) -> Option<String> {
     if from < 0 {
-        return Some(format!("java.lang.IndexOutOfBoundsException: fromIndex = {from}"));
+        return Some(format!(
+            "java.lang.IndexOutOfBoundsException: fromIndex = {from}"
+        ));
     }
     if to > len as i64 {
-        return Some(format!("java.lang.IndexOutOfBoundsException: toIndex = {to}"));
+        return Some(format!(
+            "java.lang.IndexOutOfBoundsException: toIndex = {to}"
+        ));
     }
     if from > to {
         return Some(format!(
@@ -6678,8 +6682,9 @@ fn coro_next(vm: &mut VM, handle: &Value) -> Result<Option<Value>, String> {
 
 /// `KT_DELEG_GET` — see [`KT_DELEG_GET`].
 fn b_deleg_get(vm: &mut VM, _argc: u8) -> Value {
+    let _property = vm.pop();
+    let _this_ref = vm.pop();
     let d = vm.pop();
-    let _ = vm;
     with_obj(&d, |o| match o {
         HeapObj::Observed { value, .. } => value.clone(),
         _ => Value::Undef,
@@ -6692,9 +6697,12 @@ fn b_deleg_get(vm: &mut VM, _argc: u8) -> Value {
 /// The handler takes `(property, old, new)`, and it runs BEFORE the store for
 /// the vetoable form and after it for the observable one — which is what
 /// Kotlin's own `ObservableProperty.beforeChange`/`afterChange` split is. The
-/// property argument is null, there being no `KProperty` to hand it.
+/// property argument is the access's `KProperty`, as `ObservableProperty`
+/// passes its own.
 fn b_deleg_set(vm: &mut VM, _argc: u8) -> Value {
     let new = vm.pop();
+    let property = vm.pop();
+    let _this_ref = vm.pop();
     let d = vm.pop();
     let Some((old, on, vetoable)) = with_obj(&d, |o| match o {
         HeapObj::Observed {
@@ -6717,7 +6725,7 @@ fn b_deleg_set(vm: &mut VM, _argc: u8) -> Value {
     };
     if vetoable {
         // The handler decides, and the store only happens if it agrees.
-        let verdict = invoke_closure(vm, &on, &[Value::Undef, old, new.clone()]);
+        let verdict = invoke_closure(vm, &on, &[property.clone(), old, new.clone()]);
         match verdict {
             Ok(v) if truthy(&v) => store(vm, new),
             Ok(_) => {}
@@ -6728,7 +6736,7 @@ fn b_deleg_set(vm: &mut VM, _argc: u8) -> Value {
         return Value::Undef;
     }
     store(vm, new.clone());
-    if let Err(e) = invoke_closure(vm, &on, &[Value::Undef, old, new]) {
+    if let Err(e) = invoke_closure(vm, &on, &[property, old, new]) {
         fault(vm, e);
     }
     Value::Undef
@@ -8427,7 +8435,11 @@ fn format_general(x: f64, prec: Option<usize>) -> String {
     };
     if x == 0.0 {
         let s = fill_decimal(&[b'0'], 1, p - 1);
-        return if x.is_sign_negative() { format!("-{s}") } else { s };
+        return if x.is_sign_negative() {
+            format!("-{s}")
+        } else {
+            s
+        };
     }
     let (mut digits, exp) = shortest_digits(x);
     let exp = apply_precision(&mut digits, exp, p);
@@ -8924,7 +8936,9 @@ fn format_string(fmt: &str, args: &[Value]) -> Result<String, String> {
                 'x' => body.insert_str(0, "0x"),
                 'X' => body.insert_str(0, "0X"),
                 'o' => body.insert(0, '0'),
-                'f' | 'e' | 'E' if !body.contains('.') && body.ends_with(|c: char| c.is_ascii_digit()) => {
+                'f' | 'e' | 'E'
+                    if !body.contains('.') && body.ends_with(|c: char| c.is_ascii_digit()) =>
+                {
                     let at = body.find(['e', 'E']).unwrap_or(body.len());
                     body.insert(at, '.');
                 }
@@ -10308,7 +10322,13 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         (Value::Float(x), "mod") => {
             let other = args.first().map(num_f64).unwrap_or(f64::NAN);
             let r = x % other;
-            let sign = |v: f64| if v == 0.0 || v.is_nan() { v } else { v.signum() };
+            let sign = |v: f64| {
+                if v == 0.0 || v.is_nan() {
+                    v
+                } else {
+                    v.signum()
+                }
+            };
             Ok(Value::Float(if r != 0.0 && sign(r) != sign(other) {
                 r + other
             } else {
