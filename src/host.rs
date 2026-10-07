@@ -8442,7 +8442,7 @@ fn format_scientific(x: f64, prec: usize) -> String {
     let (mut digits, exp) = shortest_digits(x);
     let exp = apply_precision(&mut digits, exp, prec + 1);
     let mut s = fill_decimal(&digits, 1, prec);
-    let e = if digits == [b'0'] { 0 } else { exp - 1 };
+    let e = if digits == *b"0" { 0 } else { exp - 1 };
     s.push_str(&format!("e{}{:02}", if e < 0 { '-' } else { '+' }, e.abs()));
     if x.is_sign_negative() {
         s.insert(0, '-');
@@ -8464,7 +8464,7 @@ fn format_general(x: f64, prec: Option<usize>) -> String {
         Some(p) => p,
     };
     if x == 0.0 {
-        let s = fill_decimal(&[b'0'], 1, p - 1);
+        let s = fill_decimal(b"0", 1, p - 1);
         return if x.is_sign_negative() {
             format!("-{s}")
         } else {
@@ -8473,7 +8473,7 @@ fn format_general(x: f64, prec: Option<usize>) -> String {
     }
     let (mut digits, exp) = shortest_digits(x);
     let exp = apply_precision(&mut digits, exp, p);
-    if exp - 1 < -4 || exp - 1 >= p as i32 {
+    if exp - 1 < -4 || exp > p as i32 {
         return format_scientific(x, p - 1);
     }
     let s = fill_decimal(&digits, exp, (p as i32 - exp) as usize);
