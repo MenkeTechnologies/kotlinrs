@@ -6789,9 +6789,11 @@ fn b_comparator(vm: &mut VM, argc: u8) -> Value {
     let mut chain = if name.starts_with("then") {
         // `thenBy` answers a NEW comparator: the base's keys are copied, not
         // extended in place, so `val byA = compareBy { … }` keeps its own order
-        // after `byA.thenBy { … }` is built from it.
+        // after `byA.thenBy { … }` is built from it. A base that is a whole
+        // comparator rather than a chain (`Comparator { a, b -> … }`, a user
+        // `Comparator`) becomes the chain's first step.
         let base = vm.pop();
-        comparator_keys(&base).unwrap_or_default()
+        comparator_keys(&base).unwrap_or_else(|| vec![(base, false)])
     } else {
         Vec::new()
     };
@@ -6816,6 +6818,15 @@ fn comparator_keys(v: &Value) -> Option<Vec<(Value, bool)>> {
     .flatten()
 }
 
+/// Whether a comparator STEP compares two elements itself rather than
+/// extracting a key from one: a `compareBy` chain, a user `Comparator`, or a
+/// two-parameter lambda.
+fn is_whole_comparator(v: &Value) -> bool {
+    comparator_keys(v).is_some()
+        || user_compare_sub(v).is_some()
+        || closure_meta(v).is_some_and(|(_, params, _)| params == 2)
+}
+
 /// Order two elements by `cmp`, which is either a `Comparator` built by
 /// `compareBy` or a plain `(a, b) -> Int` lambda. Answers the sign convention
 /// `Comparator.compare` uses: negative when `a` sorts first.
@@ -6837,6 +6848,17 @@ fn compare_with(vm: &mut VM, cmp: &Value, a: &Value, b: &Value) -> Result<i64, S
         return Ok(invoke_closure(vm, cmp, &[a.clone(), b.clone()])?.to_int());
     };
     for (sel, descending) in keys {
+        // A step that is itself a comparator (`then`, `reversed`, a lambda or
+        // user `Comparator` base) compares the pair whole; descending swaps
+        // the operands, as the JDK's `reverseOrder(cmp)` does.
+        if is_whole_comparator(&sel) {
+            let (x, y) = if descending { (b, a) } else { (a, b) };
+            let ord = compare_with(vm, &sel, x, y)?;
+            if ord != 0 {
+                return Ok(ord);
+            }
+            continue;
+        }
         let ka = invoke_closure(vm, &sel, std::slice::from_ref(a))?;
         let kb = invoke_closure(vm, &sel, std::slice::from_ref(b))?;
         let ord = match value_cmp(&ka, &kb) {
@@ -9453,6 +9475,30 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         && (comparator_keys(recv).is_some() || closure_meta(recv).is_some())
     {
         return Ok(Value::Int(compare_with(vm, recv, &args[0], &args[1])?));
+    }
+    // `Comparator`'s composition members, answering a NEW comparator whose
+    // steps run in order until one is non-zero: `reversed()` (the JDK's
+    // `Collections.reverseOrder(cmp)`, which swaps the operands),
+    // `then`/`thenComparing(cmp)` and `thenDescending(cmp)` (a tiebreak by a
+    // whole comparator, the latter reversed). `thenComparing` with a
+    // one-argument key extractor is a key step, decided per step at compare
+    // time.
+    if is_comparator(recv) {
+        let step = match (name, args) {
+            ("reversed", []) => Some((recv.clone(), true)),
+            ("then" | "thenComparing", [c]) => Some((c.clone(), false)),
+            ("thenDescending", [c]) => Some((c.clone(), true)),
+            _ => None,
+        };
+        if let Some(step) = step {
+            let mut chain = if name == "reversed" {
+                Vec::new()
+            } else {
+                comparator_keys(recv).unwrap_or_else(|| vec![(recv.clone(), false)])
+            };
+            chain.push(step);
+            return Ok(alloc(HeapObj::Comparator(chain)));
+        }
     }
     // The two nullable-receiver extensions whose answer is a function of the
     // VALUE, so they resolve ahead of every kind-specific table: a `null`

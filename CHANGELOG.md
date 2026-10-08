@@ -1289,3 +1289,16 @@ Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
   `compare(a, b)`, each implementing class publishes that member to the
   runtime, and every comparator consumer (`sortedWith`, `sortWith`,
   `maxWith`/`minWith`, `sortedSetOf(cmp, …)`, `PriorityQueue(cmp)`) calls it.
+- **`cmp.thenBy { … }` over a comparator that is not a `compareBy` chain** —
+  `Comparator { x, y -> x.length - y.length }.thenBy { it }` — silently DROPPED
+  the base and sorted by the tiebreak key alone (`[a, ab, bb, c]` for the
+  reference's `[a, c, ab, bb]`). A whole comparator (a two-parameter lambda, a
+  user `Comparator`, a chain) is now a step of the chain that compares the pair
+  itself.
+- **`Comparator` composition** — `reversed()`, `then(cmp)`,
+  `thenComparing(cmp)` and `thenDescending(cmp)` were `unresolved reference`
+  on every comparator. Each answers a new comparator; a reversed step swaps the
+  operands, as the JDK's `Collections.reverseOrder(cmp)` does. `nullsFirst` /
+  `nullsLast` (with and without a comparator) are ported from the stdlib's
+  `when` over `===`/`null`, and `Comparator.naturalOrder()` /
+  `Comparator.reverseOrder()` resolve to the top-level functions.

@@ -5125,6 +5125,17 @@ impl Compiler {
         if zero_arity_member(name) {
             self.mark_zero_arity_lambda(args);
         }
+        // `Comparator.naturalOrder()` / `Comparator.reverseOrder()` — the JDK
+        // statics, the same comparators as Kotlin's top-level functions.
+        if matches!(name, "naturalOrder" | "reverseOrder")
+            && args.is_empty()
+            && matches!(
+                self.qualifier(sc, recv).as_deref(),
+                Some("Comparator" | "java.util.Comparator")
+            )
+        {
+            return self.compile_call(sc, name, &[], line);
+        }
         // `String.CASE_INSENSITIVE_ORDER` — the JDK comparator, which is
         // `compareToIgnoreCase` and therefore Kotlin's
         // `a.compareTo(b, ignoreCase = true)`. Lowered to that lambda, so every
@@ -8200,6 +8211,77 @@ impl Compiler {
                 };
                 let lambda = Expr::Lambda {
                     params: vec![(a.clone(), Type::Unknown), (b.clone(), Type::Unknown)],
+                    body: vec![Stmt::new(line, StmtKind::Expr(body))],
+                    catch_tag: None,
+                };
+                self.compile_expr(sc, &lambda)?;
+                Ok(Type::Obj)
+            }
+            // `nullsFirst(cmp)` / `nullsLast(cmp)` — the stdlib's
+            // `Comparator { a, b -> when { a === b -> 0; a == null -> -1;
+            // b == null -> 1; else -> cmp.compare(a, b) } }` (signs flipped for
+            // `nullsLast`), and the no-argument forms over `naturalOrder()`.
+            // `cmp` is evaluated once, into a hidden local the lambda captures.
+            "nullsFirst" | "nullsLast"
+                if args.len() <= 1
+                    && !self.fun_sig.contains_key(name)
+                    && !self.local_sigs.contains_key(name) =>
+            {
+                let inner = match args.first() {
+                    Some(a) => a.clone(),
+                    None => Expr::Call {
+                        name: "naturalOrder".into(),
+                        args: Vec::new(),
+                        line,
+                    },
+                };
+                let cmp = format!("#{name}_cmp");
+                self.compile_expr(sc, &inner)?;
+                let slot = sc.declare(&cmp, Type::Obj, false);
+                self.b.emit(Op::SetSlot(slot), line);
+                let (a, b) = ("#nul_a".to_string(), "#nul_b".to_string());
+                let null_first = if name == "nullsFirst" { -1 } else { 1 };
+                let var = |n: &str| Box::new(Expr::Var(n.to_string()));
+                let is_null = |n: &str| {
+                    Box::new(Expr::Binary {
+                        op: BinOp::Eq,
+                        l: var(n),
+                        r: Box::new(Expr::Null),
+                    })
+                };
+                let arm = |cond: Box<Expr>, then: Expr, els: Expr| {
+                    Expr::If(IfExpr {
+                        cond,
+                        then: vec![Stmt::new(line, StmtKind::Expr(then))],
+                        els: Some(vec![Stmt::new(line, StmtKind::Expr(els))]),
+                        line,
+                    })
+                };
+                let body = arm(
+                    Box::new(Expr::Binary {
+                        op: BinOp::RefEq,
+                        l: var(&a),
+                        r: var(&b),
+                    }),
+                    Expr::Int(0),
+                    arm(
+                        is_null(&a),
+                        Expr::Int(null_first),
+                        arm(
+                            is_null(&b),
+                            Expr::Int(-null_first),
+                            Expr::MethodCall {
+                                recv: var(&cmp),
+                                name: "compare".into(),
+                                args: vec![Expr::Var(a.clone()), Expr::Var(b.clone())],
+                                safe: false,
+                                line,
+                            },
+                        ),
+                    ),
+                );
+                let lambda = Expr::Lambda {
+                    params: vec![(a, Type::Unknown), (b, Type::Unknown)],
                     body: vec![Stmt::new(line, StmtKind::Expr(body))],
                     catch_tag: None,
                 };
