@@ -557,7 +557,10 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   defaults and `vararg` like any other function. An **extension property**
   (`val Int.squared get() = this * this`, `val List<Int>.total: Int get() =
   sum()`) is the zero-parameter extension function its getter is, read without
-  parentheses. Dispatch is by the receiver's
+  parentheses. A receiver may be NULLABLE (`fun String?.orDash()`,
+  `val String?.len get() = this?.length ?: 0`), callable on `null`, and an
+  extension property may declare its own type variables (`val <T> List<T>.second:
+  T get() = this[1]`). Dispatch is by the receiver's
   **static** type, which is what keeps an `Int` and a `Long` extension of one
   name apart (they share a runtime representation) and what makes the `Int` one's
   arithmetic wrap at 32 bits. A member function of the same name and arity wins,

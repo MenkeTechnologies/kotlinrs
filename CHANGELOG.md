@@ -1220,3 +1220,9 @@ Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
   explicit labels and the implicit one a trailing lambda takes from its callee
   (`return@run`, `return@map`, `return@with`) alike; the return unwinds to the
   named lambda's frame, which claims it.
+- **A nullable extension receiver** — `fun String?.safeLen() = this?.length
+  ?: 0`, `val String?.lenOr get() = …`, `fun <T> List<T>?.sizeOrMinus()` — was
+  a parse error (`expected LParen, found Question`). It parses, and the
+  extension is called on `null` with `this` bound to it.
+- **A generic extension property** — `val <T> List<T>.second: T get() =
+  this[1]` — was `expected identifier, found Lt`.

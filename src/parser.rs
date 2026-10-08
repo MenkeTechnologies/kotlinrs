@@ -1057,6 +1057,13 @@ impl Parser {
             // `fun Recv.name(…)` — an extension. The first identifier is
             // the receiver type only when a `.` follows it.
             let first = self.ident()?;
+            // A NULLABLE receiver (`fun String?.orBlank()`) is the same
+            // extension, callable on `null` as well.
+            let nullable_dot =
+                self.at(&Tok::Question) && matches!(self.peek_at(1), Tok::Dot);
+            if nullable_dot {
+                self.advance();
+            }
             if self.at(&Tok::Dot) {
                 self.advance();
                 let (ty, class) = (Type::from_name(&first), None);
@@ -1074,6 +1081,9 @@ impl Parser {
             } else if self.at(&Tok::Lt) {
                 // `fun List<Int>.sum2()` — a generic receiver keeps its head name.
                 self.skip_type_args();
+                if self.at(&Tok::Question) {
+                    self.advance();
+                }
                 self.eat(&Tok::Dot)?;
                 recv = Some((first.clone(), Type::Obj, None));
                 self.ident()?
@@ -2169,9 +2179,20 @@ impl Parser {
     }
 
     fn accessor_prop(&mut self, mods: Mods) -> Result<Option<FunDecl>, String> {
+        // `val <T> List<T>.second: T get() = …` declares type variables of its
+        // own, in scope for the receiver, the annotation and the getter only.
+        let outer_tps = self.type_params.clone();
+        let prop = self.accessor_prop_body(mods);
+        self.type_params = outer_tps;
+        prop
+    }
+
+    fn accessor_prop_body(&mut self, mods: Mods) -> Result<Option<FunDecl>, String> {
         let start = self.pos;
         let line = self.line();
         self.advance(); // `val` / `var`
+        let (declared, _) = self.type_params_decl_reified();
+        self.type_params.extend(declared);
                         // `val Recv.name get() = …` is an EXTENSION property: a getter with the
                         // receiver bound as `this`, which is exactly an extension function of
                         // no parameters, and is lowered as one.
@@ -2183,6 +2204,10 @@ impl Parser {
             if self.at(&Tok::Lt) {
                 let save = self.pos;
                 self.skip_type_args();
+                // `val List<Int>?.total` — a nullable receiver, likewise.
+                if self.at(&Tok::Question) && matches!(self.peek_at(1), Tok::Dot) {
+                    self.advance();
+                }
                 if self.at(&Tok::Dot) && matches!(self.peek_at(1), Tok::Ident(_)) {
                     self.advance();
                     recv = Some((name.clone(), Type::Obj, None));
@@ -2190,6 +2215,20 @@ impl Parser {
                 } else {
                     self.pos = save;
                 }
+            } else if self.at(&Tok::Question)
+                && matches!(self.peek_at(1), Tok::Dot)
+                && matches!(self.peek_at(2), Tok::Ident(_))
+            {
+                // `val String?.orEmptyLen` — a nullable receiver.
+                self.advance();
+                self.advance();
+                let ty = Type::from_name(&name);
+                recv = Some(if ty == Type::Unknown {
+                    (name.clone(), Type::Obj, Some(name.clone()))
+                } else {
+                    (name.clone(), ty, None)
+                });
+                name = self.ident()?;
             } else if self.at(&Tok::Dot) && matches!(self.peek_at(1), Tok::Ident(_)) {
                 self.advance();
                 let ty = Type::from_name(&name);
