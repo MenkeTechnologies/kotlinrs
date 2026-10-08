@@ -11578,7 +11578,19 @@ impl Compiler {
                 if let Some((_, cls)) = self.ext_ret(sc, recv, name, args.len()) {
                     return cls;
                 }
+                // A member the receiver's own class declares wins over the
+                // stdlib extension of the same name, exactly as at the call:
+                // `Box(3).map { … }` on a class declaring `map` answers that
+                // method's class, not a `List`.
+                let recv_cls = self.infer_class(sc, recv);
+                let declares = recv_cls.as_ref().is_some_and(|c| {
+                    self.classes
+                        .get(c)
+                        .and_then(|m| m.methods.get(name))
+                        .is_some_and(|s| s.arity == args.len())
+                });
                 match name.as_str() {
+                    _ if declares => {}
                     "map" | "mapIndexed" | "flatMap" | "filter" | "filterNot" | "sortedBy"
                     | "sortedByDescending" | "toList" | "distinct" | "sorted"
                     | "sortedDescending" | "take" | "drop" => return Some("List".to_string()),
@@ -11597,7 +11609,7 @@ impl Compiler {
                     "runCatching" => return Some("Result".to_string()),
                     _ => {}
                 }
-                let cls = self.infer_class(sc, recv)?;
+                let cls = recv_cls?;
                 let sig = self.classes.get(&cls).and_then(|m| m.methods.get(name))?;
                 // Same rule as the property read above, for a method whose
                 // declared result is one of the class's type variables.

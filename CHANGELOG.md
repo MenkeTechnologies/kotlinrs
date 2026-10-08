@@ -1313,3 +1313,9 @@ Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
   ranges are snapshots, as every collection view here is (see BUGS).
 - **`java.util.TreeMap<K, V>()`** and the other JDK collection constructors in
   their fully qualified spelling were `unresolved reference: java`.
+- **A user method named like a collection extension, called on a call's
+  result** — `Box(3).map { … }.map { … }` on a `class Box` declaring `map` —
+  was `unresolved reference: map on Box`: the static class of the first call
+  was taken from the stdlib's `map` (a `List`), so the second call never looked
+  at `Box`. A member the receiver's own class declares now decides the result's
+  class, as it already decided the call.
