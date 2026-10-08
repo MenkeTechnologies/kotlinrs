@@ -1242,3 +1242,15 @@ Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
   `sumOf`. **`longArrayOf(Long.MAX_VALUE, 1).sum()` panicked** with `attempt to
   add with overflow`; integral totals now wrap at 64 bits as the JVM's `long`
   addition does.
+- **`"abcdef".substring(2..4)`** answered the whole string; the `IntRange`
+  overload now reads `start` and `endInclusive`.
+- **`"abc".contentEquals("abc")`** answered `false` — the array member compared
+  the string as a non-array. `CharSequence.contentEquals` now compares
+  characters against a `String` or `StringBuilder`, with `ignoreCase`, and a
+  `null` receiver equals only `null`.
+- **`String.replaceRange`/`removeRange`** were unresolved. Both overloads are
+  ported with the stdlib's fault sequence: the order check, `removeRange`'s
+  `NegativeArraySizeException` from the builder capacity, then the JDK's
+  `Range [a, b) out of bounds` from each copy.
+- **`zip`, `contentEquals` and `matches` in infix spelling** (`a zip b`,
+  `x contentEquals y`, `s matches re`) were parse errors.

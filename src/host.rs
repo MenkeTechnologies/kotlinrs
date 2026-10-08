@@ -9461,6 +9461,11 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
             }
         }
     }
+    // `contentEquals` is declared on the nullable `CharSequence?` and array
+    // receivers alike: a `null` receiver equals only a `null` argument.
+    if name == "contentEquals" && matches!(recv, Value::Undef) && !args.is_empty() {
+        return Ok(Value::Bool(matches!(args[0], Value::Undef)));
+    }
     // A boxed `Float` is a heap object, but its MEMBERS are a `Float`'s and not
     // a container's, so it unboxes here and takes the primitive path below.
     // `toString` is the exception: the whole point of the box is that this
@@ -9666,16 +9671,80 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
                 },
             ))
         }
+        // `replaceRange(start, end, replacement)` / `removeRange(start, end)`,
+        // and the `IntRange` spellings, whose end is inclusive. The faults are
+        // the stdlib's own sequence of steps: the order check, then (for
+        // `removeRange`) a `StringBuilder` sized `length - (end - start)`, then
+        // the two `appendRange` copies, each bounds-checked by the JDK.
+        (Value::Str(s), "replaceRange" | "removeRange") => {
+            let units: Vec<u16> = s.encode_utf16().collect();
+            let len = units.len() as i64;
+            let range = args.first().and_then(|v| {
+                with_obj(v, |o| match o {
+                    HeapObj::Range(r) => Some((r.first, r.end.wrapping_add(1))),
+                    _ => None,
+                })
+                .flatten()
+            });
+            let (start, end, rest) = match range {
+                Some((a, b)) => (a, b, &args[1..]),
+                None => (
+                    args.first().map_or(0, Value::to_int),
+                    args.get(1).map_or(0, Value::to_int),
+                    args.get(2..).unwrap_or(&[]),
+                ),
+            };
+            if end < start {
+                return Err(format!(
+                    "java.lang.IndexOutOfBoundsException: End index ({end}) is less than start index ({start})."
+                ));
+            }
+            let removing = name == "removeRange";
+            if removing && end == start {
+                return Ok(Value::str(s.to_string()));
+            }
+            let capacity = len - (end - start);
+            if removing && capacity < 0 {
+                return Err(format!("java.lang.NegativeArraySizeException: {capacity}"));
+            }
+            let copy = |from: i64, to: i64| -> Result<String, String> {
+                if from < 0 || from > to || to > len {
+                    return Err(format!(
+                        "java.lang.IndexOutOfBoundsException: Range [{from}, {to}) out of bounds for length {len}"
+                    ));
+                }
+                Ok(utf16_to_string(&units[from as usize..to as usize]))
+            };
+            let mut out = copy(0, start)?;
+            if !removing {
+                out.push_str(&arg_str(rest, 0));
+            }
+            out.push_str(&copy(end, len)?);
+            Ok(Value::str(out))
+        }
         // `subSequence` is the `CharSequence` spelling of the two-argument
         // `substring`. It is typed `CharSequence` rather than `String`, but the
         // JVM answers a `String` for both receivers kotlinrs has.
         (Value::Str(s), "substring" | "subSequence") => {
             let units: Vec<u16> = s.encode_utf16().collect();
-            let start = args.first().map(|v| v.to_int()).unwrap_or(0);
-            let end = args
-                .get(1)
-                .map(|v| v.to_int())
-                .unwrap_or(units.len() as i64);
+            // `substring(range)` is `subSequence(range.start,
+            // range.endInclusive + 1)`.
+            let range = args.first().and_then(|v| {
+                with_obj(v, |o| match o {
+                    HeapObj::Range(r) => Some((r.first, r.end.wrapping_add(1))),
+                    _ => None,
+                })
+                .flatten()
+            });
+            let (start, end) = match range {
+                Some(bounds) => bounds,
+                None => (
+                    args.first().map(|v| v.to_int()).unwrap_or(0),
+                    args.get(1)
+                        .map(|v| v.to_int())
+                        .unwrap_or(units.len() as i64),
+                ),
+            };
             if start < 0 || end > units.len() as i64 || start > end {
                 Err(sioobe_range(start, end, units.len()))
             } else {
@@ -10124,6 +10193,22 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
             } else {
                 args.first().is_some_and(|o| value_eq(recv, o))
             }))
+        }
+        // `CharSequence.contentEquals(other[, ignoreCase])` — the CHARACTERS of
+        // a `String` or a `StringBuilder`, compared without regard to which
+        // of the two either one is. A null `other` is unequal.
+        (Value::Str(s), "contentEquals") if !args.is_empty() => {
+            let other = match &args[0] {
+                Value::Str(o) => Some(o.to_string()),
+                v => builder_units(v).map(|u| utf16_to_string(&u)),
+            };
+            Ok(Value::Bool(other.is_some_and(|o| {
+                if truthy_arg(args, 1) {
+                    Folded::of(s, true).keys == Folded::of(&o, true).keys
+                } else {
+                    **s == *o
+                }
+            })))
         }
         // `compareTo(other, ignoreCase = true)` is the JVM's
         // `CASE_INSENSITIVE_ORDER`, which is not the plain comparison of two

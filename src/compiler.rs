@@ -11949,7 +11949,9 @@ fn builtin_params(name: &str) -> Option<&'static [(&'static str, Dflt)]> {
             ("ignoreCase", Dflt::Bool(false)),
         ],
         "contains" => &[("other", Dflt::Required), ("ignoreCase", Dflt::Bool(false))],
-        "equals" | "compareTo" => &[("other", Dflt::Required), ("ignoreCase", Dflt::Bool(false))],
+        "equals" | "compareTo" | "contentEquals" => {
+            &[("other", Dflt::Required), ("ignoreCase", Dflt::Bool(false))]
+        }
         "commonPrefixWith" | "commonSuffixWith" => {
             &[("other", Dflt::Required), ("ignoreCase", Dflt::Bool(false))]
         }

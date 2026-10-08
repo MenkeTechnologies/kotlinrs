@@ -253,6 +253,9 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   than from the length, which shows for an empty delimiter),
   `.capitalize()`/`.decapitalize()`/`.replaceFirstChar { }`,
   `.ifEmpty { }`/`.ifBlank { }`,
+  `.substring(range)`, `.replaceRange()`/`.removeRange()` (index pair or
+  `IntRange`, with the stdlib's own faults), `.contentEquals()` against a
+  `String` or a `StringBuilder`,
   `.removePrefix()`/`.removeSuffix()`/`.removeSurrounding()`, `.toCharArray()`,
   `.replaceFirst()`, `.regionMatches()`,
   `.commonPrefixWith()`/`.commonSuffixWith()`,
@@ -440,6 +443,8 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `.union`/`.intersect`/`.subtract` — in the infix spelling (`a union b`) as
   well as the method one, the infix form reading only when it is on the same
   line as its left operand, exactly as Kotlin's grammar admits it —
+  as are `zip`, `contentEquals` and `String.matches(Regex)`, the other stdlib
+  infix extensions —
   `.joinToString(sep, prefix, postfix, limit, truncated)`, `.reversed()` and
   `.asReversed()`, `.contentToString()` on an array, `.orEmpty()`,
   `.plusElement`/`.minusElement`. Beside the copying members are the IN-PLACE

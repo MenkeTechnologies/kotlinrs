@@ -745,12 +745,13 @@ fn is_bitwise_infix(w: &str) -> bool {
     matches!(w, "and" | "or" | "xor" | "shl" | "shr" | "ushr")
 }
 
-/// Whether an identifier spells one of the `kotlin.collections` infix set
-/// functions. They are ordinary `infix fun Iterable<T>.union(other)` extensions,
-/// so `a union b` and `a.union(b)` are one call written two ways.
+/// Whether an identifier spells one of the stdlib's infix extension functions:
+/// the `kotlin.collections` set functions, `zip`, `contentEquals` (arrays and
+/// `CharSequence`) and `CharSequence.matches(Regex)`. They are ordinary `infix
+/// fun` extensions, so `a union b` and `a.union(b)` are one call written two ways.
 ///
 /// Unlike [`is_bitwise_infix`], a call site is accepted only when the name is
-/// GLUED to the left operand's line. These three names are plausible ones for a
+/// GLUED to the left operand's line. These names are plausible ones for a
 /// user function, and the lexer drops newlines — without the line test,
 ///
 /// ```text
@@ -761,8 +762,11 @@ fn is_bitwise_infix(w: &str) -> bool {
 /// would parse as `1 union (2)` and the second statement would disappear.
 /// Kotlin's own grammar has that rule (`infixFunctionCall` admits no newline
 /// before the identifier), so the gate is the spec, not a workaround.
-fn is_set_infix(w: &str) -> bool {
-    matches!(w, "union" | "intersect" | "subtract")
+fn is_stdlib_infix(w: &str) -> bool {
+    matches!(
+        w,
+        "union" | "intersect" | "subtract" | "zip" | "contentEquals" | "matches"
+    )
 }
 
 /// The names declared by an `infix fun` anywhere in the token stream: the
@@ -3815,7 +3819,7 @@ impl Parser {
                 // functions.
                 Tok::Ident(n)
                     if is_bitwise_infix(n)
-                        || ((is_set_infix(n) || self.infix_names.contains(n.as_str()))
+                        || ((is_stdlib_infix(n) || self.infix_names.contains(n.as_str()))
                             && self.glued_to_prev()) =>
                 {
                     let name = self.ident()?;
