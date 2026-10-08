@@ -390,3 +390,26 @@ Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 
 The last is the limit `emit_init_blocks` documents: the instance is allocated
 after the initializers run, so an `init` block has no `this` to call through.
+
+## Round 20: measured and not closed
+
+Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
+
+| program | kotlinrs | reference |
+| --- | --- | --- |
+| `val a = 5u; println(a - 7u)` (any unsigned literal or type) | `expected RParen, found Ident("u")` | `4294967294` |
+| `println(ULong.MAX_VALUE)` | `kotlin: unresolved reference: ULong` | `18446744073709551615` |
+| `println(listOf(1, 2).stream().findFirst())` | `unresolved reference: Stream.findFirst (its java.util.Optional result is not modelled)` | `Optional[1]` |
+
+Unsigned types need a design decision rather than a member port. `UInt`,
+`UShort` and `UByte` values fit a non-negative `i64` and would only need new
+static types (32/16/8-bit masking on `+ - *`, `toInt()` reinterpretation), but
+`ULong` values at or above 2^63 share their bit pattern with negative `Long`s:
+printing, comparing and dividing one correctly after it has passed through an
+untyped collection needs the width carried on the value at run time, which is
+the same substrate as consistent `Long` boxing.
+
+`java.util.Optional` is not modelled, so the stream terminals that answer one
+(`findFirst`, `findAny`, `max`, `min`, `average`, one-argument `reduce`) are
+refused at compile time: lowered onto the sequence they would print the bare
+value.
