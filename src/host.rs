@@ -910,10 +910,11 @@ fn pq_member(
                 let mut cmp = None;
                 let mut src = Vec::new();
                 for a in ctor {
-                    let is_cmp = with_obj(a, |o| {
-                        matches!(o, HeapObj::Closure { .. } | HeapObj::Comparator(_))
-                    })
-                    .unwrap_or(false);
+                    let is_cmp = user_compare_sub(a).is_some()
+                        || with_obj(a, |o| {
+                            matches!(o, HeapObj::Closure { .. } | HeapObj::Comparator(_))
+                        })
+                        .unwrap_or(false);
                     if is_cmp {
                         cmp = Some(a.clone());
                     } else if let Some(items) = as_iterable(a) {
@@ -1259,9 +1260,12 @@ fn comparator_of(v: &Value) -> Option<Value> {
 
 /// Whether `v` can be a sorted collection's comparator: a `compareBy` chain,
 /// or a two-argument lambda (`Comparator { a, b -> … }`,
-/// `String.CASE_INSENSITIVE_ORDER`).
+/// `String.CASE_INSENSITIVE_ORDER`), or an instance of a user class
+/// implementing `Comparator`.
 fn is_comparator(v: &Value) -> bool {
-    comparator_keys(v).is_some() || closure_meta(v).is_some_and(|(_, params, _)| params == 2)
+    comparator_keys(v).is_some()
+        || user_compare_sub(v).is_some()
+        || closure_meta(v).is_some_and(|(_, params, _)| params == 2)
 }
 
 /// Take the leading comparator off a SORTED builder's arguments —
@@ -6795,6 +6799,13 @@ fn b_comparator(vm: &mut VM, argc: u8) -> Value {
     alloc(HeapObj::Comparator(chain))
 }
 
+/// The `compare` subroutine of a user class implementing `Comparator`, when
+/// `v` is an instance of one (published through [`KT_OPER_REG`]).
+fn user_compare_sub(v: &Value) -> Option<u16> {
+    let tag = instance_tag(v)?;
+    OPER_SUBS.with(|t| t.borrow().get(&(tag, "compare".to_string())).copied())
+}
+
 /// The `(selector, descending)` chain of a comparator value, or `None` when `v`
 /// is something else — a plain two-argument lambda, most often.
 fn comparator_keys(v: &Value) -> Option<Vec<(Value, bool)>> {
@@ -6813,6 +6824,15 @@ fn comparator_keys(v: &Value) -> Option<Vec<(Value, bool)>> {
 /// decides, so a later key is consulted only on a tie — which is what makes
 /// `compareBy { it.a }.thenBy { it.b }` a tiebreak rather than a second sort.
 fn compare_with(vm: &mut VM, cmp: &Value, a: &Value, b: &Value) -> Result<i64, String> {
+    if let Some(sub) = user_compare_sub(cmp) {
+        let entry = vm
+            .chunk
+            .find_sub(sub)
+            .ok_or_else(|| "kotlin: compare body not found".to_string())?;
+        let base = vm.stack.len();
+        vm.stack.extend([cmp.clone(), a.clone(), b.clone()]);
+        return Ok(run_sub(vm, entry, base)?.to_int());
+    }
     let Some(keys) = comparator_keys(cmp) else {
         return Ok(invoke_closure(vm, cmp, &[a.clone(), b.clone()])?.to_int());
     };

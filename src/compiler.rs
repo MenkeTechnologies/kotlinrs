@@ -58,6 +58,7 @@ fn is_marker_supertype(name: &str) -> bool {
     matches!(
         name,
         "Comparable"
+            | "Comparator"
             | "Cloneable"
             | "Serializable"
             | "Runnable"
@@ -77,6 +78,7 @@ fn is_marker_supertype(name: &str) -> bool {
 fn marker_member(parent: &str, name: &str, arity: usize) -> bool {
     match parent {
         "Comparable" => name == "compareTo" && arity == 1,
+        "Comparator" => name == "compare" && arity == 2,
         "Runnable" => name == "run" && arity == 0,
         "AutoCloseable" | "Closeable" => name == "close" && arity == 0,
         // An `Iterator` is driven by `for` through its own two members (see
@@ -3076,6 +3078,25 @@ impl Compiler {
                 self.b.emit(Op::LoadInt(sub as i64), 0);
                 self.b.emit(Op::Extended(KT_OPER_REG, 0), 0);
             }
+        }
+        // A user `Comparator` (`object : Comparator<T> { override fun compare(a,
+        // b) … }`) reaches `sortedWith` and the sorted collections as a plain
+        // handle, so its `compare` is published the same way.
+        for (tag, owner) in self.method_index.get("compare").cloned().unwrap_or_default() {
+            if !self.classes[&tag].mro.iter().any(|a| {
+                self.classes
+                    .get(a)
+                    .is_some_and(|m| m.parents.iter().any(|p| p == "Comparator"))
+            }) {
+                continue;
+            }
+            let t = self.b.add_constant(Value::str(tag));
+            self.b.emit(Op::LoadConst(t), 0);
+            let n = self.b.add_constant(Value::str("compare"));
+            self.b.emit(Op::LoadConst(n), 0);
+            let sub = self.b.add_name(&method_sub_name(&owner, "compare"));
+            self.b.emit(Op::LoadInt(sub as i64), 0);
+            self.b.emit(Op::Extended(KT_OPER_REG, 0), 0);
         }
     }
 

@@ -1282,3 +1282,10 @@ Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
   captures, and one built in a method copies the class's read-only properties.
 - **`xs.map { v -> object : F { … } }`** was a parse error: an unnamed `object`
   at the start of a statement was read as a declaration.
+- **A user `Comparator`** — `object : Comparator<String> { override fun
+  compare(a: String, b: String) = … }`, a named `class ByLen : Comparator<…>`
+  or an `object ByAge : Comparator<P>` — was `unresolved supertype Comparator`.
+  `Comparator` is now an accepted supertype whose abstract member is
+  `compare(a, b)`, each implementing class publishes that member to the
+  runtime, and every comparator consumer (`sortedWith`, `sortWith`,
+  `maxWith`/`minWith`, `sortedSetOf(cmp, …)`, `PriorityQueue(cmp)`) calls it.

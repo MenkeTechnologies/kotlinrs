@@ -1142,3 +1142,9 @@ interface G { fun g(): String }\nfun main() { val p = "x"; val o = object : G { 
 abstract class B(val k: Int) { abstract fun h(): Int }\nfun main() { val m = 3; val o = object : B(m * 2) { override fun h() = k + m }; println(o.h()) }	9\n
 fun main() { var log = ""; val o = object { init { log += "i" }; fun go() { listOf(1,2).forEach { log += it } } }; o.go(); println(log) }	i12\n
 class Holder(val tag: String) { fun mk() = object { override fun toString() = "in-" + tag } }\nfun main() { println(Holder("t").mk()) }	in-t\n
+fun main() { val c = object : Comparator<String> { override fun compare(a: String, b: String) = a.length - b.length }; println(listOf("ccc", "a", "bb").sortedWith(c)) }	[a, bb, ccc]\n
+fun main() { val c = object : Comparator<Int> { override fun compare(a: Int, b: Int) = b.compareTo(a) }; val l = mutableListOf(3, 1, 2); l.sortWith(c); println(l); println(listOf(4, 9, 2).maxWith(c)); println(listOf(4, 9, 2).minWith(c)) }	[3, 2, 1]\n2\n9\n
+class ByLen : Comparator<String> { override fun compare(a: String, b: String): Int = a.length.compareTo(b.length) }\nfun main() { println(listOf("aaa", "b", "cc").sortedWith(ByLen())); println(ByLen().compare("x", "yy")) }	[b, cc, aaa]\n-1\n
+fun main() { val c = object : Comparator<Int> { override fun compare(a: Int, b: Int) = b - a }; val s = sortedSetOf(c, 1, 5, 3); println(s); println(c.compare(1, 2)) }	[5, 3, 1]\n1\n
+import java.util.PriorityQueue\nfun main() { val pq = PriorityQueue<Int>(object : Comparator<Int> { override fun compare(a: Int, b: Int) = b - a }); pq.add(2); pq.add(9); pq.add(4); println(pq.poll()); println(pq.poll()) }	9\n4\n
+data class P(val n: String, val a: Int)\nobject ByAge : Comparator<P> { override fun compare(x: P, y: P) = x.a - y.a }\nfun main() { println(listOf(P("a", 3), P("b", 1)).sortedWith(ByAge)); println(listOf(P("a", 3), P("b", 1)).maxWith(ByAge)) }	[P(n=b, a=1), P(n=a, a=3)]\nP(n=a, a=3)\n
