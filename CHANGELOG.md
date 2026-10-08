@@ -1265,3 +1265,20 @@ Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
   static class (`Animal`, `Any`) lacked the member, so no candidate was tried.
   It now dispatches over the subtypes that declare it.
 - **`Comparator { a, b -> … }`** was `unresolved reference: Comparator`.
+
+## Round 20 — object expressions close over their function, and the gaps round 19 measured
+
+Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
+
+- **An object expression capturing a local** — `val r = 2.0; object : Shape {
+  override fun area() = r * r }` — was `unresolved reference: r`: the
+  expression is hoisted to a top-level class and saw nothing of its function.
+  Each local the body names now travels as a hidden constructor property, typed
+  as the construction site saw it. A `var` written on either side
+  (`var n = 0; object { fun inc() { n++ } }`, a counter returned from a
+  factory) is passed as its heap cell, the same sharing a lambda's write gets,
+  so the frame and the object see each other's writes. An object built inside
+  another object's member forwards what it needs through the outer one's
+  captures, and one built in a method copies the class's read-only properties.
+- **`xs.map { v -> object : F { … } }`** was a parse error: an unnamed `object`
+  at the start of a statement was read as a declaration.

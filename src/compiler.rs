@@ -642,6 +642,509 @@ fn infer_constructor_returns(program: &Program) -> Program {
     out
 }
 
+/// The name prefix the parser gives a hoisted object expression. The parse
+/// sequence number follows it, and an object nested in another one's body is
+/// always numbered after it.
+const ANON_OBJECT: &str = "<anonymous>$";
+
+/// The parse sequence number of a hoisted object expression.
+fn anon_seq(name: &str) -> Option<usize> {
+    name.strip_prefix(ANON_OBJECT)?.parse().ok()
+}
+
+/// One body an object expression can be constructed in: a function, a method,
+/// or a class's construction-time code (property initializers, `init` blocks,
+/// superclass arguments). `owner` is the class a method or initializer belongs
+/// to, which is how a capture reaches an object built inside ANOTHER object.
+struct CaptureCtx {
+    owner: Option<String>,
+    /// The names a construction in this body can pass: its parameters and
+    /// locals, plus the owning class's read-only properties.
+    available: HashSet<String>,
+    /// The names this body assigns or increments anywhere.
+    written: HashSet<String>,
+    /// The object expressions constructed directly in this body.
+    objects: Vec<String>,
+}
+
+/// Every name `body` DECLARES — locals, loop variables, destructured names,
+/// local `fun`s and their parameters, lambda parameters and `catch` names, at
+/// any depth.
+fn declared_names(body: &[Stmt]) -> HashSet<String> {
+    let out = RefCell::new(HashSet::new());
+    stmt_any(body, &|k| {
+        let mut o = out.borrow_mut();
+        match k {
+            StmtKind::Let { name, .. } => {
+                o.insert(name.clone());
+            }
+            StmtKind::Destructure { names, .. } => o.extend(names.iter().cloned()),
+            StmtKind::For { var, .. } => {
+                o.insert(var.clone());
+            }
+            StmtKind::ForIn { var, parts, .. } => {
+                o.insert(var.clone());
+                o.extend(parts.iter().cloned());
+            }
+            StmtKind::LocalFun(lf) => {
+                o.insert(lf.name.clone());
+                o.extend(lf.params.iter().map(|p| p.name.clone()));
+            }
+            _ => {}
+        }
+        false
+    });
+    body_any(body, &|e| {
+        let mut o = out.borrow_mut();
+        match e {
+            Expr::Lambda { params, .. } => o.extend(params.iter().map(|(n, _)| n.clone())),
+            Expr::Try(t) => o.extend(t.catches.iter().map(|c| c.name.clone())),
+            _ => {}
+        }
+        false
+    });
+    out.into_inner()
+}
+
+/// Every name `body` writes: an assignment target or an `++`/`--` operand.
+fn written_names(body: &[Stmt]) -> HashSet<String> {
+    let out = RefCell::new(HashSet::new());
+    stmt_any(body, &|k| {
+        if let StmtKind::Assign { name, .. } = k {
+            out.borrow_mut().insert(name.clone());
+        }
+        false
+    });
+    body_any(body, &|e| {
+        if let Expr::IncDec { target, .. } = e {
+            if let Expr::Var(n) = &**target {
+                out.borrow_mut().insert(n.clone());
+            }
+        }
+        false
+    });
+    out.into_inner()
+}
+
+/// The object expressions `body` constructs directly (not inside another
+/// object's members, which are bodies of their own).
+fn constructed_objects(body: &[Stmt]) -> Vec<String> {
+    let out = RefCell::new(Vec::new());
+    body_any(body, &|e| {
+        if let Expr::Call { name, .. } = e {
+            if anon_seq(name).is_some() && !out.borrow().contains(name) {
+                out.borrow_mut().push(name.clone());
+            }
+        }
+        false
+    });
+    out.into_inner()
+}
+
+/// A class's construction-time code as one statement list: property
+/// initializers, `init` blocks, superclass and delegate arguments.
+fn class_init_body(cd: &ClassDecl) -> Vec<Stmt> {
+    let wrap = |e: &Expr| Stmt::new(cd.line, StmtKind::Expr(e.clone()));
+    cd.obj_props
+        .iter()
+        .map(|p| wrap(&p.init))
+        .chain(cd.super_args.iter().map(wrap))
+        .chain(cd.delegates.iter().map(|(_, e)| wrap(e)))
+        .chain(cd.inits.iter().flat_map(|b| b.body.iter().cloned()))
+        .collect()
+}
+
+/// Every member name a body inside `cd` reaches through implicit `this`: its
+/// own and its user-declared ancestors' properties, constructor parameters and
+/// methods. Kotlin resolves those BEFORE an enclosing function's locals, so
+/// none of them is a capture.
+fn member_names(cd: &ClassDecl, by_name: &HashMap<&str, &ClassDecl>) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut todo = vec![cd];
+    let mut seen = HashSet::new();
+    while let Some(c) = todo.pop() {
+        if !seen.insert(c.name.clone()) {
+            continue;
+        }
+        out.extend(c.params.iter().map(|p| p.name.clone()));
+        out.extend(c.obj_props.iter().map(|p| p.name.clone()));
+        out.extend(c.abstract_props.iter().map(|p| p.name.clone()));
+        out.extend(c.methods.iter().map(|m| m.name.clone()));
+        todo.extend(c.parents.iter().filter_map(|p| by_name.get(p.as_str()).copied()));
+    }
+    out
+}
+
+/// Let an object expression close over the locals of the function it is
+/// written in.
+///
+/// The parser hoists `object : T { … }` to a top-level class, so its body
+/// cannot see the enclosing frame. Kotlin's object expression captures exactly
+/// like a lambda does, so this pass gives the hoisted class one hidden trailing
+/// constructor property per captured local and appends the matching argument at
+/// the construction site. A `var` written on either side travels as its heap
+/// cell (the `CAPTURE_CELL` intrinsic) so both sides see every write, the
+/// boxing a lambda gets through [`shared_captures`].
+///
+/// A captured name is one the object's members mention, that is not one of the
+/// object's own (or inherited) members, not declared inside the object, and
+/// that the construction site has in scope. An object built inside another
+/// object's member forwards what it needs through the outer object's own
+/// captures, so the inner sets are computed first.
+fn capture_object_locals(program: &mut Program) {
+    let mut anon: Vec<(usize, String)> = program
+        .classes
+        .iter()
+        .filter_map(|c| anon_seq(&c.name).map(|n| (n, c.name.clone())))
+        .collect();
+    if anon.is_empty() {
+        return;
+    }
+    anon.sort();
+
+    // Where each object is constructed, and what that body can pass.
+    let mut ctxs: Vec<CaptureCtx> = Vec::new();
+    let fun_ctx = |f: &FunDecl, owner: Option<String>, extra: &HashSet<String>| {
+        let mut available = declared_names(&f.body);
+        available.extend(f.params.iter().map(|p| p.name.clone()));
+        available.extend(extra.iter().cloned());
+        CaptureCtx {
+            owner,
+            available,
+            written: written_names(&f.body),
+            objects: constructed_objects(&f.body),
+        }
+    };
+    for f in &program.funs {
+        ctxs.push(fun_ctx(f, None, &HashSet::new()));
+    }
+    for cd in &program.classes {
+        // A read-only property of the owning class reads the same through a
+        // copy as through `this`; a `var` one would not, so it is left out.
+        let vals: HashSet<String> = cd
+            .params
+            .iter()
+            .filter(|p| p.kind == PropKind::Val)
+            .map(|p| p.name.clone())
+            .chain(
+                cd.obj_props
+                    .iter()
+                    .filter(|p| !p.mutable && !p.lazy && !p.delegate)
+                    .map(|p| p.name.clone()),
+            )
+            .collect();
+        for m in &cd.methods {
+            ctxs.push(fun_ctx(m, Some(cd.name.clone()), &vals));
+        }
+        let init = class_init_body(cd);
+        let mut available = declared_names(&init);
+        available.extend(cd.params.iter().map(|p| p.name.clone()));
+        available.extend(cd.obj_props.iter().map(|p| p.name.clone()));
+        ctxs.push(CaptureCtx {
+            owner: Some(cd.name.clone()),
+            available,
+            written: written_names(&init),
+            objects: constructed_objects(&init),
+        });
+    }
+    let site_of = |name: &str| ctxs.iter().position(|c| c.objects.iter().any(|o| o == name));
+
+    // Bottom-up (innermost object first): what each object needs from outside
+    // itself, and what it writes, nested objects included.
+    let by_name: HashMap<&str, &ClassDecl> =
+        program.classes.iter().map(|c| (c.name.as_str(), c)).collect();
+    let mut free: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut writes: HashMap<String, HashSet<String>> = HashMap::new();
+    for (_, name) in anon.iter().rev() {
+        let cd = by_name[name.as_str()];
+        let mut bodies: Vec<Stmt> = class_init_body(cd);
+        for m in &cd.methods {
+            bodies.extend(m.body.iter().cloned());
+        }
+        let mut local = declared_names(&bodies);
+        for m in &cd.methods {
+            local.extend(m.params.iter().map(|p| p.name.clone()));
+        }
+        local.extend(member_names(cd, &by_name));
+        local.insert("this".into());
+        local.insert("it".into());
+        let mut need = referenced_names(&bodies);
+        let mut wrote = written_names(&bodies);
+        for (inner, _) in anon.iter().filter(|(_, n)| {
+            site_of(n).is_some_and(|s| ctxs[s].owner.as_deref() == Some(name.as_str()))
+        }) {
+            let inner = format!("{ANON_OBJECT}{inner}");
+            need.extend(free.get(&inner).into_iter().flatten().cloned());
+            wrote.extend(writes.get(&inner).into_iter().flatten().cloned());
+        }
+        need.retain(|n| !local.contains(n));
+        free.insert(name.clone(), need);
+        writes.insert(name.clone(), wrote);
+    }
+
+    // Top-down (outermost first): what each construction site can supply.
+    let mut captures: HashMap<String, Vec<ObjCapture>> = HashMap::new();
+    for (_, name) in &anon {
+        let Some(site) = site_of(name) else {
+            continue;
+        };
+        let ctx = &ctxs[site];
+        let mut available = ctx.available.clone();
+        if let Some(outer) = ctx.owner.as_ref().and_then(|o| captures.get(o)) {
+            available.extend(outer.iter().map(|c| c.name.clone()));
+        }
+        let mut names: Vec<&String> = free[name].iter().filter(|n| available.contains(*n)).collect();
+        names.sort();
+        let caps: Vec<ObjCapture> = names
+            .into_iter()
+            .map(|n| ObjCapture {
+                name: n.clone(),
+                shared: ctx.written.contains(n) || writes[name].contains(n),
+            })
+            .collect();
+        if !caps.is_empty() {
+            captures.insert(name.clone(), caps);
+        }
+    }
+    if captures.is_empty() {
+        return;
+    }
+
+    // Declare the hidden properties, then pass them at every construction.
+    for cd in &mut program.classes {
+        if let Some(caps) = captures.get(&cd.name) {
+            cd.params.extend(caps.iter().map(|c| CtorProp {
+                name: c.name.clone(),
+                ty: Type::Unknown,
+                class: None,
+                kind: PropKind::Val,
+                default: None,
+                type_param_of: None,
+                type_args: Vec::new(),
+            }));
+            cd.has_primary = true;
+            cd.captures = caps.clone();
+        }
+    }
+    let pass = |e: &mut Expr| {
+        if let Expr::Call { name, args, line } = e {
+            if let Some(caps) = captures.get(name.as_str()) {
+                args.extend(caps.iter().map(|c| {
+                    let v = Expr::Var(c.name.clone());
+                    if c.shared {
+                        Expr::Call {
+                            name: CAPTURE_CELL.into(),
+                            args: vec![v],
+                            line: *line,
+                        }
+                    } else {
+                        v
+                    }
+                }));
+            }
+        }
+    };
+    for f in &mut program.funs {
+        each_expr_mut(&mut f.body, &pass);
+    }
+    for cd in &mut program.classes {
+        for m in &mut cd.methods {
+            each_expr_mut(&mut m.body, &pass);
+        }
+        for p in &mut cd.obj_props {
+            expr_each_mut(&mut p.init, &pass);
+        }
+        for a in &mut cd.super_args {
+            expr_each_mut(a, &pass);
+        }
+        for (_, a) in &mut cd.delegates {
+            expr_each_mut(a, &pass);
+        }
+        for b in &mut cd.inits {
+            each_expr_mut(&mut b.body, &pass);
+        }
+    }
+}
+
+/// Apply `f` to every expression in `body`, outermost first, descending into
+/// nested statements, lambdas and local `fun`s — the mutable counterpart of
+/// [`body_any`].
+fn each_expr_mut(body: &mut [Stmt], f: &dyn Fn(&mut Expr)) {
+    for s in body {
+        match &mut s.kind {
+            StmtKind::Empty
+            | StmtKind::Return(None)
+            | StmtKind::Break(_)
+            | StmtKind::Continue(_) => {}
+            StmtKind::Let { init, .. } | StmtKind::Destructure { init, .. } => {
+                expr_each_mut(init, f)
+            }
+            StmtKind::Assign { value, .. } => expr_each_mut(value, f),
+            StmtKind::SetMember { recv, value, .. } => {
+                expr_each_mut(recv, f);
+                expr_each_mut(value, f);
+            }
+            StmtKind::SetIndex {
+                recv, index, value, ..
+            } => {
+                expr_each_mut(recv, f);
+                expr_each_mut(index, f);
+                expr_each_mut(value, f);
+            }
+            StmtKind::LocalFun(lf) => each_expr_mut(&mut lf.body, f),
+            StmtKind::Return(Some(e)) | StmtKind::Expr(e) => expr_each_mut(e, f),
+            StmtKind::While { cond, body, .. } | StmtKind::DoWhile { cond, body, .. } => {
+                expr_each_mut(cond, f);
+                each_expr_mut(body, f);
+            }
+            StmtKind::For {
+                start,
+                end,
+                step,
+                body,
+                ..
+            } => {
+                expr_each_mut(start, f);
+                expr_each_mut(end, f);
+                if let Some(e) = step {
+                    expr_each_mut(e, f);
+                }
+                each_expr_mut(body, f);
+            }
+            StmtKind::ForIn { iter, body, .. } => {
+                expr_each_mut(iter, f);
+                each_expr_mut(body, f);
+            }
+            StmtKind::If(ie) => if_each_mut(ie, f),
+            StmtKind::When(w) => when_each_mut(w, f),
+        }
+    }
+}
+
+fn if_each_mut(ie: &mut IfExpr, f: &dyn Fn(&mut Expr)) {
+    expr_each_mut(&mut ie.cond, f);
+    each_expr_mut(&mut ie.then, f);
+    if let Some(b) = &mut ie.els {
+        each_expr_mut(b, f);
+    }
+}
+
+fn when_each_mut(w: &mut WhenExpr, f: &dyn Fn(&mut Expr)) {
+    if let Some(e) = &mut w.subject {
+        expr_each_mut(e, f);
+    }
+    for arm in &mut w.arms {
+        if let WhenGuard::Conds(conds) = &mut arm.guard {
+            for c in conds {
+                match c {
+                    WhenCond::Expr(e) => expr_each_mut(e, f),
+                    WhenCond::InRange { start, end, .. } => {
+                        expr_each_mut(start, f);
+                        expr_each_mut(end, f);
+                    }
+                    WhenCond::In { container, .. } => expr_each_mut(container, f),
+                    WhenCond::Is { .. } => {}
+                }
+            }
+        }
+        each_expr_mut(&mut arm.body, f);
+    }
+}
+
+/// [`each_expr_mut`] for one expression and everything inside it.
+fn expr_each_mut(e: &mut Expr, f: &dyn Fn(&mut Expr)) {
+    f(e);
+    match e {
+        Expr::Call { args, .. } => args.iter_mut().for_each(|a| expr_each_mut(a, f)),
+        Expr::Invoke { target, args, .. } => {
+            expr_each_mut(target, f);
+            args.iter_mut().for_each(|a| expr_each_mut(a, f));
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            expr_each_mut(recv, f);
+            args.iter_mut().for_each(|a| expr_each_mut(a, f));
+        }
+        Expr::Member { recv: x, .. }
+        | Expr::Named { value: x, .. }
+        | Expr::Spread(x)
+        | Expr::As { value: x, .. }
+        | Expr::Unary { expr: x, .. }
+        | Expr::NotNull(x)
+        | Expr::Is { value: x, .. }
+        | Expr::IncDec { target: x, .. }
+        | Expr::Throw(x) => expr_each_mut(x, f),
+        Expr::Binary { l: a, r: b, .. }
+        | Expr::Elvis { left: a, right: b }
+        | Expr::Index {
+            recv: a, index: b, ..
+        }
+        | Expr::Pair {
+            first: a,
+            second: b,
+        }
+        | Expr::Range {
+            start: a, end: b, ..
+        }
+        | Expr::Step { recv: a, by: b }
+        | Expr::In {
+            value: a,
+            container: b,
+            ..
+        } => {
+            expr_each_mut(a, f);
+            expr_each_mut(b, f);
+        }
+        Expr::Lambda { body, .. } => each_expr_mut(body, f),
+        Expr::FunRef { recv, .. } => {
+            if let Some(r) = recv {
+                expr_each_mut(r, f);
+            }
+        }
+        Expr::If(ie) => if_each_mut(ie, f),
+        Expr::When(w) => when_each_mut(w, f),
+        Expr::Try(t) => {
+            each_expr_mut(&mut t.body, f);
+            for c in &mut t.catches {
+                each_expr_mut(&mut c.body, f);
+            }
+            each_expr_mut(&mut t.finally_body, f);
+        }
+        Expr::Str(parts) => {
+            for p in parts {
+                if let StrExpr::Expr(x) = p {
+                    expr_each_mut(x, f);
+                }
+            }
+        }
+        Expr::Int(_)
+        | Expr::Long(_)
+        | Expr::Float(_)
+        | Expr::Float32(_)
+        | Expr::Bool(_)
+        | Expr::Char(_)
+        | Expr::Null
+        | Expr::LateinitUnset
+        | Expr::Super { .. }
+        | Expr::Var(_) => {}
+    }
+}
+
+/// The names `body` reads or writes AS VARIABLES — a bare read, an
+/// assignment target, or a call through a name (which may be a local holding a
+/// function). Unlike [`mentioned_names`] it leaves out member names: `l.size`
+/// does not reference a local called `size`.
+fn referenced_names(body: &[Stmt]) -> HashSet<String> {
+    let out = RefCell::new(HashSet::new());
+    body_any(body, &|e| {
+        if let Expr::Var(n) | Expr::Call { name: n, .. } = e {
+            out.borrow_mut().insert(n.clone());
+        }
+        false
+    });
+    out.borrow_mut().extend(written_names(body));
+    out.into_inner()
+}
+
 /// The mangled sub name an extension function's body is emitted under. `$`
 /// cannot appear in a Kotlin identifier, so it can never collide with a free
 /// function, a method, or another receiver's extension of the same name.
@@ -717,6 +1220,9 @@ struct ClassMeta {
     /// constructor property [`INNER_OUTER_FIELD`] holds. See
     /// [`ClassDecl::inner_of`].
     outer: Option<String>,
+    /// The locals an object expression closes over, in hidden-constructor-
+    /// property order. See [`ClassDecl::captures`].
+    captures: Vec<ObjCapture>,
 }
 
 impl ClassMeta {
@@ -920,6 +1426,12 @@ pub struct Compiler {
     /// enclosing instance as its first argument; read and cleared by the very
     /// next [`Compiler::compile_call`]. See there.
     outer_supplied: bool,
+    /// The static type, class and element type each object-expression capture
+    /// had at its construction site, keyed `(object, name)`. The hidden
+    /// constructor property itself is untyped, so this is what types the
+    /// captured name inside the object's constructor and members — which are
+    /// compiled after the site for exactly that reason.
+    capture_types: HashMap<(String, String), (Type, Option<String>, Type)>,
     /// The `object` whose property initializers are being lowered right now.
     ///
     /// [`Compiler::build_object`] evaluates every initializer into a local slot
@@ -1733,6 +2245,7 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
                 sec_params: cd.secondaries.iter().map(|s| s.params.clone()).collect(),
                 throwable_base,
                 outer: cd.inner_of.clone(),
+                captures: cd.captures.clone(),
             },
         );
     }
@@ -1826,7 +2339,8 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
 /// adapter both did — walked the whole AST a second time for an answer that was
 /// already in hand.
 pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool), String> {
-    let annotated = infer_constructor_returns(program);
+    let mut annotated = infer_constructor_returns(program);
+    capture_object_locals(&mut annotated);
     let program = &annotated;
     // Extensions live in their own table keyed by `(receiver type, name)`: they
     // are NOT callable as free functions, and two receivers may each declare one
@@ -1906,6 +2420,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         method_index,
         cur_class: None,
         outer_supplied: false,
+        capture_types: HashMap::new(),
         building_object: None,
         debug,
         has_ffi,
@@ -2055,41 +2570,25 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
     // (slot 0) as an implicit first parameter of the enclosing class type. An
     // `abstract` declaration owns no body — it only reserves the name so a
     // subtype's override is reachable through the dispatch chain.
+    //
+    // An object expression that captures locals is compiled LAST, outermost
+    // first, each after the queues have drained: its captures are typed from
+    // its construction site (see [`Compiler::capture_types`]), which may sit in
+    // a lambda or in another object's member, so every body that can hold
+    // that site has to be lowered before it.
+    let mut capturing: Vec<&ClassDecl> = Vec::new();
     for cd in &program.classes {
-        if !cd.is_object && !cd.is_interface {
-            c.compile_ctor(cd)?;
-            for (i, sec) in cd.secondaries.iter().enumerate() {
-                c.compile_secondary_ctor(cd, i, sec)?;
-            }
-        }
-        for m in &cd.methods {
-            if !m.is_abstract {
-                c.compile_fun(m, Some(&cd.name))?;
-            }
+        if cd.captures.is_empty() {
+            c.compile_class_bodies(cd)?;
+        } else {
+            capturing.push(cd);
         }
     }
-    // Lambda bodies emit as subroutine regions last. Draining may enqueue further
-    // lambdas (one nested inside another), so loop until the queue is empty.
-    // Lambda bodies and local `fun` bodies both emit after everything that can
-    // enqueue them, and each may enqueue the other, so the two queues drain
-    // together until both are empty.
-    loop {
-        if let Some(pl) = c.pending_lambdas.pop() {
-            c.compile_lambda_body(pl)?;
-            continue;
-        }
-        match c.pending_local_funs.pop() {
-            Some(pf) => {
-                c.local_funs = pf.local_funs;
-                c.local_sigs = pf.local_sigs;
-                c.local_caps = pf.local_caps;
-                c.compile_fun_captured(&pf.decl, None, &pf.caps, pf.class_ctx.as_deref())?;
-                c.local_funs.clear();
-                c.local_sigs.clear();
-                c.local_caps.clear();
-            }
-            None => break,
-        }
+    c.drain_pending()?;
+    capturing.sort_by_key(|cd| anon_seq(&cd.name));
+    for cd in capturing {
+        c.compile_class_bodies(cd)?;
+        c.drain_pending()?;
     }
 
     let end = c.b.current_pos();
@@ -2099,7 +2598,63 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
 }
 
 impl Compiler {
-    /// Evaluate an `object`'s property initializers and construct its singleton
+    /// Lower a class's constructors and method bodies.
+    fn compile_class_bodies(&mut self, cd: &ClassDecl) -> Result<(), String> {
+        if !cd.is_object && !cd.is_interface {
+            self.compile_ctor(cd)?;
+            for (i, sec) in cd.secondaries.iter().enumerate() {
+                self.compile_secondary_ctor(cd, i, sec)?;
+            }
+        }
+        for m in &cd.methods {
+            if !m.is_abstract {
+                self.compile_fun(m, Some(&cd.name))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Bind an object expression's capture `cap` in `sc`, typed as its
+    /// construction site saw it, and boxed when it travels as a heap cell.
+    fn declare_capture(&mut self, sc: &mut Scope, object: &str, cap: &ObjCapture) -> u16 {
+        let (ty, class, elem) = self
+            .capture_types
+            .get(&(object.to_string(), cap.name.clone()))
+            .cloned()
+            .unwrap_or((Type::Unknown, None, Type::Unknown));
+        let slot = sc.declare_full(&cap.name, ty, cap.shared, class, elem);
+        if cap.shared {
+            sc.box_binding(&cap.name);
+        }
+        slot
+    }
+
+    /// Emit every queued lambda body) and local `fun` body as a subroutine.
+    /// Lambda bodies and local `fun` bodies both emit after everything that can
+    /// enqueue them, and each may enqueue the other (or a further one of its own
+    /// kind), so the two queues drain together until both are empty.
+    fn drain_pending(&mut self) -> Result<(), String> {
+        loop {
+            if let Some(pl) = self.pending_lambdas.pop() {
+                self.compile_lambda_body(pl)?;
+                continue;
+            }
+            match self.pending_local_funs.pop() {
+                Some(pf) => {
+                    self.local_funs = pf.local_funs;
+                    self.local_sigs = pf.local_sigs;
+                    self.local_caps = pf.local_caps;
+                    self.compile_fun_captured(&pf.decl, None, &pf.caps, pf.class_ctx.as_deref())?;
+                    self.local_funs.clear();
+                    self.local_sigs.clear();
+                    self.local_caps.clear();
+                }
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// Evaluate an `object`'s property initializers) and construct its singleton
     /// once, storing the handle in a global named after the object.
     fn build_object(&mut self, cd: &ClassDecl) -> Result<(), String> {
         let meta = self.classes[&cd.name].clone();
@@ -2173,7 +2728,14 @@ impl Compiler {
         // Bind the primary-constructor parameters to slots, deepest last.
         let mut sc = Scope::new();
         for p in &meta.ctor_params {
-            sc.declare_obj(&p.name, p.ty, false, p.class.clone());
+            match meta.captures.iter().find(|c| c.name == p.name) {
+                Some(cap) => {
+                    self.declare_capture(&mut sc, &cd.name, cap);
+                }
+                None => {
+                    sc.declare_obj(&p.name, p.ty, false, p.class.clone());
+                }
+            }
         }
         for i in (0..meta.ctor_params.len()).rev() {
             self.b.emit(Op::SetSlot(i as u16), cd.line);
@@ -2660,6 +3222,22 @@ impl Compiler {
         // Bind args (stack top = last arg) into slots, deepest last.
         for i in (0..nslots).rev() {
             self.b.emit(Op::SetSlot(i as u16), f.line);
+        }
+        // An object expression's captures live in hidden fields; each member
+        // binds them as locals of its own frame, so a read, a write and a
+        // lambda's capture of one all take the ordinary slot paths (a shared
+        // one through its heap cell).
+        let caps = class
+            .and_then(|c| self.classes.get(c))
+            .map(|m| m.captures.clone())
+            .unwrap_or_default();
+        for cap in caps.iter().filter(|c| !f.params.iter().any(|p| p.name == c.name)) {
+            self.b.emit(Op::GetSlot(0), f.line);
+            let nidx = self.b.add_constant(Value::str(cap.name.clone()));
+            self.b.emit(Op::LoadConst(nidx), f.line);
+            self.b.emit(Op::Extended(KT_GETFIELD, 0), f.line);
+            let slot = self.declare_capture(&mut sc, class.unwrap_or_default(), cap);
+            self.b.emit(Op::SetSlot(slot), f.line);
         }
 
         // An extension on a user class puts that class's members in implicit
@@ -7147,6 +7725,35 @@ impl Compiler {
         if zero_arity_free_fun(name) {
             self.mark_zero_arity_lambda(args);
         }
+        // A shared object-expression capture: the variable's heap cell, not
+        // its value. A binding that is not boxed here (a parameter, or a name
+        // the site reaches some other way) gets a fresh cell around its value.
+        if name == CAPTURE_CELL {
+            let Some(Expr::Var(v)) = args.first() else {
+                return Err(format!("malformed capture at line {line}"));
+            };
+            match sc.slot(v) {
+                Some(slot) if sc.is_boxed(v) => {
+                    self.b.emit(Op::GetSlot(slot), line);
+                }
+                _ => {
+                    self.compile_expr(sc, &args[0])?;
+                    self.b.emit(Op::Extended(KT_LIST, 1), line);
+                }
+            }
+            return Ok(Type::Obj);
+        }
+        // Constructing an object expression that captures: record what each
+        // captured name is here, which is what types it inside the object.
+        if let Some(meta) = self.class_meta(name).filter(|m| !m.captures.is_empty()) {
+            let object = meta.name.clone();
+            for cap in meta.captures.clone() {
+                if sc.slot(&cap.name).is_some() {
+                    let seen = (sc.ty(&cap.name), sc.class_of(&cap.name), sc.elem_of(&cap.name));
+                    self.capture_types.insert((object.clone(), cap.name), seen);
+                }
+            }
+        }
         // A bare `In(args)` naming an `inner class` passes the enclosing
         // instance in scope as the hidden first argument. `outer_supplied`
         // marks the call that already carries it (this rewrite, or the
@@ -11276,11 +11883,25 @@ fn shared_captures(body: &[Stmt]) -> HashSet<String> {
         }
         false
     });
-    captured
+    let mut shared: HashSet<String> = captured
         .into_inner()
         .intersection(&written)
         .cloned()
-        .collect()
+        .collect();
+    // An object expression passes a shared capture as its cell (see
+    // [`ObjCapture`]). The write may sit inside the object, out of this walk's
+    // sight, so the cell itself is what decides.
+    let cells = RefCell::new(Vec::new());
+    body_any(body, &|e| {
+        if let Expr::Call { name, args, .. } = e {
+            if let (CAPTURE_CELL, [Expr::Var(v)]) = (name.as_str(), args.as_slice()) {
+                cells.borrow_mut().push(v.clone());
+            }
+        }
+        false
+    });
+    shared.extend(cells.into_inner());
+    shared
 }
 
 /// Whether a parameter list can accept arguments of these coarse types.

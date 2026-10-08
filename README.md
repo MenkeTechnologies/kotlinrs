@@ -195,8 +195,10 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   property as a delegated one over a holder for the field. A `return` inside a
   custom setter is refused.
 - **Object expressions** — `object : T { … }` (and a bare `object { … }`)
-  builds a fresh instance of an anonymous class per evaluation. Like a local
-  class it cannot capture the enclosing function's locals; a body that tries
+  builds a fresh instance of an anonymous class per evaluation. It closes over
+  the enclosing function's locals as a lambda does: each captured name is a
+  hidden constructor property, and a `var` written on either side is shared
+  through one heap cell. A LOCAL class does not capture yet; a body that tries
   is an `unresolved reference`.
 - **`typealias`** — plain and generic (`typealias Pred<T> = (T) -> Boolean`),
   expanded where it is written, constructor calls included.

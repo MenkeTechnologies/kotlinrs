@@ -331,12 +331,13 @@ Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 | program | kotlinrs | reference |
 | --- | --- | --- |
 | `object : Comparator<String> { override fun compare(a: String, b: String) = a.length - b.length }` | `unresolved supertype Comparator` | a comparator `sortedWith` takes |
-| `val k = 2; object : I { override fun f() = k }` | `unresolved reference: k` | captures `k` |
+| `fun m() { val k = 2; class L { fun f() = k }; println(L().f()) }` | `unresolved reference: k` | `2` |
 | `println(check(true) == Unit)` | `unresolved reference: Unit` | `true` |
 
 The first needs a host-side call into a user `compare` with two arguments; the
-`compareTo` registry passes one. The second is the capture limit object
-expressions share with local classes: both are hoisted to the top level.
+`compareTo` registry passes one. The second is the capture limit of a LOCAL class, which is hoisted to the top
+level with no link back to its construction sites. Object expressions, hoisted
+the same way, capture since round 20 (see CHANGELOG).
 
 ## Round 17: measured and still missing
 

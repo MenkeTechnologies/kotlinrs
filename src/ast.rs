@@ -381,7 +381,24 @@ pub struct ClassDecl {
     /// passes it at every construction and reads the enclosing class's
     /// members through it.
     pub inner_of: Option<String>,
+    /// The enclosing function's locals an OBJECT EXPRESSION closes over
+    /// (`val r = 2.0; object : Shape { override fun area() = r * r }`). The
+    /// expression is hoisted to a top-level class, so each capture becomes a
+    /// hidden trailing constructor property of the same name that the
+    /// construction site passes; see `crate::compiler`'s
+    /// `capture_object_locals`. Empty for every declared class.
+    pub captures: Vec<ObjCapture>,
     pub line: u32,
+}
+
+/// One local an object expression captures. `shared` is set when the `var` is
+/// written anywhere — in the enclosing function or in the object — so both
+/// sides must hold the same one-element heap cell rather than copies (the JVM
+/// backend's `Ref.IntRef`), exactly as a lambda that writes a captured `var`.
+#[derive(Debug, Clone)]
+pub struct ObjCapture {
+    pub name: String,
+    pub shared: bool,
 }
 
 /// The field an `inner class` instance keeps its enclosing instance in. `$`
@@ -835,6 +852,11 @@ pub const REIFY_CALL: &str = "__reify";
 /// (the lambda having been inlined into it), not the lambda. Its one optional
 /// argument is the returned value. `$` cannot appear in a Kotlin identifier.
 pub const NONLOCAL_RETURN: &str = "$return";
+
+/// The intrinsic an object expression's construction site passes a SHARED
+/// capture through (see [`ObjCapture`]): its one argument is a `Var`, and the
+/// call evaluates to that variable's heap cell rather than to its value.
+pub const CAPTURE_CELL: &str = "$cell";
 
 /// The intrinsic a `return@label` parses to when the label names an ENCLOSING
 /// lambda rather than the innermost one (`run outer@{ xs.forEach { return@outer 1 } }`).

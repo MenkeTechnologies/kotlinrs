@@ -1755,6 +1755,7 @@ impl Parser {
             methods,
             is_data,
             inner_of: None,
+            captures: Vec::new(),
             is_object,
             is_interface,
             is_abstract,
@@ -1872,6 +1873,7 @@ impl Parser {
             None => ClassDecl {
                 name: companion_name(cls),
                 inner_of: None,
+                captures: Vec::new(),
                 // An `enum class` cannot declare type parameters.
                 type_params: Vec::new(),
                 params: Vec::new(),
@@ -1928,6 +1930,7 @@ impl Parser {
                     self.pending_classes.push(ClassDecl {
                         name: sub.clone(),
                         inner_of: None,
+                        captures: Vec::new(),
                         type_params: Vec::new(),
                         params: Vec::new(),
                         obj_props: Vec::new(),
@@ -3194,7 +3197,13 @@ impl Parser {
             // `unresolved reference` when the class body is compiled — rather
             // than silently reading something else, unless a top-level property
             // of the same name exists.
-            Tok::Class | Tok::Object => {
+            // `object : T { … }` / `object { … }` with no name is an object
+            // EXPRESSION in statement position (a lambda's result, typically),
+            // so it falls through to the expression statement below.
+            Tok::Class | Tok::Object
+                if !(matches!(self.peek(), Tok::Object)
+                    && matches!(self.peek_at(1), Tok::Colon | Tok::LBrace)) =>
+            {
                 let decl = self.class_decl()?;
                 self.pending_classes.push(decl);
                 StmtKind::Empty
@@ -4624,10 +4633,10 @@ impl Parser {
                 Ok(Expr::Null)
             }
             // `object : T { … }` — an object EXPRESSION. It is hoisted as an
-            // anonymous top-level class (the way a local class is, and with the
-            // same limit: it cannot capture the enclosing function's locals, and
-            // a body that tries is an `unresolved reference`), and the
-            // expression constructs a fresh instance of it.
+            // anonymous top-level class (the way a local class is), and the
+            // expression constructs a fresh instance of it. The enclosing
+            // function's locals it closes over are threaded through hidden
+            // constructor properties by the compiler's `capture_object_locals`.
             Tok::Object => {
                 static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                 let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
