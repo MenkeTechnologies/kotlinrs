@@ -19,8 +19,7 @@
 
 **Kotlin in Rust** — a compiled Kotlin runtime, hosted on the
 [`fusevm`](https://github.com/MenkeTechnologies/fusevm) bytecode VM with a
-three-tier Cranelift JIT — the same engine behind `zshrs`, `strykelang`,
-`awkrs`, `vimlrs`, `elisprs`, `rubylang`, `phplang`, `pythonrs`, and `node-js`.
+three-tier Cranelift JIT.
 No JVM, no `kotlinc`, no `.class` files.
 
 ### [`Read the Docs`](https://menketechnologies.github.io/kotlinrs/) &middot; [`Engineering Report`](https://menketechnologies.github.io/kotlinrs/report.html)
@@ -49,9 +48,7 @@ the loop. kotlinrs carries no VM or JIT of its own. Highlights:
 
 - **Compiled, not tree-walked** — arithmetic, comparison, and control flow lower
   to native fusevm ops so the JIT can block- and trace-compile hot loops.
-- **fusevm-hosted** — no local `vm.rs` / `jit.rs`; the shared engine behind
-  `zshrs`, `strykelang`, `awkrs`, `vimlrs`, `elisprs`, `rubylang`, `phplang`,
-  `pythonrs`, and `node-js`.
+- **fusevm-hosted** — no local `vm.rs` / `jit.rs`; the shared fusevm engine.
 - **Native locals & calls** — `val`/`var` bindings compile to frame slots and
   `fun` calls to fusevm's native `Op::Call` sub-dispatch, with real recursion.
 - **Kotlin-faithful boundaries** — a small extension handler supplies the
