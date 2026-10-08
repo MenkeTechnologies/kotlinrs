@@ -1234,3 +1234,11 @@ Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 - **`Map.Entry.toPair()`** was `unresolved reference: toPair on Map.Entry`.
 - **`kotlin.math.truncate`** was unresolved; it rounds toward zero, `Float`
   overload included, and is import-gated like the rest of `kotlin.math`.
+- **`Int` totals did not wrap.** `listOf(Int.MAX_VALUE, 1).sum()` answered
+  `2147483648` where the reference answers `-2147483648`, and so did `sumOf`
+  with an `Int` selector, an `IntArray`, a `List<Int>` parameter and a `map`
+  result. The width now comes from the receiver's static element type (an
+  annotation `List<Int>` included) and from the selector's result type for
+  `sumOf`. **`longArrayOf(Long.MAX_VALUE, 1).sum()` panicked** with `attempt to
+  add with overflow`; integral totals now wrap at 64 bits as the JVM's `long`
+  addition does.

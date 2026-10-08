@@ -7673,7 +7673,7 @@ fn coll_hof(
             for it in items {
                 mapped.push(invoke_closure(vm, clo, &[it])?);
             }
-            Ok(sum_values(&mapped))
+            Ok(sum_values(&mapped, false))
         }
         // `maxBy`/`minBy` and their `…OrNull` twins differ only on an EMPTY
         // receiver, where the plain pair throws — bare, with no detail, the way
@@ -12483,7 +12483,7 @@ fn sequence_member(
             }
             Value::Int(found.unwrap_or(-(lo + 1)))
         }
-        "sum" => sum_values(items),
+        "sum" => sum_values(items, recv.is_some_and(is_int_array)),
         // An empty average is NaN in Kotlin, not an error.
         // `average()` answers a `Double` for every element type, so the boxed
         // elements widen here rather than accumulating at 32 bits.
@@ -13009,11 +13009,28 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
     .ok_or_else(|| format!("no component{n} on {}", obj_label(recv)))
 }
 
+/// Whether `v` is an `IntArray` (or a `ShortArray`/`ByteArray`, which Kotlin
+/// sums as `Int`).
+fn is_int_array(v: &Value) -> bool {
+    with_obj(v, |o| matches!(o, HeapObj::Array { desc, .. } if matches!(desc.as_str(), "[I" | "[S" | "[B")))
+        .unwrap_or(false)
+}
+
 /// Sum a list of numbers — `Int` result when every element is integral, else
 /// `Double` (Kotlin `List<Int>.sum()` / `List<Double>.sum()`).
-fn sum_values(items: &[Value]) -> Value {
+///
+/// Integral totals wrap at 64 bits; `int32` (an `IntArray` receiver) wraps them
+/// at 32, as Kotlin's `Int` addition does. A plain `List` cannot say whether
+/// its integers are `Int`s or unboxed `Long`s, so its width is applied by the
+/// compiler, from the static element type.
+fn sum_values(items: &[Value], int32: bool) -> Value {
+    // Integral totals WRAP, as the JVM's `long` (and, narrowed by the
+    // caller, `int`) addition does — `longArrayOf(Long.MAX_VALUE, 1).sum()` is
+    // `Long.MIN_VALUE`, not an overflow.
+    let wrapping = |items: &[Value]| items.iter().map(num_i64).fold(0i64, i64::wrapping_add);
     if items.iter().all(|v| matches!(v, Value::Int(_))) {
-        return Value::Int(items.iter().map(|v| v.to_int()).sum());
+        let total = wrapping(items);
+        return Value::Int(if int32 { i64::from(total as i32) } else { total });
     }
     // `LongArray.sum()` / `List<Long>.sum()` answers a `Long`, so a run of boxed
     // ones sums integrally and re-boxes rather than widening to `Double`.
@@ -13022,7 +13039,7 @@ fn sum_values(items: &[Value]) -> Value {
             .iter()
             .all(|v| i64_box(v).is_some() || matches!(v, Value::Int(_)))
     {
-        return box_i64(items.iter().map(num_i64).sum());
+        return box_i64(wrapping(items));
     }
     // `List<Float>.sum()` accumulates at 32-bit width and answers a `Float`, so
     // it neither widens the elements nor renders through `Double`'s rules.

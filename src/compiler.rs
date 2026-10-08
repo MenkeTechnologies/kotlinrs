@@ -5537,6 +5537,16 @@ impl Compiler {
                 return Ok(ty);
             }
         }
+        // `sum()` answers at the ELEMENT width: an `Int` collection's total
+        // wraps at 32 bits (`listOf(Int.MAX_VALUE, 1).sum()` is
+        // `Int.MIN_VALUE`). Every integer is one `i64` at run time and an
+        // `IntArray` and a `LongArray` hold the same values, so the host sums at
+        // 64 bits and the width is applied here, from the static element type.
+        if name == "sum" && args.is_empty() && !safe && self.index_elem_ty(sc, recv) == Type::Int {
+            self.emit_kt_method(sc, recv, name, args, line)?;
+            self.emit_wrap32();
+            return Ok(Type::Int);
+        }
         self.emit_kt_method(sc, recv, name, args, line)
     }
 
@@ -6350,6 +6360,9 @@ impl Compiler {
         // staying `Unknown` (see [`Compiler::lambda_hint`]).
         let elem = self.infer_elem(sc, recv);
         let hint = self.hof_param_types(sc, recv, name, elem, extras);
+        // `sumOf`'s overload — and so the width its total wraps at — is the
+        // selector's result type: `sumOf { it }` over `Int`s is an `Int` sum.
+        let sum_int = name == "sumOf" && self.infer_lambda_result(sc, closure, &hint) == Type::Int;
         self.compile_expr(sc, recv)?;
         for e in extras {
             self.compile_expr(sc, e)?;
@@ -6365,7 +6378,35 @@ impl Compiler {
         self.b.emit(Op::LoadConst(nidx), line);
         self.b
             .emit(Op::CallBuiltin(KT_COLL_HOF, extras.len() as u8), line);
+        if sum_int {
+            self.emit_wrap32();
+            return Ok(Type::Int);
+        }
         Ok(hof_ret_type(name))
+    }
+
+    /// The static type of a lambda LITERAL's result, its parameters typed from
+    /// `hint` (see [`Compiler::hof_param_types`]) where the source leaves them
+    /// bare. `Unknown` for anything but a literal ending in an expression.
+    fn infer_lambda_result(&self, sc: &Scope, lam: &Expr, hint: &[(Type, Type)]) -> Type {
+        let Expr::Lambda { params, body, .. } = lam else {
+            return Type::Unknown;
+        };
+        let Some(StmtKind::Expr(result)) = body.last().map(|s| &s.kind) else {
+            return Type::Unknown;
+        };
+        let hinted = |i: usize| hint.get(i).map_or((Type::Unknown, Type::Unknown), |h| *h);
+        let mut inner = sc.clone();
+        if params.is_empty() {
+            let (ty, elem) = hinted(0);
+            inner.declare_elem("it", ty, false, elem);
+        }
+        for (i, (name, ty)) in params.iter().enumerate() {
+            let (hty, elem) = hinted(i);
+            let ty = if *ty == Type::Unknown { hty } else { *ty };
+            inner.declare_elem(name, ty, false, elem);
+        }
+        self.infer(&inner, result)
     }
 
     /// `recv.field (op)= value` — an object property write.
@@ -10000,7 +10041,12 @@ impl Compiler {
 
     fn infer_elem(&self, sc: &Scope, e: &Expr) -> Type {
         match e {
-            Expr::Var(n) => sc.elem_of(n),
+            // A binding whose initializer did not show its elements may still
+            // have them written in its annotation — `fun f(xs: List<Int>)`.
+            Expr::Var(n) => match sc.elem_of(n) {
+                Type::Unknown => annotated_elem(sc.class_of(n).as_deref(), &sc.type_args_of(n)),
+                t => t,
+            },
             // A range's elements are its endpoints' type: `Int`, or `Char` for
             // `'a'..'e'`.
             Expr::Range { start, .. } => match self.infer(sc, start) {
@@ -10020,12 +10066,16 @@ impl Compiler {
                 "floatArrayOf" => Type::Float,
                 "charArrayOf" => Type::Char,
                 "booleanArrayOf" => Type::Boolean,
+                // `List(n) { i -> … }` and its siblings hold what the lambda answers.
+                "List" | "MutableList" | "Array" if args.len() == 2 => {
+                    self.infer_lambda_result(sc, &args[1], &[(Type::Int, Type::Unknown)])
+                }
                 _ => Type::Unknown,
             },
             // The members that re-emit their receiver's own elements. `sorted`
             // and friends reorder, `filter`/`take`/`drop` select — none of them
             // changes what an element IS.
-            Expr::MethodCall { recv, name, .. } => match name.as_str() {
+            Expr::MethodCall { recv, name, args, .. } => match name.as_str() {
                 "filter" | "filterNot" | "filterIndexed" | "filterNotNull" | "sorted"
                 | "sortedDescending" | "sortedBy" | "sortedByDescending" | "sortedWith"
                 | "reversed" | "asReversed" | "take" | "takeLast" | "takeWhile" | "drop"
@@ -10033,6 +10083,12 @@ impl Compiler {
                 | "toList" | "toMutableList" | "toSet" | "toMutableSet" | "shuffled" | "slice"
                 | "subList" | "plus" | "minus" | "union" | "intersect" | "subtract" => {
                     self.infer_elem(sc, recv)
+                }
+                // A transform's elements are what its lambda answers.
+                "map" | "mapNotNull" | "mapIndexed" if args.len() == 1 => {
+                    let elem = self.infer_elem(sc, recv);
+                    let hint = self.hof_param_types(sc, recv, name, elem, &[]);
+                    self.infer_lambda_result(sc, &args[0], &hint)
                 }
                 _ => Type::Unknown,
             },
@@ -10933,6 +10989,20 @@ fn range_form(kind: RangeKind) -> u8 {
 /// The element type of an `Iterable`-shaped literal's arguments: the common
 /// type when they agree, `Unknown` when they do not (a heterogeneous
 /// `listOf(1, "a")` types as neither).
+/// The element type an ANNOTATION spells for a sequence-valued binding: the type
+/// argument of `List<Int>`, `Set<Long>`, `Array<Double>` and the like. A `Map`'s
+/// elements are entries, so it answers `Unknown`, as does every other class.
+fn annotated_elem(class: Option<&str>, type_args: &[TypeArg]) -> Type {
+    match class {
+        Some(
+            "List" | "MutableList" | "ArrayList" | "Set" | "MutableSet" | "HashSet"
+            | "LinkedHashSet" | "Collection" | "MutableCollection" | "Iterable"
+            | "MutableIterable" | "Sequence" | "Array" | "ArrayDeque",
+        ) => type_args.first().map_or(Type::Unknown, |a| a.ty),
+        _ => Type::Unknown,
+    }
+}
+
 fn elem_of_args(types: &[Type]) -> Type {
     let mut acc: Option<Type> = None;
     for t in types {
