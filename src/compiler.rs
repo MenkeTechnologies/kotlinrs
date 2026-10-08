@@ -946,24 +946,64 @@ fn capture_object_locals(program: &mut Program) {
             }
         }
     };
-    for f in &mut program.funs {
-        each_expr_mut(&mut f.body, &pass);
+    program_exprs_mut(program, &pass);
+}
+
+/// `java.util.TreeMap<K, V>()` and the other JDK collection classes spelled
+/// fully qualified are the same constructors their bare names reach, so the
+/// qualified spelling is rewritten to the bare call before anything — typing
+/// included — looks at it.
+fn unqualify_jdk_ctors(program: &mut Program) {
+    program_exprs_mut(program, &|e: &mut Expr| {
+        let Expr::MethodCall {
+            recv,
+            name,
+            args,
+            safe: false,
+            line,
+        } = e
+        else {
+            return;
+        };
+        let in_java_util = matches!(&**recv, Expr::Member { recv: pkg, name: util, safe: false, .. }
+            if util == "util" && matches!(&**pkg, Expr::Var(j) if j == "java"));
+        if in_java_util && is_jdk_collection_ctor(name) {
+            *e = Expr::Call {
+                name: std::mem::take(name),
+                args: std::mem::take(args),
+                line: *line,
+            };
+        }
+    });
+}
+
+/// Apply `f` to every expression of the program: function and method bodies,
+/// class construction code, and top-level property initializers.
+fn program_exprs_mut(program: &mut Program, f: &dyn Fn(&mut Expr)) {
+    for fun in &mut program.funs {
+        each_expr_mut(&mut fun.body, f);
+    }
+    for p in &mut program.props {
+        expr_each_mut(&mut p.init, f);
     }
     for cd in &mut program.classes {
         for m in &mut cd.methods {
-            each_expr_mut(&mut m.body, &pass);
+            each_expr_mut(&mut m.body, f);
         }
         for p in &mut cd.obj_props {
-            expr_each_mut(&mut p.init, &pass);
+            expr_each_mut(&mut p.init, f);
         }
         for a in &mut cd.super_args {
-            expr_each_mut(a, &pass);
+            expr_each_mut(a, f);
         }
         for (_, a) in &mut cd.delegates {
-            expr_each_mut(a, &pass);
+            expr_each_mut(a, f);
         }
         for b in &mut cd.inits {
-            each_expr_mut(&mut b.body, &pass);
+            each_expr_mut(&mut b.body, f);
+        }
+        for s in &mut cd.secondaries {
+            each_expr_mut(&mut s.body, f);
         }
     }
 }
@@ -2342,6 +2382,7 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
 /// already in hand.
 pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool), String> {
     let mut annotated = infer_constructor_returns(program);
+    unqualify_jdk_ctors(&mut annotated);
     capture_object_locals(&mut annotated);
     let program = &annotated;
     // Extensions live in their own table keyed by `(receiver type, name)`: they
@@ -13144,4 +13185,13 @@ fn builtin_binary_member(ty: &str, name: &str) -> bool {
         "Char" => matches!(name, "compareTo" | "rangeTo"),
         _ => false,
     }
+}
+
+/// The `java.util` collection classes whose constructors the frontend lowers
+/// under their bare names, and so also under the fully qualified spelling.
+fn is_jdk_collection_ctor(name: &str) -> bool {
+    matches!(
+        name,
+        "TreeMap" | "TreeSet" | "HashMap" | "HashSet" | "LinkedHashMap" | "LinkedHashSet" | "ArrayList"
+    )
 }

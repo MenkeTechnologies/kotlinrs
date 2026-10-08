@@ -9441,6 +9441,203 @@ fn builder_method(
     }
 }
 
+/// The `java.util.NavigableMap`/`NavigableSet` members of a SORTED map or set
+/// (`sortedMapOf`, `TreeMap`, `sortedSetOf`, `TreeSet`), or `None` for any
+/// other receiver or name.
+///
+/// Ported from `java.util.TreeMap`/`TreeSet`. The range members (`headMap`,
+/// `tailSet`, `descendingMap`, …) answer SNAPSHOTS rather than the JDK's live
+/// views, the same limit every collection view here has: a range keeps the
+/// source's comparator and stays sorted, and a descending one iterates in
+/// reverse.
+fn sorted_nav_method(
+    vm: &mut VM,
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    if order_of(recv) != Some(CollOrder::Sorted) {
+        return None;
+    }
+    let is_map = with_obj(recv, |o| matches!(o, HeapObj::Map(_)))?;
+    let known = if is_map {
+        matches!(
+            (name, args.len()),
+            ("firstKey" | "lastKey" | "firstEntry" | "lastEntry", 0)
+                | ("pollFirstEntry" | "pollLastEntry" | "descendingMap", 0)
+                | ("navigableKeySet" | "descendingKeySet", 0)
+                | ("floorKey" | "ceilingKey" | "higherKey" | "lowerKey", 1)
+                | ("floorEntry" | "ceilingEntry" | "higherEntry" | "lowerEntry", 1)
+                | ("headMap" | "tailMap", 1 | 2)
+                | ("subMap", 2 | 4)
+        )
+    } else {
+        matches!(
+            (name, args.len()),
+            ("pollFirst" | "pollLast" | "descendingSet", 0)
+                | ("floor" | "ceiling" | "higher" | "lower", 1)
+                | ("headSet" | "tailSet", 1 | 2)
+                | ("subSet", 2 | 4)
+        )
+    };
+    if !known {
+        return None;
+    }
+    ensure_ordered(vm, recv);
+    Some(sorted_nav(vm, recv, is_map, name, args))
+}
+
+/// [`sorted_nav_method`] once the receiver is known to answer `name`.
+fn sorted_nav(
+    vm: &mut VM,
+    recv: &Value,
+    is_map: bool,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, String> {
+    let entries: Vec<(Value, Value)> = with_obj(recv, |o| match o {
+        HeapObj::Map(e) => e.clone(),
+        HeapObj::Set(items) => items.iter().map(|k| (k.clone(), Value::Undef)).collect(),
+        _ => Vec::new(),
+    })
+    .unwrap_or_default();
+    let cmp = comparator_of(recv);
+    let order = |vm: &mut VM, a: &Value, b: &Value| -> Result<i64, String> {
+        match &cmp {
+            Some(c) => compare_with(vm, c, a, b),
+            None => Ok(value_cmp(a, b) as i64),
+        }
+    };
+    // What one position answers: the key, the entry, or the set element.
+    let answer = |i: Option<usize>, entry: bool| match i {
+        None => Value::Undef,
+        Some(i) if entry => alloc(HeapObj::Entry(entries[i].0.clone(), entries[i].1.clone())),
+        Some(i) => entries[i].0.clone(),
+    };
+    // A fresh sorted collection over `picked`, keeping the source's
+    // comparator; or, `descending`, an insertion-ordered one in reverse.
+    let rebuild = |vm: &mut VM, picked: Vec<(Value, Value)>, set: bool, descending: bool| {
+        let v = if set {
+            alloc(HeapObj::Set(picked.into_iter().map(|(k, _)| k).collect()))
+        } else {
+            alloc(HeapObj::Map(picked))
+        };
+        if descending {
+            with_obj_mut(&v, |o| match o {
+                HeapObj::Map(e) => e.reverse(),
+                HeapObj::Set(items) => items.reverse(),
+                _ => {}
+            });
+        } else {
+            set_order(vm, &v, CollOrder::Sorted);
+            record_comparator(&v, comparator_of(recv));
+        }
+        v
+    };
+    let entry_form = name.ends_with("Entry");
+    match name {
+        "firstKey" | "lastKey" if entries.is_empty() => {
+            Err("java.util.NoSuchElementException".to_string())
+        }
+        "firstKey" | "firstEntry" => Ok(answer((!entries.is_empty()).then_some(0), entry_form)),
+        "lastKey" | "lastEntry" => Ok(answer(entries.len().checked_sub(1), entry_form)),
+        "pollFirstEntry" | "pollLastEntry" | "pollFirst" | "pollLast" => {
+            let i = if name.contains("First") {
+                (!entries.is_empty()).then_some(0)
+            } else {
+                entries.len().checked_sub(1)
+            };
+            let out = answer(i, is_map);
+            if let Some(i) = i {
+                with_obj_mut(recv, |o| match o {
+                    HeapObj::Map(e) => {
+                        e.remove(i);
+                    }
+                    HeapObj::Set(items) => {
+                        items.remove(i);
+                    }
+                    _ => {}
+                });
+                invalidate_key_index(recv);
+            }
+            Ok(out)
+        }
+        "floorKey" | "floorEntry" | "floor" | "lowerKey" | "lowerEntry" | "lower" => {
+            // The LAST position at or below (strictly below, for `lower`).
+            let strict = name.starts_with("lower");
+            let mut hit = None;
+            for (i, (k, _)) in entries.iter().enumerate() {
+                let c = order(vm, k, &args[0])?;
+                if c < 0 || (c == 0 && !strict) {
+                    hit = Some(i);
+                } else {
+                    break;
+                }
+            }
+            Ok(answer(hit, entry_form))
+        }
+        "ceilingKey" | "ceilingEntry" | "ceiling" | "higherKey" | "higherEntry" | "higher" => {
+            // The FIRST position at or above (strictly above, for `higher`).
+            let strict = name.starts_with("higher");
+            let mut hit = None;
+            for (i, (k, _)) in entries.iter().enumerate() {
+                let c = order(vm, k, &args[0])?;
+                if c > 0 || (c == 0 && !strict) {
+                    hit = Some(i);
+                    break;
+                }
+            }
+            Ok(answer(hit, entry_form))
+        }
+        "headMap" | "headSet" | "tailMap" | "tailSet" | "subMap" | "subSet" => {
+            // `(bound, inclusive)` at each end; `head` defaults to exclusive,
+            // `tail` and a `sub` start to inclusive, a `sub` end to exclusive.
+            let flag = |v: &Value| matches!(v, Value::Bool(true));
+            let (lo, hi) = match (name, args) {
+                ("headMap" | "headSet", [to]) => (None, Some((to, false))),
+                ("headMap" | "headSet", [to, inc]) => (None, Some((to, flag(inc)))),
+                ("tailMap" | "tailSet", [from]) => (Some((from, true)), None),
+                ("tailMap" | "tailSet", [from, inc]) => (Some((from, flag(inc))), None),
+                (_, [from, to]) => (Some((from, true)), Some((to, false))),
+                (_, [from, fi, to, ti]) => (Some((from, flag(fi))), Some((to, flag(ti)))),
+                _ => (None, None),
+            };
+            if let (Some((from, _)), Some((to, _))) = (lo, hi) {
+                if order(vm, from, to)? > 0 {
+                    return Err(
+                        "java.lang.IllegalArgumentException: fromKey > toKey".to_string()
+                    );
+                }
+            }
+            let mut picked = Vec::new();
+            for (k, v) in &entries {
+                let above = match lo {
+                    Some((from, inc)) => {
+                        let c = order(vm, k, from)?;
+                        c > 0 || (c == 0 && inc)
+                    }
+                    None => true,
+                };
+                let below = match hi {
+                    Some((to, inc)) => {
+                        let c = order(vm, k, to)?;
+                        c < 0 || (c == 0 && inc)
+                    }
+                    None => true,
+                };
+                if above && below {
+                    picked.push((k.clone(), v.clone()));
+                }
+            }
+            Ok(rebuild(vm, picked, !is_map, false))
+        }
+        "descendingMap" => Ok(rebuild(vm, entries, false, true)),
+        "descendingSet" | "descendingKeySet" => Ok(rebuild(vm, entries, true, true)),
+        "navigableKeySet" => Ok(rebuild(vm, entries, true, false)),
+        _ => Err(format!("unresolved reference: {name}")),
+    }
+}
+
 fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     if let Some(r) = random_method(recv, name, args) {
         return r;
@@ -9475,6 +9672,9 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         && (comparator_keys(recv).is_some() || closure_meta(recv).is_some())
     {
         return Ok(Value::Int(compare_with(vm, recv, &args[0], &args[1])?));
+    }
+    if let Some(r) = sorted_nav_method(vm, recv, name, args) {
+        return r;
     }
     // `Comparator`'s composition members, answering a NEW comparator whose
     // steps run in order until one is non-zero: `reversed()` (the JDK's

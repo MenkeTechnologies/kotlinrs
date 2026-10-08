@@ -230,6 +230,12 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 - **Sorted collections with a comparator** — `sortedSetOf(cmp, …)`,
   `sortedMapOf(cmp, …)`, `TreeSet(cmp)`, `TreeMap(cmp)` order by the comparator
   and identify elements by it, as `java.util.TreeMap` does.
+  The `NavigableMap`/`NavigableSet` members are ported from `TreeMap`/`TreeSet`:
+  `firstKey`/`lastKey`, `first`/`lastEntry`, `pollFirst`/`Last(Entry)`,
+  `floor`/`ceiling`/`higher`/`lower` (`Key`/`Entry` forms on a map),
+  `head`/`tail`/`subMap` and `…Set` with their inclusive flags,
+  `descendingMap`/`Set`/`KeySet` and `navigableKeySet`. A `java.util.` qualified
+  constructor spelling reaches the same classes.
 - **`kotlin.random`** — `Random(seed)` is the stdlib's `XorWowRandom`, so a
   seeded program draws the reference's exact numbers through every `next…`
   member; `Random.Default` backs the unseeded forms.

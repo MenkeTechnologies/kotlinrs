@@ -1302,3 +1302,14 @@ Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
   `nullsLast` (with and without a comparator) are ported from the stdlib's
   `when` over `===`/`null`, and `Comparator.naturalOrder()` /
   `Comparator.reverseOrder()` resolve to the top-level functions.
+- **The `NavigableMap`/`NavigableSet` members of a sorted collection** —
+  `sortedMapOf(…).firstKey()`, `TreeMap.floorKey`/`headMap`/`pollFirstEntry`,
+  `TreeSet.floor`/`headSet`/`pollFirst` and the rest — were `unresolved
+  reference … on Map`/`on Set`. They are ported from `java.util.TreeMap` and
+  `TreeSet`, under the collection's comparator when it has one: `firstKey` on
+  an empty map raises `NoSuchElementException`, the `Entry`/`floor` forms
+  answer `null`, `subMap(from > to)` raises `IllegalArgumentException:
+  fromKey > toKey`, and the range members honour their inclusive flags. The
+  ranges are snapshots, as every collection view here is (see BUGS).
+- **`java.util.TreeMap<K, V>()`** and the other JDK collection constructors in
+  their fully qualified spelling were `unresolved reference: java`.

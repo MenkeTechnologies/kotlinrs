@@ -92,7 +92,9 @@ overflow) and succeeds for the second. Same category as the `%2147483647d` entry
 
 ## Collection VIEWS are snapshots
 
-`asReversed()`, `Map.keys`/`Map.values` and `subList()` are declared to be LIVE
+`asReversed()`, `Map.keys`/`Map.values` and `subList()`, and a sorted
+collection's `headMap`/`tailMap`/`subMap`/`headSet`/`tailSet`/`subSet`/`descending…`
+ranges, are declared to be LIVE
 VIEWS of their receiver: Kotlin's documentation for each says a change to the
 backing collection shows through. Every one of them is a copy here, taken when
 the member is called, so the view stops tracking at that moment. Measured on
@@ -283,7 +285,6 @@ Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 | --- | --- | --- |
 | `class S : Iterable<Int> { override fun iterator() = … }; S().map { … }` | `unresolved supertype Iterable of class S` | the `Iterable` extensions over `S` |
 | `java.util.LinkedList<Int>()` | `unresolved reference: java` | the JDK list |
-| `sortedMapOf("b" to 2, "a" to 1).firstKey()` / `headMap` / `tailMap` | `unresolved reference: firstKey on Map` | `a` / `{a=1}` / … |
 | `generateSequence { x }` (the seedless form) | `unresolved reference: generateSequence` | a sequence calling the block until `null` |
 | `(-1).toUInt()` / `5u + 3u` | `unresolved reference: toUInt on Int` / parse error | `4294967295` / `8` |
 | `listOf(1, 2, 3).stream().count()` | `unresolved reference: stream on List` | `3` |
@@ -386,7 +387,6 @@ Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 | program | kotlinrs | reference |
 | --- | --- | --- |
 | `println(UInt.MAX_VALUE)` (any unsigned type or `u` literal) | `expected RParen, found Ident("u")` | `4294967295` |
-| `sortedMapOf("b" to 1, "a" to 2).firstKey()` | `unresolved reference: firstKey on Map` | `a` |
 | `listOf(1, 2, 3).stream().count()` | `unresolved reference: stream on List` | `3` |
 | `open class B { init { println(f()) }; open fun f() = "b" }` | `unresolved reference: f` | calls `f` on the instance under construction |
 
