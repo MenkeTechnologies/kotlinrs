@@ -1862,6 +1862,8 @@ enum CoroState {
 #[derive(Clone)]
 enum Stage {
     Map(Value),
+    /// `onEach` — runs the action on the element and passes it through.
+    OnEach(Value),
     /// `filter` when `true`, `filterNot` when `false`.
     Filter(Value, bool),
     /// `takeWhile` — ends the sequence at the first element that fails.
@@ -6500,6 +6502,9 @@ fn gen_drive(
         for stage in stages.iter_mut() {
             match stage.clone() {
                 Stage::Map(f) => v = invoke_closure(vm, &f, std::slice::from_ref(&v))?,
+                Stage::OnEach(f) => {
+                    invoke_closure(vm, &f, std::slice::from_ref(&v))?;
+                }
                 Stage::Filter(f, keep) => {
                     if truthy(&invoke_closure(vm, &f, std::slice::from_ref(&v))?) != keep {
                         continue 'source;
@@ -7385,6 +7390,36 @@ fn coll_hof(
             "filterNot" => return gen_with(vm, recv, Stage::Filter(clo.clone(), false)),
             "takeWhile" => return gen_with(vm, recv, Stage::TakeWhile(clo.clone())),
             "dropWhile" => return gen_with(vm, recv, Stage::DropWhile(clo.clone(), false)),
+            "onEach" => return gen_with(vm, recv, Stage::OnEach(clo.clone())),
+            // The element-wise terminals consume each element as it leaves
+            // the pipeline, so their lambda's side effects interleave with the
+            // stages' exactly as Kotlin's do: `map { print(1) }.forEach {
+            // print(2) }` prints `1212`, not `1122`. `all`/`none` stop at the
+            // first element that decides them.
+            "forEach" | "forEachIndexed" | "all" | "none" | "count" => {
+                let mut at = 0i64;
+                let mut decided = false;
+                gen_drive(vm, recv, None, &mut |vm, v| {
+                    let r = if name == "forEachIndexed" {
+                        invoke_closure(vm, clo, &[Value::Int(at), v.clone()])?
+                    } else {
+                        invoke_closure(vm, clo, std::slice::from_ref(v))?
+                    };
+                    match name {
+                        "all" if !truthy(&r) => decided = true,
+                        "none" if truthy(&r) => decided = true,
+                        "count" if truthy(&r) => at += 1,
+                        "count" => {}
+                        _ => at += 1,
+                    }
+                    Ok(!decided)
+                })?;
+                return Ok(match name {
+                    "all" | "none" => Value::Bool(!decided),
+                    "count" => Value::Int(at),
+                    _ => Value::Undef,
+                });
+            }
             // `first { }` / `find { }` / `any { }` stop at the first match, so
             // they are pulled one element at a time and terminate on an endless
             // sequence — as they do on Kotlin's.

@@ -1176,3 +1176,8 @@ fun main() { val s = java.util.TreeSet<String>(); s.add("q"); s.add("b"); printl
 class Box<T>(val v: T) { fun <R> map(f: (T) -> R) = Box(f(v)); override fun toString() = "Box($v)" }\nfun main() { val b = Box(3).map { it * 2 }; println(b.map { "s$it" }) }	Box(s6)\n
 class Box<T>(val v: T) { fun <R> map(f: (T) -> R): Box<R> = Box(f(v)); override fun toString() = "Box($v)" }\nfun main() { println(Box(3).map { it * 2 }.map { "s$it" }) }	Box(s6)\n
 class Q(val xs: List<Int>) { fun filter(p: (Int) -> Boolean) = Q(xs.filter(p)); fun sorted() = Q(xs.sorted()); fun total() = xs.sum() }\nfun main() { val q = Q(listOf(5, 2, 9)).filter { it > 2 }.sorted(); println(q.total()); println(q.xs) }	14\n[5, 9]\n
+fun main() { listOf(1, 2, 3).asSequence().map { println("map $it"); it * 2 }.filter { println("filter $it"); it > 2 }.forEach { println("each $it") } }	map 1\nfilter 2\nmap 2\nfilter 4\neach 4\nmap 3\nfilter 6\neach 6\n
+fun main() { listOf(1, 2, 3).asSequence().filter { println("filter $it"); it > 1 }.forEach { println("each $it") } }	filter 1\nfilter 2\neach 2\nfilter 3\neach 3\n
+fun main() { listOf(1, 2, 3).asSequence().map { println("map $it"); it }.forEach { println("each $it") } }	map 1\neach 1\nmap 2\neach 2\nmap 3\neach 3\n
+fun main() { val s = sequenceOf(1, 2, 3, 4).map { print("m$it "); it }; println(s.all { print("a$it "); it < 3 }); println(s.none { print("n$it "); it == 2 }); println(s.count { print("c$it "); it % 2 == 0 }) }	m1 a1 m2 a2 m3 a3 false\nm1 n1 m2 n2 false\nm1 c1 m2 c2 m3 c3 m4 c4 2\n
+fun main() { sequenceOf("a", "b").onEach { print("o$it ") }.map { it.uppercase() }.forEachIndexed { i, v -> print("$i$v ") }; println(); println(generateSequence(1) { it + 1 }.onEach { print("g$it ") }.first { it > 2 }) }	oa 0A ob 1B \ng1 g2 g3 3\n

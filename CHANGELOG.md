@@ -1319,3 +1319,11 @@ Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
   was taken from the stdlib's `map` (a `List`), so the second call never looked
   at `Box`. A member the receiver's own class declares now decides the result's
   class, as it already decided the call.
+- **A lazy sequence's `forEach` ran after the whole pipeline** —
+  `asSequence().map { println("map $it") }.forEach { println("each $it") }`
+  printed every `map` line before the first `each`, where Kotlin pushes each
+  element through to the terminal before pulling the next. `forEach`,
+  `forEachIndexed`, `count { … }`, `all` and `none` now consume elements as
+  they leave the pipeline (`all`/`none` stopping at the deciding one), and
+  `onEach` is the lazy stage Kotlin's `Sequence.onEach` is rather than a
+  materializing one.
