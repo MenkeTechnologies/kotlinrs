@@ -1345,3 +1345,10 @@ Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
   `0.1 + 0.2 + 0.3`, where a plain fold gives `0.6000000000000001`). The
   `Optional`-returning terminals are refused, because the sequence member of
   the same name would answer the bare value.
+- **`is Number` / `is Comparable<*>`** answered `false` for every value
+  (`(3.0 as Any) is Number`). `Number` now holds for the numeric types and
+  `Comparable` for the numbers, `String`, `Char`, `Boolean`, enum constants,
+  `StringBuilder` and a user class declaring it (directly or through an
+  ancestor); `as Number` casts accordingly. **`(1..2) is Collection<*>`**
+  answered `true` — a range is an `Iterable` only. A star-projected call type
+  argument (`filterIsInstance<Comparable<*>>()`) was a parse error.

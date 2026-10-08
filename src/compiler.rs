@@ -3021,6 +3021,16 @@ impl Compiler {
     /// `catch (e: Throwable)` alike).
     fn runtime_supers(&self, meta: &ClassMeta) -> Vec<String> {
         let mut out: Vec<String> = meta.mro[1..].to_vec();
+        // The library interfaces a class or one of its ancestors names
+        // (`Comparable`, `Comparator`, …), so `x is Comparable<*>` holds.
+        for anc in &meta.mro {
+            let marks = self.classes.get(anc).map(|m| m.parents.clone()).unwrap_or_default();
+            for p in marks {
+                if is_marker_supertype(&p) && !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
         if let Some(t) = &meta.throwable_base {
             for name in crate::host::throwable_ancestry(t) {
                 if !out.iter().any(|x| x == name) {

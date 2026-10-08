@@ -4515,12 +4515,16 @@ impl Parser {
     fn call_type_arg(&mut self) -> Option<String> {
         let start = self.pos;
         self.skip_call_type_args();
-        // One `<`, one name, one `>` — anything else is not a bare type name.
-        match self.pos - start {
-            3 => match &self.toks[start + 1].tok {
-                Tok::Ident(n) => Some(n.clone()),
-                _ => None,
-            },
+        // One `<`, one name, one `>` — or one name carrying type arguments of
+        // its own (`<Comparable<*>>`), which the JVM erases to the bare name.
+        // Anything else is not a single type name.
+        let len = self.pos - start;
+        if len < 3 {
+            return None;
+        }
+        let generic = len > 3 && matches!(self.toks[start + 2].tok, Tok::Lt);
+        match &self.toks[start + 1].tok {
+            Tok::Ident(n) if len == 3 || generic => Some(n.clone()),
             _ => None,
         }
     }
@@ -4564,7 +4568,8 @@ impl Parser {
                         break;
                     }
                 }
-                Tok::Ident(_) | Tok::Comma | Tok::Dot | Tok::Question => {
+                // `*` is a star projection (`filterIsInstance<Comparable<*>>()`).
+                Tok::Ident(_) | Tok::Comma | Tok::Dot | Tok::Question | Tok::Star => {
                     self.advance();
                 }
                 // Not a type-argument list after all.

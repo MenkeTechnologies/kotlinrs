@@ -14889,6 +14889,24 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         }
         // `Any` matches any non-null value; unknown names never match.
         "Any" => !matches!(v, Value::Undef),
+        // `kotlin.Number` is the supertype of every boxed numeric type — and
+        // of nothing else: `Char` and `Boolean` are not numbers.
+        "Number" => is_number(v),
+        // `Comparable`: the numbers, `String`, `Char`, `Boolean`, every enum
+        // constant, `StringBuilder` (`Comparable<StringBuilder>` since JDK 11),
+        // and a user class that declares it.
+        "Comparable" => {
+            is_number(v)
+                || matches!(v, Value::Str(_) | Value::Bool(_))
+                || is_char(v)
+                || enum_ordinal(v).is_some()
+                || with_obj(v, |o| match o {
+                    HeapObj::Builder { .. } => true,
+                    HeapObj::Instance { class, .. } => type_is_a(class, "Comparable"),
+                    _ => false,
+                })
+                .unwrap_or(false)
+        }
         // The built-in container types. Type arguments are erased on the JVM,
         // so `is List<String>` can only ever test the container kind — which is
         // why the parser drops them.
@@ -14896,10 +14914,15 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         // A `Set` is a `Collection` but NOT a `List`, so the two names cannot
         // share an arm: `setOf(1) is List<*>` is `false` in Kotlin.
         "List" | "MutableList" => with_obj(v, |o| matches!(o, HeapObj::List(_))).unwrap_or(false),
-        "Iterable" | "Collection" => with_obj(v, |o| {
+        // A range is an `Iterable` but not a `Collection`: `IntRange` implements
+        // no `size`.
+        "Iterable" => with_obj(v, |o| {
             matches!(o, HeapObj::List(_) | HeapObj::Set(_) | HeapObj::Range(_))
         })
         .unwrap_or(false),
+        "Collection" => {
+            with_obj(v, |o| matches!(o, HeapObj::List(_) | HeapObj::Set(_))).unwrap_or(false)
+        }
         "Set" | "MutableSet" => with_obj(v, |o| matches!(o, HeapObj::Set(_))).unwrap_or(false),
         "Map" | "MutableMap" => with_obj(v, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false),
         "Pair" => with_obj(v, |o| matches!(o, HeapObj::Pair(_, _))).unwrap_or(false),
@@ -15764,4 +15787,10 @@ fn deep_to_string(a: &Value, seen: &mut Vec<u32>, out: &mut String) {
     }
     out.push(']');
     seen.pop();
+}
+
+/// Whether `v` is a `kotlin.Number`: an `Int`/`Short`/`Byte`, a `Double`, or a
+/// boxed `Long`/`Float`.
+fn is_number(v: &Value) -> bool {
+    matches!(v, Value::Int(_) | Value::Float(_)) || i64_box(v).is_some() || f32_box(v).is_some()
 }
