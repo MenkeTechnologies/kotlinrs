@@ -5458,8 +5458,22 @@ impl Compiler {
         // fold) and `-7` under the 32-bit one; it answered `-7` in any program
         // where some user class happened to declare `hashCode`, because that
         // made the candidate list non-empty and swallowed the call here.
-        if static_cls.is_none() && !is_primitive_recv(self.infer(sc, recv)) {
-            let cands = self.candidates(None, name, args.len());
+        //
+        // A receiver typed `Any`, or a user class that does not declare the
+        // member, reaches here too: the program compiled, so a smart cast the
+        // frontend does not track (`if (a is Dog) a.fetch()` with `a: Animal`)
+        // narrowed it to a subtype that does, and the candidates are that
+        // class's subtypes.
+        let narrowed_from = match static_cls.as_deref() {
+            None | Some("Any") => Some(None),
+            Some(c) => self
+                .classes
+                .get(c)
+                .filter(|m| !m.methods.contains_key(name) && m.prop(name).is_none())
+                .map(|_| Some(c)),
+        };
+        if let Some(within) = narrowed_from.filter(|_| !is_primitive_recv(self.infer(sc, recv))) {
+            let cands = self.candidates(within, name, args.len());
             if !cands.is_empty() {
                 self.emit_virtual_call(sc, recv, name, args, Targets::dynamic(&cands), line)?;
                 return Ok(self.virtual_ret_type(&cands, name));
@@ -7350,6 +7364,13 @@ impl Compiler {
             // `-f(Int.MIN_VALUE)` narrows only if this says `Int`.
             return Ok(sc.fn_ret_of(name));
         }
+        // A user `fun` shadows a default-imported stdlib function of the same
+        // name (`fun check(a: Int)`, `fun max(…)`): Kotlin resolves the file's
+        // own package before the default imports, whenever the user function
+        // accepts the call.
+        if let Some(sig) = self.shadowing_user_fun(name, args) {
+            return self.compile_user_fun_call(sc, name, sig, args, line);
+        }
         match name {
             "println" | "print" => {
                 if args.len() > 1 {
@@ -7462,6 +7483,17 @@ impl Compiler {
                 self.b.emit(Op::LoadConst(nidx), line);
                 self.b
                     .emit(Op::CallBuiltin(KT_COMPARATOR, args.len() as u8), line);
+                Ok(Type::Obj)
+            }
+            // `Comparator { a, b -> … }` — the SAM constructor of
+            // `java.util.Comparator`. Every comparator consumer already takes a
+            // two-parameter closure as one, so the lambda IS the comparator.
+            "Comparator"
+                if args.len() == 1 && is_lambda(&args[0]) && !self.classes.contains_key(name) =>
+            {
+                self.lambda_hint = Some(vec![(Type::Unknown, Type::Unknown); 2]);
+                self.compile_expr(sc, &args[0])?;
+                self.lambda_hint = None;
                 Ok(Type::Obj)
             }
             // `Pair(a, b)` / `Triple(a, b, c)` — the constructor spellings of
@@ -7980,28 +8012,7 @@ impl Compiler {
                     .or_else(|| self.fun_sig.get(name))
                     .cloned()
                 {
-                    let full = self.expand_args(&format!("function {name}"), &sig.params, args)?;
-                    self.compile_call_args(sc, &sig.params, &full)?;
-                    // A local `fun` shadows a top-level one of the same name and
-                    // lives under its mangled sub. Its captures follow the real
-                    // arguments as synthesized trailing ones (see [`LocalCap`]),
-                    // resolved by name HERE so a call from inside another local
-                    // `fun` — where they are that function's own parameters —
-                    // passes on the same bindings.
-                    let sub = self.local_funs.get(name).cloned();
-                    let caps = self.local_caps.get(name).cloned().unwrap_or_default();
-                    for c in &caps {
-                        match cap_slot(sc, c) {
-                            Some(slot) => self.b.emit(Op::GetSlot(slot), line),
-                            None => {
-                                return Err(format!("unresolved reference: {}", c.name));
-                            }
-                        };
-                    }
-                    let idx = self.b.add_name(sub.as_deref().unwrap_or(name));
-                    self.b
-                        .emit(Op::Call(idx, (sig.arity + caps.len()) as u8), line);
-                    return Ok(self.call_ret(sc, &sig, args));
+                    return self.compile_user_fun_call(sc, name, sig, args, line);
                 }
                 // A TOP-LEVEL property holding a first-class function value:
                 // `val f = { x: Int -> x + 1 }` at file scope, then `f(3)`.
@@ -8490,6 +8501,65 @@ impl Compiler {
     /// that IS declared `Float` keeps the static type on the callee's side and
     /// needs no box, which is what keeps an ordinary numeric call allocation-
     /// free.
+    /// Call the user (top-level or local) `fun` `name` whose signature is
+    /// `sig`: the arguments bound against its parameters, then any captures a
+    /// local `fun` carries.
+    fn compile_user_fun_call(
+        &mut self,
+        sc: &mut Scope,
+        name: &str,
+        sig: FnSig,
+        args: &[Expr],
+        line: u32,
+    ) -> Result<Type, String> {
+        let full = self.expand_args(&format!("function {name}"), &sig.params, args)?;
+        self.compile_call_args(sc, &sig.params, &full)?;
+        // A local `fun` shadows a top-level one of the same name and
+        // lives under its mangled sub. Its captures follow the real
+        // arguments as synthesized trailing ones (see [`LocalCap`]),
+        // resolved by name HERE so a call from inside another local
+        // `fun` — where they are that function's own parameters —
+        // passes on the same bindings.
+        let sub = self.local_funs.get(name).cloned();
+        let caps = self.local_caps.get(name).cloned().unwrap_or_default();
+        for c in &caps {
+            match cap_slot(sc, c) {
+                Some(slot) => self.b.emit(Op::GetSlot(slot), line),
+                None => {
+                    return Err(format!("unresolved reference: {}", c.name));
+                }
+            };
+        }
+        let idx = self.b.add_name(sub.as_deref().unwrap_or(name));
+        self.b
+            .emit(Op::Call(idx, (sig.arity + caps.len()) as u8), line);
+        Ok(self.call_ret(sc, &sig, args))
+    }
+
+    /// The user `fun` a call to `name` resolves to AHEAD of a stdlib function
+    /// of the same name: one declared in this file (or locally) whose
+    /// parameter list accepts the call's arguments by count. Kotlin searches
+    /// the file's own package before the default imports, so `fun check(a:
+    /// Int)` makes `check(5)` the user's, and a call it cannot accept falls
+    /// through to the stdlib as before.
+    fn shadowing_user_fun(&self, name: &str, args: &[Expr]) -> Option<FnSig> {
+        if self.class_meta(name).is_some() {
+            return None;
+        }
+        let sig = self.local_sigs.get(name).or_else(|| self.fun_sig.get(name))?;
+        if args.iter().any(|a| matches!(a, Expr::Named { .. })) {
+            return Some(sig.clone());
+        }
+        let required = sig
+            .params
+            .iter()
+            .filter(|p| p.default.is_none() && p.vararg.is_none())
+            .count();
+        let variadic = sig.params.iter().any(|p| p.vararg.is_some());
+        let n = args.len();
+        (n >= required && (variadic || n <= sig.params.len())).then(|| sig.clone())
+    }
+
     fn compile_call_args(
         &mut self,
         sc: &mut Scope,
@@ -9629,6 +9699,12 @@ impl Compiler {
                     promote(self.infer(sc, l), self.infer(sc, r))
                 }
             },
+            // A user `fun` shadowing a stdlib name types as the user's (see
+            // [`Compiler::shadowing_user_fun`]).
+            Expr::Call { name, args, .. } if self.shadowing_user_fun(name, args).is_some() => {
+                let sig = self.shadowing_user_fun(name, args).expect("just matched");
+                self.call_ret(sc, &sig, args)
+            }
             Expr::Call { name, args, .. } => match name.as_str() {
                 "println" | "print" => Type::Unit,
                 "listOf" | "mutableListOf" | "arrayListOf" | "emptyList" | "ArrayList"

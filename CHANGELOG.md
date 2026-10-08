@@ -1254,3 +1254,14 @@ Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
   `Range [a, b) out of bounds` from each copy.
 - **`zip`, `contentEquals` and `matches` in infix spelling** (`a zip b`,
   `x contentEquals y`, `s matches re`) were parse errors.
+- **A user `fun` named like a stdlib one** — `fun check(a: Int)`, then
+  `check(5)` or `xs.map(::check)` — ran the stdlib's `check` and died with
+  `IllegalStateException: Check failed.` A file's own top-level and local
+  functions now take precedence whenever their parameter list accepts the
+  call, as Kotlin resolves its own package before the default imports.
+- **A member reached through an untracked smart cast** — `fun act(a: Animal) =
+  when (a) { is Dog -> a.fetch() … }`, or `if (x is Dog) x.fetch()` with `x:
+  Any` — was `unresolved reference: fetch on Dog` at run time: the receiver's
+  static class (`Animal`, `Any`) lacked the member, so no candidate was tried.
+  It now dispatches over the subtypes that declare it.
+- **`Comparator { a, b -> … }`** was `unresolved reference: Comparator`.

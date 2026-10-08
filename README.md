@@ -359,6 +359,9 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   Animal(name)` forwards. `is` is a full expression (`x is Dog`, `x !is Cat`),
   not only a `when` arm, and it answers for every level of the hierarchy —
   including an `interface`.
+  After `if (a is Dog)` or an `is Dog ->` arm, a member only `Dog` declares
+  (`a.fetch()` with `a: Animal` or `a: Any`) resolves against the subtypes that
+  declare it.
   A user class may extend a **built-in throwable** (`class ParseError(m: String)
   : IllegalArgumentException(m)`): it carries `.message`, is claimed by
   `catch (e: IllegalArgumentException)` / `catch (e: Exception)` on the real
@@ -1100,7 +1103,8 @@ re-runnable and `dropWhile`'s progress never leaks between pipelines.
 does `sequenceOf(…)`, which is the read-only list of its elements carrying the
 `Sequence` tag (so `sequenceOf<Int>().first()` still says `Sequence is empty.`).
 
-Also landed: `Comparator`s — `compareBy` / `compareByDescending` over one or
+Also landed: `Comparator`s — the `Comparator { a, b -> … }` SAM constructor,
+`compareBy` / `compareByDescending` over one or
 more key selectors, extended by `thenBy` / `thenByDescending`, and consumed by
 `sortedWith` alongside the plain two-argument lambda it already took. The keys
 are kept as a chain rather than folded into one closure, because `thenBy`
