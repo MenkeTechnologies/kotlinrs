@@ -379,3 +379,17 @@ the element type is not visible statically the total is computed at 64 bits:
 A literal, an annotated binding or parameter (`xs: List<Int>`), an `IntArray`,
 and the results of `map`/`mapIndexed`/`mapNotNull`/`List(n) { … }`/`sumOf { … }`
 whose lambda result is an `Int` all carry the width.
+
+## Round 19: measured and not closed
+
+Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
+
+| program | kotlinrs | reference |
+| --- | --- | --- |
+| `println(UInt.MAX_VALUE)` (any unsigned type or `u` literal) | `expected RParen, found Ident("u")` | `4294967295` |
+| `sortedMapOf("b" to 1, "a" to 2).firstKey()` | `unresolved reference: firstKey on Map` | `a` |
+| `listOf(1, 2, 3).stream().count()` | `unresolved reference: stream on List` | `3` |
+| `open class B { init { println(f()) }; open fun f() = "b" }` | `unresolved reference: f` | calls `f` on the instance under construction |
+
+The last is the limit `emit_init_blocks` documents: the instance is allocated
+after the initializers run, so an `init` block has no `this` to call through.
