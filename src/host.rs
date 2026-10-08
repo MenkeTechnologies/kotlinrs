@@ -13077,8 +13077,22 @@ fn sequence_member(
         }
         // `toSet` yields a `Set`; `distinct` yields a `List` with the same
         // elements — the pair Kotlin draws the distinction between.
-        "toSet" | "toMutableSet" | "toHashSet" => {
-            return Some(Ok(alloc(HeapObj::Set(distinct(vm, items)))))
+        "toSet" | "toMutableSet" => return Some(Ok(alloc(HeapObj::Set(distinct(vm, items))))),
+        // `toHashSet` is a `java.util.HashSet`, iterating in bucket order from
+        // the capacity the stdlib asks for: `mapCapacity(size)` for a
+        // collection or an array, `mapCapacity(12)` for any other `Iterable`
+        // (a range), `mapCapacity(min(length, 128))` for a `CharSequence`, and
+        // the no-argument default for a `Sequence`.
+        "toHashSet" => {
+            let cap = match kind {
+                SeqKind::Seq => DEFAULT_CAPACITY,
+                SeqKind::Range => map_capacity(12),
+                SeqKind::CharSeq => map_capacity(items.len().min(128)),
+                _ => map_capacity(items.len()),
+            };
+            let s = alloc(HeapObj::Set(distinct(vm, items)));
+            set_order(vm, &s, CollOrder::Hash(cap));
+            return Some(Ok(s));
         }
         "distinct" => return Some(Ok(alloc_ro_list(distinct(vm, items)))),
         // `filterNotNull` drops Kotlin `null` (carried as `Undef`) and always

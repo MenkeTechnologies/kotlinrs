@@ -1327,3 +1327,9 @@ Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
   they leave the pipeline (`all`/`none` stopping at the deciding one), and
   `onEach` is the lazy stage Kotlin's `Sequence.onEach` is rather than a
   materializing one.
+- **`toHashSet()` iterated in insertion order** — `listOf("banana", "apple",
+  "cherry", "zebra").toHashSet()` printed `[banana, apple, cherry, zebra]` where
+  the reference's `java.util.HashSet` prints `[banana, zebra, apple, cherry]`.
+  It now carries the bucket order, from the capacity the stdlib requests for
+  each receiver kind (`mapCapacity(size)` for a collection or array,
+  `mapCapacity(12)` for a range, the default for a `Sequence`).
