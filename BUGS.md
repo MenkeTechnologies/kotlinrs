@@ -287,7 +287,6 @@ Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 | `java.util.LinkedList<Int>()` | `unresolved reference: java` | the JDK list |
 | `generateSequence { x }` (the seedless form) | `unresolved reference: generateSequence` | a sequence calling the block until `null` |
 | `(-1).toUInt()` / `5u + 3u` | `unresolved reference: toUInt on Int` / parse error | `4294967295` / `8` |
-| `listOf(1, 2, 3).stream().count()` | `unresolved reference: stream on List` | `3` |
 
 ## A closure's `Unit` result prints `null`
 
@@ -387,7 +386,6 @@ Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 | program | kotlinrs | reference |
 | --- | --- | --- |
 | `println(UInt.MAX_VALUE)` (any unsigned type or `u` literal) | `expected RParen, found Ident("u")` | `4294967295` |
-| `listOf(1, 2, 3).stream().count()` | `unresolved reference: stream on List` | `3` |
 | `open class B { init { println(f()) }; open fun f() = "b" }` | `unresolved reference: f` | calls `f` on the instance under construction |
 
 The last is the limit `emit_init_blocks` documents: the instance is allocated

@@ -180,7 +180,19 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   SUSPENDS at every `yield`, its frames and operand stack are parked off the VM
   and put back on the next pull, so `sequence { while (true) yield(i++) }
   .take(5)` terminates. `yieldAll`, `generateSequence`, and the `map`/`filter`/
-  `take`/`drop`/`takeWhile`/`dropWhile` pipeline over either source.
+  `take`/`drop`/`takeWhile`/`dropWhile`/`onEach` pipeline over either source,
+  each element carried through to the terminal before the next is pulled.
+- **`java.util.stream` pipelines** — `coll.stream()`, `Stream.of(…)` and
+  `IntStream.range`/`rangeClosed` lower onto the lazy sequence, which evaluates
+  the same way: `filter`, `map`, the `mapTo…`/`boxed` conversions, `flatMap`,
+  `sorted`, `distinct`, `limit`, `skip`, `peek`, and the terminals `forEach`,
+  `count`, `sum`, `toList`, `anyMatch`/`allMatch`/`noneMatch`,
+  `reduce(identity, op)` and `collect(Collectors.toList()/toSet()/joining(…))`.
+  `count()` over a pipeline the JDK keeps `SIZED` answers without running its
+  stages, as JDK 21 does.
+  `DoubleStream.sum()` is the JDK's compensated summation. The terminals that
+  answer an `Optional` (`findFirst`, `max`, `min`, `average`, one-argument
+  `reduce`) are refused at compile time.
 - **Reified generics** — `inline fun <reified T>` with `T::class`, `x is T` and
   `x as T`, including from inside a lambda in the body and with one reified
   parameter passed on to another.

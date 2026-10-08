@@ -9476,6 +9476,28 @@ fn builder_method(
     }
 }
 
+/// `DoubleStream.sum()`, ported from JDK 21's `DoublePipeline.sum`: Kahan
+/// summation through `Collectors.sumWithCompensation`, a simple sum alongside,
+/// and `Collectors.computeFinalSum`, which prefers the simple sum only when
+/// the compensated one went NaN from infinities of one sign.
+fn double_stream_sum(items: &[Value]) -> f64 {
+    let (mut sum, mut neg_low, mut simple) = (0.0f64, 0.0f64, 0.0f64);
+    for v in items {
+        let d = v.to_float();
+        let tmp = d - neg_low;
+        let velvel = sum + tmp;
+        neg_low = (velvel - sum) - tmp;
+        sum = velvel;
+        simple += d;
+    }
+    let tmp = sum - neg_low;
+    if tmp.is_nan() && simple.is_infinite() {
+        simple
+    } else {
+        tmp
+    }
+}
+
 /// The `java.util.NavigableMap`/`NavigableSet` members of a SORTED map or set
 /// (`sortedMapOf`, `TreeMap`, `sortedSetOf`, `TreeSet`), or `None` for any
 /// other receiver or name.
@@ -9710,6 +9732,15 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
     }
     if let Some(r) = sorted_nav_method(vm, recv, name, args) {
         return r;
+    }
+    // `DoubleStream.sum()` over the lowered pipeline (see the compiler's
+    // `lower_java_streams`).
+    if name == "#doubleStreamSum" && args.is_empty() {
+        let items = match gen_parts(recv) {
+            Some(_) => gen_pull(vm, recv, None)?,
+            None => as_iterable(recv).unwrap_or_default(),
+        };
+        return Ok(Value::Float(double_stream_sum(&items)));
     }
     // `Comparator`'s composition members, answering a NEW comparator whose
     // steps run in order until one is non-zero: `reversed()` (the JDK's

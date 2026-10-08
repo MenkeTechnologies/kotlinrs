@@ -977,6 +977,288 @@ fn unqualify_jdk_ctors(program: &mut Program) {
     });
 }
 
+/// The `java.util.stream` operations that keep a pipeline a `Stream`.
+fn is_stream_intermediate(name: &str) -> bool {
+    matches!(
+        name,
+        "filter"
+            | "map"
+            | "mapToInt"
+            | "mapToLong"
+            | "mapToDouble"
+            | "mapToObj"
+            | "boxed"
+            | "flatMap"
+            | "sorted"
+            | "distinct"
+            | "limit"
+            | "skip"
+            | "peek"
+    )
+}
+
+/// The intermediate operations that keep a pipeline `SIZED` in the JDK (21):
+/// the element count passes through them unchanged — or, for `limit`/`skip`,
+/// adjusted by their argument — so `count()` can answer it without running
+/// them.
+fn stream_keeps_size(name: &str) -> bool {
+    matches!(
+        name,
+        "map"
+            | "mapToInt"
+            | "mapToLong"
+            | "mapToDouble"
+            | "mapToObj"
+            | "boxed"
+            | "sorted"
+            | "peek"
+            | "limit"
+            | "skip"
+    )
+}
+
+/// The source of a `Stream` pipeline: `coll.stream()`, `Stream.of(…)`,
+/// `IntStream.range(a, b)` / `rangeClosed(a, b)`.
+fn is_stream_source(e: &Expr) -> bool {
+    match e {
+        Expr::MethodCall { name, args, .. } if name == "stream" && args.is_empty() => true,
+        Expr::MethodCall {
+            recv, name, args, ..
+        } => match (&**recv, name.as_str(), args.len()) {
+            (Expr::Var(s), "of", _) => s == "Stream",
+            (Expr::Var(s), "range" | "rangeClosed", 2) => s == "IntStream" || s == "LongStream",
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// The host member a `DoubleStream.sum()` lowers to (see
+/// `crate::host`'s `double_stream_sum`). `#` cannot appear in a Kotlin name.
+const DOUBLE_STREAM_SUM: &str = "#doubleStreamSum";
+
+/// Whether the stream pipeline `e` is a `DoubleStream`: its nearest
+/// conversion is `mapToDouble`. (`map` keeps whichever kind it is applied to.)
+fn is_double_stream(e: &Expr) -> bool {
+    match e {
+        Expr::MethodCall { recv, name, .. } if !is_stream_source(e) => match name.as_str() {
+            "mapToDouble" => true,
+            "mapToInt" | "mapToLong" | "mapToObj" | "boxed" => false,
+            _ => is_double_stream(recv),
+        },
+        _ => false,
+    }
+}
+
+/// Whether `e` evaluates to a `Stream`: a source, then intermediate operations.
+fn is_stream_chain(e: &Expr) -> bool {
+    is_stream_source(e)
+        || matches!(e, Expr::MethodCall { recv, name, .. }
+            if is_stream_intermediate(name) && is_stream_chain(recv))
+}
+
+/// Whether every operation between `e` and its source keeps the pipeline
+/// `SIZED` (see [`stream_keeps_size`]).
+fn stream_stays_sized(e: &Expr) -> bool {
+    is_stream_source(e)
+        || matches!(e, Expr::MethodCall { recv, name, .. }
+            if stream_keeps_size(name) && stream_stays_sized(recv))
+}
+
+/// The source of the stream pipeline `e`, which [`is_stream_chain`] accepted.
+fn stream_source(e: &Expr) -> &Expr {
+    match e {
+        Expr::MethodCall { recv, .. } if !is_stream_source(e) => stream_source(recv),
+        _ => e,
+    }
+}
+
+/// Lower a `java.util.stream` pipeline onto Kotlin's `Sequence`, which
+/// evaluates the same way: lazily, one element through every stage before the
+/// next, with `sorted` the barrier in both. The Java spellings are renamed to
+/// the sequence operations they are (`limit` → `take`, `peek` → `onEach`,
+/// `anyMatch` → `any`, `reduce(identity, op)` → `fold`, the `mapTo…` and
+/// `boxed` conversions → `map` and nothing), and the `Collectors` this
+/// frontend models become their terminal (`toList()`, `toSet()`,
+/// `joining(…)` → `joinToString(…)`).
+///
+/// `count()` on a pipeline that stays `SIZED` answers the source's size and
+/// runs none of its stages, as the JDK (9 and later) does: `peek { print(it) }
+/// .count()` prints nothing.
+///
+/// A program that declares its own `stream` member or extension keeps its own
+/// meaning; nothing in it is rewritten.
+fn lower_java_streams(program: &mut Program) {
+    let user_stream = program.funs.iter().any(|f| f.name == "stream")
+        || program
+            .classes
+            .iter()
+            .any(|c| c.methods.iter().any(|m| m.name == "stream"));
+    if user_stream {
+        return;
+    }
+    program_exprs_mut(program, &|e: &mut Expr| {
+        // A rewrite can expose another node to rewrite in the same position
+        // (`boxed()` is replaced by its receiver), so this repeats until
+        // nothing changes.
+        while lower_stream_op(e) {}
+    });
+}
+
+/// One step of [`lower_java_streams`] at `e`; `true` when `e` changed.
+fn lower_stream_op(e: &mut Expr) -> bool {
+    let source = is_stream_source(e);
+    let Expr::MethodCall {
+        recv, name, args, line, ..
+    } = e
+    else {
+        return false;
+    };
+    let line = *line;
+    let call = |name: &str, args: Vec<Expr>| Expr::Call {
+        name: name.to_string(),
+        args,
+        line,
+    };
+    let method = |recv: Expr, name: &str, args: Vec<Expr>| Expr::MethodCall {
+        recv: Box::new(recv),
+        name: name.to_string(),
+        args,
+        safe: false,
+        line,
+    };
+    // The sources.
+    if source {
+        *e = match name.as_str() {
+            "stream" => method(std::mem::replace(&mut **recv, Expr::Null), "asSequence", Vec::new()),
+            "of" => call("sequenceOf", std::mem::take(args)),
+            _ => {
+                let end = args.pop().unwrap_or(Expr::Null);
+                let start = args.pop().unwrap_or(Expr::Null);
+                let kind = if name == "range" {
+                    RangeKind::Until
+                } else {
+                    RangeKind::Inclusive
+                };
+                let range = Expr::Range {
+                    start: Box::new(start),
+                    end: Box::new(end),
+                    kind,
+                };
+                method(range, "asSequence", Vec::new())
+            }
+        };
+        return true;
+    }
+    if !is_stream_chain(recv) {
+        return false;
+    }
+    // The terminals that answer a `java.util.Optional`/`OptionalDouble`,
+    // which is not modelled. The sequence member of the same name answers the
+    // bare value (`max` → `3` where Java prints `Optional[3]`), so they are
+    // refused at compile time rather than lowered.
+    if matches!(
+        (name.as_str(), args.len()),
+        ("findFirst" | "findAny" | "average" | "max" | "min", 0)
+            | ("max" | "min" | "reduce", 1)
+    ) {
+        *e = call(
+            &format!("Stream.{name} (its java.util.Optional result is not modelled)"),
+            Vec::new(),
+        );
+        return true;
+    }
+    let renamed = match (name.as_str(), args.len()) {
+        ("limit", 1) => "take",
+        ("skip", 1) => "drop",
+        ("peek", 1) => "onEach",
+        ("anyMatch", 1) => "any",
+        ("allMatch", 1) => "all",
+        ("noneMatch", 1) => "none",
+        ("mapToInt" | "mapToLong" | "mapToDouble" | "mapToObj", 1) => "map",
+        ("sorted", 1) => "sortedWith",
+        ("reduce", 2) => "fold",
+        // `DoubleStream.sum()` is compensated (Kahan) summation, not the
+        // plain left fold `Sequence<Double>.sum()` is.
+        ("sum", 0) if is_double_stream(recv) => DOUBLE_STREAM_SUM,
+        ("boxed", 0) => {
+            *e = std::mem::replace(&mut **recv, Expr::Null);
+            return true;
+        }
+        ("count", 0) if stream_stays_sized(recv) => {
+            // The source's own size; the stages never run. A collection's
+            // `stream()` counts the collection; the other sources are lowered
+            // to the sequence they are first.
+            let sized = match stream_source(recv).clone() {
+                Expr::MethodCall { recv: coll, name, .. } if name == "stream" => *coll,
+                mut other => {
+                    lower_stream_op(&mut other);
+                    other
+                }
+            };
+            // Then each `limit(k)` caps it and each `skip(k)` lowers it, from
+            // the source outward.
+            let mut slices = Vec::new();
+            let mut at: &Expr = recv;
+            while let Expr::MethodCall { recv: inner, name, args, .. } = at {
+                if is_stream_source(at) {
+                    break;
+                }
+                if matches!(name.as_str(), "limit" | "skip") {
+                    slices.push((name.clone(), args[0].clone()));
+                }
+                at = inner;
+            }
+            let mut count = method(sized, "count", Vec::new());
+            for (op, k) in slices.into_iter().rev() {
+                count = if op == "limit" {
+                    call("minOf", vec![count, k])
+                } else {
+                    let rest = Expr::Binary {
+                        op: BinOp::Sub,
+                        l: Box::new(count),
+                        r: Box::new(k),
+                    };
+                    call("maxOf", vec![Expr::Int(0), rest])
+                };
+            }
+            *e = count;
+            return true;
+        }
+        ("collect", 1) => {
+            let Expr::MethodCall {
+                recv: c,
+                name: coll,
+                args: cargs,
+                ..
+            } = &mut args[0]
+            else {
+                return false;
+            };
+            if !matches!(&**c, Expr::Var(v) if v == "Collectors") {
+                return false;
+            }
+            let (terminal, targs) = match (coll.as_str(), cargs.len()) {
+                ("toList", 0) => ("toList", Vec::new()),
+                // `Collectors.toSet()` collects into a `HashSet`, which iterates in
+                // bucket order.
+                ("toSet", 0) => ("toHashSet", Vec::new()),
+                // `joining()` separates with nothing, where `joinToString`'s
+                // default separator is `", "`.
+                ("joining", 0) => ("joinToString", vec![Expr::Str(Vec::new())]),
+                ("joining", 1 | 3) => ("joinToString", std::mem::take(cargs)),
+                _ => return false,
+            };
+            *name = terminal.to_string();
+            *args = targs;
+            return true;
+        }
+        _ => return false,
+    };
+    *name = renamed.to_string();
+    true
+}
+
 /// Apply `f` to every expression of the program: function and method bodies,
 /// class construction code, and top-level property initializers.
 fn program_exprs_mut(program: &mut Program, f: &dyn Fn(&mut Expr)) {
@@ -2383,6 +2665,7 @@ pub fn compile_with(program: &Program, debug: bool) -> Result<Chunk, String> {
 pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool), String> {
     let mut annotated = infer_constructor_returns(program);
     unqualify_jdk_ctors(&mut annotated);
+    lower_java_streams(&mut annotated);
     capture_object_locals(&mut annotated);
     let program = &annotated;
     // Extensions live in their own table keyed by `(receiver type, name)`: they

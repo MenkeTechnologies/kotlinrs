@@ -1333,3 +1333,15 @@ Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
   It now carries the bucket order, from the capacity the stdlib requests for
   each receiver kind (`mapCapacity(size)` for a collection or array,
   `mapCapacity(12)` for a range, the default for a `Sequence`).
+- **`java.util.stream` pipelines** — `listOf(1, 2, 3).stream()…` was
+  `unresolved reference: stream on List`. A pipeline from `coll.stream()`,
+  `Stream.of(…)` or `IntStream.range`/`rangeClosed` is lowered onto the lazy
+  sequence (the Java names renamed to the sequence operations they are), so
+  stage side effects interleave exactly as the JDK's do. Two JDK behaviours are
+  ported rather than inherited from the sequence: `count()` over a pipeline
+  that stays `SIZED` (`map`, `peek`, `sorted`, `limit`, `skip`, …) answers from
+  the source size without running a stage, and `DoubleStream.sum()` is
+  `Collectors.sumWithCompensation` + `computeFinalSum` (`0.6` for
+  `0.1 + 0.2 + 0.3`, where a plain fold gives `0.6000000000000001`). The
+  `Optional`-returning terminals are refused, because the sequence member of
+  the same name would answer the bare value.
