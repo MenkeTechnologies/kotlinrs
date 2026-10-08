@@ -518,6 +518,10 @@ pub struct BodyProp {
     /// type argument; it READS the one the construction site already fixed,
     /// exactly as a `T`-returning method does off its receiver.
     pub type_param_of: Option<usize>,
+    /// `val b: Int` with no initializer in a class body, assigned by an
+    /// `init` block: `init` holds the JVM default, and the constructor may
+    /// write the property even when it is a `val`.
+    pub deferred: bool,
 }
 
 /// A primary-constructor parameter with its property kind.

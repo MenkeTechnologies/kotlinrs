@@ -312,6 +312,9 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `toString`/`equals`/`hashCode`/`componentN` from the primary constructor alone,
   so `data class D(val a: Int) { val b = 2 }` prints `D(a=1)` while `D(1).b`
   still reads `2`.
+  A body property may also leave its initializer to an `init` block (`val b:
+  Int` then `init { b = a * 2 }`); the constructor may write it there even as a
+  `val`, and nothing else may.
   A **`companion object`** (one per class, named or not) is hoisted to a
   singleton reached through the class name — `C.K`, `C.of(…)` — and, from inside
   the class, with no qualifier at all.

@@ -2264,7 +2264,9 @@ impl Compiler {
                     self.b.emit(Op::Extended(KT_LAZY_NEW, 0), cd.line);
                 }
                 let ty = if p.ty == Type::Unknown { t } else { p.ty };
-                let slot = sc.declare_obj(&p.name, ty, p.mutable, p.class.clone());
+                // A deferred `val` is assigned by an `init` block below, so the
+                // constructor's binding of it is writable.
+                let slot = sc.declare_obj(&p.name, ty, p.mutable || p.deferred, p.class.clone());
                 if matches!(p.init, Expr::LateinitUnset) {
                     sc.mark_lateinit(&p.name);
                 }

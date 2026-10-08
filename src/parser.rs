@@ -163,6 +163,35 @@ fn invocable(e: &Expr) -> bool {
 /// The coarse type of one function-type parameter: a lone identifier reads as
 /// its named type, anything more (generic, nullable, nested function) is
 /// `Unknown`.
+/// A class-body `val b: T` with no initializer, stored and assigned later by an
+/// `init` block. It starts out holding what the JVM zero-fills a field with:
+/// `null` for a nullable or reference type, `0`, `0.0`, `false` or `\u0000` for
+/// a primitive one.
+fn deferred_prop(p: CtorProp, nullable: bool) -> BodyProp {
+    let init = match p.ty {
+        _ if nullable => Expr::Null,
+        Type::Int => Expr::Int(0),
+        Type::Long => Expr::Long(0),
+        Type::Float => Expr::Float32(0.0),
+        Type::Double => Expr::Float(0.0),
+        Type::Boolean => Expr::Bool(false),
+        Type::Char => Expr::Char(0),
+        _ => Expr::Null,
+    };
+    BodyProp {
+        name: p.name,
+        ty: p.ty,
+        class: p.class,
+        init,
+        mutable: matches!(p.kind, PropKind::Var),
+        lazy: false,
+        delegate: false,
+        type_args: p.type_args,
+        type_param_of: p.type_param_of,
+        deferred: true,
+    }
+}
+
 fn fn_param_ty(words: &[String], plain: bool) -> Type {
     match (plain, words) {
         (true, [one]) => Type::from_name(one),
@@ -639,6 +668,7 @@ fn expand_interface_delegation(prog: &mut Program) -> Result<(), String> {
                     // frontend keeping its arguments.
                     type_args: Vec::new(),
                     type_param_of: None,
+                    deferred: false,
                 },
             );
             let mut inherited = Vec::new();
@@ -1634,7 +1664,18 @@ impl Parser {
                         // form that does need storage still has none to go in
                         // inside an interface, so that stays an error.
                         if let Some(p) = self.abstract_prop()? {
-                            abstract_props.push(p);
+                            // In a concrete class body the same spelling is a
+                            // STORED property an `init` block assigns (`val b:
+                            // Int` then `init { b = a * 2 }`). Until that
+                            // assignment runs it holds the JVM default, which a
+                            // member called from an earlier initializer sees.
+                            if !is_interface && !mods.abstract_ {
+                                let nullable =
+                                    matches!(self.toks[self.pos - 1].tok, Tok::Question);
+                                obj_props.push(deferred_prop(p, nullable));
+                            } else {
+                                abstract_props.push(p);
+                            }
                             continue;
                         }
                         if is_interface {
@@ -1928,6 +1969,7 @@ impl Parser {
                 // type parameters.
                 type_args: Vec::new(),
                 type_param_of: None,
+                deferred: false,
             });
         }
 
@@ -1957,6 +1999,7 @@ impl Parser {
             delegate: false,
             type_args: Vec::new(),
             type_param_of: None,
+            deferred: false,
         });
         props.append(&mut comp.obj_props);
         comp.obj_props = props;
@@ -2378,6 +2421,7 @@ impl Parser {
             delegate: false,
             type_args: annot.args,
             type_param_of: None,
+            deferred: false,
         })
     }
 
@@ -2734,6 +2778,7 @@ impl Parser {
                     delegate: false,
                     type_args,
                     type_param_of,
+                    deferred: false,
                 });
             }
             let init = self.expr()?;
@@ -2747,6 +2792,7 @@ impl Parser {
                 delegate: true,
                 type_args,
                 type_param_of,
+                deferred: false,
             });
         }
         // `var f: Double get() = … set(v) { … }` with no initializer: accessors
@@ -2769,6 +2815,7 @@ impl Parser {
             delegate: false,
             type_args,
             type_param_of,
+            deferred: false,
         })
     }
 

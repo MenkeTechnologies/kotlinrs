@@ -1226,3 +1226,8 @@ Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
   extension is called on `null` with `this` bound to it.
 - **A generic extension property** — `val <T> List<T>.second: T get() =
   this[1]` — was `expected identifier, found Lt`.
+- **A body property assigned in `init`** — `class C(val a: Int) { val b: Int;
+  init { b = a * 2 } }` — was `unresolved reference: b`: with no initializer,
+  the declaration was taken for an abstract one with no storage. In a concrete
+  class it is now stored, holds the JVM default until the `init` block writes
+  it, and stays a `val` to every write outside the constructor.
