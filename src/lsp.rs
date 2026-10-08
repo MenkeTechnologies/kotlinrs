@@ -1032,6 +1032,13 @@ const CORPUS: &[Entry] = &[
         "import kotlin.math.ceil\nfun main() { println(ceil(1.2)) }   // 2.0",
     ),
     (
+        "truncate",
+        "Math",
+        "truncate(x: Double): Double",
+        "The argument rounded toward zero. Needs the `kotlin.math` import.",
+        "import kotlin.math.truncate\nfun main() { println(truncate(-2.7)) }   // -2.0",
+    ),
+    (
         "round",
         "Math",
         "round(x: Double): Double",

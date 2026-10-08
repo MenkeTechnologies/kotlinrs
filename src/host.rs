@@ -4993,6 +4993,7 @@ fn math_call(name: &str, args: &[Value]) -> Result<Value, String> {
         })),
         "floor" => Ok(Value::Float(a.to_float().floor())),
         "ceil" => Ok(Value::Float(a.to_float().ceil())),
+        "truncate" => Ok(Value::Float(a.to_float().trunc())),
         "round" => Ok(Value::Float(a.to_float().round_ties_even())),
         "jround" => Ok(Value::Int(java_math_round(a.to_float()))),
         _ => Err(format!("unresolved reference: {name}")),
@@ -11857,6 +11858,18 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         .flatten();
         if let Some(parts) = parts {
             return Ok(alloc_ro_list(parts));
+        }
+    }
+    // `Map.Entry.toPair()` — the one conversion from an entry to a `Pair`,
+    // which then prints `(k, v)` rather than `k=v`.
+    if name == "toPair" && args.is_empty() {
+        let kv = with_obj(recv, |o| match o {
+            HeapObj::Entry(k, v) => Some((k.clone(), v.clone())),
+            _ => None,
+        })
+        .flatten();
+        if let Some((k, v)) = kv {
+            return Ok(alloc(HeapObj::Pair(k, v)));
         }
     }
 

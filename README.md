@@ -394,7 +394,7 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 - **`Map.Entry`** — a distinct type from `Pair`, because all three observable
   members differ: an entry renders `k=v` where a pair renders `(k, v)`, its hash
   is `key xor value` where a pair folds like the `data class` it is, and
-  `mapOf(1 to "a").entries.first() == (1 to "a")` is `false`. `keys` and
+  `mapOf(1 to "a").entries.first() == (1 to "a")` is `false`. `toPair()` converts one. `keys` and
   `entries` are `Set`s, so their hash sums and their equality ignores order;
   `values` is a plain `Collection`, whose `equals`/`hashCode` the JVM leaves as
   identity.
@@ -505,7 +505,7 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   keeps JVM semantics: `==` is reference identity (`arrayOf(1) == arrayOf(1)` is
   `false`) and `toString()` is `[I@…`-style (the identity-hash digits are ours,
   the shape is Kotlin's).
-- **Math** — `kotlin.math` `abs`/`max`/`min`/`sqrt`/`floor`/`ceil`/`round`, the
+- **Math** — `kotlin.math` `abs`/`max`/`min`/`sqrt`/`floor`/`ceil`/`round`/`truncate`, the
   logarithms and `exp` (`ln`/`log10`/`log2`/`ln1p`/`log(x, base)`/`exp`), the
   trigonometric and hyperbolic functions other than `sin`/`cos`
   (`tan`/`asin`/`acos`/`atan`/`atan2`/`sinh`/`cosh`/`tanh`), `cbrt`, `hypot`,

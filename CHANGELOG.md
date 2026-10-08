@@ -1231,3 +1231,6 @@ Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
   the declaration was taken for an abstract one with no storage. In a concrete
   class it is now stored, holds the JVM default until the `init` block writes
   it, and stays a `val` to every write outside the constructor.
+- **`Map.Entry.toPair()`** was `unresolved reference: toPair on Map.Entry`.
+- **`kotlin.math.truncate`** was unresolved; it rounds toward zero, `Float`
+  overload included, and is import-gated like the rest of `kotlin.math`.
