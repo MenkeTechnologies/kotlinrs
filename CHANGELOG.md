@@ -1208,3 +1208,15 @@ on JRE 21.0.12.1) from a probe that diverged:
 - **`%h`/`%H`** were `UnknownFormatConversionException`; they are
   `Integer.toHexString(arg.hashCode())`, a user `hashCode` included, with the
   precision capping the length.
+
+### Round 19, first batch
+
+Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
+
+- **`return@label` naming an enclosing lambda** — `run outer@{ xs.forEach {
+  return@outer "early" }; "late" }` — returned from the INNER lambda only, so the
+  program silently answered `late` where the reference answers `early`. The
+  label now resolves against every enclosing lambda up to the nearest `fun`,
+  explicit labels and the implicit one a trailing lambda takes from its callee
+  (`return@run`, `return@map`, `return@with`) alike; the return unwinds to the
+  named lambda's frame, which claims it.

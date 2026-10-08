@@ -832,6 +832,13 @@ pub const REIFY_CALL: &str = "__reify";
 /// argument is the returned value. `$` cannot appear in a Kotlin identifier.
 pub const NONLOCAL_RETURN: &str = "$return";
 
+/// The intrinsic a `return@label` parses to when the label names an ENCLOSING
+/// lambda rather than the innermost one (`run outer@{ xs.forEach { return@outer 1 } }`).
+/// Its first argument is the target lambda's [`Expr::Lambda`] `catch_tag`, the
+/// optional second the returned value. It travels as a non-local return does,
+/// and the tagged lambda's frame claims it.
+pub const LABELED_RETURN: &str = "$return@";
+
 /// The reserved member name `x::class` lowers to. `class` is a Kotlin keyword,
 /// so no program can spell a member of this name and the two cannot collide.
 pub const CLASS_REF: &str = "class";
@@ -1017,6 +1024,9 @@ pub enum Expr {
     Lambda {
         params: Vec<(String, Type)>,
         body: Vec<Stmt>,
+        /// Set when a `return@label` in a lambda nested inside this one names
+        /// THIS one (see [`LABELED_RETURN`]): the tag its frame claims.
+        catch_tag: Option<String>,
     },
     /// The value a `lateinit var` holds before its first write. Every property
     /// read checks for it and raises `UninitializedPropertyAccessException`.

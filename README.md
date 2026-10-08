@@ -644,7 +644,11 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
    `val f = lit@ { … }`). The label needs no lowering of its own: every lambda
    body is its own VM frame, so a local return IS a frame return; what it needed
    was to PARSE, and until it did the parser ended the statement at the label and
-   then reported that a label must precede a loop. A BARE `return` in a lambda is
+   then reported that a label must precede a loop. A `return@label` that names an
+   ENCLOSING lambda — explicitly labelled, or implicitly by the function it
+   trails (`run { xs.forEach { return@run 1 } }`) — leaves every lambda in
+   between: it rides the exception unwind and the named lambda's frame claims it.
+   A BARE `return` in a lambda is
    Kotlin's non-local return out of the enclosing `fun`, carried out of the
    lambda by the exception unwind and claimed by that function's own frame; an
    anonymous `fun(x: Int): Int { … }` is a closure whose `return` leaves it. Blocks are lexically scoped: bindings

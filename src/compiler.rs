@@ -1169,6 +1169,9 @@ struct PendingLambda {
     /// [`Compiler::nlr_target`]), snapshotted because the body is emitted
     /// after that function's lowering finished.
     nlr_target: Option<(String, Type)>,
+    /// The literal's catch tag (see [`LABELED_RETURN`]): the frame claims a
+    /// `return@label` a nested lambda aims at it.
+    catch_tag: Option<String>,
     /// The `reified` type-parameter names in scope at the literal. A lambda
     /// inside a `reified` body sees them — Kotlin inlines the lambda into that
     /// body, so `xs.firstOrNull { it is T }` is a test against the CALL's type
@@ -4097,7 +4100,11 @@ impl Compiler {
                 inc,
                 prefix,
             } => self.compile_incdec(sc, target, *inc, *prefix),
-            Expr::Lambda { params, body } => self.compile_lambda(sc, params, body),
+            Expr::Lambda {
+                params,
+                body,
+                catch_tag,
+            } => self.compile_lambda(sc, params, body, catch_tag.as_deref()),
             Expr::FunRef { recv, name, line } => {
                 self.compile_fun_ref(sc, recv.as_deref(), name, *line)
             }
@@ -4540,6 +4547,7 @@ impl Compiler {
             let lambda = Expr::Lambda {
                 params: vec![(a, Type::String), (b, Type::String)],
                 body: vec![Stmt::new(line, StmtKind::Expr(body))],
+                catch_tag: None,
             };
             return self.compile_expr(sc, &lambda);
         }
@@ -4853,6 +4861,7 @@ impl Compiler {
                 let block = Expr::Lambda {
                     params: Vec::new(),
                     body: vec![Stmt::new(line, body)],
+                    catch_tag: None,
                 };
                 return self.compile_call(sc, "runCatching", &[block], line);
             }
@@ -5945,6 +5954,7 @@ impl Compiler {
         sc: &mut Scope,
         params: &[(String, Type)],
         body: &[Stmt],
+        catch_tag: Option<&str>,
     ) -> Result<Type, String> {
         // A receiver-scope block (`x.apply { … }`) takes the receiver as `this`
         // rather than as `it`, so it gets no implicit `it` at all.
@@ -6017,6 +6027,7 @@ impl Compiler {
             local_caps: self.local_caps.clone(),
             reified: self.cur_reified.clone(),
             nlr_target: self.nlr_target.clone(),
+            catch_tag: catch_tag.map(str::to_string),
         });
         self.b.emit(Op::LoadInt(name_idx as i64), 0);
         self.b.emit(Op::LoadInt(effective.len() as i64), 0);
@@ -6054,6 +6065,7 @@ impl Compiler {
         let lam = |n: usize, body: Expr| Expr::Lambda {
             params: (0..n).map(|i| (param(i), Type::Unknown)).collect(),
             body: vec![Stmt::new(line, StmtKind::Expr(body))],
+            catch_tag: None,
         };
 
         let Some(recv) = recv else {
@@ -6265,7 +6277,7 @@ impl Compiler {
         // unresolvable name.
         let outer_reified = std::mem::replace(&mut self.cur_reified, pl.reified.clone());
         let outer_nlr = std::mem::replace(&mut self.nlr_target, pl.nlr_target.clone());
-        let outer_catch = self.nlr_catch.take();
+        let outer_catch = std::mem::replace(&mut self.nlr_catch, pl.catch_tag.clone());
         // A lambda body is invoked through a nested `vm.run()`, so it is its own
         // frame for unwinding too: a raise inside it returns out, and the host
         // suppresses any further invocation while the exception is in flight.
@@ -6273,6 +6285,12 @@ impl Compiler {
         let outer_returns = std::mem::take(&mut self.finally_returns);
         let outer_exits = std::mem::take(&mut self.finally_exits);
         let res = self.compile_block_value(&mut sc, &pl.body);
+        // `run outer@{ xs.forEach { return@outer 1 } }` — the RESULT
+        // expression may itself be the call a nested lambda returned through,
+        // and the parked value, not the half-computed one, is the answer.
+        if res.is_ok() && pl.catch_tag.is_some() {
+            self.unwind_check_dropping(1);
+        }
         self.local_funs = outer_locals;
         self.local_sigs = outer_local_sigs;
         self.local_caps = outer_local_caps;
@@ -7225,6 +7243,25 @@ impl Compiler {
             self.b.emit(Op::CallBuiltin(KT_NLR_RAISE, 2), line);
             return Ok(Type::Unit);
         }
+        // `return@label` out of an enclosing lambda (see [`LABELED_RETURN`]):
+        // the value goes to that lambda's erased result position, then the
+        // raise carries it out through every frame in between.
+        if name == LABELED_RETURN {
+            let Some(Expr::Str(tag)) = args.first() else {
+                return Err(format!("malformed labeled return (line {line})"));
+            };
+            match args.get(1) {
+                Some(e) => {
+                    self.compile_erased(sc, e)?;
+                }
+                None => {
+                    self.b.emit(Op::LoadUndef, line);
+                }
+            }
+            self.compile_expr(sc, &Expr::Str(tag.clone()))?;
+            self.b.emit(Op::CallBuiltin(KT_NLR_RAISE, 2), line);
+            return Ok(Type::Unit);
+        }
         // The width-boxing intrinsic (see [`BOX_WIDTH`]).
         if name == BOX_WIDTH {
             if let Some(inner) = args.first() {
@@ -7461,6 +7498,7 @@ impl Compiler {
                 let lambda = Expr::Lambda {
                     params: vec![(a.clone(), Type::Unknown), (b.clone(), Type::Unknown)],
                     body: vec![Stmt::new(line, StmtKind::Expr(body))],
+                    catch_tag: None,
                 };
                 self.compile_expr(sc, &lambda)?;
                 Ok(Type::Obj)
@@ -7796,6 +7834,7 @@ impl Compiler {
                 let fill = Expr::Lambda {
                     params: Vec::new(),
                     body: vec![Stmt::new(line, StmtKind::Expr(Expr::Null))],
+                    catch_tag: None,
                 };
                 self.compile_expr(sc, &args[0])?;
                 let didx = self.b.add_constant(Value::str(""));
@@ -8859,7 +8898,7 @@ impl Compiler {
     /// Mark `args`' trailing lambda literal, when it has no parameters, as one
     /// passed where a `() -> R` is expected (see [`Compiler::zero_arity_body`]).
     fn mark_zero_arity_lambda(&mut self, args: &[Expr]) {
-        if let Some(Expr::Lambda { params, body }) = args.last() {
+        if let Some(Expr::Lambda { params, body, .. }) = args.last() {
             if params.is_empty() {
                 self.zero_arity_body = Some(body.as_ptr());
             }
@@ -12160,7 +12199,9 @@ pub fn uses_exceptions(program: &Program) -> bool {
         body_any(body, &|e| match e {
             Expr::Try(_) | Expr::Throw(_) => true,
             // A non-local `return` travels on the same unwind checks.
-            Expr::Call { name, .. } => name == "runCatching" || name == NONLOCAL_RETURN,
+            Expr::Call { name, .. } => {
+                name == "runCatching" || name == NONLOCAL_RETURN || name == LABELED_RETURN
+            }
             Expr::MethodCall { recv, name, .. } => {
                 name == "runCatching"
                     || (matches!(name.as_str(), "success" | "failure")

@@ -104,6 +104,10 @@ pub struct Parser {
     /// `fun` (or an anonymous `fun(…)`) it is an ordinary return; inside a
     /// lambda it is Kotlin's non-local return out of the enclosing `fun`.
     bodies: Vec<BodyKind>,
+    /// The lambda literals being parsed, innermost last — a parallel record to
+    /// the `Lambda` entries of [`Parser::bodies`], carrying what a `return@label`
+    /// needs to resolve its label.
+    lambdas: Vec<LambdaScope>,
     /// The names of every `infix fun` the program declares, collected by
     /// [`infix_fun_names`] before parsing starts so a call may precede the
     /// declaration. `a name b` is an infix call only for one of these (or a
@@ -111,6 +115,23 @@ pub struct Parser {
     /// Kotlin's `infixFunctionCall` admits no newline before the identifier.
     infix_names: std::rc::Rc<std::collections::HashSet<String>>,
 }
+
+/// A lambda literal being parsed (see [`Parser::lambdas`]).
+struct LambdaScope {
+    /// The name a `return@name` uses for it: an explicit `name@` label, else
+    /// the name of the function the lambda trails (`forEach { … }` is
+    /// `forEach`), as Kotlin labels a lambda implicitly.
+    label: Option<String>,
+    /// `bodies.len()` once this lambda's own entry is pushed.
+    depth: usize,
+    /// Set when a `return@label` in a NESTED lambda leaves this one — the
+    /// unique tag that return raises and this lambda's frame claims.
+    catch_tag: Option<String>,
+}
+
+/// Source of [`LambdaScope::catch_tag`]s: unique across every parser,
+/// including the sub-parsers string templates spawn.
+static LAMBDA_TAGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// One entry of [`Parser::bodies`].
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -364,6 +385,7 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
         nested_names: Vec::new(),
         in_subjectless_cond: false,
         bodies: Vec::new(),
+        lambdas: Vec::new(),
         infix_names: std::rc::Rc::new(HashSet::new()),
     };
     p.infix_names = std::rc::Rc::new(infix_fun_names(&p.toks));
@@ -2426,6 +2448,7 @@ impl Parser {
             nested_names: Vec::new(),
             in_subjectless_cond: false,
             bodies: Vec::new(),
+            lambdas: Vec::new(),
             infix_names: Default::default(),
         })
     }
@@ -2661,7 +2684,7 @@ impl Parser {
                 if mutable {
                     return Err(format!("property {name}: `by lazy` requires `val`"));
                 }
-                let init = self.lambda()?;
+                let init = self.lambda(Some("lazy".to_string()))?;
                 return Ok(BodyProp {
                     name,
                     ty,
@@ -3105,17 +3128,21 @@ impl Parser {
             }
             Tok::Return => {
                 self.advance();
-                // `return@label` — a LOCAL return from the lambda (or `fun`)
-                // carrying that label. Every lambda body here compiles to its
-                // own VM frame, so a local return IS a frame return and the
-                // label needs no lowering of its own; it is consumed and
-                // dropped. A BARE `return` in a lambda is the other construct,
-                // Kotlin's non-local return, handled below.
+                // `return@label` — a return from the lambda (or `fun`) carrying
+                // that label. Every lambda body here compiles to its own VM
+                // frame, so leaving the INNERMOST lambda is a frame return and
+                // the label needs no lowering. Leaving an ENCLOSING lambda is
+                // not: it raises that lambda's catch tag, unwinding every frame
+                // in between (see [`LABELED_RETURN`]). A BARE `return` in a
+                // lambda is Kotlin's non-local return, handled below.
                 let labelled = self.at(&Tok::At);
-                if labelled {
+                let outer_tag = if labelled {
                     self.advance();
-                    self.ident()?;
-                }
+                    let label = self.ident()?;
+                    self.outer_lambda_return(&label)
+                } else {
+                    None
+                };
                 // A `return` with no expression (Unit) — the next token starts a
                 // new statement or closes the block.
                 let value = if matches!(self.peek(), Tok::RBrace | Tok::Semi | Tok::Eof) {
@@ -3123,13 +3150,20 @@ impl Parser {
                 } else {
                     Some(self.expr()?)
                 };
-                // A bare `return` inside a lambda is NON-LOCAL: it leaves the
-                // nearest enclosing `fun`. One leaving an anonymous function
-                // through a lambda is refused rather than sent to the wrong
-                // frame.
-                let owner = self.bodies.iter().rev().find(|k| **k != BodyKind::Lambda);
-                if !labelled && self.bodies.last() == Some(&BodyKind::Lambda) {
-                    match owner {
+                if let Some(tag) = outer_tag {
+                    let mut args = vec![Expr::Str(vec![StrExpr::Text(tag)])];
+                    args.extend(value);
+                    StmtKind::Expr(Expr::Call {
+                        name: LABELED_RETURN.to_string(),
+                        args,
+                        line,
+                    })
+                } else if !labelled && self.bodies.last() == Some(&BodyKind::Lambda) {
+                    // A bare `return` inside a lambda is NON-LOCAL: it leaves
+                    // the nearest enclosing `fun`. One leaving an anonymous
+                    // function through a lambda is refused rather than sent to
+                    // the wrong frame.
+                    match self.bodies.iter().rev().find(|k| **k != BodyKind::Lambda) {
                         Some(BodyKind::Fun) => StmtKind::Expr(Expr::Call {
                             name: NONLOCAL_RETURN.to_string(),
                             args: value.into_iter().collect(),
@@ -3242,7 +3276,7 @@ impl Parser {
             if mutable {
                 return Err(format!("local {name}: `by lazy` requires `val`"));
             }
-            let init = self.lambda()?;
+            let init = self.lambda(Some("lazy".to_string()))?;
             return Ok(StmtKind::Let {
                 name,
                 ty,
@@ -3918,7 +3952,7 @@ impl Parser {
                 }
                 self.eat(&Tok::RParen)?;
                 if self.at_lambda() {
-                    args.push(self.labeled_lambda()?);
+                    args.push(self.labeled_lambda(None)?);
                 }
                 e = Expr::Invoke {
                     target: Box::new(e),
@@ -3991,7 +4025,7 @@ impl Parser {
             // Trailing-lambda syntax: `list.map { … }` / `list.map(sel) { … }`.
             if self.at_lambda() {
                 is_call = true;
-                args.push(self.labeled_lambda()?);
+                args.push(self.labeled_lambda(Some(&name))?);
             }
             if is_call {
                 e = reify_wrap(
@@ -4059,29 +4093,67 @@ impl Parser {
 
     /// A lambda literal, consuming an optional `NAME@` label first.
     ///
-    /// The label needs no lowering: every lambda body here compiles to its own
-    /// VM frame, so a `return@lit` IS a frame return, and [`Parser::stmt`]
-    /// already consumes and drops the label on the `return` side. What was
-    /// missing was the DECLARATION side. Without it the parser ended the
-    /// expression statement before the label, met `lit@ {` as a fresh statement,
-    /// and reported that a label must precede a loop — a message about a
-    /// construct the program did not contain.
-    fn labeled_lambda(&mut self) -> Result<Expr, String> {
+    /// `callee` is the function the lambda trails, if any — Kotlin's implicit
+    /// label for it; an explicit label replaces it. A `return@label` naming THIS
+    /// lambda from directly inside it is a frame return (every lambda body
+    /// compiles to its own VM frame); one naming it from a lambda nested inside
+    /// it leaves both, and [`Parser::outer_lambda_return`] resolves it.
+    fn labeled_lambda(&mut self, callee: Option<&str>) -> Result<Expr, String> {
+        let mut label = callee.map(str::to_string);
         if matches!(self.peek(), Tok::Ident(_))
             && matches!(self.peek_at(1), Tok::At)
             && matches!(self.peek_at(2), Tok::LBrace)
         {
-            self.ident()?;
+            label = Some(self.ident()?);
             self.eat(&Tok::At)?;
         }
-        self.lambda()
+        self.lambda(label)
     }
 
-    fn lambda(&mut self) -> Result<Expr, String> {
+    fn lambda(&mut self, label: Option<String>) -> Result<Expr, String> {
         self.bodies.push(BodyKind::Lambda);
+        self.lambdas.push(LambdaScope {
+            label,
+            depth: self.bodies.len(),
+            catch_tag: None,
+        });
         let lam = self.lambda_inner();
+        let scope = self.lambdas.pop().expect("pushed above");
         self.bodies.pop();
-        lam
+        let mut lam = lam?;
+        if let Expr::Lambda { catch_tag, .. } = &mut lam {
+            *catch_tag = scope.catch_tag;
+        }
+        Ok(lam)
+    }
+
+    /// Resolve `return@label` to the lambda it leaves when that is NOT the
+    /// innermost one, answering the enclosing lambda's catch tag (allocated on
+    /// first use). `None` is a frame return: the label names the innermost
+    /// lambda, or no lambda reachable without crossing a `fun` boundary.
+    fn outer_lambda_return(&mut self, label: &str) -> Option<String> {
+        // The innermost body that is not a lambda bounds the search: a
+        // `return@label` cannot leave a `fun` it is nested in.
+        let fun_depth = self
+            .bodies
+            .iter()
+            .rposition(|k| *k != BodyKind::Lambda)
+            .map_or(0, |i| i + 1);
+        let innermost = self.lambdas.last()?.depth;
+        let scope = self
+            .lambdas
+            .iter_mut()
+            .rev()
+            .take_while(|s| s.depth > fun_depth)
+            .find(|s| s.label.as_deref() == Some(label))?;
+        if scope.depth == innermost {
+            return None;
+        }
+        let tag = scope.catch_tag.get_or_insert_with(|| {
+            let n = LAMBDA_TAGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            format!("$lambda@{n}")
+        });
+        Some(tag.clone())
     }
 
     /// `fun(params)[: T] { … }` / `fun(params) = expr` — an anonymous
@@ -4128,6 +4200,7 @@ impl Parser {
         Ok(Expr::Lambda {
             params,
             body: body?,
+            catch_tag: None,
         })
     }
 
@@ -4263,7 +4336,11 @@ impl Parser {
                 ),
             );
         }
-        Ok(Expr::Lambda { params, body })
+        Ok(Expr::Lambda {
+            params,
+            body,
+            catch_tag: None,
+        })
     }
 
     /// Consume the tokens of a lambda parameter's type annotation, stopping
@@ -4490,7 +4567,7 @@ impl Parser {
             // A brace in expression position is a lambda literal (`val f = { … }`,
             // `f({ … })`). Trailing-lambda braces are consumed by `postfix` /
             // `primary`'s call arms before reaching here.
-            Tok::LBrace => self.lambda(),
+            Tok::LBrace => self.lambda(None),
             // `fun(x: Int): Int { … }` — an anonymous function.
             Tok::Fun if matches!(self.peek_at(1), Tok::LParen) => self.anonymous_fun(),
             // A LABELLED lambda literal in expression position: `lit@ { … }`,
@@ -4501,7 +4578,7 @@ impl Parser {
             Tok::Ident(_)
                 if matches!(self.peek_at(1), Tok::At) && matches!(self.peek_at(2), Tok::LBrace) =>
             {
-                self.labeled_lambda()
+                self.labeled_lambda(None)
             }
             Tok::LParen => {
                 self.advance();
@@ -4573,7 +4650,7 @@ impl Parser {
                     self.eat(&Tok::RParen)?;
                     // Trailing-lambda syntax on a free call: `apply(x) { … }`.
                     if self.at_lambda() {
-                        args.push(self.labeled_lambda()?);
+                        args.push(self.labeled_lambda(Some(&name))?);
                     }
                     // `enumValues<E>()` / `enumValueOf<E>(s)` are the two calls
                     // whose TYPE ARGUMENT is the whole meaning — they are
@@ -4601,7 +4678,7 @@ impl Parser {
                     // Bare trailing-lambda call `run { … }` (no parenthesized
                     // args). `Ident {` is unambiguously a call in Kotlin's
                     // expression grammar — there are no anonymous block statements.
-                    let lam = self.labeled_lambda()?;
+                    let lam = self.labeled_lambda(Some(&name))?;
                     Ok(Expr::Call {
                         name,
                         args: vec![lam],
@@ -4670,7 +4747,7 @@ impl Parser {
         }
         self.eat(&Tok::RParen)?;
         if self.at(&Tok::LBrace) {
-            args.push(self.lambda()?);
+            args.push(self.lambda(Some(name.clone()))?);
         }
         Ok(Expr::Call { name, args, line })
     }
@@ -4977,6 +5054,7 @@ impl Parser {
                         nested_names: Vec::new(),
                         in_subjectless_cond: false,
                         bodies: Vec::new(),
+                        lambdas: Vec::new(),
                         infix_names: self.infix_names.clone(),
                     };
                     let e = sub.expr()?;
