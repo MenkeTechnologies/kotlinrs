@@ -21,10 +21,11 @@ runs Kotlin programs by lexing and parsing to an AST, lowering to
 bytecode, and executing on a shared bytecode VM with a three-tier Cranelift
 JIT \(em with no JVM and no bytecode interpreter of its own. Arithmetic,
 comparison, control flow, locals, and calls lower to native fusevm ops so the
-JIT can trace hot loops; a small runtime host supplies the Kotlin display form
-of
-.BR Boolean / Double
-and truncating integer division.
+JIT can trace hot loops; a runtime host supplies what those ops cannot
+express: the Kotlin display form of
+.BR Boolean / Double ,
+truncating integer division, and the object heap behind classes, collections,
+and lambdas.
 .SH OPTIONS
 .TP
 .BR \-e ", " \-\-eval " " \fISRC\fR
@@ -80,12 +81,12 @@ fun main() {
 .RE
 .SH DIAGNOSTICS
 Errors are written to standard error in the terse form
-.BR "kotlin: <reason>" .
-An integer division by zero is reported as an uncaught
-.B java.lang.ArithmeticException
-and exits non-zero.
+.BR "kotlin: <reason>" ,
+and the process exits with status 1. An uncaught exception is reported as
+.BR "Exception in thread ""main"" <class>: <message>" ;
+an integer division by zero is a
+.BR java.lang.ArithmeticException .
 .SH SEE ALSO
-.BR kotlinall (1),
-.BR fusevm (1)
+.BR kotlinall (1)
 .SH HOMEPAGE
 https://github.com/MenkeTechnologies/kotlinrs

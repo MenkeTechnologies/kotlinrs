@@ -16,6 +16,10 @@ subset, the runtime coercions, and the full toolchain surface of the single
 binary. For the terse invocation summary see
 .BR kotlin (1).
 .SH "LANGUAGE SUBSET"
+The core forms are listed below. Classes, data classes, interfaces, objects,
+lambdas, collections, exceptions, and a large part of the standard library are
+also supported; the complete per\-feature list is in the project README and in
+.IR docs/reference.html .
 .TP
 .B Declarations
 .B fun
@@ -50,18 +54,20 @@ and string templates with
 .TP
 .B Builtins
 .BR println " and " print
-write a single value to standard output.
+write at most one value to standard output.
 .SH "RUNTIME COERCIONS"
-Three Kotlin behaviours the language-agnostic ops cannot express are served by
+Kotlin behaviours the language\-agnostic ops cannot express are served by
 the runtime host:
 .BR Boolean / Double
 display form
 .RB ( true / false ", " 1.0 ),
-and truncating integer
+truncating integer
 .BR / " and " %
 (with a
 .B java.lang.ArithmeticException
-on a zero divisor). Everything else is native fusevm bytecode.
+on a zero divisor), the object heap behind classes, collections, and lambdas,
+and in\-flight exceptions. Arithmetic, comparison, control flow, locals, and
+calls are native fusevm bytecode.
 .SH OPTIONS
 .TP
 .BR \-e ", " \-\-eval " " \fISRC\fR
@@ -104,7 +110,6 @@ completion / hover and for the generated
 .I docs/reference.html
 page, so the language server and the published reference never drift.
 .SH SEE ALSO
-.BR kotlin (1),
-.BR fusevm (1)
+.BR kotlin (1)
 .SH HOMEPAGE
 https://github.com/MenkeTechnologies/kotlinrs
