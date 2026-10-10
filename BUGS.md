@@ -386,10 +386,6 @@ Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 | program | kotlinrs | reference |
 | --- | --- | --- |
 | `println(UInt.MAX_VALUE)` (any unsigned type or `u` literal) | `expected RParen, found Ident("u")` | `4294967295` |
-| `open class B { init { println(f()) }; open fun f() = "b" }` | `unresolved reference: f` | calls `f` on the instance under construction |
-
-The last is the limit `emit_init_blocks` documents: the instance is allocated
-after the initializers run, so an `init` block has no `this` to call through.
 
 ## Round 20: measured and not closed
 
@@ -413,3 +409,33 @@ the same substrate as consistent `Long` boxing.
 (`findFirst`, `findAny`, `max`, `min`, `average`, one-argument `reduce`) are
 refused at compile time: lowered onto the sequence they would print the bare
 value.
+
+## Round 8: measured and not closed
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | kotlinrs | reference |
+| --- | --- | --- |
+| `open class A { init { println("A " + name()) }; abstract fun name(): String }` with `class B : A() { val nm = "b"; override fun name() = nm }` | `A ` | `A null` |
+| `listOf(1, 2, 3).listIterator().next()` | `unresolved reference: listIterator on List` | `1` |
+| `val i = mutableListOf(1, 2).iterator(); i.next(); i.remove()` | `unresolved reference: remove on Iterator` | removes the element |
+| `println(mutableListOf(1).clear())`, `val f = { }; println(f())` | `null` | `kotlin.Unit` |
+| `IntRange.EMPTY`, `sequence.constrainOnce()`, `Integer.reverse(1)`, `java.lang.String.valueOf(5)` | `unresolved reference` | `1..0`, the sequence, `-2147483648`, `5` |
+| `data class D(val a: Int, val b: Int)`; `d.copy(b = g(), a = h())` | `h` before `g` | `g` before `h` |
+
+**A `String`-typed field read before its initializer.** A field the JVM has not
+yet written is `null`, and a value statically typed `String` concatenates as
+written, so the first row prints `A ` where Kotlin prints `A null`. A nullable
+declaration (`String?`) renders correctly, as does every non-`String` type
+(`Int` reads `0`). Making the concatenation test its operand costs an op on every
+`String` `+`, for a program that is already outside what Kotlin promises.
+
+**Which classes are built in two steps.** A class whose chain holds a throwable,
+an enum constant with a body, or an object expression that captures keeps the
+older build-then-extend construction, because the message, the cause and the
+captured values are assembled around the finished instance. Its `init` blocks
+may still not call a member of their own class, and a virtual call from a
+superclass initializer lands on the superclass's method.
+
+**Unsigned types** are not modelled at all (`5u`, `UInt`, `toUInt()`); see Round
+20 for the representation question.

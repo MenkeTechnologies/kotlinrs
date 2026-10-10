@@ -11,6 +11,53 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Round 8 — constructors that have an object, defaults in the callee, receiver function types
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12, compiled and run on the same JVM.
+Eight harness modes were added (`calldflt`, `callorder`, `initorder`, `recvfn`,
+`jumpexpr`, `charclass`, `splitmulti`, `numeq`) and twelve frozen records
+captured from the reference toolchain.
+
+### Wrong or failing, now answering what the JVM answers
+
+| program | before | reference |
+| --- | --- | --- |
+| `class P(val a: Int) { val d = twice(a); fun twice(x: Int) = x * 2 }` | `unresolved reference: twice` | constructs |
+| `open class A { init { println(who()) }; open fun who() = "A" }` with `class B : A() { override fun who() = "B" }` | `A` | `B` |
+| `fun f(a: Int, b: Int = a * 2)`; `f(1)` | `unresolved reference: a` | `1/2` |
+| `class K(val n: Int) { fun m(p: Int = n) = p }`; `K(5).m()` | `unresolved reference: n` | `5` |
+| `f(c = g(), a = h())` | `h` ran before `g` | `g` then `h` |
+| `fun build(f: StringBuilder.() -> Unit)` | parse error at the `.` | declares |
+| `val n = s ?: return -1` | `unexpected token Return` | `-1` for a null `s` |
+| `return` then a newline then a call | the call was the return value | `return` with no operand |
+| `when (x) { null -> … }` for the object whose heap handle is `0` | the `null` arm matched | the `null` arm is for `null` |
+| `object O { init { println("i") } }` | never ran the block | runs it at first use |
+| `"a--b".split("--", "-")` | `[a, , b]` | `[a, b]` |
+| `'\u0663'.isDigit()`, `'²'.isDigit()` | Rust's `is_numeric` | the JDK's `Nd` table |
+| `'f'.digitToInt(16)` | `Char f is not a decimal digit` | `15` |
+| `1.0.equals(1)`, `1.equals(1L)` | `true` | `false` |
+| `5.coerceIn(1..3)` | `5.0` | `3` |
+| `String.format("%s", null)` | `MissingFormatArgumentException` | `null` |
+| `println(Unit)`, `Unit.toString()` | `unresolved reference` | `kotlin.Unit` |
+| `Lg.Factory.make()` for `companion object Factory` | `unresolved reference: Factory` | resolves |
+| `@JvmStatic fun f()` inside a class body | parse error | accepted |
+| `fun List<Int>.e() = filter { it > 1 } + reversed()` | `0.0` | the list |
+
+### How
+
+- **Constructors.** A class on the chained scheme is built in two steps
+  (`Class#$init` allocates every field of every class up the chain at its zero
+  value, `Class#$into` runs the constructors over it). Field writes are by
+  POSITION, so a property a subclass redeclares keeps the superclass's own field.
+  Throwables, object expressions and enums-with-bodies keep the build-then-extend
+  form; BUGS.md lists what that leaves.
+- **Defaults.** A default that names an earlier parameter, `this` or a member is
+  filled by the callee's prologue; the caller passes the unset marker.
+- **Character classes.** `isLetter`, `isDigit`, `isUpperCase`, `isLowerCase` and
+  `digitToInt` read tables produced by evaluating the predicates over the BMP on
+  the reference JVM (`src/unicode_jdk.rs`). Rust's `char` predicates disagreed on
+  hundreds of characters, partly by Unicode version.
+
 ## Round 7 — a fault the program cannot catch is not a fault Kotlin has
 
 ### The oracle

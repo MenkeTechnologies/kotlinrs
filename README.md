@@ -335,6 +335,15 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   A body property may also leave its initializer to an `init` block (`val b:
   Int` then `init { b = a * 2 }`); the constructor may write it there even as a
   `val`, and nothing else may.
+  Property initializers and `init` blocks run over a REAL instance: the whole
+  object — every field of every class up the chain, at its zero value — is
+  allocated first and the constructors then run over it, superclass first. So a
+  member may be called from an initializer, and a superclass initializer's virtual
+  call reaches the subclass's override, which reads the subclass's own fields at
+  their zero values, as on the JVM. A class whose chain holds a throwable, an
+  enum or an object expression keeps the older build-then-extend lowering.
+  An `object` that has an `init` block or an initializer with an effect is built
+  on FIRST USE, and a companion with the first construction of its owner.
   A **`companion object`** (one per class, named or not) is hoisted to a
   singleton reached through the class name — `C.K`, `C.of(…)` — and, from inside
   the class, with no qualifier at all.
@@ -598,15 +607,27 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   name, and an ambiguous one is a compile error rather than an arbitrary pick.
 - **Default, named and `vararg` parameters** — `fun f(a: Int, b: Int = 10)`,
   `f(b = 3, a = 4)`, `fun total(vararg xs: Int)`, for functions, methods,
-  constructors and extensions alike. Defaults are evaluated at the CALL site, so
-  one may not name another parameter of the same callee; that form is rejected
-  rather than silently misbound. A `vararg` binds an array of its declared
+  constructors and extensions alike. A default is evaluated in the CALLEE's
+  frame, as Kotlin does, so it may name an earlier parameter, `this` or a member
+  (`fun f(a: Int, b: Int = a * 2)`, `fun m(p: Int = n + 1)`); an override inherits
+  the overridden declaration's defaults. Arguments are evaluated in the order
+  they are WRITTEN, so a reordered named argument keeps its effect where it was
+  written. A `vararg` binds an array of its declared
   element type and is supported as the last parameter. The spread operator
   passes an array's elements as that many arguments — `total(1, *xs, 9)`, and
   into the stdlib factories and `format` (`listOf(*xs, 3)`, `arrayOf(*a)`,
   `fmt.format(*args)`) — always as a COPY, so a callee writing its `vararg`
   array cannot reach the caller's. A positional argument may follow named ones
   that sit in their own positions (`f(a = 1, 2)`), as Kotlin allows since 1.4.
+- **Function types with a receiver** — `f: Html.() -> Unit`, `Int.(Int) -> Int`,
+  as a parameter, a `val`, or an optional `(R.() -> Unit)?`. A lambda literal
+  passed for one binds the receiver as `this` (and a single further parameter as
+  `it`); the callee may call it `r.f(…)`, `f(r, …)`, or — inside a member of the
+  receiver's class — with the receiver implicit, which is the shape a builder DSL
+  takes. An anonymous `fun R.(…)` is not supported.
+- **`return`, `break` and `continue` as expressions** — `val n = s ?: return -1`,
+  `t += x ?: continue`, `(x ?: break).length`, `?: return@label`. A `return`
+  followed by a newline has no operand.
 - **Local functions** — a `fun` declared inside another function's body. It
   lowers to a real subroutine rather than a closure value, which is what lets it
   **recurse** (a closure captures by value at creation, so a self-reference would
@@ -766,9 +787,7 @@ the type argument and the body reads it back.
 
 Not yet (see roadmap): variance and bounds, an explicit `: super(args)` from a
 secondary constructor (the primary constructor is the only thing that chains to
-the superclass here), calling a method on `this` from inside an `init` block
-(the instance is allocated after the initializers run, so there is no receiver
-yet — reading properties works), and the rest of the standard-library surface.
+the superclass here), and the rest of the standard-library surface.
 Each fails loudly rather than answering wrong.
 
 One limitation is a **representation** limit rather than a missing feature, and
