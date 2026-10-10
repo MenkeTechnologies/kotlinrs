@@ -9524,7 +9524,10 @@ fn sorted_nav_method(
                 | ("pollFirstEntry" | "pollLastEntry" | "descendingMap", 0)
                 | ("navigableKeySet" | "descendingKeySet", 0)
                 | ("floorKey" | "ceilingKey" | "higherKey" | "lowerKey", 1)
-                | ("floorEntry" | "ceilingEntry" | "higherEntry" | "lowerEntry", 1)
+                | (
+                    "floorEntry" | "ceilingEntry" | "higherEntry" | "lowerEntry",
+                    1
+                )
                 | ("headMap" | "tailMap", 1 | 2)
                 | ("subMap", 2 | 4)
         )
@@ -9661,9 +9664,7 @@ fn sorted_nav(
             };
             if let (Some((from, _)), Some((to, _))) = (lo, hi) {
                 if order(vm, from, to)? > 0 {
-                    return Err(
-                        "java.lang.IllegalArgumentException: fromKey > toKey".to_string()
-                    );
+                    return Err("java.lang.IllegalArgumentException: fromKey > toKey".to_string());
                 }
             }
             let mut picked = Vec::new();
@@ -13443,8 +13444,11 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
 /// Whether `v` is an `IntArray` (or a `ShortArray`/`ByteArray`, which Kotlin
 /// sums as `Int`).
 fn is_int_array(v: &Value) -> bool {
-    with_obj(v, |o| matches!(o, HeapObj::Array { desc, .. } if matches!(desc.as_str(), "[I" | "[S" | "[B")))
-        .unwrap_or(false)
+    with_obj(
+        v,
+        |o| matches!(o, HeapObj::Array { desc, .. } if matches!(desc.as_str(), "[I" | "[S" | "[B")),
+    )
+    .unwrap_or(false)
 }
 
 /// Sum a list of numbers — `Int` result when every element is integral, else
@@ -13461,7 +13465,11 @@ fn sum_values(items: &[Value], int32: bool) -> Value {
     let wrapping = |items: &[Value]| items.iter().map(num_i64).fold(0i64, i64::wrapping_add);
     if items.iter().all(|v| matches!(v, Value::Int(_))) {
         let total = wrapping(items);
-        return Value::Int(if int32 { i64::from(total as i32) } else { total });
+        return Value::Int(if int32 {
+            i64::from(total as i32)
+        } else {
+            total
+        });
     }
     // `LongArray.sum()` / `List<Long>.sum()` answers a `Long`, so a run of boxed
     // ones sums integrally and re-boxes rather than widening to `Double`.

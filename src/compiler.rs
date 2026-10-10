@@ -772,7 +772,11 @@ fn member_names(cd: &ClassDecl, by_name: &HashMap<&str, &ClassDecl>) -> HashSet<
         out.extend(c.obj_props.iter().map(|p| p.name.clone()));
         out.extend(c.abstract_props.iter().map(|p| p.name.clone()));
         out.extend(c.methods.iter().map(|m| m.name.clone()));
-        todo.extend(c.parents.iter().filter_map(|p| by_name.get(p.as_str()).copied()));
+        todo.extend(
+            c.parents
+                .iter()
+                .filter_map(|p| by_name.get(p.as_str()).copied()),
+        );
     }
     out
 }
@@ -849,12 +853,18 @@ fn capture_object_locals(program: &mut Program) {
             objects: constructed_objects(&init),
         });
     }
-    let site_of = |name: &str| ctxs.iter().position(|c| c.objects.iter().any(|o| o == name));
+    let site_of = |name: &str| {
+        ctxs.iter()
+            .position(|c| c.objects.iter().any(|o| o == name))
+    };
 
     // Bottom-up (innermost object first): what each object needs from outside
     // itself, and what it writes, nested objects included.
-    let by_name: HashMap<&str, &ClassDecl> =
-        program.classes.iter().map(|c| (c.name.as_str(), c)).collect();
+    let by_name: HashMap<&str, &ClassDecl> = program
+        .classes
+        .iter()
+        .map(|c| (c.name.as_str(), c))
+        .collect();
     let mut free: HashMap<String, HashSet<String>> = HashMap::new();
     let mut writes: HashMap<String, HashSet<String>> = HashMap::new();
     for (_, name) in anon.iter().rev() {
@@ -895,7 +905,10 @@ fn capture_object_locals(program: &mut Program) {
         if let Some(outer) = ctx.owner.as_ref().and_then(|o| captures.get(o)) {
             available.extend(outer.iter().map(|c| c.name.clone()));
         }
-        let mut names: Vec<&String> = free[name].iter().filter(|n| available.contains(*n)).collect();
+        let mut names: Vec<&String> = free[name]
+            .iter()
+            .filter(|n| available.contains(*n))
+            .collect();
         names.sort();
         let caps: Vec<ObjCapture> = names
             .into_iter()
@@ -1109,7 +1122,11 @@ fn lower_java_streams(program: &mut Program) {
 fn lower_stream_op(e: &mut Expr) -> bool {
     let source = is_stream_source(e);
     let Expr::MethodCall {
-        recv, name, args, line, ..
+        recv,
+        name,
+        args,
+        line,
+        ..
     } = e
     else {
         return false;
@@ -1130,7 +1147,11 @@ fn lower_stream_op(e: &mut Expr) -> bool {
     // The sources.
     if source {
         *e = match name.as_str() {
-            "stream" => method(std::mem::replace(&mut **recv, Expr::Null), "asSequence", Vec::new()),
+            "stream" => method(
+                std::mem::replace(&mut **recv, Expr::Null),
+                "asSequence",
+                Vec::new(),
+            ),
             "of" => call("sequenceOf", std::mem::take(args)),
             _ => {
                 let end = args.pop().unwrap_or(Expr::Null);
@@ -1159,8 +1180,7 @@ fn lower_stream_op(e: &mut Expr) -> bool {
     // refused at compile time rather than lowered.
     if matches!(
         (name.as_str(), args.len()),
-        ("findFirst" | "findAny" | "average" | "max" | "min", 0)
-            | ("max" | "min" | "reduce", 1)
+        ("findFirst" | "findAny" | "average" | "max" | "min", 0) | ("max" | "min" | "reduce", 1)
     ) {
         *e = call(
             &format!("Stream.{name} (its java.util.Optional result is not modelled)"),
@@ -1190,7 +1210,9 @@ fn lower_stream_op(e: &mut Expr) -> bool {
             // `stream()` counts the collection; the other sources are lowered
             // to the sequence they are first.
             let sized = match stream_source(recv).clone() {
-                Expr::MethodCall { recv: coll, name, .. } if name == "stream" => *coll,
+                Expr::MethodCall {
+                    recv: coll, name, ..
+                } if name == "stream" => *coll,
                 mut other => {
                     lower_stream_op(&mut other);
                     other
@@ -1200,7 +1222,13 @@ fn lower_stream_op(e: &mut Expr) -> bool {
             // the source outward.
             let mut slices = Vec::new();
             let mut at: &Expr = recv;
-            while let Expr::MethodCall { recv: inner, name, args, .. } = at {
+            while let Expr::MethodCall {
+                recv: inner,
+                name,
+                args,
+                ..
+            } = at
+            {
                 if is_stream_source(at) {
                     break;
                 }
@@ -3024,7 +3052,11 @@ impl Compiler {
         // The library interfaces a class or one of its ancestors names
         // (`Comparable`, `Comparator`, …), so `x is Comparable<*>` holds.
         for anc in &meta.mro {
-            let marks = self.classes.get(anc).map(|m| m.parents.clone()).unwrap_or_default();
+            let marks = self
+                .classes
+                .get(anc)
+                .map(|m| m.parents.clone())
+                .unwrap_or_default();
             for p in marks {
                 if is_marker_supertype(&p) && !out.contains(&p) {
                     out.push(p);
@@ -3416,7 +3448,12 @@ impl Compiler {
         // A user `Comparator` (`object : Comparator<T> { override fun compare(a,
         // b) … }`) reaches `sortedWith` and the sorted collections as a plain
         // handle, so its `compare` is published the same way.
-        for (tag, owner) in self.method_index.get("compare").cloned().unwrap_or_default() {
+        for (tag, owner) in self
+            .method_index
+            .get("compare")
+            .cloned()
+            .unwrap_or_default()
+        {
             if !self.classes[&tag].mro.iter().any(|a| {
                 self.classes
                     .get(a)
@@ -3586,7 +3623,10 @@ impl Compiler {
             .and_then(|c| self.classes.get(c))
             .map(|m| m.captures.clone())
             .unwrap_or_default();
-        for cap in caps.iter().filter(|c| !f.params.iter().any(|p| p.name == c.name)) {
+        for cap in caps
+            .iter()
+            .filter(|c| !f.params.iter().any(|p| p.name == c.name))
+        {
             self.b.emit(Op::GetSlot(0), f.line);
             let nidx = self.b.add_constant(Value::str(cap.name.clone()));
             self.b.emit(Op::LoadConst(nidx), f.line);
@@ -8115,7 +8155,11 @@ impl Compiler {
             let object = meta.name.clone();
             for cap in meta.captures.clone() {
                 if sc.slot(&cap.name).is_some() {
-                    let seen = (sc.ty(&cap.name), sc.class_of(&cap.name), sc.elem_of(&cap.name));
+                    let seen = (
+                        sc.ty(&cap.name),
+                        sc.class_of(&cap.name),
+                        sc.elem_of(&cap.name),
+                    );
                     self.capture_types.insert((object.clone(), cap.name), seen);
                 }
             }
@@ -9590,7 +9634,10 @@ impl Compiler {
         if self.class_meta(name).is_some() {
             return None;
         }
-        let sig = self.local_sigs.get(name).or_else(|| self.fun_sig.get(name))?;
+        let sig = self
+            .local_sigs
+            .get(name)
+            .or_else(|| self.fun_sig.get(name))?;
         if args.iter().any(|a| matches!(a, Expr::Named { .. })) {
             return Some(sig.clone());
         }
@@ -11195,7 +11242,9 @@ impl Compiler {
             // The members that re-emit their receiver's own elements. `sorted`
             // and friends reorder, `filter`/`take`/`drop` select — none of them
             // changes what an element IS.
-            Expr::MethodCall { recv, name, args, .. } => match name.as_str() {
+            Expr::MethodCall {
+                recv, name, args, ..
+            } => match name.as_str() {
                 "filter" | "filterNot" | "filterIndexed" | "filterNotNull" | "sorted"
                 | "sortedDescending" | "sortedBy" | "sortedByDescending" | "sortedWith"
                 | "reversed" | "asReversed" | "take" | "takeLast" | "takeWhile" | "drop"
@@ -12128,8 +12177,8 @@ fn annotated_elem(class: Option<&str>, type_args: &[TypeArg]) -> Type {
     match class {
         Some(
             "List" | "MutableList" | "ArrayList" | "Set" | "MutableSet" | "HashSet"
-            | "LinkedHashSet" | "Collection" | "MutableCollection" | "Iterable"
-            | "MutableIterable" | "Sequence" | "Array" | "ArrayDeque",
+            | "LinkedHashSet" | "Collection" | "MutableCollection" | "Iterable" | "MutableIterable"
+            | "Sequence" | "Array" | "ArrayDeque",
         ) => type_args.first().map_or(Type::Unknown, |a| a.ty),
         _ => Type::Unknown,
     }
@@ -13497,6 +13546,12 @@ fn builtin_binary_member(ty: &str, name: &str) -> bool {
 fn is_jdk_collection_ctor(name: &str) -> bool {
     matches!(
         name,
-        "TreeMap" | "TreeSet" | "HashMap" | "HashSet" | "LinkedHashMap" | "LinkedHashSet" | "ArrayList"
+        "TreeMap"
+            | "TreeSet"
+            | "HashMap"
+            | "HashSet"
+            | "LinkedHashMap"
+            | "LinkedHashSet"
+            | "ArrayList"
     )
 }

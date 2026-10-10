@@ -1093,8 +1093,7 @@ impl Parser {
             let first = self.ident()?;
             // A NULLABLE receiver (`fun String?.orBlank()`) is the same
             // extension, callable on `null` as well.
-            let nullable_dot =
-                self.at(&Tok::Question) && matches!(self.peek_at(1), Tok::Dot);
+            let nullable_dot = self.at(&Tok::Question) && matches!(self.peek_at(1), Tok::Dot);
             if nullable_dot {
                 self.advance();
             }
@@ -1674,8 +1673,7 @@ impl Parser {
                             // assignment runs it holds the JVM default, which a
                             // member called from an earlier initializer sees.
                             if !is_interface && !mods.abstract_ {
-                                let nullable =
-                                    matches!(self.toks[self.pos - 1].tok, Tok::Question);
+                                let nullable = matches!(self.toks[self.pos - 1].tok, Tok::Question);
                                 obj_props.push(deferred_prop(p, nullable));
                             } else {
                                 abstract_props.push(p);
@@ -2243,9 +2241,9 @@ impl Parser {
         self.advance(); // `val` / `var`
         let (declared, _) = self.type_params_decl_reified();
         self.type_params.extend(declared);
-                        // `val Recv.name get() = …` is an EXTENSION property: a getter with the
-                        // receiver bound as `this`, which is exactly an extension function of
-                        // no parameters, and is lowered as one.
+        // `val Recv.name get() = …` is an EXTENSION property: a getter with the
+        // receiver bound as `this`, which is exactly an extension function of
+        // no parameters, and is lowered as one.
         let mut recv: Option<(String, Type, Option<String>)> = None;
         let parsed = (|| -> Result<Option<(String, TypeArg)>, String> {
             let mut name = self.ident()?;
