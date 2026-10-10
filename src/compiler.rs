@@ -152,6 +152,14 @@ const YIELD_ALL_VAR: &str = "$yieldAll";
 /// program can spell.
 const BOX_WIDTH: &str = "__box_width";
 
+/// The intrinsic `expand_args` wraps a lambda literal in when the parameter it is
+/// bound to has a function type WITH a receiver. Its arguments are the lambda,
+/// the number of parameters after the receiver, the receiver's type as a
+/// [`type_code`], and its class name (empty for none). The wrapping is what lets
+/// every call path — function, method, constructor, extension — bind the
+/// receiver as `this` without each one knowing about it.
+const RECV_LAMBDA: &str = "__recv_lambda";
+
 /// The members whose ARGUMENT is a key or a stored element rather than a
 /// number to compute with — the argument positions that erase a `Float`'s or a
 /// `Long`'s width the way a collection literal's elements do.
@@ -210,6 +218,10 @@ struct Binding {
     /// division path and answered `3.5` where the reference toolchain truncates
     /// to `3`, and `f(a) + f(b)` skipped the 32-bit wrap.
     fn_ret: Type,
+    /// How many parameters follow the receiver, when this binding holds a value
+    /// of a function type WITH a receiver (`f: Html.(Int) -> Unit`). A call
+    /// through it may then leave the receiver implicit or write it as `r.f(…)`.
+    fn_recv: Option<usize>,
     /// The TYPE ARGUMENTS of this binding's class, when it holds an instance of
     /// a generic class — `val b = Box(65536)` records `[Int]`. Empty for
     /// everything else, including a generic class whose argument the frontend
@@ -326,6 +338,7 @@ impl Scope {
                 class,
                 elem,
                 fn_ret: Type::Unknown,
+                fn_recv: None,
                 type_args: Vec::new(),
                 boxed: false,
                 lazy: false,
@@ -418,6 +431,16 @@ impl Scope {
     }
     /// Record the declared RESULT type of a function-typed binding — see
     /// [`Binding::fn_ret`].
+    fn set_fn_recv(&mut self, name: &str, extra: usize) {
+        if let Some(b) = self.map.get_mut(name) {
+            b.fn_recv = Some(extra);
+        }
+    }
+    /// How many parameters follow the receiver of the function value `name`, if
+    /// it was declared with a function type that has one.
+    fn fn_recv_of(&self, name: &str) -> Option<usize> {
+        self.map.get(name).and_then(|b| b.fn_recv)
+    }
     fn set_fn_ret(&mut self, name: &str, ret: Type) {
         if let Some(b) = self.map.get_mut(name) {
             b.fn_ret = ret;
@@ -470,6 +493,7 @@ impl Scope {
                 elem: b.elem,
                 boxed: b.boxed,
                 lateinit: b.lateinit,
+                fn_recv: b.fn_recv,
             })
             .collect();
         out.sort_by_key(|c| c.slot);
@@ -487,6 +511,7 @@ impl Scope {
                 elem: b.elem,
                 boxed: b.boxed,
                 lateinit: b.lateinit,
+                fn_recv: b.fn_recv,
             })
             .collect();
         // By SLOT, not by name: the capture layout has to be deterministic
@@ -581,6 +606,9 @@ struct FnSig {
     /// annotation wrote, which is the only source of a generic result's width
     /// when neither an argument nor the receiver carries one.
     ret_type_args: Vec<TypeArg>,
+    /// The receiver type of an extension, whose members its parameter defaults
+    /// may name (see [`Compiler::needs_callee_frame`]); `None` otherwise.
+    owner: Option<String>,
     arity: usize,
     /// The parameters in declaration order. Names are what a named argument
     /// (`f(count = 3)`) binds against; the defaults and the `vararg` marker are
@@ -589,6 +617,18 @@ struct FnSig {
 }
 
 impl FnSig {
+    /// Whether a call with `argc` arguments can bind: no fewer than the
+    /// parameters that have neither a default nor `vararg`, and no more than
+    /// there are (a `vararg` takes any number).
+    fn accepts(&self, argc: usize) -> bool {
+        let required = self
+            .params
+            .iter()
+            .filter(|p| p.default.is_none() && p.vararg.is_none())
+            .count();
+        let variadic = self.params.iter().any(|p| p.vararg.is_some());
+        argc >= required && (variadic || argc <= self.arity)
+    }
     fn of(f: &FunDecl) -> FnSig {
         FnSig {
             ret: f.ret,
@@ -597,6 +637,7 @@ impl FnSig {
             ret_class_type_param_of: f.ret_class_type_param_of,
             ret_type_args: f.ret_type_args.clone(),
             arity: f.params.len(),
+            owner: f.recv.as_ref().map(|(r, _, _)| r.clone()),
             params: f.params.clone(),
         }
     }
@@ -1446,6 +1487,11 @@ fn expr_each_mut(e: &mut Expr, f: &dyn Fn(&mut Expr)) {
             expr_each_mut(a, f);
             expr_each_mut(b, f);
         }
+        Expr::Seq { binds, value } => {
+            binds.iter_mut().for_each(|(_, b)| expr_each_mut(b, f));
+            expr_each_mut(value, f);
+        }
+        Expr::Jump(s) => each_expr_mut(std::slice::from_mut(s.as_mut()), f),
         Expr::Lambda { body, .. } => each_expr_mut(body, f),
         Expr::FunRef { recv, .. } => {
             if let Some(r) = recv {
@@ -1509,6 +1555,8 @@ fn ext_sub_name(recv: &str, name: &str) -> String {
 /// synthesized-member routing.
 #[derive(Clone)]
 struct ClassMeta {
+    /// See [`ClassDecl::companion_alias`].
+    companion_alias: Option<String>,
     name: String,
     /// How many type parameters the class declares — the length of the type
     /// ARGUMENT vector an instantiation of it produces. See [`TypeArg`].
@@ -1683,6 +1731,17 @@ fn ctor_sub_name(class: &str) -> String {
     format!("{class}#$init")
 }
 
+/// The entry that runs a chained-scheme class's constructors over an instance
+/// that already exists — see `Compiler::compile_ctor_chained`.
+fn ctor_into_sub_name(class: &str) -> String {
+    format!("{class}#$into")
+}
+
+/// The subroutine that builds a lazily initialized `object` on first use.
+fn object_init_sub_name(class: &str) -> String {
+    format!("{class}#$clinit")
+}
+
 /// The built-in throwables that declare the `(message, cause)` and `(cause)`
 /// constructors — read off `javap -public` on the JDK; `ArithmeticException`,
 /// `NullPointerException`, `NumberFormatException`, `ClassCastException` and the
@@ -1795,6 +1854,17 @@ pub struct Compiler {
     /// fail at runtime. Recording the object being built lets that read resolve
     /// to the slot instead, which is what the unqualified `NORTH` already does.
     building_object: Option<String>,
+    /// The `object`s built on FIRST USE rather than at program start: the ones
+    /// whose initializers have an effect a program can see (an `init` block, or
+    /// a property initialized by a call). Kotlin initializes every object
+    /// lazily; an object of constants cannot tell, so it keeps the cheap form.
+    lazy_objects: HashSet<String>,
+    /// Each class's body-property initializers by property name, so the zero a
+    /// field holds before its initializer runs can take the initializer's type.
+    prop_inits: HashMap<String, HashMap<String, Expr>>,
+    /// Set by the static `String.format(fmt, …)` spelling for the one member
+    /// call it forwards to; see the `Locale?` overload rule in `compile_member`.
+    static_format: bool,
     /// When true, emit a per-statement `Op::Extended(KT_DBG_LINE, 0)` marker
     /// (carrying the statement's source line) before each statement, so the
     /// `--dap` debugger can stop at breakpoints and step. Off for normal runs —
@@ -1860,6 +1930,10 @@ pub struct Compiler {
     /// function — and what lets the block name the receiver's members with no
     /// qualifier.
     lambda_recv: Option<(Type, Option<String>)>,
+    /// Set with `lambda_recv` when the function type the lambda is passed as
+    /// also takes ONE more parameter, which a lambda that names none reads as
+    /// `it`.
+    lambda_recv_it: bool,
     /// The BODY of a lambda literal passed where the expected function type
     /// has NO parameters (`runCatching { … }`, `getOrPut(k) { … }`), which
     /// therefore declares no implicit `it` — a bare `it` in it is the
@@ -2059,6 +2133,8 @@ struct Captured {
     /// The binding is a `lateinit` one, so a read through the capture checks
     /// it for the unset marker the same way the declaring frame does.
     lateinit: bool,
+    /// The binding is a function value with a receiver (see [`Binding::fn_recv`]).
+    fn_recv: Option<usize>,
 }
 
 /// One enclosing-frame binding a local `fun` closes over, passed as a
@@ -2085,6 +2161,8 @@ struct LocalCap {
     boxed: bool,
     /// See [`Captured::lateinit`].
     lateinit: bool,
+    /// See [`Captured::fn_recv`].
+    fn_recv: Option<usize>,
 }
 
 /// The scope key a captured `name` is bound under inside a local `fun` whose
@@ -2418,10 +2496,13 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
                 // of two of them (`O.a == O.b`) would miss the object-equality
                 // path and compare the raw handles with the native op.
                 (Type::Unknown, Some(_)) => Type::Obj,
+                // An unannotated `val n = 7` is an `Int`: the literal says so.
+                (Type::Unknown, None) => literal_type(&p.init),
                 (t, _) => t,
             },
             class: p.class.clone().or_else(|| body_prop_class(p, &by_name)),
-            mutable: p.mutable,
+            // A `val` an `init` block assigns is stored like any other.
+            mutable: p.mutable || p.deferred,
             lazy: p.lazy,
             // The delegate's class, taken from the initializer — `by Upper()`
             // names `Upper`, whose `getValue`/`setValue` the accesses call.
@@ -2560,9 +2641,24 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
                 if data_regenerates(cd, d, m) {
                     continue;
                 }
-                methods
-                    .entry(m.name.clone())
-                    .or_insert_with(|| FnSig::of(m));
+                // An override restates no defaults — it inherits the nearest
+                // overridden declaration's — so the entry already recorded for
+                // this name (the subclass's own) takes any it lacks from here.
+                match methods.entry(m.name.clone()) {
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(FnSig::of(m));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut o) => {
+                        let sig = o.get_mut();
+                        if sig.arity == m.params.len() {
+                            for (mine, inherited) in sig.params.iter_mut().zip(&m.params) {
+                                if mine.default.is_none() && mine.vararg.is_none() {
+                                    mine.default = inherited.default.clone();
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         let own_methods = cd
@@ -2593,6 +2689,7 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
                 base,
                 super_args: cd.super_args.clone(),
                 has_primary: cd.has_primary,
+                companion_alias: cd.companion_alias.clone(),
                 sec_arities: cd.secondaries.iter().map(|s| s.params.len()).collect(),
                 sec_params: cd.secondaries.iter().map(|s| s.params.clone()).collect(),
                 throwable_base,
@@ -2776,6 +2873,16 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         outer_supplied: false,
         capture_types: HashMap::new(),
         building_object: None,
+        lazy_objects: HashSet::new(),
+        prop_inits: program
+            .classes
+            .iter()
+            .map(|k| {
+                let inits = k.obj_props.iter().map(|p| (p.name.clone(), p.init.clone()));
+                (k.name.clone(), inits.collect())
+            })
+            .collect(),
+        static_format: false,
         debug,
         has_ffi,
         loops: Vec::new(),
@@ -2789,6 +2896,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         boxed_vars: HashSet::new(),
         lambda_hint: None,
         lambda_recv: None,
+        lambda_recv_it: false,
         zero_arity_body: None,
         math_scope: HashMap::new(),
         math_star: false,
@@ -2859,8 +2967,33 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
     c.emit_tostring_registry();
     c.emit_equality_registry();
     c.emit_enum_registry(program);
+    let user_calls: HashSet<String> = program
+        .funs
+        .iter()
+        .map(|f| f.name.clone())
+        .chain(
+            program
+                .classes
+                .iter()
+                .flat_map(|k| k.methods.iter().map(|m| m.name.clone())),
+        )
+        .chain(["println".to_string(), "print".to_string()])
+        .collect();
+    for cd in &program.classes {
+        let effectful = !cd.inits.is_empty()
+            || cd
+                .obj_props
+                .iter()
+                .any(|p| expr_names(&p.init).iter().any(|n| user_calls.contains(n)));
+        if cd.is_object && effectful && c.object_chained(cd) {
+            c.lazy_objects.insert(cd.name.clone());
+        }
+    }
     for cd in &program.classes {
         if cd.is_object {
+            if c.lazy_objects.contains(&cd.name) {
+                continue;
+            }
             c.build_object(cd)?;
         }
     }
@@ -2954,8 +3087,15 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
 impl Compiler {
     /// Lower a class's constructors and method bodies.
     fn compile_class_bodies(&mut self, cd: &ClassDecl) -> Result<(), String> {
+        if cd.is_object && self.lazy_objects.contains(&cd.name) {
+            self.build_object_in_place(cd, true)?;
+        }
         if !cd.is_object && !cd.is_interface {
-            self.compile_ctor(cd)?;
+            if self.ctor_chained(&cd.name) {
+                self.compile_ctor_chained(cd)?;
+            } else {
+                self.compile_ctor(cd)?;
+            }
             for (i, sec) in cd.secondaries.iter().enumerate() {
                 self.compile_secondary_ctor(cd, i, sec)?;
             }
@@ -3008,9 +3148,122 @@ impl Compiler {
         }
     }
 
+    /// [`Compiler::build_object`] for a singleton whose initializers may call
+    /// its own members or name `this`: the instance exists, at zero values and
+    /// published in its global, before the first initializer runs. A property
+    /// then reads back through the instance, which is where a member called
+    /// from an initializer finds it.
+    ///
+    /// Not for an object with a superclass or captures, nor for the companion
+    /// of an `enum`: the enum lowering builds its constants as ordinary
+    /// initializers and relies on them being evaluated into slots first.
+    fn object_chained(&self, cd: &ClassDecl) -> bool {
+        let m = &self.classes[&cd.name];
+        m.base.is_none()
+            && m.throwable_base.is_none()
+            && m.captures.is_empty()
+            && !m.is_enum
+            && cd.name.strip_suffix("$Companion").map_or(true, |owner| {
+                !self.classes.get(owner).is_some_and(|o| o.is_enum)
+            })
+    }
+
+    /// With `as_sub`, the object is built by the subroutine `Object#$clinit`, which
+    /// the first reference to it calls (see [`Compiler::lazy_objects`]) and which
+    /// answers the instance; otherwise it is built inline, at program start.
+    fn build_object_in_place(&mut self, cd: &ClassDecl, as_sub: bool) -> Result<(), String> {
+        let meta = self.classes[&cd.name].clone();
+        let mut sc = Scope::new();
+        if as_sub {
+            let entry = self.b.current_pos();
+            let name_idx = self.b.add_name(&object_init_sub_name(&cd.name));
+            self.b.add_sub_entry(name_idx, entry);
+            self.push_unwind(UnwindKind::Frame);
+        }
+        let meta_idx = self.b.add_constant(Value::str(meta.meta_string()));
+        self.b.emit(Op::LoadConst(meta_idx), cd.line);
+        for p in &meta.own_props {
+            let ty = self.field_zero_type(&cd.name, p);
+            self.compile_expr(&mut sc, &jvm_default(ty))?;
+        }
+        self.b
+            .emit(Op::Extended(KT_NEW, meta.own_props.len() as u8), cd.line);
+        let g = self.b.add_name(&cd.name);
+        self.b.emit(Op::SetVar(g), cd.line);
+        let this = sc.declare_obj("this", Type::Obj, false, Some(cd.name.clone()));
+        self.b.emit(Op::GetVar(g), cd.line);
+        self.b.emit(Op::SetSlot(this), cd.line);
+
+        let outer_class = self.cur_class.replace(cd.name.clone());
+        let ctor_body: Vec<Stmt> = cd
+            .obj_props
+            .iter()
+            .map(|p| Stmt::new(cd.line, StmtKind::Expr(p.init.clone())))
+            .chain(cd.inits.iter().flat_map(|b| b.body.iter().cloned()))
+            .collect();
+        let outer_boxed = std::mem::replace(&mut self.boxed_vars, shared_captures(&ctor_body));
+        let res: Result<(), String> = (|| {
+            for (i, p) in cd.obj_props.iter().enumerate() {
+                self.emit_init_blocks(&mut sc, cd, i)?;
+                self.compile_expr(&mut sc, &p.init)?;
+                if p.lazy {
+                    self.b.emit(Op::Extended(KT_LAZY_NEW, 0), cd.line);
+                }
+                let held = sc.temp();
+                self.b.emit(Op::SetSlot(held), cd.line);
+                self.emit_set_this_field(&cd.name, &p.name, this, held, cd.line)?;
+            }
+            self.emit_init_blocks(&mut sc, cd, cd.obj_props.len())
+        })();
+        self.boxed_vars = outer_boxed;
+        self.cur_class = outer_class;
+        if as_sub {
+            let here = self.b.current_pos();
+            self.pop_unwind_to(here);
+            let g = self.b.add_name(&cd.name);
+            self.b.emit(Op::GetVar(g), cd.line);
+            self.b.emit(Op::ReturnValue, cd.line);
+        }
+        res
+    }
+
+    /// After the object's global has been read onto the stack: if the object is
+    /// built on first use and has not been yet, build it now and use the
+    /// instance. Leaves one value, as the read did.
+    fn emit_object_first_use(&mut self, obj: &str) {
+        if !self.lazy_objects.contains(obj) {
+            return;
+        }
+        self.b.emit(Op::Dup, 0);
+        self.b.emit(Op::Extended(KT_ISNULL, 0), 0);
+        let built = self.b.emit(Op::JumpIfFalse(0), 0);
+        self.b.emit(Op::Pop, 0);
+        let init = self.b.add_name(&object_init_sub_name(obj));
+        self.b.emit(Op::Call(init, 0), 0);
+        let end = self.b.current_pos();
+        self.b.patch_jump(built, end);
+    }
+
+    /// Initialize the companion of `class` — Kotlin runs it with the class's
+    /// own static initializer, before the first instance exists.
+    fn emit_companion_first_use(&mut self, class: &str) {
+        if let Some(comp) = self
+            .companion_of(class)
+            .filter(|c| self.lazy_objects.contains(c))
+        {
+            let g = self.b.add_name(&comp);
+            self.b.emit(Op::GetVar(g), 0);
+            self.emit_object_first_use(&comp);
+            self.b.emit(Op::Pop, 0);
+        }
+    }
+
     /// Evaluate an `object`'s property initializers) and construct its singleton
     /// once, storing the handle in a global named after the object.
     fn build_object(&mut self, cd: &ClassDecl) -> Result<(), String> {
+        if self.object_chained(cd) {
+            return self.build_object_in_place(cd, false);
+        }
         let meta = self.classes[&cd.name].clone();
         let meta_idx = self.b.add_constant(Value::str(meta.meta_string()));
         self.b.emit(Op::LoadConst(meta_idx), cd.line);
@@ -3073,6 +3326,219 @@ impl Compiler {
         out
     }
 
+    /// Whether `class` is built by the allocate-then-initialize scheme (see
+    /// [`Compiler::compile_ctor_chained`]) rather than by building each
+    /// superclass instance and extending it.
+    ///
+    /// The extending scheme has no object until its last initializer has run,
+    /// so an `init` block or property initializer cannot call a member, and a
+    /// virtual call from a superclass initializer lands on the superclass's own
+    /// method. Left on it: a throwable (its message and cause are assembled
+    /// around the finished instance), an object expression (its captures are
+    /// hidden fields the creating frame supplies), an enum, and anything whose
+    /// superclass is one of those — the chained form can only initialize INTO a
+    /// superclass that has an `into` entry.
+    fn ctor_chained(&self, class: &str) -> bool {
+        let Some(m) = self.classes.get(class) else {
+            return false;
+        };
+        m.throwable_base.is_none()
+            && m.captures.is_empty()
+            && !m.is_object
+            && !m.is_interface
+            && m.base.as_deref().map_or(true, |b| self.ctor_chained(b))
+    }
+
+    /// The type whose zero a property of `class` holds before its initializer
+    /// runs: the declared one, or — for an unannotated property — what its
+    /// initializer infers to.
+    fn field_zero_type(&mut self, class: &str, p: &PropMeta) -> Type {
+        if p.ty != Type::Unknown {
+            return p.ty;
+        }
+        let Some(init) = self
+            .prop_inits
+            .get(class)
+            .and_then(|m| m.get(&p.name))
+            .cloned()
+        else {
+            return Type::Unknown;
+        };
+        let outer = self.cur_class.replace(class.to_string());
+        let t = self.infer(&Scope::new(), &init);
+        self.cur_class = outer;
+        t
+    }
+
+    /// The constructor of a class on the chained scheme: `Class#$init` allocates
+    /// the WHOLE instance — every field of every class up the chain at its zero
+    /// value, tagged with this class — and `Class#$into` runs the constructors
+    /// over it, superclass first.
+    ///
+    /// That is the object the JVM has, which is what makes three things
+    /// observable that the extending scheme cannot show: a member called from an
+    /// initializer sees the instance, a virtual call from a superclass
+    /// initializer reaches the subclass's override, and that override reads the
+    /// subclass's fields at their zero values (`null`/`0`) because its own
+    /// initializers have not run.
+    fn compile_ctor_chained(&mut self, cd: &ClassDecl) -> Result<(), String> {
+        let meta = self.classes[&cd.name].clone();
+        let n = meta.ctor_params.len();
+
+        // `Class#$init(args…)` — allocate, then initialize into the instance.
+        let entry = self.b.current_pos();
+        let name_idx = self.b.add_name(&ctor_sub_name(&cd.name));
+        self.b.add_sub_entry(name_idx, entry);
+        for i in (0..n).rev() {
+            self.b.emit(Op::SetSlot(i as u16), cd.line);
+        }
+        self.emit_companion_first_use(&cd.name);
+        let mut chain = vec![cd.name.clone()];
+        while let Some(b) = self.classes[chain.last().expect("non-empty")].base.clone() {
+            chain.push(b);
+        }
+        let mut sc = Scope::new();
+        for (k, class) in chain.iter().rev().enumerate() {
+            let m = self.classes[class].clone();
+            let midx = self.b.add_constant(Value::str(m.meta_string()));
+            self.b.emit(Op::LoadConst(midx), cd.line);
+            let own: Vec<&PropMeta> = m.own_props.iter().collect();
+            for p in &own {
+                let ty = self.field_zero_type(class, p);
+                self.compile_expr(&mut sc, &jvm_default(ty))?;
+            }
+            let op = if k == 0 { KT_NEW } else { KT_EXTEND };
+            self.b.emit(Op::Extended(op, own.len() as u8), cd.line);
+        }
+        let this = n as u16;
+        self.b.emit(Op::SetSlot(this), cd.line);
+        self.b.emit(Op::GetSlot(this), cd.line);
+        for i in 0..n {
+            self.b.emit(Op::GetSlot(i as u16), cd.line);
+        }
+        let into = self.b.add_name(&ctor_into_sub_name(&cd.name));
+        self.b.emit(Op::Call(into, (n + 1) as u8), cd.line);
+        self.b.emit(Op::Pop, cd.line);
+        self.b.emit(Op::GetSlot(this), cd.line);
+        self.b.emit(Op::ReturnValue, cd.line);
+
+        // `Class#$into(this, args…)` — the constructor proper.
+        let entry = self.b.current_pos();
+        let this = 0u16;
+        let name_idx = self.b.add_name(&ctor_into_sub_name(&cd.name));
+        self.b.add_sub_entry(name_idx, entry);
+        let mut sc = Scope::new();
+        sc.declare_obj("this", Type::Obj, false, Some(cd.name.clone()));
+        for p in &meta.ctor_params {
+            sc.declare_obj(&p.name, p.ty, false, p.class.clone());
+        }
+        for i in (0..=n).rev() {
+            self.b.emit(Op::SetSlot(i as u16), cd.line);
+        }
+        let ctor_params: Vec<Param> = meta.ctor_params.iter().map(|p| p.as_param()).collect();
+        let defaults: Vec<Option<Expr>> = ctor_params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                p.default
+                    .clone()
+                    .filter(|d| self.needs_callee_frame(None, &ctor_params[..i], d))
+            })
+            .collect();
+        let outer_class = self.cur_class.replace(cd.name.clone());
+        let outer_returns = std::mem::take(&mut self.finally_returns);
+        let outer_exits = std::mem::take(&mut self.finally_exits);
+        self.push_unwind(UnwindKind::Frame);
+        let res: Result<(), String> = (|| {
+            self.emit_callee_defaults(&mut sc, &ctor_params, &defaults, cd.line)?;
+            // The superclass constructor runs first, over the same instance.
+            if let Some(base) = &meta.base {
+                let bmeta = self.classes[base].clone();
+                if meta.super_args.len() != bmeta.ctor_params.len() {
+                    return Err(format!(
+                        "superclass constructor {base} expects {} argument(s), got {}",
+                        bmeta.ctor_params.len(),
+                        meta.super_args.len()
+                    ));
+                }
+                self.b.emit(Op::GetSlot(this), cd.line);
+                for a in &meta.super_args {
+                    self.compile_expr(&mut sc, a)?;
+                }
+                let idx = self.b.add_name(&ctor_into_sub_name(base));
+                self.b
+                    .emit(Op::Call(idx, (meta.super_args.len() + 1) as u8), cd.line);
+                self.b.emit(Op::Pop, cd.line);
+            }
+            // Constructor properties take their arguments before any initializer.
+            for p in meta.ctor_params.iter().filter(|p| p.kind != PropKind::None) {
+                let slot = sc.slot(&p.name).expect("parameter bound above");
+                self.emit_set_this_field(&cd.name, &p.name, this, slot, cd.line)?;
+            }
+            let ctor_body: Vec<Stmt> = cd
+                .obj_props
+                .iter()
+                .map(|p| Stmt::new(cd.line, StmtKind::Expr(p.init.clone())))
+                .chain(cd.inits.iter().flat_map(|b| b.body.iter().cloned()))
+                .collect();
+            let outer_boxed = std::mem::replace(&mut self.boxed_vars, shared_captures(&ctor_body));
+            let res: Result<(), String> = (|| {
+                for (i, p) in cd.obj_props.iter().enumerate() {
+                    self.emit_init_blocks(&mut sc, cd, i)?;
+                    self.compile_expr(&mut sc, &p.init)?;
+                    if p.lazy {
+                        self.b.emit(Op::Extended(KT_LAZY_NEW, 0), cd.line);
+                    }
+                    let held = sc.temp();
+                    self.b.emit(Op::SetSlot(held), cd.line);
+                    self.emit_set_this_field(&cd.name, &p.name, this, held, cd.line)?;
+                }
+                self.emit_init_blocks(&mut sc, cd, cd.obj_props.len())
+            })();
+            self.boxed_vars = outer_boxed;
+            res
+        })();
+        self.cur_class = outer_class;
+        self.finally_returns = outer_returns;
+        self.finally_exits = outer_exits;
+        let here = self.b.current_pos();
+        self.pop_unwind_to(here);
+        res?;
+        self.b.emit(Op::LoadUndef, cd.line);
+        self.b.emit(Op::ReturnValue, cd.line);
+        Ok(())
+    }
+
+    /// Store the value in slot `value` into the field `name` that class `cd`
+    /// itself declares, over the instance in slot `this`. The field is addressed
+    /// by POSITION — every ancestor's own fields come first — so a property a
+    /// subclass redeclares keeps the superclass's separate, as the JVM does.
+    fn emit_set_this_field(
+        &mut self,
+        cd: &str,
+        name: &str,
+        this: u16,
+        value: u16,
+        line: u32,
+    ) -> Result<(), String> {
+        let mut above = 0usize;
+        let mut up = self.classes[cd].base.clone();
+        while let Some(b) = up {
+            above += self.classes[&b].own_props.len();
+            up = self.classes[&b].base.clone();
+        }
+        let within = self.classes[cd]
+            .own_props
+            .iter()
+            .position(|p| p.name == name)
+            .ok_or_else(|| format!("class {cd}: no field {name}"))?;
+        self.b.emit(Op::GetSlot(this), line);
+        self.b.emit(Op::GetSlot(value), line);
+        self.b.emit(Op::LoadInt((above + within) as i64), line);
+        self.b.emit(Op::Extended(KT_SETFIELD, 1), line);
+        Ok(())
+    }
+
     /// Emit a class's constructor subroutine `Class#$init`.
     ///
     /// The subroutine exists (rather than an inline `KT_NEW` at every `C(...)`
@@ -3108,6 +3574,18 @@ impl Compiler {
         for i in (0..meta.ctor_params.len()).rev() {
             self.b.emit(Op::SetSlot(i as u16), cd.line);
         }
+        self.emit_companion_first_use(&cd.name);
+        let ctor_params: Vec<Param> = meta.ctor_params.iter().map(|p| p.as_param()).collect();
+        let defaults: Vec<Option<Expr>> = ctor_params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                p.default
+                    .clone()
+                    .filter(|d| self.needs_callee_frame(None, &ctor_params[..i], d))
+            })
+            .collect();
+        self.emit_callee_defaults(&mut sc, &ctor_params, &defaults, cd.line)?;
 
         // The base instance, when there is a superclass to chain to.
         if let Some(base) = &meta.base {
@@ -3311,6 +3789,17 @@ impl Compiler {
         for i in (0..sec.params.len()).rev() {
             self.b.emit(Op::SetSlot(i as u16), sec.line);
         }
+        let defaults: Vec<Option<Expr>> = sec
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                p.default
+                    .clone()
+                    .filter(|d| self.needs_callee_frame(None, &sec.params[..i], d))
+            })
+            .collect();
+        self.emit_callee_defaults(&mut sc, &sec.params, &defaults, sec.line)?;
 
         // The delegation target. `: super(…)` is not a separate object here —
         // the primary constructor is the one that chains to the superclass — so
@@ -3365,7 +3854,8 @@ impl Compiler {
         self.cur_class = Some(cd.name.clone());
         let outer_boxed = std::mem::replace(&mut self.boxed_vars, shared_captures(&sec.body));
         let res: Result<(), String> = (|| {
-            let full = self.expand_args(&format!("constructor {}", cd.name), &params, &args)?;
+            let full =
+                self.expand_args(&format!("constructor {}", cd.name), None, &params, &args)?;
             for a in &full {
                 self.compile_expr(&mut sc, a)?;
             }
@@ -3543,6 +4033,7 @@ impl Compiler {
                 elem: b.elem,
                 boxed: b.boxed,
                 lateinit: b.lateinit,
+                fn_recv: b.fn_recv,
             })
             .collect()
     }
@@ -3590,6 +4081,9 @@ impl Compiler {
             if !p.type_args.is_empty() {
                 sc.set_type_args(&p.name, p.type_args.clone());
             }
+            if let Some(r) = &p.fn_recv {
+                sc.set_fn_recv(&p.name, r.extra);
+            }
         }
         // Then the synthesized captures, which the call site pushed after the
         // real arguments. A capture whose name one of the declared parameters
@@ -3608,6 +4102,9 @@ impl Compiler {
             }
             if c.lateinit {
                 sc.mark_lateinit(&key);
+            }
+            if let Some(extra) = c.fn_recv {
+                sc.set_fn_recv(&key, extra);
             }
             nslots += 1;
         }
@@ -3672,7 +4169,12 @@ impl Compiler {
             &mut self.nlr_catch,
             has_nonlocal_return(&f.body).then(|| sub_name.clone()),
         );
+        let owner = class.or(f.recv.as_ref().map(|(r, _, _)| r.as_str()));
+        let defaults: Vec<Option<Expr>> = (0..f.params.len())
+            .map(|i| self.callee_default(owner, f, i))
+            .collect();
         let res: Result<(), String> = (|| {
+            self.emit_callee_defaults(&mut sc, &f.params, &defaults, f.line)?;
             for s in &f.body {
                 self.compile_stmt(&mut sc, s)?;
             }
@@ -3849,6 +4351,7 @@ impl Compiler {
                 class: annotated_class,
                 fn_params,
                 fn_ret,
+                fn_recv,
                 type_args: annotated,
                 init,
                 mutable,
@@ -3887,6 +4390,10 @@ impl Compiler {
                 if !fn_params.is_empty() {
                     self.lambda_hint =
                         Some(fn_params.iter().map(|t| (*t, Type::Unknown)).collect());
+                }
+                if let (Some(r), Expr::Lambda { .. }) = (fn_recv, init) {
+                    self.lambda_recv = Some((r.ty, r.class.clone()));
+                    self.lambda_recv_it = r.extra == 1;
                 }
                 // `val x: Any = 1.0f` is an erased position as much as a list
                 // element is: the declaration throws the width away, so the
@@ -3972,6 +4479,9 @@ impl Compiler {
                 }
                 if let Some(r) = fn_ret {
                     sc.set_fn_ret(name, *r);
+                }
+                if let Some(r) = fn_recv {
+                    sc.set_fn_recv(name, r.extra);
                 }
                 if boxed {
                     sc.box_binding(name);
@@ -4626,6 +5136,15 @@ impl Compiler {
             // before it can be compiled on its own, so reaching here means the
             // program wrote it somewhere Kotlin does not allow it either.
             Expr::Super { .. } => Err("`super` is not an expression".to_string()),
+            Expr::Seq { binds, value } => {
+                for (name, init) in binds {
+                    let ty = self.compile_expr(sc, init)?;
+                    let class = self.infer_class(sc, init);
+                    let slot = sc.declare_obj(name, ty, false, class);
+                    self.b.emit(Op::SetSlot(slot), 0);
+                }
+                self.compile_expr(sc, value)
+            }
             // A named argument is bound by the callee (see [`bind_args`]).
             // Reaching here means it was written where no parameter names are
             // known — a stdlib member or a lambda invocation.
@@ -4776,6 +5295,7 @@ impl Compiler {
                 {
                     let g = self.b.add_name(&obj);
                     self.b.emit(Op::GetVar(g), 0);
+                    self.emit_object_first_use(&obj);
                     return Ok(Type::Obj);
                 }
                 // `kotlin.math.PI` / `.E`, in scope only under the import.
@@ -4790,6 +5310,12 @@ impl Compiler {
                 // diagnostic, where the member set IS statically known.
                 if sc.slot("this").is_some() && self.cur_class.is_none() {
                     return self.compile_member(sc, &Expr::Var("this".into()), name, &[], false, 0);
+                }
+                // The `Unit` object. Its representation is the absent value; the
+                // static type is what makes it display as `kotlin.Unit`.
+                if name == "Unit" {
+                    self.b.emit(Op::LoadUndef, 0);
+                    return Ok(Type::Unit);
                 }
                 Err(format!("unresolved reference: {name}"))
             }
@@ -5086,6 +5612,14 @@ impl Compiler {
             Expr::If(ie) => self.compile_if(sc, ie),
             Expr::When(w) => self.compile_when(sc, w),
             Expr::Try(t) => self.compile_try(sc, t),
+            // `return`/`break`/`continue` as an operand: the jump is the whole
+            // effect, and the placeholder after it keeps the stack balanced for
+            // the code that is never reached.
+            Expr::Jump(s) => {
+                self.compile_stmt(sc, s)?;
+                self.b.emit(Op::LoadUndef, 0);
+                Ok(Type::Unknown)
+            }
             Expr::Throw(e) => {
                 self.compile_expr(sc, e)?;
                 self.b.emit(Op::CallBuiltin(KT_EXC_THROW, 1), 0);
@@ -5478,7 +6012,14 @@ impl Compiler {
         let rt = self.compile_expr(sc, right)?; // [R]
         let end = self.b.current_pos();
         self.b.patch_jump(jf, end);
-        Ok(if lt == rt { lt } else { Type::Unknown })
+        // A right side that never produces a value (`?: return`, `?: throw`)
+        // leaves the type to the left.
+        let diverges = matches!(right, Expr::Throw(_) | Expr::Jump(_));
+        Ok(if lt == rt || diverges {
+            lt
+        } else {
+            Type::Unknown
+        })
     }
 
     /// Lower a member/method access to a `KT_METHOD` host dispatch. The receiver
@@ -5495,6 +6036,81 @@ impl Compiler {
         safe: bool,
         line: u32,
     ) -> Result<Type, String> {
+        // `recv.f(args)` where `f` is a local of a function type with a receiver:
+        // the receiver is the closure's first argument.
+        if sc.fn_recv_of(name) == Some(args.len()) && !safe {
+            let mut with = vec![recv.clone()];
+            with.extend(args.iter().cloned());
+            return self.compile_call(sc, name, &with, line);
+        }
+        // `Owner.Factory` where `Factory` is the name its `companion object` was
+        // declared with: the companion singleton itself, which `Owner` reaches
+        // anyway.
+        if let Expr::Var(owner) = recv {
+            if sc.slot(owner).is_none() && args.is_empty() {
+                if let Some(comp) = self
+                    .companion_of(owner)
+                    .filter(|c| self.classes[c].companion_alias.as_deref() == Some(name))
+                {
+                    return self.compile_expr(sc, &Expr::Var(comp));
+                }
+            }
+        }
+        if let Expr::Member {
+            recv: inner,
+            name: alias,
+            ..
+        } = recv
+        {
+            if let Expr::Var(owner) = &**inner {
+                if sc.slot(owner).is_none()
+                    && self.companion_of(owner).is_some_and(|c| {
+                        self.classes[&c].companion_alias.as_deref() == Some(alias.as_str())
+                    })
+                {
+                    return self.compile_member(sc, inner, name, args, safe, line);
+                }
+            }
+        }
+        // `x.coerceIn(lo..hi)` written with a range LITERAL is `coerceIn(lo, hi)`.
+        if name == "coerceIn" && args.len() == 1 {
+            if let Expr::Range {
+                start,
+                end,
+                kind: RangeKind::Inclusive,
+            } = &args[0]
+            {
+                let bounds = [(**start).clone(), (**end).clone()];
+                return self.compile_member(sc, recv, name, &bounds, safe, line);
+            }
+        }
+        // `a.equals(b)` between two DIFFERENT numeric types is `false`: the boxes
+        // are different classes, whatever value they hold. The runtime has one
+        // representation for `Int` and `Long` and one for `Float` and `Double`,
+        // so only the static types can say.
+        if name == "equals" && args.len() == 1 && !safe {
+            let numeric =
+                |t: Type| matches!(t, Type::Int | Type::Long | Type::Double | Type::Float);
+            let (rt, at) = (self.infer(sc, recv), self.infer(sc, &args[0]));
+            if numeric(rt) && numeric(at) && rt != at {
+                self.compile_expr(sc, recv)?;
+                self.b.emit(Op::Pop, line);
+                self.compile_expr(sc, &args[0])?;
+                self.b.emit(Op::Pop, line);
+                self.b.emit(Op::LoadFalse, line);
+                return Ok(Type::Boolean);
+            }
+        }
+        // `Unit.toString()` — the object is the absent value, so the receiver
+        // alone cannot say what it displays as.
+        if name == "toString"
+            && args.is_empty()
+            && matches!(recv, Expr::Var(n) if n == "Unit" && sc.slot(n).is_none())
+        {
+            let idx = self.b.add_constant(Value::str("kotlin.Unit"));
+            self.b.emit(Op::LoadConst(idx), line);
+            return Ok(Type::String);
+        }
         // A lambda passed as a `() -> R` declares no implicit `it`.
         if zero_arity_member(name) {
             self.mark_zero_arity_lambda(args);
@@ -5927,7 +6543,10 @@ impl Compiler {
         // `MissingFormatArgumentException`; `"%b".format(null)` has none.
         // Packing the `null` as an element instead made `%b` render an absent
         // value, which is `false` — the right answer for a call nobody wrote.
-        if name == "format" && matches!(args.first(), Some(Expr::Null)) {
+        // The static `String.format(fmt, null)` has no such overload: its first
+        // parameter is the format, so the `null` is an argument.
+        let static_format = std::mem::take(&mut self.static_format);
+        if name == "format" && !static_format && matches!(args.first(), Some(Expr::Null)) {
             return self.compile_member(sc, recv, name, &args[1..], false, line);
         }
         // A `Float` or a `Long` handed to a member that stores it or looks it UP
@@ -6022,7 +6641,8 @@ impl Compiler {
                 // `fmt.format(args…)` member, with the receiver moved into the
                 // first argument position.
                 "String" if name == "format" && !args.is_empty() => {
-                    return self.compile_member(sc, &args[0], "format", &args[1..], false, line)
+                    self.static_format = true;
+                    return self.compile_member(sc, &args[0], "format", &args[1..], false, line);
                 }
                 // `Integer.parseInt` / `Integer.valueOf` are `String.toInt()`
                 // under another name — same parse, same NumberFormatException.
@@ -6030,6 +6650,29 @@ impl Compiler {
                     if matches!(name, "parseInt" | "valueOf") && args.len() == 1 =>
                 {
                     return self.compile_member(sc, &args[0], "toInt", &[], false, line)
+                }
+                // The other box classes' parsers, under the same rewrite.
+                "Double" | "java.lang.Double" | "Long" | "java.lang.Long" | "Boolean"
+                | "java.lang.Boolean" | "Float" | "java.lang.Float"
+                    if args.len() == 1
+                        && matches!(
+                            name,
+                            "parseDouble" | "parseLong" | "parseBoolean" | "parseFloat" | "valueOf"
+                        ) =>
+                {
+                    let member = match name {
+                        "parseDouble" => "toDouble",
+                        "parseLong" => "toLong",
+                        "parseBoolean" => "toBoolean",
+                        "parseFloat" => "toFloat",
+                        _ => match path.rsplit('.').next().unwrap_or("") {
+                            "Double" => "toDouble",
+                            "Long" => "toLong",
+                            "Float" => "toFloat",
+                            _ => "toBoolean",
+                        },
+                    };
+                    return self.compile_member(sc, &args[0], member, &[], false, line);
                 }
                 // `Integer.toBinaryString`/`toHexString`/`toOctalString` are NOT
                 // `Int.toString(radix)`: they render the UNSIGNED 32-bit
@@ -6041,6 +6684,26 @@ impl Compiler {
                         && args.len() == 1 =>
                 {
                     return self.compile_member(sc, &args[0], name, &[], false, line)
+                }
+                // The `Long` spellings read the 64-bit pattern.
+                "Long" | "java.lang.Long"
+                    if matches!(name, "toBinaryString" | "toHexString" | "toOctalString")
+                        && args.len() == 1 =>
+                {
+                    let member = format!("#long{name}");
+                    return self.compile_member(sc, &args[0], &member, &[], false, line);
+                }
+                "Character" | "java.lang.Character"
+                    if name == "getNumericValue" && args.len() == 1 =>
+                {
+                    return self.compile_member(sc, &args[0], "#getNumericValue", &[], false, line);
+                }
+                "Character" | "java.lang.Character" if name == "toString" && args.len() == 1 => {
+                    self.compile_member(sc, &args[0], "toChar", &[], false, line)?;
+                    let nidx = self.b.add_constant(Value::str("toString"));
+                    self.b.emit(Op::LoadConst(nidx), line);
+                    self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 0), line);
+                    return Ok(Type::String);
                 }
                 // `java.util.PriorityQueue(…)`, written out instead of imported.
                 "java.util" if name == "PriorityQueue" && args.len() <= 2 => {
@@ -6229,11 +6892,11 @@ impl Compiler {
             self.classes
                 .get(&c)
                 .and_then(|m| m.methods.get(name))
-                .is_some_and(|s| s.arity == args.len())
+                .is_some_and(|s| s.accepts(args.len()))
         });
         if !member_wins {
             if let Some((sub, sig)) = self.resolve_ext(sc, recv, name) {
-                let full = self.expand_args(name, &sig.params, args)?;
+                let full = self.expand_args(name, sig.owner.as_deref(), &sig.params, args)?;
                 self.compile_expr(sc, recv)?;
                 self.compile_call_args(sc, &sig.params, &full)?;
                 let idx = self.b.add_name(&sub);
@@ -6327,8 +6990,12 @@ impl Compiler {
                 // any subtype of its static one, so the call resolves against
                 // every candidate implementation (see [`Compiler::candidates`]).
                 if let Some(sig) = meta.methods.get(name).cloned() {
-                    let full =
-                        self.expand_args(&format!("method {name} on {cls}"), &sig.params, args)?;
+                    let full = self.expand_args(
+                        &format!("method {name} on {cls}"),
+                        Some(cls),
+                        &sig.params,
+                        args,
+                    )?;
                     let cands = self.candidates(Some(cls), name, sig.arity);
                     if !cands.is_empty() {
                         // A subclass that overrides this getter with STORAGE
@@ -6459,7 +7126,32 @@ impl Compiler {
         if let Some(within) = narrowed_from.filter(|_| !is_primitive_recv(self.infer(sc, recv))) {
             let cands = self.candidates(within, name, args.len());
             if !cands.is_empty() {
-                self.emit_virtual_call(sc, recv, name, args, Targets::dynamic(&cands), line)?;
+                // The receiver's class is not known, but the candidates agree on a
+                // signature, so defaults, named arguments and receiver lambdas
+                // bind against it exactly as they would for a known class.
+                let sigs: Vec<FnSig> = cands
+                    .iter()
+                    .filter_map(|(t, _)| self.classes.get(t)?.methods.get(name).cloned())
+                    .collect();
+                let same = sigs.first().is_some_and(|f| {
+                    sigs.iter().all(|s| {
+                        s.arity == f.arity
+                            && s.params
+                                .iter()
+                                .zip(&f.params)
+                                .all(|(a, b)| a.name == b.name)
+                    })
+                });
+                let full = match sigs.first() {
+                    Some(f) if same => self.expand_args(
+                        &format!("method {name}"),
+                        Some(&cands[0].0),
+                        &f.params,
+                        args,
+                    )?,
+                    _ => args.to_vec(),
+                };
+                self.emit_virtual_call(sc, recv, name, &full, Targets::dynamic(&cands), line)?;
                 return Ok(self.virtual_ret_type(&cands, name));
             }
         }
@@ -6581,7 +7273,7 @@ impl Compiler {
                 self.classes
                     .get(tag)
                     .and_then(|m| m.methods.get(name))
-                    .is_some_and(|s| s.arity == argc)
+                    .is_some_and(|s| s.accepts(argc))
             })
             .cloned()
             .collect()
@@ -6969,14 +7661,16 @@ impl Compiler {
         // A receiver-scope block (`x.apply { … }`) takes the receiver as `this`
         // rather than as `it`, so it gets no implicit `it` at all.
         let recv = self.lambda_recv.take();
+        let recv_it = std::mem::take(&mut self.lambda_recv_it);
         let zero_arity = self.zero_arity_body.take() == Some(body.as_ptr());
         // An unparameterized lambda has the single implicit parameter `it` —
         // unless the function type it is passed as takes none.
-        let declared: Vec<(String, Type)> = if params.is_empty() && recv.is_none() && !zero_arity {
-            vec![("it".to_string(), Type::Unknown)]
-        } else {
-            params.to_vec()
-        };
+        let declared: Vec<(String, Type)> =
+            if params.is_empty() && (recv.is_none() || recv_it) && !zero_arity {
+                vec![("it".to_string(), Type::Unknown)]
+            } else {
+                params.to_vec()
+            };
         // A parameter the source did not annotate takes its type from the call
         // site (see [`Compiler::lambda_hint`]), which is what lets `it` inside
         // `listOf(1, 2).map { … }` be an `Int` rather than a width the frontend
@@ -7264,6 +7958,9 @@ impl Compiler {
             }
             if c.lateinit {
                 sc.mark_lateinit(&c.name);
+            }
+            if let Some(extra) = c.fn_recv {
+                sc.set_fn_recv(&c.name, extra);
             }
         }
         let total = pl.params.len() + pl.captures.len();
@@ -8131,6 +8828,13 @@ impl Compiler {
         if zero_arity_free_fun(name) {
             self.mark_zero_arity_lambda(args);
         }
+        // A call through a function value that has a receiver: the receiver may
+        // be left implicit, in which case it is `this`.
+        if sc.fn_recv_of(name) == Some(args.len()) && sc.slot("this").is_some() {
+            let mut with = vec![Expr::Var("this".to_string())];
+            with.extend(args.iter().cloned());
+            return self.compile_call(sc, name, &with, line);
+        }
         // A shared object-expression capture: the variable's heap cell, not
         // its value. A binding that is not boxed here (a parameter, or a name
         // the site reaches some other way) gets a fresh cell around its value.
@@ -8335,6 +9039,17 @@ impl Compiler {
             self.compile_expr(sc, &Expr::Str(tag.clone()))?;
             self.b.emit(Op::CallBuiltin(KT_NLR_RAISE, 2), line);
             return Ok(Type::Unit);
+        }
+        if name == RECV_LAMBDA {
+            if let [lambda, Expr::Int(extra), Expr::Int(code), Expr::Str(cls)] = args {
+                let class = match cls.as_slice() {
+                    [StrExpr::Text(c)] if !c.is_empty() => Some(c.clone()),
+                    _ => None,
+                };
+                self.lambda_recv = Some((type_from_code(*code), class));
+                self.lambda_recv_it = *extra == 1;
+                return self.compile_expr(sc, lambda);
+            }
         }
         // The width-boxing intrinsic (see [`BOX_WIDTH`]).
         if name == BOX_WIDTH {
@@ -9235,6 +9950,80 @@ impl Compiler {
         }
     }
 
+    /// Whether the default `d` of the parameter after `earlier` must run in the
+    /// callee's frame: it names an earlier parameter, `this`, or a member of
+    /// `owner` (the class, or extension receiver, the function belongs to).
+    /// A constant — or anything that reads only globals — evaluates identically
+    /// at either site, and stays at the call site.
+    fn needs_callee_frame(&self, owner: Option<&str>, earlier: &[Param], d: &Expr) -> bool {
+        let names = expr_names(d);
+        if names.contains("this") || earlier.iter().any(|q| names.contains(&q.name)) {
+            return true;
+        }
+        // An extension on a built-in type (`fun String.f(n: Int = length)`): its
+        // members are not a table this compiler holds, so every name the default
+        // spells is left for the callee, where `this` resolves them.
+        if owner.is_some_and(|o| !self.classes.contains_key(o)) && !names.is_empty() {
+            return true;
+        }
+        owner.and_then(|o| self.classes.get(o)).is_some_and(|m| {
+            names
+                .iter()
+                .any(|n| m.prop(n).is_some() || m.methods.contains_key(n))
+        })
+    }
+
+    /// The default a callee fills an unset parameter `i` from: its own, or — for
+    /// an override, which may not restate one — the nearest ancestor method's.
+    /// Only a default that [`Compiler::needs_callee_frame`] is returned, since
+    /// the others were already supplied by the caller.
+    fn callee_default(&self, owner: Option<&str>, f: &FunDecl, i: usize) -> Option<Expr> {
+        let earlier = &f.params[..i];
+        if let Some(d) = &f.params[i].default {
+            return self
+                .needs_callee_frame(owner, earlier, d)
+                .then(|| d.clone());
+        }
+        let meta = self.classes.get(owner?)?;
+        meta.mro.iter().skip(1).find_map(|anc| {
+            let sig = self.classes.get(anc)?.methods.get(&f.name)?;
+            let d = sig.params.get(i)?.default.as_ref()?;
+            (sig.arity == f.params.len() && self.needs_callee_frame(Some(anc), earlier, d))
+                .then(|| d.clone())
+        })
+    }
+
+    /// The callee-side half of [`Compiler::expand_args`]: for each parameter
+    /// whose default is evaluated in the callee's frame, replace the unset
+    /// marker the caller passed with the default, evaluated now — after the
+    /// earlier parameters are bound and with `this` in scope.
+    fn emit_callee_defaults(
+        &mut self,
+        sc: &mut Scope,
+        params: &[Param],
+        defaults: &[Option<Expr>],
+        line: u32,
+    ) -> Result<(), String> {
+        for (p, d) in params.iter().zip(defaults) {
+            let (Some(d), Some(slot)) = (d, sc.slot(&p.name)) else {
+                continue;
+            };
+            self.b.emit(Op::GetSlot(slot), line);
+            self.b.emit(Op::Extended(KT_LATEINIT, 3), line);
+            let set = self.b.emit(Op::JumpIfTrue(0), line);
+            let d = recv_lambda(p, d).unwrap_or_else(|| d.clone());
+            if p.ty == Type::Float {
+                self.compile_expr(sc, &d)?;
+            } else {
+                self.compile_erased(sc, &d)?;
+            }
+            self.b.emit(Op::SetSlot(slot), line);
+            let end = self.b.current_pos();
+            self.b.patch_jump(set, end);
+        }
+        Ok(())
+    }
+
     /// Rewrite a call's argument list into one expression per declared
     /// parameter, in declaration order — resolving named arguments, filling
     /// omitted ones from their defaults, and packing a `vararg` tail into an
@@ -9245,12 +10034,16 @@ impl Compiler {
     /// `vararg` from one implementation, and the emit sites keep lowering a
     /// plain positional list.
     ///
-    /// A default is evaluated at the CALL site, so it may not name another
-    /// parameter of the callee. Kotlin evaluates it in the callee's frame, where
-    /// it can; that form is rejected loudly rather than silently misbound.
+    /// A default that names another parameter, `this` or a member of the callee's
+    /// class is not evaluated here: it is evaluated in the callee's frame, which
+    /// is where Kotlin evaluates every default, so the slot is filled with the
+    /// unset marker and the callee's prologue replaces it (see
+    /// [`Compiler::needs_callee_frame`], [`Compiler::emit_callee_defaults`]).
+    /// `owner` is the class whose members such a default may name.
     fn expand_args(
         &self,
         callee: &str,
+        owner: Option<&str>,
         params: &[Param],
         args: &[Expr],
     ) -> Result<Vec<Expr>, String> {
@@ -9298,8 +10091,13 @@ impl Compiler {
         let names = params.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
         let slots = bind_args(callee, &names, &head)?;
         let mut out = Vec::with_capacity(params.len());
+        let hoisted = hoist_written_order(&slots, &head, vararg_at.is_some());
         for (i, p) in params.iter().enumerate() {
-            match (slots[i], p.vararg, &p.default) {
+            let supplied = match hoisted.as_ref().and_then(|h| h.1[i].as_ref()) {
+                Some(read) => Some(read),
+                None => slots[i],
+            };
+            match (supplied, p.vararg, &p.default) {
                 // A `vararg` given as a single named/positional argument passes
                 // that value through — it is already the array (`f(xs = arr)`).
                 (Some(a), Some(_), _) if rest.is_empty() => out.push(a.clone()),
@@ -9307,13 +10105,26 @@ impl Compiler {
                     rest.insert(0, a.clone());
                     out.push(spread_concat(elem, &rest));
                 }
-                (Some(a), None, _) => out.push(self.sam_convert(p, a)),
+                (Some(a), None, _) => out.push(match recv_lambda(p, a) {
+                    Some(wrapped) => wrapped,
+                    None => self.sam_convert(p, a),
+                }),
                 (None, Some(elem), _) => out.push(spread_concat(elem, &rest)),
-                (None, _, Some(d)) => out.push(d.clone()),
+                (None, _, Some(d)) if self.needs_callee_frame(owner, &params[..i], d) => {
+                    out.push(Expr::LateinitUnset)
+                }
+                (None, _, Some(d)) => out.push(recv_lambda(p, d).unwrap_or_else(|| d.clone())),
                 (None, None, None) => {
                     return Err(format!("{callee} has no argument for `{}`", p.name))
                 }
             }
+        }
+        if let (Some((binds, _)), Some(first)) = (hoisted, out.first_mut()) {
+            let value = std::mem::replace(first, Expr::Null);
+            *first = Expr::Seq {
+                binds,
+                value: Box::new(value),
+            };
         }
         Ok(out)
     }
@@ -9400,7 +10211,7 @@ impl Compiler {
             self.classes
                 .get(&c)
                 .and_then(|m| m.methods.get(name))
-                .is_some_and(|s| s.arity == argc)
+                .is_some_and(|s| s.accepts(argc))
         });
         if member_wins {
             return None;
@@ -9600,7 +10411,12 @@ impl Compiler {
         args: &[Expr],
         line: u32,
     ) -> Result<Type, String> {
-        let full = self.expand_args(&format!("function {name}"), &sig.params, args)?;
+        let full = self.expand_args(
+            &format!("function {name}"),
+            sig.owner.as_deref(),
+            &sig.params,
+            args,
+        )?;
         self.compile_call_args(sc, &sig.params, &full)?;
         // A local `fun` shadows a top-level one of the same name and
         // lives under its mangled sub. Its captures follow the real
@@ -10055,6 +10871,7 @@ impl Compiler {
                     class: None,
                     fn_params: Vec::new(),
                     fn_ret: None,
+                    fn_recv: None,
                     type_args: Vec::new(),
                     init: next,
                     mutable: false,
@@ -10081,6 +10898,7 @@ impl Compiler {
                     class: None,
                     fn_params: Vec::new(),
                     fn_ret: None,
+                    fn_recv: None,
                     type_args: Vec::new(),
                     init,
                     mutable: false,
@@ -10222,7 +11040,13 @@ impl Compiler {
             .sec_arities
             .iter()
             .enumerate()
-            .filter(|(_, n)| **n == argc)
+            .filter(|(i, n)| {
+                let required = meta.sec_params[*i]
+                    .iter()
+                    .filter(|p| p.default.is_none() && p.vararg.is_none())
+                    .count();
+                argc >= required && argc <= **n
+            })
             .map(|(i, _)| i)
             // Prefer a secondary whose parameter types match; fall back to the
             // first of that arity so an unresolvable argument type still picks
@@ -10258,7 +11082,7 @@ impl Compiler {
             return Err(format!("cannot construct {what} {}", meta.name));
         }
         let (sec, params) = self.select_ctor(sc, meta, args);
-        let full = self.expand_args(&format!("constructor {}", meta.name), &params, args)?;
+        let full = self.expand_args(&format!("constructor {}", meta.name), None, &params, args)?;
         // An instance's fields are a `(name, value)` list with no types in it,
         // so a `Float` property erases however it was declared — which is what
         // made a `data class`'s generated `toString` render one as a `Double`.
@@ -10503,6 +11327,13 @@ impl Compiler {
     ) -> Result<(), String> {
         match cond {
             WhenCond::Expr(e) => match subj {
+                // `null ->` is an identity test against the absent value. The
+                // numeric comparison below would read an absent subject as `0` and
+                // match the object whose heap handle is `0`.
+                Some((slot, _)) if matches!(e, Expr::Null) => {
+                    self.b.emit(Op::GetSlot(slot), 0);
+                    self.b.emit(Op::Extended(KT_ISNULL, 0), 0);
+                }
                 Some((slot, sty)) => {
                     self.b.emit(Op::GetSlot(slot), 0);
                     let et = self.compile_expr(sc, e)?;
@@ -10673,6 +11504,7 @@ impl Compiler {
             Expr::Invoke { .. } => Type::Unknown,
             // A named argument types as the value it carries.
             Expr::Named { value, .. } => self.infer(sc, value),
+            Expr::Seq { value, .. } => self.infer(sc, value),
             Expr::Spread(inner) => self.infer(sc, inner),
             Expr::Int(_) => Type::Int,
             Expr::Long(_) => Type::Long,
@@ -10718,6 +11550,8 @@ impl Compiler {
                     p.ty
                 } else if self.resolve_math_const(n).is_some() {
                     Type::Double
+                } else if n == "Unit" {
+                    Type::Unit
                 } else {
                     sc.ty(n)
                 }
@@ -10852,6 +11686,20 @@ impl Compiler {
                             self.ext_ret(sc, &Expr::Var("this".into()), name, args.len())
                         {
                             return t.0;
+                        }
+                        // …and otherwise a member of it, which types as the same
+                        // call written with the receiver spelled out.
+                        if !self.local_sigs.contains_key(name) {
+                            return self.infer(
+                                sc,
+                                &Expr::MethodCall {
+                                    recv: Box::new(Expr::Var("this".into())),
+                                    name: name.clone(),
+                                    args: args.clone(),
+                                    safe: false,
+                                    line: 0,
+                                },
+                            );
                         }
                     }
                     match self.local_sigs.get(name).or_else(|| self.fun_sig.get(name)) {
@@ -11022,6 +11870,9 @@ impl Compiler {
             }
             Expr::Elvis { left, right } => {
                 let lt = self.infer(sc, left);
+                if matches!(**right, Expr::Throw(_) | Expr::Jump(_)) {
+                    return lt;
+                }
                 let rt = self.infer(sc, right);
                 if lt == rt {
                     lt
@@ -11082,6 +11933,7 @@ impl Compiler {
                 joined.unwrap_or(Type::Unit)
             }
             // `throw` is Kotlin's `Nothing`: it has no value to type.
+            Expr::Jump(_) => Type::Unknown,
             Expr::Throw(_) => Type::Unknown,
         }
     }
@@ -11929,7 +12781,7 @@ impl Compiler {
                     self.classes
                         .get(c)
                         .and_then(|m| m.methods.get(name))
-                        .is_some_and(|s| s.arity == args.len())
+                        .is_some_and(|s| s.accepts(args.len()))
                 });
                 match name.as_str() {
                     _ if declares => {}
@@ -12962,7 +13814,8 @@ fn method_ret_type(name: &str) -> Type {
         // The in-place mutators answer `Unit`, which prints as `kotlin.Unit`.
         // (`reverse` is not among them: `StringBuilder.reverse()` answers the
         // builder.)
-        "sort" | "sortDescending" | "shuffle" | "fill" | "addFirst" | "addLast" => Type::Unit,
+        "sort" | "sortDescending" | "shuffle" | "fill" | "addFirst" | "addLast" | "setLength"
+        | "setCharAt" | "putAll" => Type::Unit,
         "uppercase" | "toUpperCase" | "lowercase" | "toLowerCase" | "trim" | "toString" => {
             Type::String
         }
@@ -13408,6 +14261,9 @@ fn expr_any(e: &Expr, f: &dyn Fn(&Expr) -> bool) -> bool {
         } => expr_any(value, f) || expr_any(container, f),
         Expr::Is { value, .. } => expr_any(value, f),
         Expr::IncDec { target, .. } => expr_any(target, f),
+        Expr::Seq { binds, value } => {
+            binds.iter().any(|(_, b)| expr_any(b, f)) || expr_any(value, f)
+        }
         Expr::Lambda { body, .. } => body_any(body, f),
         // A callable reference names a function; nothing inside it is an
         // expression of the enclosing body except an explicit bound receiver.
@@ -13419,6 +14275,7 @@ fn expr_any(e: &Expr, f: &dyn Fn(&Expr) -> bool) -> bool {
                 || t.catches.iter().any(|c| body_any(&c.body, f))
                 || body_any(&t.finally_body, f)
         }
+        Expr::Jump(s) => body_any(std::slice::from_ref(s.as_ref()), f),
         Expr::Throw(inner) => expr_any(inner, f),
         Expr::Str(parts) => parts.iter().any(|p| match p {
             StrExpr::Expr(e) => expr_any(e, f),
@@ -13554,4 +14411,189 @@ fn is_jdk_collection_ctor(name: &str) -> bool {
             | "LinkedHashSet"
             | "ArrayList"
     )
+}
+
+/// Every name `e` spells — variable reads, calls, members — with none of the
+/// implicit receivers [`mentioned_names`] adds. Used to decide what a parameter
+/// default depends on.
+fn expr_names(e: &Expr) -> HashSet<String> {
+    let out = RefCell::new(HashSet::new());
+    expr_any(e, &|x| {
+        if let Expr::Var(n)
+        | Expr::Call { name: n, .. }
+        | Expr::Member { name: n, .. }
+        | Expr::MethodCall { name: n, .. } = x
+        {
+            out.borrow_mut().insert(n.clone());
+        }
+        false
+    });
+    out.into_inner()
+}
+
+/// Whether evaluating `e` can neither have an effect nor observe one — a
+/// literal, a lambda, or a name. Everything else (a call, an operator the
+/// program may have overloaded, an index) is treated as effectful.
+fn is_inert(e: &Expr) -> bool {
+    match e {
+        Expr::Int(_)
+        | Expr::Long(_)
+        | Expr::Float(_)
+        | Expr::Float32(_)
+        | Expr::Bool(_)
+        | Expr::Char(_)
+        | Expr::Null
+        | Expr::Var(_)
+        | Expr::Lambda { .. }
+        | Expr::FunRef { recv: None, .. } => true,
+        Expr::Str(parts) => parts.iter().all(|p| matches!(p, StrExpr::Text(_))),
+        _ => false,
+    }
+}
+
+/// Distinct names for the hidden locals [`hoist_written_order`] binds.
+static HOIST_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Evaluate a call's arguments in the order they were WRITTEN.
+///
+/// [`Compiler::expand_args`] hands the emit sites one expression per
+/// parameter, in declaration order, so `f(b = g(), a = h())` against
+/// `fun f(a, b)` would run `h` before `g`; Kotlin runs `g` first. When the
+/// written order differs from the declaration order and some argument is not
+/// inert, every argument that is not a literal or lambda is bound to a hidden
+/// local in written order and read back from it in its own position.
+///
+/// Returns the `(name, expression)` bindings and, per parameter, the
+/// replacement read — or `None` when the order is already right.
+#[allow(clippy::type_complexity)]
+fn hoist_written_order(
+    slots: &[Option<&Expr>],
+    head: &[Expr],
+    has_vararg: bool,
+) -> Option<(Vec<(String, Expr)>, Vec<Option<Expr>>)> {
+    if has_vararg {
+        return None;
+    }
+    let written_at = |a: &Expr| {
+        head.iter().position(|h| {
+            std::ptr::eq(h, a)
+                || matches!(h, Expr::Named { value, .. } if std::ptr::eq(&**value, a))
+        })
+    };
+    let order: Vec<Option<usize>> = slots.iter().map(|s| s.and_then(written_at)).collect();
+    let given: Vec<usize> = (0..slots.len()).filter(|i| order[*i].is_some()).collect();
+    let in_order = given.windows(2).all(|w| order[w[0]] < order[w[1]]);
+    let all_inert = given
+        .iter()
+        .all(|i| slots[*i].is_some_and(|a| is_inert(a) && !matches!(a, Expr::Var(_))));
+    let any_effect = given
+        .iter()
+        .any(|i| slots[*i].is_some_and(|a| !is_inert(a)));
+    if in_order || !any_effect || all_inert {
+        return None;
+    }
+    let mut by_written: Vec<usize> = given
+        .into_iter()
+        .filter(|i| slots[*i].is_some_and(|a| !matches!(a, Expr::Lambda { .. }) && !is_literal(a)))
+        .collect();
+    by_written.sort_by_key(|i| order[*i]);
+    let id = HOIST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut binds = Vec::new();
+    let mut reads: Vec<Option<Expr>> = vec![None; slots.len()];
+    for i in by_written {
+        let name = format!("$arg{id}${i}");
+        binds.push((name.clone(), slots[i]?.clone()));
+        reads[i] = Some(Expr::Var(name));
+    }
+    Some((binds, reads))
+}
+
+/// A literal constant — evaluated the same wherever it sits in an argument list.
+fn is_literal(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Int(_)
+            | Expr::Long(_)
+            | Expr::Float(_)
+            | Expr::Float32(_)
+            | Expr::Bool(_)
+            | Expr::Char(_)
+            | Expr::Null
+    ) || matches!(e, Expr::Str(parts) if parts.iter().all(|p| matches!(p, StrExpr::Text(_))))
+}
+
+/// The value the JVM zero-fills a field of declared type `ty` with: `0`, `0.0`,
+/// `false` or `\u0000` for a primitive, `null` for everything else.
+fn jvm_default(ty: Type) -> Expr {
+    match ty {
+        Type::Int => Expr::Int(0),
+        Type::Long => Expr::Long(0),
+        Type::Float => Expr::Float32(0.0),
+        Type::Double => Expr::Float(0.0),
+        Type::Boolean => Expr::Bool(false),
+        Type::Char => Expr::Char(0),
+        _ => Expr::Null,
+    }
+}
+
+/// The type a bare literal initializer gives an unannotated declaration, or
+/// `Unknown` when the initializer is anything else.
+fn literal_type(e: &Expr) -> Type {
+    match e {
+        Expr::Int(_) => Type::Int,
+        Expr::Long(_) => Type::Long,
+        Expr::Float(_) => Type::Double,
+        Expr::Float32(_) => Type::Float,
+        Expr::Bool(_) => Type::Boolean,
+        Expr::Char(_) => Type::Char,
+        _ => Type::Unknown,
+    }
+}
+
+/// A [`Type`] as the integer a synthesized call argument can carry.
+fn type_code(t: Type) -> i64 {
+    match t {
+        Type::Int => 0,
+        Type::Long => 1,
+        Type::Double => 2,
+        Type::Float => 3,
+        Type::Boolean => 4,
+        Type::Char => 5,
+        Type::String => 6,
+        Type::Obj => 7,
+        _ => 8,
+    }
+}
+
+/// The inverse of [`type_code`].
+fn type_from_code(c: i64) -> Type {
+    match c {
+        0 => Type::Int,
+        1 => Type::Long,
+        2 => Type::Double,
+        3 => Type::Float,
+        4 => Type::Boolean,
+        5 => Type::Char,
+        6 => Type::String,
+        7 => Type::Obj,
+        _ => Type::Unknown,
+    }
+}
+
+/// `a` wrapped in the [`RECV_LAMBDA`] intrinsic, when it is a lambda literal
+/// bound to a parameter whose function type has a receiver; `None` otherwise.
+fn recv_lambda(p: &Param, a: &Expr) -> Option<Expr> {
+    let (Some(r), Expr::Lambda { .. }) = (&p.fn_recv, a) else {
+        return None;
+    };
+    Some(Expr::Call {
+        name: RECV_LAMBDA.to_string(),
+        args: vec![
+            a.clone(),
+            Expr::Int(r.extra as i64),
+            Expr::Int(type_code(r.ty)),
+            Expr::Str(vec![StrExpr::Text(r.class.clone().unwrap_or_default())]),
+        ],
+        line: 0,
+    })
 }

@@ -208,6 +208,23 @@ pub struct Param {
     /// selects a secondary reads its type argument off the secondary's
     /// parameters, which need not agree with the primary's.
     pub type_param_of: Option<usize>,
+    /// `f: Html.(Int) -> Unit` — the receiver of a function type that has one.
+    /// A lambda literal passed for this parameter binds the receiver as its
+    /// `this`, and the callee may call `f` with the receiver in front or (inside
+    /// a member of the receiver's class) with it implicit. `None` for every
+    /// other parameter.
+    pub fn_recv: Option<FnRecv>,
+}
+
+/// The receiver of a function type `R.(A, B) -> T`.
+#[derive(Debug, Clone)]
+pub struct FnRecv {
+    /// The receiver's coarse type.
+    pub ty: Type,
+    /// The receiver's class name when it names a user class or container.
+    pub class: Option<String>,
+    /// How many parameters follow the receiver.
+    pub extra: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -331,6 +348,10 @@ pub struct ClassDecl {
     /// type parameters of its own, so this annotation is the ONLY thing that
     /// fixes the inherited `T`-typed members' width. See [`TypeArg`].
     pub parent_args: Vec<Vec<TypeArg>>,
+    /// The name a `companion object Factory` was declared with, so `Owner.Factory`
+    /// reaches the same singleton `Owner` does. `None` for an anonymous one and
+    /// for every other class.
+    pub companion_alias: Option<String>,
     /// The superclass constructor arguments of `: Super(a, b)`. Empty when the
     /// supertype list holds only interfaces or a parameterless superclass.
     pub super_args: Vec<Expr>,
@@ -580,6 +601,7 @@ impl CtorProp {
             vararg: None,
             type_args: self.type_args.clone(),
             type_param_of: self.type_param_of,
+            fn_recv: None,
         }
     }
 }
@@ -627,6 +649,9 @@ pub enum StmtKind {
         /// it `val f: (Int) -> Int` made `f(7) / f(2)` an untyped division —
         /// answering `3.5` where Kotlin truncates to `3`.
         fn_ret: Option<Type>,
+        /// The receiver when the annotation is a function type with one
+        /// (`val f: Html.() -> Unit`): a lambda initializer binds it as `this`.
+        fn_recv: Option<FnRecv>,
         /// The type arguments the annotation wrote — `val b: Box<Int> = mk()`.
         /// The annotation IS the static type, so it takes precedence over
         /// whatever the initializer would have revealed. See [`TypeArg`].
@@ -1054,6 +1079,14 @@ pub enum Expr {
         /// THIS one (see [`LABELED_RETURN`]): the tag its frame claims.
         catch_tag: Option<String>,
     },
+    /// Evaluate `binds` in order into hidden locals, then `value`, which reads
+    /// them. A call's arguments are bound by DECLARATION order, but Kotlin
+    /// evaluates them in WRITTEN order; this is how a reordered named argument
+    /// keeps its side effect where it was written (see `Compiler::expand_args`).
+    Seq {
+        binds: Vec<(String, Expr)>,
+        value: Box<Expr>,
+    },
     /// The value a `lateinit var` holds before its first write. Every property
     /// read checks for it and raises `UninitializedPropertyAccessException`.
     LateinitUnset,
@@ -1082,6 +1115,10 @@ pub enum Expr {
     /// statement value, so it appears here rather than as a statement kind — a
     /// statement-position `try` is an [`StmtKind::Expr`] whose value is dropped.
     Try(TryExpr),
+    /// `return`, `break` or `continue` used as an expression (`s ?: return -1`).
+    /// Kotlin types it `Nothing`; it leaves no value, because control does not
+    /// reach the next operation.
+    Jump(Box<Stmt>),
     /// `throw e`. Kotlin types a `throw` as `Nothing`, so it is an expression
     /// (`val x = y ?: throw IllegalStateException("…")`); the value it leaves is
     /// never observed, because the enclosing statement unwinds.

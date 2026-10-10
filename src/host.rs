@@ -22,6 +22,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::regex::{next_search, KRegex, Match};
+use crate::unicode_jdk;
 
 /// Coerce the top of stack to its Kotlin `toString()` form.
 pub const KT_TO_STRING: u16 = 1;
@@ -4074,6 +4075,31 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             }
         }
         KT_SETFIELD => {
+            // `arg == 1`: the third operand is the field's POSITION in the
+            // instance, not its name. A constructor writes the field of ITS OWN
+            // class, and a subclass that redeclares a property (`override val`)
+            // holds a second field of the same name that a lookup by name would
+            // reach instead.
+            if arg == 1 {
+                let at = vm.pop().to_int() as usize;
+                let value = vm.pop();
+                let obj = vm.pop();
+                let ok = with_obj_mut(&obj, |o| match o {
+                    HeapObj::Instance { fields, .. } => match fields.get_mut(at) {
+                        Some(slot) => {
+                            slot.1 = value;
+                            true
+                        }
+                        None => false,
+                    },
+                    _ => false,
+                })
+                .unwrap_or(false);
+                if !ok {
+                    fault(vm, format!("unresolved field slot {at}"));
+                }
+                return;
+            }
             // Stack: [obj, value, nameStr].
             let name = vm.pop().to_str();
             let value = vm.pop();
@@ -9794,6 +9820,36 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
             }
         }
     }
+    // `String?.toBoolean()` is `parseBoolean`: true only for `true` in any
+    // case, and a `null` receiver is `false`.
+    if name == "toBoolean" && args.is_empty() {
+        match recv {
+            Value::Undef => return Ok(Value::Bool(false)),
+            Value::Str(s) => return Ok(Value::Bool(s.eq_ignore_ascii_case("true"))),
+            _ => {}
+        }
+    }
+    if let (Value::Str(s), true) = (recv, args.is_empty()) {
+        match name {
+            "toBooleanStrict" => {
+                return match s.as_str() {
+                    "true" => Ok(Value::Bool(true)),
+                    "false" => Ok(Value::Bool(false)),
+                    _ => Err(format!(
+                        "java.lang.IllegalArgumentException: The string doesn't represent a boolean value: {s}"
+                    )),
+                };
+            }
+            "toBooleanStrictOrNull" => {
+                return Ok(match s.as_str() {
+                    "true" => Value::Bool(true),
+                    "false" => Value::Bool(false),
+                    _ => Value::Undef,
+                });
+            }
+            _ => {}
+        }
+    }
     // `contentEquals` is declared on the nullable `CharSequence?` and array
     // receivers alike: a `null` receiver equals only a `null` argument.
     if name == "contentEquals" && matches!(recv, Value::Undef) && !args.is_empty() {
@@ -10358,7 +10414,10 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
                             hay.find(d, search).map(|at| (at, d.len()))
                         }
                     })
-                    .min();
+                    // The earliest match wins, and at one position the delimiter listed
+                    // FIRST does (`findAnyOf` tries them in argument order), which is
+                    // not the shortest or longest.
+                    .min_by_key(|(at, _)| *at);
                 let Some((at, len)) = hit else { break };
                 parts.push(cut(start, at));
                 start = at + len;
@@ -10713,6 +10772,11 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
                 })
             }))
         }
+        // `x.coerceIn(range)` over a range VALUE: its two ends.
+        (Value::Int(_), "coerceIn") if args.len() == 1 && range_ends(&args[0]).is_some() => {
+            let (lo, hi) = range_ends(&args[0]).expect("checked above");
+            kt_method(vm, recv, "coerceIn", &[Value::Int(lo), Value::Int(hi)])
+        }
         // `coerceIn`/`coerceAtLeast`/`coerceAtMost` clamp to a bound. The result
         // stays integral only when receiver and bounds all are.
         (Value::Int(_) | Value::Float(_), "coerceIn" | "coerceAtLeast" | "coerceAtMost") => {
@@ -10830,6 +10894,14 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
             Ok(Value::str(match name {
                 "toBinaryString" => format!("{bits:b}"),
                 "toHexString" => format!("{bits:x}"),
+                _ => format!("{bits:o}"),
+            }))
+        }
+        (Value::Int(n), "#longtoBinaryString" | "#longtoHexString" | "#longtoOctalString") => {
+            let bits = *n as u64;
+            Ok(Value::str(match name {
+                "#longtoBinaryString" => format!("{bits:b}"),
+                "#longtoHexString" => format!("{bits:x}"),
                 _ => format!("{bits:o}"),
             }))
         }
@@ -11082,9 +11154,13 @@ fn char_method(code: i64, name: &str, args: &[Value]) -> Result<Value, String> {
         "plus" => char_of(code + other()),
         "minus" if args.first().is_some_and(is_char) => Value::Int(code - other()),
         "minus" => char_of(code - other()),
-        "isDigit" => Value::Bool(c.is_numeric()),
-        "isLetter" => Value::Bool(c.is_alphabetic()),
-        "isLetterOrDigit" => Value::Bool(c.is_alphanumeric()),
+        // The JDK's own character data, not Rust's (see [`crate::unicode_jdk`]).
+        "isDigit" => Value::Bool(unicode_jdk::contains(unicode_jdk::DIGIT, c)),
+        "isLetter" => Value::Bool(unicode_jdk::contains(unicode_jdk::LETTER, c)),
+        "isLetterOrDigit" => Value::Bool(
+            unicode_jdk::contains(unicode_jdk::LETTER, c)
+                || unicode_jdk::contains(unicode_jdk::DIGIT, c),
+        ),
         "isWhitespace" => Value::Bool(kotlin_is_whitespace(c)),
         // `java.lang.Character.isWhitespace`: Kotlin's member less the three
         // non-breaking spaces, which the JDK method excludes and Kotlin's
@@ -11092,8 +11168,8 @@ fn char_method(code: i64, name: &str, args: &[Value]) -> Result<Value, String> {
         "#javaIsWhitespace" => {
             Value::Bool(kotlin_is_whitespace(c) && !matches!(c, '\u{a0}' | '\u{2007}' | '\u{202f}'))
         }
-        "isUpperCase" => Value::Bool(c.is_uppercase()),
-        "isLowerCase" => Value::Bool(c.is_lowercase()),
+        "isUpperCase" => Value::Bool(unicode_jdk::contains(unicode_jdk::UPPER, c)),
+        "isLowerCase" => Value::Bool(unicode_jdk::contains(unicode_jdk::LOWER, c)),
         "uppercaseChar" | "lowercaseChar" | "titlecaseChar" if surrogate => char_of(code),
         "uppercase" | "lowercase" | "titlecase" if surrogate => Value::str(char_string(code)),
         "uppercaseChar" => char_of(single_uppercase(c) as i64),
@@ -11120,14 +11196,55 @@ fn char_method(code: i64, name: &str, args: &[Value]) -> Result<Value, String> {
         }
         "uppercase" => Value::str(c.to_uppercase().to_string()),
         "lowercase" => Value::str(c.to_lowercase().to_string()),
-        "digitToInt" => match c.to_digit(10) {
-            Some(d) => Value::Int(d as i64),
-            None => {
+        // `Char.digitToInt(radix = 10)`. The radix is checked first, as the
+        // stdlib's `checkRadix` runs first; the two faults word the same
+        // failure differently depending on whether a radix was written.
+        // `Char` is `Comparable`, so it clamps like the numbers do; the bounds
+        // are `Char`s (or one `CharRange`).
+        "coerceIn" | "coerceAtLeast" | "coerceAtMost" => {
+            let (lo, hi) = match (name, args) {
+                ("coerceIn", [r]) => range_ends(r).ok_or("coerceIn: expected a range")?,
+                ("coerceIn", [a, b]) => (num_of(a), num_of(b)),
+                ("coerceAtLeast", [a]) => (num_of(a), i64::MAX),
+                (_, [b]) => (i64::MIN, num_of(b)),
+                _ => return Err(format!("unresolved reference: {name} on Char")),
+            };
+            if lo > hi {
                 return Err(format!(
-                    "java.lang.IllegalArgumentException: Char {c} is not a decimal digit"
-                ))
+                    "java.lang.IllegalArgumentException: Cannot coerce value to an empty \
+                     range: maximum {} is less than minimum {}.",
+                    char_string(hi),
+                    char_string(lo)
+                ));
             }
-        },
+            char_of(code.clamp(lo, hi))
+        }
+        // `Character.getNumericValue`: the digit value in radix 36, `-1` when the
+        // character has none.
+        "#getNumericValue" => Value::Int(i64::from(unicode_jdk::numeric_value(c))),
+        "digitToInt" | "digitToIntOrNull" => {
+            let radix = args.first().map(Value::to_int);
+            if let Some(r) = radix.filter(|r| !(2..=36).contains(r)) {
+                return Err(format!(
+                    "java.lang.IllegalArgumentException: radix {r} was not in valid range 2..36"
+                ));
+            }
+            let r = radix.unwrap_or(10) as u32;
+            match unicode_jdk::digit(c, r) {
+                Some(d) => Value::Int(d as i64),
+                None if name == "digitToIntOrNull" => Value::Undef,
+                None if radix.is_none() => {
+                    return Err(format!(
+                        "java.lang.IllegalArgumentException: Char {c} is not a decimal digit"
+                    ))
+                }
+                None => {
+                    return Err(format!(
+                        "java.lang.IllegalArgumentException: Char {c} is not a digit in the given radix={r}"
+                    ))
+                }
+            }
+        }
         _ => return Err(format!("unresolved reference: {name} on Char")),
     })
 }
@@ -15801,4 +15918,15 @@ fn deep_to_string(a: &Value, seen: &mut Vec<u32>, out: &mut String) {
 /// boxed `Long`/`Float`.
 fn is_number(v: &Value) -> bool {
     matches!(v, Value::Int(_) | Value::Float(_)) || i64_box(v).is_some() || f32_box(v).is_some()
+}
+
+/// The first and last element of an integral range VALUE (`1..3`, `'a'..'f'`),
+/// or `None` for anything else — including a progression with a step, which has
+/// no single clamp interval.
+fn range_ends(v: &Value) -> Option<(i64, i64)> {
+    with_obj(v, |o| match o {
+        HeapObj::Range(r) if !r.progression => Some((r.first, r.end)),
+        _ => None,
+    })
+    .flatten()
 }

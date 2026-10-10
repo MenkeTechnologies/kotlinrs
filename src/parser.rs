@@ -54,6 +54,10 @@ pub struct Parser {
     /// learn WHICH variable an annotation used — which is what pairs a return
     /// type with the parameter that supplies it.
     last_type_param: Option<String>,
+    /// The receiver of the function type the most recent [`Parser::type_ref`]
+    /// read (`Html.() -> Unit`), or `None`. A caller that cares takes it
+    /// straight after the call.
+    last_fn_recv: Option<FnRecv>,
     /// The type-parameter names of the `fun` whose body is being parsed
     /// (`fun <T> f(…)`). A runtime test against one of them — `x is T`, `x as T`
     /// — needs a `reified` type argument the coarse type system cannot carry, so
@@ -405,6 +409,7 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
         fn_param_types: Vec::new(),
         fn_ret_types: Vec::new(),
         last_type_param: None,
+        last_fn_recv: None,
         type_params: Vec::new(),
         class_type_params: Vec::new(),
         reified_params: Vec::new(),
@@ -985,6 +990,7 @@ impl Parser {
     /// no visibility boundaries to enforce.
     fn modifiers(&mut self) -> Mods {
         let mut m = Mods::default();
+        self.skip_annotations();
         while let Tok::Ident(w) = self.peek() {
             match w.as_str() {
                 "open" => m.open = true,
@@ -1148,6 +1154,7 @@ impl Parser {
                 }
             }
             let pname = self.ident()?;
+            self.last_fn_recv = None;
             let ann = if self.at(&Tok::Colon) {
                 self.advance();
                 self.type_ref()?
@@ -1155,6 +1162,7 @@ impl Parser {
                 self.last_type_param = None;
                 TypeArg::unknown()
             };
+            let fn_recv = self.last_fn_recv.take();
             let TypeArg {
                 ty,
                 class,
@@ -1189,6 +1197,7 @@ impl Parser {
                 // A free function's parameter names no CLASS type variable —
                 // only a secondary constructor's does, and that is parsed
                 // elsewhere.
+                fn_recv,
                 type_param_of: None,
             });
             if self.at(&Tok::Comma) {
@@ -1344,13 +1353,15 @@ impl Parser {
             self.eat(&Tok::Class)?;
             false
         };
+        let mut companion_alias = None;
         let name = match companion_of {
             // `companion object { … }` may be anonymous, and a named one
             // (`companion object Factory`) is still reached through the owner —
             // so either way the declaration is hoisted under the owner's name.
             Some(owner) => {
-                if matches!(self.peek(), Tok::Ident(_)) {
+                if let Tok::Ident(n) = self.peek().clone() {
                     self.advance();
+                    companion_alias = Some(n);
                 }
                 companion_name(owner)
             }
@@ -1540,6 +1551,12 @@ impl Parser {
             while !self.at(&Tok::RBrace) && !self.at(&Tok::Eof) {
                 if self.at(&Tok::Semi) {
                     self.advance();
+                    continue;
+                }
+                // Annotations (`@JvmStatic`, `@Suppress(…)`) change nothing the
+                // program computes; they are read and dropped.
+                if self.at(&Tok::At) {
+                    self.skip_annotations();
                     continue;
                 }
                 // `companion object [Name] { … }` — one per class.
@@ -1747,6 +1764,7 @@ impl Parser {
         }
         Ok(ClassDecl {
             name,
+            companion_alias,
             type_params: tps,
             params,
             obj_props,
@@ -1870,6 +1888,7 @@ impl Parser {
             Some(c) => *c,
             None => ClassDecl {
                 name: companion_name(cls),
+                companion_alias: None,
                 inner_of: None,
                 captures: Vec::new(),
                 // An `enum class` cannot declare type parameters.
@@ -1927,6 +1946,7 @@ impl Parser {
                     let sub = entry_class_name(cls, &e.name);
                     self.pending_classes.push(ClassDecl {
                         name: sub.clone(),
+                        companion_alias: None,
                         inner_of: None,
                         captures: Vec::new(),
                         type_params: Vec::new(),
@@ -2082,6 +2102,7 @@ impl Parser {
                 vararg: None,
                 type_args: Vec::new(),
                 type_param_of: None,
+                fn_recv: None,
             }],
             ret: Type::Obj,
             ret_class: Some(cls.to_string()),
@@ -2148,6 +2169,7 @@ impl Parser {
                 vararg: None,
                 type_args,
                 type_param_of,
+                fn_recv: None,
             });
             if self.at(&Tok::Comma) {
                 self.advance();
@@ -2441,6 +2463,7 @@ impl Parser {
             class: annot.class,
             fn_params: Vec::new(),
             fn_ret: None,
+            fn_recv: None,
             type_args: annot.args,
             init: Expr::LateinitUnset,
             mutable: true,
@@ -2530,6 +2553,7 @@ impl Parser {
             fn_param_types: Vec::new(),
             fn_ret_types: Vec::new(),
             last_type_param: None,
+            last_fn_recv: None,
             no_trailing_lambda: false,
             pending_classes: Vec::new(),
             anon_object: None,
@@ -2661,6 +2685,7 @@ impl Parser {
             vararg: None,
             type_args: p.type_args.clone(),
             type_param_of: None,
+            fn_recv: None,
         };
         let method = |name: String, params: Vec<Param>, body: Vec<Stmt>| FunDecl {
             name,
@@ -3091,12 +3116,33 @@ impl Parser {
         }
         let name = self.qualified_ident()?;
         let args = self.type_args_list();
+        self.last_fn_recv = None;
         let nullable = if self.at(&Tok::Question) {
             self.advance(); // nullable marker `T?`
             true
         } else {
             false
         };
+        // `Recv.(A, B) -> R` — a function type with a receiver. The receiver
+        // is read here, where its name has been parsed, and the rest is the
+        // ordinary function type that follows the dot.
+        if self.at(&Tok::Dot) && matches!(self.peek_at(1), Tok::LParen) {
+            self.advance();
+            let known = Type::from_name(&name);
+            let before = self.fn_param_types.len();
+            let func = self.type_ref()?;
+            self.last_fn_recv = Some(FnRecv {
+                ty: if known == Type::Unknown {
+                    Type::Obj
+                } else {
+                    known
+                },
+                class: (known == Type::Unknown && !self.type_params.contains(&name))
+                    .then_some(name),
+                extra: self.fn_param_types.len() - before,
+            });
+            return Ok(func);
+        }
         let ty = Type::from_name(&name);
         // `String?` is tracked apart from `String` so a null one still displays
         // as `null`; every other nullable annotation already displays through the
@@ -3223,61 +3269,7 @@ impl Parser {
                 self.pending_classes.push(decl);
                 StmtKind::Empty
             }
-            Tok::Return => {
-                self.advance();
-                // `return@label` — a return from the lambda (or `fun`) carrying
-                // that label. Every lambda body here compiles to its own VM
-                // frame, so leaving the INNERMOST lambda is a frame return and
-                // the label needs no lowering. Leaving an ENCLOSING lambda is
-                // not: it raises that lambda's catch tag, unwinding every frame
-                // in between (see [`LABELED_RETURN`]). A BARE `return` in a
-                // lambda is Kotlin's non-local return, handled below.
-                let labelled = self.at(&Tok::At);
-                let outer_tag = if labelled {
-                    self.advance();
-                    let label = self.ident()?;
-                    self.outer_lambda_return(&label)
-                } else {
-                    None
-                };
-                // A `return` with no expression (Unit) — the next token starts a
-                // new statement or closes the block.
-                let value = if matches!(self.peek(), Tok::RBrace | Tok::Semi | Tok::Eof) {
-                    None
-                } else {
-                    Some(self.expr()?)
-                };
-                if let Some(tag) = outer_tag {
-                    let mut args = vec![Expr::Str(vec![StrExpr::Text(tag)])];
-                    args.extend(value);
-                    StmtKind::Expr(Expr::Call {
-                        name: LABELED_RETURN.to_string(),
-                        args,
-                        line,
-                    })
-                } else if !labelled && self.bodies.last() == Some(&BodyKind::Lambda) {
-                    // A bare `return` inside a lambda is NON-LOCAL: it leaves
-                    // the nearest enclosing `fun`. One leaving an anonymous
-                    // function through a lambda is refused rather than sent to
-                    // the wrong frame.
-                    match self.bodies.iter().rev().find(|k| **k != BodyKind::Lambda) {
-                        Some(BodyKind::Fun) => StmtKind::Expr(Expr::Call {
-                            name: NONLOCAL_RETURN.to_string(),
-                            args: value.into_iter().collect(),
-                            line,
-                        }),
-                        Some(BodyKind::AnonFun) => {
-                            return Err(format!(
-                                "a non-local `return` out of an anonymous function is not \
-                                 supported (line {line})"
-                            ))
-                        }
-                        _ => StmtKind::Return(value),
-                    }
-                } else {
-                    StmtKind::Return(value)
-                }
-            }
+            Tok::Return => self.return_kind(line)?,
             Tok::While => self.while_stmt(None)?,
             Tok::Do => self.do_while_stmt(None)?,
             Tok::For => self.for_stmt(None)?,
@@ -3294,6 +3286,87 @@ impl Parser {
             _ => self.assign_or_expr()?,
         };
         Ok(Stmt::new(line, kind))
+    }
+
+    /// `return` / `return@label` / `return value`, positioned at the keyword.
+    /// Used for the statement form and for the expression form (`x ?: return`).
+    fn return_kind(&mut self, line: u32) -> Result<StmtKind, String> {
+        self.advance();
+        // `return@label` — a return from the lambda (or `fun`) carrying
+        // that label. Every lambda body here compiles to its own VM
+        // frame, so leaving the INNERMOST lambda is a frame return and
+        // the label needs no lowering. Leaving an ENCLOSING lambda is
+        // not: it raises that lambda's catch tag, unwinding every frame
+        // in between (see [`LABELED_RETURN`]). A BARE `return` in a
+        // lambda is Kotlin's non-local return, handled below.
+        let labelled = self.at(&Tok::At);
+        let outer_tag = if labelled {
+            self.advance();
+            let label = self.ident()?;
+            self.outer_lambda_return(&label)
+        } else {
+            None
+        };
+        // A `return` with no expression (Unit) — the next token starts a
+        // new statement, closes the block, or sits on a later line (the lexer
+        // drops newlines, and Kotlin does not read an operand across one).
+        let value = if !self.glued_to_prev()
+            || matches!(
+                self.peek(),
+                Tok::RBrace | Tok::Semi | Tok::Eof | Tok::RParen | Tok::Comma | Tok::RBracket
+            ) {
+            None
+        } else {
+            Some(self.expr()?)
+        };
+        Ok(if let Some(tag) = outer_tag {
+            let mut args = vec![Expr::Str(vec![StrExpr::Text(tag)])];
+            args.extend(value);
+            StmtKind::Expr(Expr::Call {
+                name: LABELED_RETURN.to_string(),
+                args,
+                line,
+            })
+        } else if !labelled && self.bodies.last() == Some(&BodyKind::Lambda) {
+            // A bare `return` inside a lambda is NON-LOCAL: it leaves
+            // the nearest enclosing `fun`. One leaving an anonymous
+            // function through a lambda is refused rather than sent to
+            // the wrong frame.
+            match self.bodies.iter().rev().find(|k| **k != BodyKind::Lambda) {
+                Some(BodyKind::Fun) => StmtKind::Expr(Expr::Call {
+                    name: NONLOCAL_RETURN.to_string(),
+                    args: value.into_iter().collect(),
+                    line,
+                }),
+                Some(BodyKind::AnonFun) => {
+                    return Err(format!(
+                        "a non-local `return` out of an anonymous function is not \
+                         supported (line {line})"
+                    ))
+                }
+                _ => StmtKind::Return(value),
+            }
+        } else {
+            StmtKind::Return(value)
+        })
+    }
+
+    /// `return …`, `break` or `continue` in EXPRESSION position — the right of
+    /// `?:` and the like. Kotlin types each `Nothing`.
+    fn jump_expr(&mut self) -> Result<Expr, String> {
+        let line = self.line();
+        let kind = match self.peek() {
+            Tok::Return => self.return_kind(line)?,
+            Tok::Break => {
+                self.advance();
+                StmtKind::Break(self.opt_label()?)
+            }
+            _ => {
+                self.advance();
+                StmtKind::Continue(self.opt_label()?)
+            }
+        };
+        Ok(Expr::Jump(Box::new(Stmt::new(line, kind))))
     }
 
     /// An optional `@label` after `break`/`continue`.
@@ -3326,10 +3399,11 @@ impl Parser {
             return Ok(StmtKind::Destructure { names, init });
         }
         let name = self.ident()?;
-        let (ty, class, type_args, fn_params, fn_ret) = if self.at(&Tok::Colon) {
+        let (ty, class, type_args, fn_params, fn_ret, fn_recv) = if self.at(&Tok::Colon) {
             self.advance();
             let before = self.fn_param_types.len();
             let ret_before = self.fn_ret_types.len();
+            self.last_fn_recv = None;
             let t = self.type_ref()?;
             (
                 Some(t.ty),
@@ -3337,9 +3411,10 @@ impl Parser {
                 t.args,
                 self.fn_param_types.split_off(before),
                 self.fn_ret_types.split_off(ret_before).pop(),
+                self.last_fn_recv.take(),
             )
         } else {
-            (None, None, Vec::new(), Vec::new(), None)
+            (None, None, Vec::new(), Vec::new(), None, None)
         };
         // `val x by lazy { … }` on a LOCAL, the same soft-keyword position a
         // class property uses. Only `lazy` is accepted here: the general
@@ -3362,6 +3437,7 @@ impl Parser {
                     class: class.clone(),
                     fn_params,
                     fn_ret,
+                    fn_recv,
                     type_args,
                     init,
                     mutable,
@@ -3380,6 +3456,7 @@ impl Parser {
                 class,
                 fn_params,
                 fn_ret,
+                fn_recv,
                 type_args,
                 init,
                 mutable,
@@ -3395,6 +3472,7 @@ impl Parser {
             class: class.clone(),
             fn_params,
             fn_ret,
+            fn_recv,
             type_args,
             init,
             mutable,
@@ -4660,6 +4738,7 @@ impl Parser {
             Tok::If => Ok(Expr::If(self.if_expr()?)),
             Tok::When => Ok(Expr::When(self.when_expr()?)),
             Tok::Try => Ok(Expr::Try(self.try_expr()?)),
+            Tok::Return | Tok::Break | Tok::Continue => self.jump_expr(),
             // `throw e` — an expression (Kotlin types it `Nothing`), so it is
             // usable as a statement and on the right of `?:`.
             Tok::Throw => {
@@ -5148,6 +5227,7 @@ impl Parser {
                         fn_param_types: Vec::new(),
                         fn_ret_types: Vec::new(),
                         last_type_param: None,
+                        last_fn_recv: None,
                         no_trailing_lambda: false,
                         // A string template holds an expression, which can
                         // never declare a class.
