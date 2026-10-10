@@ -1603,6 +1603,305 @@ fn g_strcoll(r: &mut Rng, _idx: usize) -> String {
     }
 }
 
+/// A default that is written in terms of something the CALLEE has: an earlier
+/// parameter, `this`, or a member. Kotlin evaluates every default in the
+/// callee's frame, so each probe has an answer the source spells out — and a
+/// frontend that evaluates the default where the call is written has no `a` in
+/// scope there at all.
+///
+/// The three calling shapes matter separately because each reaches the default
+/// by a different route: omitted entirely, omitted in the middle by naming the
+/// later parameter, and supplied. An override restates no default and inherits
+/// the overridden declaration's, which is a fourth route.
+fn g_calldflt(r: &mut Rng, _idx: usize) -> String {
+    let a = pick(r, &["1", "7", "-3", "100"]);
+    let b = pick(r, &["0", "5", "-2"]);
+    let d = pick(r, &["0.5", "3.0", "-8.0", "1.0e3"]);
+    match r.below(18) {
+        0 => p(format!("dflA({a})")),
+        1 => p(format!("dflA({a}, {b})")),
+        2 => p(format!("dflA({a}, c = \"x\")")),
+        3 => p(format!("dflA(c = \"y\", a = {a})")),
+        4 => p(format!("dflB({d})")),
+        5 => p(format!("dflB({d}, z = {b})")),
+        6 => p(format!("DflK({a}).m()")),
+        7 => p(format!("DflK({a}).m({b})")),
+        8 => p(format!("DflK({a}).m(q = {b})")),
+        9 => p(format!("DflK({a}).s()")),
+        10 => p(format!("DflSub({a}).f()")),
+        11 => p(format!("DflSub({a}).f({b})")),
+        12 => p(format!("(DflSub({a}) as DflBase).f()")),
+        13 => p(format!("DflCtor({a})")),
+        14 => p(format!("DflCtor({a}, {b})")),
+        15 => p(format!("DflCtor({a}, c = \"k\")")),
+        16 => p(format!("\"s{a}\".dflE()")),
+        _ => p(format!("({a}).dflF()")),
+    }
+}
+
+/// Arguments are evaluated in the order they were WRITTEN, not the order the
+/// parameters were declared in — which is only visible when a reordered named
+/// argument has an effect. Each probe resets the log, makes the call, and
+/// prints the result with the log appended.
+fn g_callorder(r: &mut Rng, _idx: usize) -> String {
+    let perms: [[usize; 3]; 6] = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
+    let order = perms[r.below(perms.len())];
+    let names = ["a", "b", "c"];
+    let args: Vec<String> = order
+        .iter()
+        .map(|&i| format!("{} = trc(\"{}\", {})", names[i], names[i], i + 1))
+        .collect();
+    let target = pick(r, &["trThree", "TrBox"]);
+    let tail = if r.below(2) == 0 {
+        ""
+    } else {
+        ".let { it.toString() }"
+    };
+    format!(
+        "trLog = \"\"; println(\"\" + {target}({}){tail} + \"|\" + trLog)",
+        args.join(", ")
+    )
+}
+
+/// Constructors and initializers that need the object itself: an `init` block
+/// or property initializer that calls a member, a superclass initializer whose
+/// virtual call lands on a subclass override (which then reads the subclass's
+/// own fields at their zero values, because its initializers have not run), and
+/// `object`s, which Kotlin initializes on FIRST USE rather than at start-up.
+///
+/// Every probe prints from inside the constructors, so the ORDER of the lines is
+/// the observation — which is why none of these can be checked by a final value.
+fn g_initorder(r: &mut Rng, _idx: usize) -> String {
+    let k = pick(r, &["1", "4", "9"]);
+    match r.below(14) {
+        0 => format!("IniLog({k})"),
+        1 => p(format!("IniCalc({k}).total")),
+        2 => p(format!("IniCalc({k}).label")),
+        3 => format!("IniChild({k}, \"c\")"),
+        4 => p(format!("IniChild({k}, \"c\").tag")),
+        5 => "IniAbs()".to_string(),
+        6 => p(format!("IniSec({k}).q")),
+        7 => p(format!("IniSec({k}, 2).q")),
+        8 => p(format!("IniObj.value + {k}")),
+        9 => p("IniObj.describe()".to_string()),
+        10 => p("IniHost().seen".to_string()),
+        11 => p("IniHost.TAG".to_string()),
+        12 => p(format!("IniData({k}).sum")),
+        _ => p(format!("IniLazy({k}).y")),
+    }
+}
+
+/// A function type WITH a receiver: `R.(A) -> T`. A lambda passed for one binds
+/// the receiver as `this`; the callee may call it with the receiver in front,
+/// as `recv.f(args)`, or — inside a member of the receiver's class — with the
+/// receiver implicit. The three are one construct to the language and three
+/// to a frontend, so each is drawn.
+fn g_recvfn(r: &mut Rng, idx: usize) -> String {
+    let n = pick(r, &["3", "8", "-2"]);
+    let s = pick(r, &["\"ab\"", "\"hello\"", "\"\""]);
+    match r.below(16) {
+        0 => p(format!("rfBuild {{ append({s}); append({n}) }}")),
+        1 => p(format!("rfBuild2 {{ append({s}).append('!') }}")),
+        2 => p(format!("rfApply({n}) {{ this * 2 + 1 }}")),
+        3 => p(format!("rfApplyS({n}) {{ toString() + \"!\" }}")),
+        4 => p(format!("rfTwice({n}) {{ x -> this * x }}")),
+        5 => p(format!("rfTwice({n}) {{ this + it }}")),
+        6 => p(format!(
+            "RfHtml().also {{ it.root {{ text({s}); tag(\"b\") {{ text(\"{n}\") }} }} }}"
+        )),
+        7 => p(format!("rfHtml {{ tag(\"p\") {{ text({s}) }} }}")),
+        8 => format!(
+            "val rf{idx}: StringBuilder.() -> Unit = {{ append({s}) }}; println(rfBuild(rf{idx}))"
+        ),
+        9 => format!(
+            "val rg{idx}: Int.(Int) -> Int = {{ o -> this - o }}; println({n}.rg{idx}(4)); \
+             println(rg{idx}({n}, 4))"
+        ),
+        10 => p(format!("rfConfig {{ a = {n}; b = {s} }}.show()")),
+        11 => p(format!("rfConfig {{ a += {n}; a *= 3 }}.show()")),
+        12 => p("rfOpt()".to_string()),
+        13 => p(format!("rfOpt {{ a = {n} }}")),
+        14 => p(format!("rfFold(listOf(1, 2, 3), {n}) {{ x -> this - x }}")),
+        _ => p(format!("{s}.rfLen {{ length * 10 }}")),
+    }
+}
+
+/// `return`, `break` and `continue` as the right operand of `?:` — Kotlin types
+/// each `Nothing`, so they sit wherever a value does. The same jump is also
+/// drawn under a `finally`, inside a lambda (a non-local return), and with an
+/// explicit label, because each leaves through a different route.
+fn g_jumpexpr(r: &mut Rng, _idx: usize) -> String {
+    let xs = pick(
+        r,
+        &[
+            "listOf(\"1\", \"x\", \"4\")",
+            "listOf(\"x\", \"y\")",
+            "listOf(\"7\")",
+            "listOf(\"2\", null, \"3\")",
+            "emptyList<String?>()",
+        ],
+    );
+    match r.below(12) {
+        0 => p(format!("jxSum({xs})")),
+        1 => p(format!("jxStop({xs})")),
+        2 => p(format!("jxFirst({xs})")),
+        3 => p("jxLen(null)".to_string()),
+        4 => p("jxLen(\"abc\")".to_string()),
+        5 => p("jxFin(null)".to_string()),
+        6 => p("jxFin(\"abcd\")".to_string()),
+        7 => p(format!("jxLam({xs})")),
+        8 => p(format!("jxLbl({xs})")),
+        9 => p("jxAdd(null)".to_string()),
+        10 => p("jxAdd(\"zz\")".to_string()),
+        _ => p("jxBig(2147483647)".to_string()),
+    }
+}
+
+/// The JDK's character classes, which are Unicode 15 data and are NOT Rust's:
+/// `isLetter` is the `L*` categories (Rust's `is_alphabetic` takes every
+/// `Other_Alphabetic` mark too), `isDigit` is `Nd` alone (`is_numeric` takes `No`
+/// and `Nl`: `²`, `½`, `Ⅷ`), and `digitToInt` reads any script's decimal digits
+/// and the fullwidth Latin letters. The pool mixes ASCII with the characters on
+/// which the two definitions disagree.
+fn g_charclass(r: &mut Rng, _idx: usize) -> String {
+    const POOL: &[&str] = &[
+        "'a'",
+        "'Z'",
+        "'7'",
+        "' '",
+        "'_'",
+        "'\\u00b2'",
+        "'\\u00bd'",
+        "'\\u00e9'",
+        "'\\u00df'",
+        "'\\u0660'",
+        "'\\u0663'",
+        "'\\u06f5'",
+        "'\\u0966'",
+        "'\\u2160'",
+        "'\\u2167'",
+        "'\\u24b6'",
+        "'\\u24d0'",
+        "'\\uff17'",
+        "'\\uff21'",
+        "'\\uff5a'",
+        "'\\u0345'",
+        "'\\u0903'",
+        "'\\u02b0'",
+        "'\\u01c5'",
+        "'\\u3007'",
+        "'\\u00aa'",
+        "'\\u0e51'",
+    ];
+    let c = pick(r, POOL);
+    let radix = pick(r, &["2", "8", "10", "16", "36"]);
+    match r.below(11) {
+        0 => p(format!("{c}.isLetter()")),
+        1 => p(format!("{c}.isDigit()")),
+        2 => p(format!("{c}.isLetterOrDigit()")),
+        3 => p(format!("{c}.isUpperCase()")),
+        4 => p(format!("{c}.isLowerCase()")),
+        5 => p(format!("{c}.digitToIntOrNull()")),
+        6 => p(format!("{c}.digitToIntOrNull({radix})")),
+        7 => p(format!(
+            "runCatching {{ {c}.digitToInt() }}.let {{ it.getOrNull() ?: it.exceptionOrNull()?.message }}"
+        )),
+        8 => p(format!(
+            "runCatching {{ {c}.digitToInt({radix}) }}.let {{ it.getOrNull() ?: it.exceptionOrNull()?.message }}"
+        )),
+        9 => p(format!("Character.getNumericValue({c})")),
+        _ => p(format!("\"x\" + {c} + \"y\".filter {{ it.isLetter() }}")),
+    }
+}
+
+/// `split` with several delimiters: the EARLIEST match wins, and at one position
+/// the delimiter listed FIRST does — not the shortest, not the longest. The
+/// pool is built so that one delimiter is a prefix of another.
+fn g_splitmulti(r: &mut Rng, _idx: usize) -> String {
+    let s = pick(
+        r,
+        &[
+            "\"a--b-c\"",
+            "\"x::y:z\"",
+            "\"1,2;3,,4\"",
+            "\"abcabc\"",
+            "\"--\"",
+            "\"a-b--c---d\"",
+        ],
+    );
+    let delims = pick(
+        r,
+        &[
+            "\"--\", \"-\"",
+            "\"-\", \"--\"",
+            "\"::\", \":\"",
+            "\":\", \"::\"",
+            "\",\", \";\"",
+            "\"ab\", \"abc\"",
+            "\"abc\", \"ab\"",
+            "\"b\", \"\"",
+        ],
+    );
+    let limit = pick(r, &["0", "2", "3"]);
+    match r.below(4) {
+        0 => p(format!("{s}.split({delims})")),
+        1 => p(format!("{s}.split({delims}, limit = {limit})")),
+        2 => p(format!("{s}.split({delims}).size")),
+        _ => p(format!("{s}.split({delims}, ignoreCase = true)")),
+    }
+}
+
+/// Numeric corners of the boxed types: `equals` between two DIFFERENT numeric
+/// types is `false` whatever the values (the boxes are different classes),
+/// `coerceIn` takes a range as well as two bounds, and the String parsers have
+/// their own leniency — `toBoolean` is true for any case of `true`, and the
+/// `Strict` pair accepts only the two lowercase spellings.
+fn g_numeq(r: &mut Rng, _idx: usize) -> String {
+    let i = pick(r, &["0", "1", "5", "-3"]);
+    let l = pick(r, &["0L", "1L", "5L", "-3L"]);
+    let d = pick(r, &["0.0", "1.0", "5.0", "-3.0"]);
+    let lo = pick(r, &["0", "2"]);
+    let hi = pick(r, &["4", "9"]);
+    let bs = pick(
+        r,
+        &[
+            "\"true\"",
+            "\"TRUE\"",
+            "\"True\"",
+            "\"false\"",
+            "\"yes\"",
+            "\"\"",
+        ],
+    );
+    match r.below(16) {
+        0 => p(format!("({i}).equals({l})")),
+        1 => p(format!("({l}).equals({i})")),
+        2 => p(format!("({d}).equals({i})")),
+        3 => p(format!("({i}).equals({i})")),
+        4 => p(format!("({d}).equals({d})")),
+        5 => p(format!("({l}).equals({l})")),
+        6 => p(format!("({i}).coerceIn({lo}..{hi})")),
+        7 => p(format!("({l}).coerceIn({lo}L..{hi}L)")),
+        8 => p(format!("({d}).coerceIn({lo}.0..{hi}.0)")),
+        9 => p(format!("({i}).coerceIn({lo}, {hi})")),
+        10 => p(format!("{bs}.toBoolean()")),
+        11 => p(format!("{bs}.toBooleanStrictOrNull()")),
+        12 => p(format!(
+            "runCatching {{ {bs}.toBooleanStrict() }}.let {{ it.getOrNull() ?: it.exceptionOrNull()?.message }}"
+        )),
+        13 => p("String.format(\"%s|%b\", null, null)".to_string()),
+        14 => p(format!("java.lang.Long.toBinaryString({l})")),
+        _ => p(format!("('a' + {lo}).coerceIn('b'..'f')")),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     All,
@@ -1674,6 +1973,14 @@ enum Mode {
     NullColl,
     MapOps,
     Contract,
+    CallDflt,
+    CallOrder,
+    InitOrder,
+    RecvFn,
+    JumpExpr,
+    CharClass,
+    SplitMulti,
+    NumEq,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -1745,6 +2052,14 @@ const CONCRETE: &[Mode] = &[
     Mode::NullColl,
     Mode::MapOps,
     Mode::Contract,
+    Mode::CallDflt,
+    Mode::CallOrder,
+    Mode::InitOrder,
+    Mode::RecvFn,
+    Mode::JumpExpr,
+    Mode::CharClass,
+    Mode::SplitMulti,
+    Mode::NumEq,
 ];
 
 /// The **operator conventions** on a collection receiver, plus the iteration
@@ -2764,6 +3079,14 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::NullColl => "nullcoll",
         Mode::MapOps => "mapops",
         Mode::Contract => "contract",
+        Mode::CallDflt => "calldflt",
+        Mode::CallOrder => "callorder",
+        Mode::InitOrder => "initorder",
+        Mode::RecvFn => "recvfn",
+        Mode::JumpExpr => "jumpexpr",
+        Mode::CharClass => "charclass",
+        Mode::SplitMulti => "splitmulti",
+        Mode::NumEq => "numeq",
     }
 }
 
@@ -2849,6 +3172,14 @@ fn gen_probe(r: &mut Rng, mode: Mode, idx: usize) -> String {
         Mode::NullColl => g_nullcoll(r, idx),
         Mode::MapOps => g_mapops(r, idx),
         Mode::Contract => g_contract(r, idx),
+        Mode::CallDflt => g_calldflt(r, idx),
+        Mode::CallOrder => g_callorder(r, idx),
+        Mode::InitOrder => g_initorder(r, idx),
+        Mode::RecvFn => g_recvfn(r, idx),
+        Mode::JumpExpr => g_jumpexpr(r, idx),
+        Mode::CharClass => g_charclass(r, idx),
+        Mode::SplitMulti => g_splitmulti(r, idx),
+        Mode::NumEq => g_numeq(r, idx),
         Mode::All => unreachable!("resolved above"),
     }
 }
@@ -3392,6 +3723,194 @@ fn extra_declarations(probes: &[String]) -> String {
              \x20   fun inner(v: Int): Int = outerCap() * 10 + v\n\
              \x20   return inner(n % 10)\n\
              }\n",
+        );
+    }
+    // ── calldflt: defaults written in the callee's terms ──
+    if named("dflA(")
+        || named("dflB(")
+        || named("DflK")
+        || named("DflSub")
+        || named("DflCtor")
+        || named(".dflE()")
+        || named(".dflF()")
+    {
+        out.push_str(
+            "fun dflA(a: Int, b: Int = a * 2, c: String = \"c\" + b) = \"$a/$b/$c\"\n\
+             fun dflB(x: Double, y: Double = x / 4, z: Int = y.toInt() + 1) = \"$x $y $z\"\n\
+             class DflK(val n: Int) {\n\
+             \x20   fun m(p: Int = n + 1, q: Int = p * n) = \"$p,$q\"\n\
+             \x20   fun s(t: String = \"n=$n\") = t\n\
+             }\n\
+             open class DflBase(val n: Int) {\n\
+             \x20   open fun f(x: Int = n + 10): String = \"base\" + x\n\
+             }\n\
+             class DflSub(n: Int) : DflBase(n) {\n\
+             \x20   override fun f(x: Int): String = \"sub\" + x\n\
+             }\n\
+             class DflCtor(val a: Int, val b: Int = a + 1, val c: String = \"c\" + b) {\n\
+             \x20   override fun toString(): String = \"$a/$b/$c\"\n\
+             }\n\
+             fun String.dflE(n: Int = length, tag: String = this + n) = tag\n\
+             fun Int.dflF(k: Int = this + 1, m: Int = k * 2) = \"$this:$k:$m\"\n",
+        );
+    }
+    // ── callorder ──
+    if named("trThree(") || named("TrBox(") {
+        out.push_str(
+            "var trLog = \"\"\n\
+             fun trc(tag: String, v: Int): Int { trLog += tag; return v }\n\
+             fun trThree(a: Int, b: Int, c: Int) = \"$a$b$c\"\n\
+             class TrBox(val a: Int, val b: Int, val c: Int) {\n\
+             \x20   override fun toString(): String = \"$a$b$c\"\n\
+             }\n",
+        );
+    }
+    // ── initorder ──
+    if named("IniLog(")
+        || named("IniCalc(")
+        || named("IniChild(")
+        || named("IniAbs(")
+        || named("IniSec(")
+        || named("IniObj")
+        || named("IniHost")
+        || named("IniData(")
+        || named("IniLazy(")
+    {
+        out.push_str(
+            "class IniLog(val n: Int) {\n\
+             \x20   val twice = double(n)\n\
+             \x20   init { println(\"IniLog init \" + twice + \" \" + describe()) }\n\
+             \x20   fun double(x: Int) = x * 2\n\
+             \x20   fun describe() = \"<\" + n + \">\"\n\
+             }\n\
+             class IniCalc(val n: Int) {\n\
+             \x20   val total = sum(n)\n\
+             \x20   val label = \"L\" + total\n\
+             \x20   fun sum(k: Int): Int { var t = 0; for (i in 1..k) t += i; return t }\n\
+             }\n\
+             open class IniBase(val id: Int) {\n\
+             \x20   open val tag = \"base\"\n\
+             \x20   val seen = who()\n\
+             \x20   init { println(\"IniBase \" + id + \" \" + tag + \" \" + who()) }\n\
+             \x20   open fun who() = \"IniBase\"\n\
+             }\n\
+             class IniChild(id: Int, val extra: String?) : IniBase(id) {\n\
+             \x20   override val tag = \"child\"\n\
+             \x20   val own: String? = extra + id\n\
+             \x20   override fun who() = \"IniChild\" + extra + own\n\
+             \x20   init { println(\"IniChild \" + tag + \" \" + who()) }\n\
+             }\n\
+             abstract class IniTmpl {\n\
+             \x20   init { println(\"IniTmpl \" + name()) }\n\
+             \x20   abstract fun name(): String?\n\
+             }\n\
+             class IniAbs : IniTmpl() {\n\
+             \x20   val nm: String? = \"abs-name\"\n\
+             \x20   override fun name(): String? = nm\n\
+             }\n\
+             class IniSec(val p: Int) {\n\
+             \x20   var q = 0\n\
+             \x20   constructor(a: Int, b: Int) : this(a + b) { q = scale(a) }\n\
+             \x20   fun scale(x: Int) = x * 100\n\
+             }\n\
+             object IniObj {\n\
+             \x20   val value = compute()\n\
+             \x20   init { println(\"IniObj init \" + value) }\n\
+             \x20   fun compute() = 41\n\
+             \x20   fun describe() = \"IniObj\" + value\n\
+             }\n\
+             class IniHost {\n\
+             \x20   companion object {\n\
+             \x20       val TAG = make()\n\
+             \x20       fun make() = \"tag\"\n\
+             \x20       init { println(\"IniHost companion init\") }\n\
+             \x20   }\n\
+             \x20   val seen = TAG + \"!\"\n\
+             }\n\
+             data class IniData(val a: Int, val b: Int = a * 2) {\n\
+             \x20   val sum = total()\n\
+             \x20   fun total() = a + b\n\
+             }\n\
+             class IniLazy(val k: Int) {\n\
+             \x20   val x by lazy { calc() }\n\
+             \x20   fun calc(): Int { println(\"IniLazy calc\"); return k * 3 }\n\
+             \x20   val y = x + 1\n\
+             }\n",
+        );
+    }
+    // ── recvfn ──
+    if named("rfBuild")
+        || named("rfApply(")
+        || named("rfApplyS(")
+        || named("rfTwice(")
+        || named("RfHtml")
+        || named("rfHtml")
+        || named("rfConfig")
+        || named("rfOpt(")
+        || named("rfFold(")
+        || named(".rfLen")
+    {
+        out.push_str(
+            "fun rfBuild(f: StringBuilder.() -> Unit): String { val sb = StringBuilder(); sb.f(); return sb.toString() }\n\
+             fun rfBuild2(f: StringBuilder.() -> Unit): String { val sb = StringBuilder(); f(sb); return sb.toString() }\n\
+             fun rfApply(n: Int, f: Int.() -> Int): Int = n.f()\n\
+             fun rfApplyS(n: Int, f: Int.() -> String): String = n.f()\n\
+             fun rfTwice(n: Int, f: Int.(Int) -> Int): Int = n.f(n)\n\
+             class RfHtml {\n\
+             \x20   val items = mutableListOf<String>()\n\
+             \x20   fun tag(n: String, f: RfHtml.() -> Unit) { items.add(\"<\" + n + \">\"); f(); items.add(\"</\" + n + \">\") }\n\
+             \x20   fun text(s: String) { items.add(s) }\n\
+             \x20   fun root(f: RfHtml.() -> Unit) { f() }\n\
+             \x20   override fun toString(): String = items.joinToString(\"\")\n\
+             }\n\
+             fun rfHtml(f: RfHtml.() -> Unit): RfHtml { val h = RfHtml(); h.f(); return h }\n\
+             class RfCfg { var a = 0; var b = \"\"; fun show() = \"$a/$b\" }\n\
+             fun rfConfig(f: RfCfg.() -> Unit): RfCfg = RfCfg().also { it.f() }\n\
+             fun rfOpt(f: (RfCfg.() -> Unit)? = null): String { val c = RfCfg(); if (f != null) c.f(); return c.show() }\n\
+             fun rfFold(xs: List<Int>, init: Int, op: Int.(Int) -> Int): Int { var r = init; for (x in xs) r = r.op(x); return r }\n\
+             fun String.rfLen(f: String.() -> Int): Int = this.f() + 1\n",
+        );
+    }
+    // ── jumpexpr ──
+    if named("jxSum(")
+        || named("jxStop(")
+        || named("jxFirst(")
+        || named("jxLen(")
+        || named("jxFin(")
+        || named("jxLam(")
+        || named("jxLbl(")
+        || named("jxAdd(")
+        || named("jxBig(")
+    {
+        out.push_str(
+            "fun jxSum(xs: List<String?>): Int {\n\
+             \x20   var t = 0\n\
+             \x20   for (x in xs) { val n = x?.toIntOrNull() ?: continue; t += n }\n\
+             \x20   return t\n\
+             }\n\
+             fun jxStop(xs: List<String?>): Int {\n\
+             \x20   var t = 0\n\
+             \x20   for (x in xs) { t += (x ?: break).toIntOrNull() ?: 100 }\n\
+             \x20   return t\n\
+             }\n\
+             fun jxFirst(xs: List<String?>): String {\n\
+             \x20   for (x in xs) { val s = x ?: continue; if (s.length > 0) return \"first=\" + s }\n\
+             \x20   return \"none\"\n\
+             }\n\
+             fun jxLen(s: String?): Int {\n\
+             \x20   val n = s ?: return -1\n\
+             \x20   return n.length\n\
+             }\n\
+             fun jxFin(s: String?): Int {\n\
+             \x20   try {\n\
+             \x20       val n = s ?: return -5\n\
+             \x20       return n.length\n\
+             \x20   } finally { println(\"jxFin finally\") }\n\
+             }\n\
+             fun jxLam(xs: List<String?>): List<Int> = xs.map { (it ?: return emptyList()).length }\n\
+             fun jxLbl(xs: List<String?>): List<Int> = xs.map lab@{ (it ?: return@lab -1).length }\n\
+             fun jxAdd(s: String?): Int = 1 + ((s ?: return 99).length)\n\
+             fun jxBig(n: Int?): Int { val m = n ?: return 0; return m + 1 }\n",
         );
     }
     if named("capDeep(") {

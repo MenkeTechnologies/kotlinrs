@@ -7019,3 +7019,124 @@ fn unbound_references_to_one_argument_builtin_members() {
         "6\n13\n{a=6}\n[a, b]\n3.5\nabc\n5\n2\n"
     );
 }
+
+#[test]
+fn a_default_is_evaluated_in_the_callees_frame() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12. A default naming an earlier
+    // parameter, `this` or a member is not evaluable where the call is written.
+    assert_eq!(
+        stdout(
+            "class K(val n: Int) { fun m(p: Int = n + 1, q: Int = p * n) = \"$p,$q\" }\n\
+             open class B(val n: Int) { open fun f(x: Int = n + 10) = \"b\" + x }\n\
+             class S(n: Int) : B(n) { override fun f(x: Int) = \"s\" + x }\n\
+             fun a(x: Int, y: Int = x * 2, z: String = \"z\" + y) = \"$x/$y/$z\"\n\
+             fun String.e(n: Int = length, t: String = this + n) = t\n\
+             fun main() {\n\
+             println(a(1)); println(a(3, z = \"k\")); println(a(z = \"q\", x = 4))\n\
+             println(K(3).m()); println(K(3).m(q = 2))\n\
+             println(S(1).f()); val b: B = S(2); println(b.f(5))\n\
+             println(\"abc\".e()); println(\"\".e())\n\
+             }"
+        ),
+        "1/2/z2\n3/6/k\n4/8/q\n4,12\n4,2\ns11\ns5\nabc3\n0\n"
+    );
+}
+
+#[test]
+fn named_arguments_run_in_written_order() {
+    assert_eq!(
+        stdout(
+            "var log = \"\"\n\
+             fun t(s: String, v: Int): Int { log += s; return v }\n\
+             fun f(a: Int, b: Int, c: Int) = \"$a$b$c\"\n\
+             fun main() {\n\
+             println(f(c = t(\"c\", 1), a = t(\"a\", 2), b = t(\"b\", 3)) + \"|\" + log)\n\
+             log = \"\"\n\
+             println(f(t(\"a\", 1), c = t(\"c\", 2), b = t(\"b\", 3)) + \"|\" + log)\n\
+             }"
+        ),
+        "231|cab\n132|acb\n"
+    );
+}
+
+#[test]
+fn initializers_may_call_members_and_reach_overrides() {
+    // A superclass initializer's virtual call lands on the subclass override,
+    // which reads the subclass's own field at its zero value: the JVM allocates
+    // the whole object before any constructor runs.
+    assert_eq!(
+        stdout(
+            "open class A { init { println(\"A \" + hello()) }; open fun hello() = \"A\" }\n\
+             class B : A() { val own = 7; override fun hello() = \"B\" + own; init { println(\"B \" + hello()) } }\n\
+             class C(val n: Int) { val d = twice(n); init { println(\"C \" + d + \" \" + me()) }\n\
+             fun twice(x: Int) = x * 2; fun me() = \"<\" + n + \">\" }\n\
+             fun main() { B(); C(4) }"
+        ),
+        "A B0\nB B7\nC 8 <4>\n"
+    );
+}
+
+#[test]
+fn an_object_initializes_on_first_use() {
+    assert_eq!(
+        stdout(
+            "object O { init { println(\"O init\") }; val v = 5 }\n\
+             fun main() { println(\"start\"); println(O.v); println(O.v) }"
+        ),
+        "start\nO init\n5\n5\n"
+    );
+}
+
+#[test]
+fn a_function_type_with_a_receiver_binds_this() {
+    assert_eq!(
+        stdout(
+            "class H { val s = StringBuilder(); fun tag(n: String, f: H.() -> Unit) { s.append(\"<\" + n + \">\"); f(); s.append(\"</\" + n + \">\") }\n\
+             fun text(t: String) { s.append(t) } }\n\
+             fun h(f: H.() -> Unit): String { val x = H(); x.f(); return x.s.toString() }\n\
+             fun twice(n: Int, f: Int.(Int) -> Int) = n.f(n)\n\
+             fun main() {\n\
+             println(h { tag(\"p\") { text(\"hi\"); tag(\"b\") { text(\"x\") } } })\n\
+             println(twice(6) { this * it })\n\
+             val g: Int.(Int) -> Int = { o -> this - o }\n\
+             println(10.g(4)); println(g(10, 4))\n\
+             }"
+        ),
+        "<p>hi<b>x</b></p>\n36\n6\n6\n"
+    );
+}
+
+#[test]
+fn return_break_and_continue_are_expressions() {
+    assert_eq!(
+        stdout(
+            "fun len(s: String?): Int { val n = s ?: return -1; return n.length }\n\
+             fun sum(xs: List<String?>): Int { var t = 0; for (x in xs) { t += x?.toIntOrNull() ?: continue }; return t }\n\
+             fun upTo(xs: List<Int?>): Int { var t = 0; for (x in xs) { t += x ?: break }; return t }\n\
+             fun main() {\n\
+             println(len(null)); println(len(\"abc\"))\n\
+             println(sum(listOf(\"1\", \"x\", null, \"4\")))\n\
+             println(upTo(listOf(1, 2, null, 4)))\n\
+             }"
+        ),
+        "-1\n3\n5\n3\n"
+    );
+}
+
+#[test]
+fn char_classes_come_from_the_jdks_tables() {
+    // `²` and `½` are numeric but not decimal digits, `Ⅷ` is a letter-number,
+    // `٣` and fullwidth `７` ARE digits, and `ᵃ` (modifier letter) is a letter.
+    assert_eq!(
+        stdout(
+            "fun main() {\n\
+             println(listOf('\\u00b2', '\\u00bd', '\\u2167', '\\u0663', '\\uff17').map { it.isDigit() })\n\
+             println(listOf('\\u00b2', '\\u2167', '\\u02b0', '\\u0345').map { it.isLetter() })\n\
+             println('\\u0663'.digitToInt() + '\\uff17'.digitToInt())\n\
+             println('f'.digitToInt(16)); println('9'.digitToIntOrNull(8))\n\
+             println(runCatching { '8'.digitToInt(8) }.exceptionOrNull()?.message)\n\
+             }"
+        ),
+        "[false, false, false, true, true]\n[false, false, true, false]\n10\n15\nnull\nChar 8 is not a digit in the given radix=8\n"
+    );
+}
