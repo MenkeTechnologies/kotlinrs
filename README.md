@@ -196,8 +196,8 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 - **Delegated properties** — `by lazy`, a user delegate declaring
   `operator fun getValue`/`setValue` (on a class, top-level or local
   property, handed the property's `KProperty` so `property.name` reads), and
-  `Delegates.observable`/`vetoable` on a top-level or local property (a class
-  property still refuses them; see BUGS.md).
+  `Delegates.observable`/`vetoable`/`notNull` on a class, top-level or local
+  property, and a `Map`/`MutableMap` as a delegate (`val name: String by m`).
 - **Property accessors with a backing field** — `var x = 0 get() = … set(v)
   { field = … }` on a class property, `field` included; a bodyless `private
   set` is accepted. The accessors compile as methods of the owner and the

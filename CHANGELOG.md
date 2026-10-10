@@ -42,6 +42,10 @@ captured from the reference toolchain.
 | `Lg.Factory.make()` for `companion object Factory` | `unresolved reference: Factory` | resolves |
 | `@JvmStatic fun f()` inside a class body | parse error | accepted |
 | `fun List<Int>.e() = filter { it > 1 } + reversed()` | `0.0` | the list |
+| `class O { var o: Int by Delegates.observable(1) { p, a, b -> } }` | compile error naming `getValue` | `1` |
+| `Delegates.notNull()`, `val n: String by map` | `unresolved`/rejected | the delegate reads and writes by property name |
+| `groupingBy { }.fold`/`reduce`/`aggregate`, `reduceOrNull`, `Regex.escape` | `unresolved reference` | the results |
+| `list.iterator().remove()`, `listIterator()` | `unresolved reference` | removes / walks both ways |
 
 ### How
 

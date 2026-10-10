@@ -2559,19 +2559,20 @@ fn secondary_constructor_delegating_to_itself_is_rejected() {
 }
 
 #[test]
-fn property_delegate_without_a_resolvable_class_is_rejected() {
-    // `by Delegates.observable(…)` names no class whose `getValue` could be
-    // called. Left unchecked the property becomes a plain stored field and
-    // printing it shows the DELEGATE instead of the value — a silent wrong
-    // answer, which is exactly what this rejection prevents.
-    let out = eval(
-        "import kotlin.properties.Delegates\n\
-         class O { var o: Int by Delegates.observable(1) { p, a, b -> } }\n\
-         fun main() { println(O().o) }",
+fn a_class_property_may_delegate_to_the_stdlib_observable() {
+    // This pinned a compile error for a program the reference accepts (`1`,
+    // measured on kotlinc 2.4.21): `Delegates.observable` is supplied by the
+    // frontend, so no user `getValue` is needed. A delegate that is neither a
+    // user class with `getValue` nor one of those stays rejected, see
+    // `a_local_by_a_delegate_with_no_getvalue_is_rejected`.
+    assert_eq!(
+        stdout(
+            "import kotlin.properties.Delegates\n\
+             class O { var o: Int by Delegates.observable(1) { p, a, b -> } }\n\
+             fun main() { println(O().o) }"
+        ),
+        "1\n"
     );
-    assert!(!out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("getValue"), "stderr was: {err}");
 }
 
 #[test]

@@ -349,19 +349,6 @@ Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 `withDefault` is a VIEW over the receiver, and maps here have no view
 representation (see "Collection VIEWS are snapshots").
 
-## `Delegates.observable`/`vetoable` on a class property is still refused
-
-```
-class O { var o: Int by Delegates.observable(1) { p, a, b -> } }
-fun main() { println(O().o) }      kotlinrs: compile error naming getValue   reference: 1
-```
-
-The access lowering handles the host delegate on a class property exactly as it
-does on a top-level or local one (both now measured equal to the reference),
-but `tests/lang.rs` `property_delegate_without_a_resolvable_class_is_rejected`
-pins the rejection, so lifting it is left to the owner. Lifting it is the
-`c != HOST_DELEGATE` test in `build_class_meta`'s delegate check plus that test.
-
 ## Round 19: `sum()` over an `Int` collection the frontend cannot type
 
 Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1. The total of an `Int` collection
@@ -417,8 +404,6 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
 | program | kotlinrs | reference |
 | --- | --- | --- |
 | `open class A { init { println("A " + name()) }; abstract fun name(): String }` with `class B : A() { val nm = "b"; override fun name() = nm }` | `A ` | `A null` |
-| `listOf(1, 2, 3).listIterator().next()` | `unresolved reference: listIterator on List` | `1` |
-| `val i = mutableListOf(1, 2).iterator(); i.next(); i.remove()` | `unresolved reference: remove on Iterator` | removes the element |
 | `println(mutableListOf(1).clear())`, `val f = { }; println(f())` | `null` | `kotlin.Unit` |
 | `IntRange.EMPTY`, `sequence.constrainOnce()`, `Integer.reverse(1)`, `java.lang.String.valueOf(5)` | `unresolved reference` | `1..0`, the sequence, `-2147483648`, `5` |
 | `data class D(val a: Int, val b: Int)`; `d.copy(b = g(), a = h())` | `h` before `g` | `g` before `h` |
