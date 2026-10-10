@@ -70,10 +70,10 @@ cargo build --release
 # the binary is target/release/kotlin
 ```
 
-Requires a stable Rust toolchain. The language itself depends on `fusevm` alone
-(which pulls Cranelift for the JIT); `lsp-server` and `lsp-types` back the
-editor server in `src/lsp.rs` and reach no part of the runtime. Everything else
-is std.
+Requires a stable Rust toolchain. The language itself depends on `fusevm`
+(which pulls Cranelift for the JIT) and `fancy-regex` (`kotlin.text.Regex`);
+`lsp-server`, `lsp-types`, `serde`, `serde_json` and `libc` back the editor
+servers in `src/lsp.rs` and `src/dap.rs`. Everything else is std.
 
 ## [0x02] USAGE
 
@@ -623,10 +623,9 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 - **`Pair` / `Triple`** — the constructor spellings beside `a to b`, with the
   `data class` behaviour Kotlin gives them: `(a, b)` / `(a, b, c)` display,
   structural equality, the `31`-fold `hashCode`, `first`/`second`/`third`, and
-  `componentN` so `val (a, b, c) = t` destructures. Their generated `copy` is
-  the one member not modelled — `Pair(1, 2).copy(second = 9)` is an unresolved
-  reference here, where a DECLARED `data class`'s `copy` is supported in both
-  argument forms.
+  `componentN` so `val (a, b, c) = t` destructures. Their generated `copy` takes each component by position or by
+  name (`Pair(1, 2).copy(second = 9)`), as a DECLARED `data class`'s `copy`
+  does.
 - **Captured `var` mutation** — a `var` of the enclosing frame that a lambda
   *assigns* to is stored in a shared cell, so the write is visible to the frame
   (`var n = 0; xs.forEach { n += it }`). This is what the JVM backend does with
@@ -1714,8 +1713,7 @@ every column doubles with the input out to 40 000; the 80 000 `hashMapOf` cell
 varied from 0.81 s to 1.32 s across repetitions and is reported as the minimum
 rather than trusted to three digits.
 
-Next: `RegexOption` and `Regex.escape`, `infix` calls, labels on lambda
-literals, variance and bounds, and a growing standard-library surface —
+Next: `RegexOption` and `Regex.escape`, variance and bounds, and a growing standard-library surface —
 alongside the sibling parity tooling (LSP/DAP, reference generator, differential
 harness). Open divergences are tracked in [BUGS.md](BUGS.md); the round-by-round
 record continues in [CHANGELOG.md](CHANGELOG.md).
