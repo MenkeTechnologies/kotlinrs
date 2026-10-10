@@ -1723,6 +1723,10 @@ enum HeapObj {
     Iter {
         src: Value,
         at: usize,
+        /// The index `next`/`previous` last returned, which `remove` and `set`
+        /// act on; `-1` when there is none (before the first step, or after a
+        /// `remove`/`add`).
+        last: i64,
     },
     /// An `IntRange` / `IntProgression`. See [`RangeObj`].
     Range(RangeObj),
@@ -4548,7 +4552,8 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let on = vm.pop();
             let value = vm.pop();
             vm.push(alloc(HeapObj::Observed {
-                value,
+                // `arg == 2` is `Delegates.notNull()`: no value until the first write.
+                value: if arg == 2 { lateinit_unset() } else { value },
                 on,
                 vetoable: arg == 1,
             }));
@@ -6718,14 +6723,55 @@ fn coro_next(vm: &mut VM, handle: &Value) -> Result<Option<Value>, String> {
 
 /// `KT_DELEG_GET` — see [`KT_DELEG_GET`].
 fn b_deleg_get(vm: &mut VM, _argc: u8) -> Value {
-    let _property = vm.pop();
+    let property = vm.pop();
     let _this_ref = vm.pop();
     let d = vm.pop();
-    with_obj(&d, |o| match o {
-        HeapObj::Observed { value, .. } => value.clone(),
-        _ => Value::Undef,
+    let name = property_name(&property);
+    let found = with_obj(&d, |o| match o {
+        HeapObj::Observed { value, .. } => Some(Ok(value.clone())),
+        // `Map.getValue(thisRef, property)`: the entry under the property's name.
+        HeapObj::Map(entries) => Some(
+            entries
+                .iter()
+                .find(|(k, _)| matches!(k, Value::Str(s) if **s == name))
+                .map(|(_, v)| v.clone())
+                .ok_or_else(|| {
+                    format!("java.util.NoSuchElementException: Key {name} is missing in the map.")
+                }),
+        ),
+        _ => None,
     })
-    .unwrap_or(Value::Undef)
+    .flatten();
+    match found {
+        Some(Ok(v)) if is_lateinit_unset(&v) => {
+            fault(
+                vm,
+                format!(
+                    "java.lang.IllegalStateException: Property {name} should be initialized before get."
+                ),
+            );
+            Value::Undef
+        }
+        Some(Ok(v)) => v,
+        Some(Err(e)) => {
+            fault(vm, e);
+            Value::Undef
+        }
+        None => Value::Undef,
+    }
+}
+
+/// The name a `KProperty` instance carries.
+fn property_name(property: &Value) -> String {
+    with_obj(property, |o| match o {
+        HeapObj::Instance { fields, .. } => fields
+            .iter()
+            .find(|(n, _)| n == "name")
+            .map(|(_, v)| v.to_str()),
+        _ => None,
+    })
+    .flatten()
+    .unwrap_or_default()
 }
 
 /// `KT_DELEG_SET` — see [`KT_DELEG_GET`].
@@ -6740,6 +6786,20 @@ fn b_deleg_set(vm: &mut VM, _argc: u8) -> Value {
     let property = vm.pop();
     let _this_ref = vm.pop();
     let d = vm.pop();
+    // A `MutableMap` delegate stores under the property's name.
+    let is_map = with_obj(&d, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false);
+    if is_map {
+        let key = Value::str(property_name(&property));
+        with_obj_mut(&d, |o| {
+            if let HeapObj::Map(entries) = o {
+                match entries.iter_mut().find(|(k, _)| value_eq(k, &key)) {
+                    Some(slot) => slot.1 = new,
+                    None => entries.push((key, new)),
+                }
+            }
+        });
+        return Value::Undef;
+    }
     let Some((old, on, vetoable)) = with_obj(&d, |o| match o {
         HeapObj::Observed {
             value,
@@ -6772,6 +6832,10 @@ fn b_deleg_set(vm: &mut VM, _argc: u8) -> Value {
         return Value::Undef;
     }
     store(vm, new.clone());
+    // `Delegates.notNull()` has no handler.
+    if matches!(on, Value::Undef) {
+        return Value::Undef;
+    }
     if let Err(e) = invoke_closure(vm, &on, &[property, old, new]) {
         fault(vm, e);
     }
@@ -7394,6 +7458,45 @@ fn coll_hof(
     {
         return result_hof(vm, recv, name, clo);
     }
+    // The `Grouping` terminals that carry a lambda. Each walks the elements once,
+    // keeping one accumulator per key, and answers a `Map` whose keys are in
+    // first-encounter order.
+    if let Some((items, key)) = grouping_parts(recv) {
+        let shape = match (name, extras.len()) {
+            ("fold", 1) | ("reduce", 0) | ("aggregate", 0) => Some(name),
+            _ => None,
+        };
+        if let Some(shape) = shape {
+            let mut acc: Vec<(Value, Value)> = Vec::new();
+            for it in items {
+                let k = invoke_closure(vm, &key, std::slice::from_ref(&it))?;
+                let at = acc.iter().position(|(ek, _)| value_eq(ek, &k));
+                let next = match (shape, at) {
+                    ("fold", Some(i)) => invoke_closure(vm, clo, &[acc[i].1.clone(), it.clone()])?,
+                    ("fold", None) => invoke_closure(vm, clo, &[extras[0].clone(), it.clone()])?,
+                    ("reduce", Some(i)) => {
+                        invoke_closure(vm, clo, &[k.clone(), acc[i].1.clone(), it.clone()])?
+                    }
+                    ("reduce", None) => it.clone(),
+                    (_, Some(i)) => invoke_closure(
+                        vm,
+                        clo,
+                        &[k.clone(), acc[i].1.clone(), it.clone(), Value::Bool(false)],
+                    )?,
+                    (_, None) => invoke_closure(
+                        vm,
+                        clo,
+                        &[k.clone(), Value::Undef, it.clone(), Value::Bool(true)],
+                    )?,
+                };
+                match at {
+                    Some(i) => acc[i].1 = next,
+                    None => acc.push((k, next)),
+                }
+            }
+            return Ok(alloc(HeapObj::Map(acc)));
+        }
+    }
     // `Result.fold(onSuccess, onFailure)`: the first lambda arrives as the
     // extra argument, the second as the closure.
     if name == "fold" && extras.len() == 1 {
@@ -7717,9 +7820,24 @@ fn coll_hof(
             }
             Ok(alloc(HeapObj::List(items[lo..hi].to_vec())))
         }
-        "reduce" => {
+        // `aggregate` is a `Grouping` terminal, answered above; any other receiver
+        // has no such member.
+        "aggregate" => Err(format!(
+            "unresolved reference: aggregate on {}",
+            obj_label(recv)
+        )),
+        "reduce" | "reduceOrNull" => {
             let mut iter = items.into_iter();
-            let mut acc = iter.next().ok_or_else(|| {
+            let Some(first) = iter.next() else {
+                if name == "reduceOrNull" {
+                    return Ok(Value::Undef);
+                }
+                return Err(format!(
+                    "java.lang.UnsupportedOperationException: Empty {} can't be reduced.",
+                    kind.reduce_noun(name)
+                ));
+            };
+            let mut acc = Some(first).ok_or_else(|| {
                 format!(
                     "java.lang.UnsupportedOperationException: Empty {} can't be reduced.",
                     kind.reduce_noun(name)
@@ -7733,9 +7851,18 @@ fn coll_hof(
         // `reduceRight` is to `reduce` what `foldRight` is to `fold`: the seed
         // is the LAST element, the walk runs backwards, and the lambda's
         // arguments are `(element, acc)`.
-        "reduceRight" => {
+        "reduceRight" | "reduceRightOrNull" => {
             let mut iter = items.into_iter().rev();
-            let mut acc = iter.next().ok_or_else(|| {
+            let Some(first) = iter.next() else {
+                if name == "reduceRightOrNull" {
+                    return Ok(Value::Undef);
+                }
+                return Err(format!(
+                    "java.lang.UnsupportedOperationException: Empty {} can't be reduced.",
+                    kind.reduce_noun(name)
+                ));
+            };
+            let mut acc = Some(first).ok_or_else(|| {
                 format!(
                     "java.lang.UnsupportedOperationException: Empty {} can't be reduced.",
                     kind.reduce_noun(name)
@@ -10897,6 +11024,15 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
                 _ => format!("{bits:o}"),
             }))
         }
+        // `Regex.escape` is `Pattern.quote`: `\Q…\E`, with a literal `\E` inside the
+        // text closed, escaped and reopened.
+        (Value::Str(s), "#regexescape") => Ok(Value::str(format!(
+            "\\Q{}\\E",
+            s.replace("\\E", "\\E\\\\E\\Q")
+        ))),
+        (Value::Str(s), "#regexescapeReplacement") => {
+            Ok(Value::str(s.replace('\\', "\\\\").replace('$', "\\$")))
+        }
         (Value::Int(n), "#longtoBinaryString" | "#longtoHexString" | "#longtoOctalString") => {
             let bits = *n as u64;
             Ok(Value::str(match name {
@@ -11057,6 +11193,7 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         (Value::Str(_), "iterator") if args.is_empty() => Ok(alloc(HeapObj::Iter {
             src: recv.clone(),
             at: 0,
+            last: -1,
         })),
         // `String.slice` answers a `String`, where the `CharSequence` members
         // below would answer a `List<Char>`. An `IntRange` is `substring` (with
@@ -11308,15 +11445,26 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     }
     // The iterator cursor. It resolves first because `next` and `hasNext` are
     // its own and nothing else here declares them.
-    if let Some((src, at)) = with_obj(recv, |o| match o {
-        HeapObj::Iter { src, at } => Some((src.clone(), *at)),
+    if let Some((src, at, last)) = with_obj(recv, |o| match o {
+        HeapObj::Iter { src, at, last } => Some((src.clone(), *at, *last)),
         _ => None,
     })
     .flatten()
     {
         let len = iter_len(&src).unwrap_or(0);
+        let step = |to: usize, last: i64| {
+            with_obj_mut(recv, |o| {
+                if let HeapObj::Iter { at, last: l, .. } = o {
+                    *at = to;
+                    *l = last;
+                }
+            });
+        };
         return match name {
             "hasNext" => Ok(Value::Bool((at as i64) < len)),
+            "hasPrevious" => Ok(Value::Bool(at > 0)),
+            "nextIndex" => Ok(Value::Int(at as i64)),
+            "previousIndex" => Ok(Value::Int(at as i64 - 1)),
             "next" => {
                 if (at as i64) >= len {
                     // `ArrayList$Itr.next` raises the no-argument constructor,
@@ -11325,15 +11473,60 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                     return Err("java.util.NoSuchElementException".to_string());
                 }
                 let v = iter_at(&src, at as i64);
-                with_obj_mut(recv, |o| {
-                    if let HeapObj::Iter { at, .. } = o {
-                        *at += 1;
-                    }
-                });
+                step(at + 1, at as i64);
                 Ok(v)
+            }
+            "previous" => {
+                if at == 0 {
+                    return Err("java.util.NoSuchElementException".to_string());
+                }
+                let v = iter_at(&src, at as i64 - 1);
+                step(at - 1, at as i64 - 1);
+                Ok(v)
+            }
+            // `remove`, `set` and `add` act on the cursor's source, at the index
+            // the last step returned (`remove`, `set`) or the cursor itself (`add`).
+            "remove" | "set" if last < 0 => Err("java.lang.IllegalStateException".to_string()),
+            "remove" => {
+                let is_set = with_obj(&src, |o| matches!(o, HeapObj::Set(_))).unwrap_or(false);
+                if is_set {
+                    let v = iter_at(&src, last);
+                    kt_method(vm, &src, "remove", &[v])?;
+                } else {
+                    kt_method(vm, &src, "removeAt", &[Value::Int(last)])?;
+                }
+                let back = if (last as usize) < at { at - 1 } else { at };
+                step(back, -1);
+                Ok(Value::Undef)
+            }
+            "set" => {
+                let v = args.first().cloned().unwrap_or(Value::Undef);
+                kt_method(vm, &src, "set", &[Value::Int(last), v])?;
+                Ok(Value::Undef)
+            }
+            "add" => {
+                let v = args.first().cloned().unwrap_or(Value::Undef);
+                kt_method(vm, &src, "add", &[Value::Int(at as i64), v])?;
+                step(at + 1, -1);
+                Ok(Value::Undef)
             }
             _ => Err(format!("unresolved reference: {name} on Iterator")),
         };
+    }
+    // `xs.listIterator(index)` — the same cursor, positioned. The index is
+    // checked against the size, both bounds inclusive.
+    if name == "listIterator" && args.len() <= 1 {
+        if let Some(len) = iter_len(recv) {
+            let at = args.first().map_or(0, Value::to_int);
+            if at < 0 || at > len {
+                return Err(format!("java.lang.IndexOutOfBoundsException: Index: {at}"));
+            }
+            return Ok(alloc(HeapObj::Iter {
+                src: recv.clone(),
+                at: at as usize,
+                last: -1,
+            }));
+        }
     }
     // `xs.iterator()` — the cursor over any iterable, including the `String`
     // and `Map` forms, which is why the argument is the RECEIVER and not a
@@ -11342,6 +11535,7 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         return Ok(alloc(HeapObj::Iter {
             src: recv.clone(),
             at: 0,
+            last: -1,
         }));
     }
     // A `StringBuilder` resolves first and entirely on its own: it is a

@@ -68,7 +68,8 @@ fn run_error(e: impl std::fmt::Display) -> String {
 }
 
 impl KRegex {
-    pub fn new(pattern: &str) -> Result<KRegex, String> {
+    pub fn new(written: &str) -> Result<KRegex, String> {
+        let pattern = &expand_quotes(written);
         let find = Engine::new(pattern).map_err(syntax_error)?;
         let entire = Engine::new(&format!(r"\A(?:{pattern})\z")).map_err(syntax_error)?;
         let names = find
@@ -76,7 +77,7 @@ impl KRegex {
             .map(|n| n.map(str::to_string))
             .collect();
         Ok(KRegex {
-            pattern: pattern.to_string(),
+            pattern: written.to_string(),
             find,
             entire,
             names,
@@ -234,6 +235,45 @@ fn to_match(c: &fancy_regex::Captures<'_>, n: usize) -> Match {
             .map(|i| c.get(i).map(|g| (g.start(), g.end())))
             .collect(),
     }
+}
+
+/// Rewrite `\Q…\E` quotations — `Pattern.quote`'s output, and what
+/// `Regex.escape` answers — into the escaped literal the engine understands.
+/// An unterminated `\Q` quotes to the end of the pattern, as in Java; an escaped
+/// backslash (`\\`) is passed through whole so `\\Q` is not read as a quote.
+fn expand_quotes(pattern: &str) -> String {
+    if !pattern.contains("\\Q") {
+        return pattern.to_string();
+    }
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('Q') => {
+                chars.next();
+                let mut literal = String::new();
+                while let Some(q) = chars.next() {
+                    if q == '\\' && chars.peek() == Some(&'E') {
+                        chars.next();
+                        break;
+                    }
+                    literal.push(q);
+                }
+                out.push_str(&fancy_regex::escape(&literal));
+            }
+            Some(&next) => {
+                chars.next();
+                out.push('\\');
+                out.push(next);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 #[cfg(test)]

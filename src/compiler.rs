@@ -135,7 +135,7 @@ fn reify_arg_name(e: &Expr) -> Option<String> {
 fn is_observable_delegate(e: &Expr) -> bool {
     match e {
         Expr::MethodCall { recv, name, .. } => {
-            matches!(name.as_str(), "observable" | "vetoable")
+            matches!(name.as_str(), "observable" | "vetoable" | "notNull")
                 && matches!(&**recv, Expr::Var(v) if v == "Delegates")
         }
         _ => false,
@@ -1709,6 +1709,30 @@ fn delegate_class_of(init: &Expr) -> Option<String> {
     }
 }
 
+/// Whether `init` is a bare name that the declaring class gives a `Map` type — a
+/// constructor parameter or an earlier body property declared `Map<…>` — which
+/// makes `by init` the map delegate: a read is `map[propertyName]`, a write on a
+/// `MutableMap` stores under it.
+fn map_delegate(cd: &ClassDecl, init: &Expr) -> bool {
+    let Expr::Var(n) = init else {
+        return false;
+    };
+    let is_map = |c: &Option<String>| c.as_deref().is_some_and(is_map_class);
+    cd.params.iter().any(|p| p.name == *n && is_map(&p.class))
+        || cd
+            .obj_props
+            .iter()
+            .any(|p| p.name == *n && is_map(&p.class))
+}
+
+/// The `Map` classes a delegate may be.
+fn is_map_class(c: &str) -> bool {
+    matches!(
+        c,
+        "Map" | "MutableMap" | "HashMap" | "LinkedHashMap" | "TreeMap" | "SortedMap"
+    )
+}
+
 /// The pseudo-class [`delegate_class_of`] records for a delegate the host
 /// supplies rather than a user class. `$` cannot start a Kotlin identifier, so
 /// it never names a declared class.
@@ -2414,15 +2438,14 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
         // stored field, which would silently print the DELEGATE where the
         // property's value belongs.
         //
-        // `kotlin.properties.Delegates.observable` / `vetoable` are still
-        // rejected on a CLASS property although the access lowering below
-        // handles their [`HOST_DELEGATE`] (as it does for a local and a
-        // top-level property): tests/lang.rs
-        // `property_delegate_without_a_resolvable_class_is_rejected` pins this
-        // rejection, and changing a pinned expectation is the owner's call.
+        // `kotlin.properties.Delegates.observable` / `vetoable` name no class but
+        // are supplied by the frontend itself ([`HOST_DELEGATE`]), and the access
+        // lowering below handles them on a class property as it does on a local
+        // and a top-level one.
         for p in cd.obj_props.iter().filter(|p| p.delegate) {
             if !delegate_class_of(&p.init)
-                .is_some_and(|c| c != HOST_DELEGATE && by_name.contains_key(c.as_str()))
+                .is_some_and(|c| c == HOST_DELEGATE || by_name.contains_key(c.as_str()))
+                && !map_delegate(cd, &p.init)
             {
                 return Err(format!(
                     "class {}: property {} delegates to a value whose class is not a \
@@ -2488,32 +2511,40 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
         // Everything up to here comes from the primary constructor, which is
         // exactly what a `data class`'s derived members read (see `data_len`).
         let data_len = own_props.len();
-        own_props.extend(cd.obj_props.iter().map(|p| PropMeta {
-            name: p.name.clone(),
-            ty: match (p.ty, body_prop_class(p, &by_name)) {
-                // An unannotated body property holding a heap object types as
-                // one. Without this its type stays `Unknown`, and a comparison
-                // of two of them (`O.a == O.b`) would miss the object-equality
-                // path and compare the raw handles with the native op.
-                (Type::Unknown, Some(_)) => Type::Obj,
-                // An unannotated `val n = 7` is an `Int`: the literal says so.
-                (Type::Unknown, None) => literal_type(&p.init),
-                (t, _) => t,
-            },
-            class: p.class.clone().or_else(|| body_prop_class(p, &by_name)),
-            // A `val` an `init` block assigns is stored like any other.
-            mutable: p.mutable || p.deferred,
-            lazy: p.lazy,
-            // The delegate's class, taken from the initializer — `by Upper()`
-            // names `Upper`, whose `getValue`/`setValue` the accesses call.
-            delegate: p.delegate.then(|| delegate_class_of(&p.init)).flatten(),
-            // A BODY property does not FIX a type argument — it is not a
-            // constructor parameter — but it does READ the one the construction
-            // site fixed, exactly as a `T`-returning method does off its
-            // receiver. `class Box<T>(v: T) { val w: T = v }` therefore answers
-            // `Int` for `Box(65536).w`.
-            type_param_of: p.type_param_of,
-            type_args: p.type_args.clone(),
+        own_props.extend(cd.obj_props.iter().map(|p| {
+            PropMeta {
+                name: p.name.clone(),
+                ty: match (p.ty, body_prop_class(p, &by_name)) {
+                    // An unannotated body property holding a heap object types as
+                    // one. Without this its type stays `Unknown`, and a comparison
+                    // of two of them (`O.a == O.b`) would miss the object-equality
+                    // path and compare the raw handles with the native op.
+                    (Type::Unknown, Some(_)) => Type::Obj,
+                    // An unannotated `val n = 7` is an `Int`: the literal says so.
+                    (Type::Unknown, None) => literal_type(&p.init),
+                    (t, _) => t,
+                },
+                class: p.class.clone().or_else(|| body_prop_class(p, &by_name)),
+                // A `val` an `init` block assigns is stored like any other.
+                mutable: p.mutable || p.deferred,
+                lazy: p.lazy,
+                // The delegate's class, taken from the initializer — `by Upper()`
+                // names `Upper`, whose `getValue`/`setValue` the accesses call.
+                delegate: p
+                    .delegate
+                    .then(|| delegate_class_of(&p.init))
+                    .flatten()
+                    .or_else(|| {
+                        (p.delegate && map_delegate(cd, &p.init)).then(|| HOST_DELEGATE.to_string())
+                    }),
+                // A BODY property does not FIX a type argument — it is not a
+                // constructor parameter — but it does READ the one the construction
+                // site fixed, exactly as a `T`-returning method does off its
+                // receiver. `class Box<T>(v: T) { val w: T = v }` therefore answers
+                // `Int` for `Box(65536).w`.
+                type_param_of: p.type_param_of,
+                type_args: p.type_args.clone(),
+            }
         }));
 
         // The type argument this class WROTE for a DIRECT supertype's `k`th type
@@ -2577,7 +2608,14 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
                             class: p.class.clone(),
                             mutable: p.mutable,
                             lazy: p.lazy,
-                            delegate: p.delegate.then(|| delegate_class_of(&p.init)).flatten(),
+                            delegate: p
+                                .delegate
+                                .then(|| delegate_class_of(&p.init))
+                                .flatten()
+                                .or_else(|| {
+                                    (p.delegate && map_delegate(d, &p.init))
+                                        .then(|| HOST_DELEGATE.to_string())
+                                }),
                             type_param_of: p.type_param_of,
                             type_args: p.type_args.clone(),
                         },
@@ -4451,7 +4489,8 @@ impl Compiler {
                     // stdlib FACTORY calls — so the delegate they answer is one
                     // this frontend supplies and the accesses go through the
                     // host ops rather than a subroutine.
-                    if dc.is_none() && is_observable_delegate(init) {
+                    let map_valued = self.infer_class(sc, init).is_some_and(|c| is_map_class(&c));
+                    if dc.is_none() && (is_observable_delegate(init) || map_valued) {
                         None
                     } else if dc.is_none() {
                         return Err(format!(
@@ -6478,6 +6517,15 @@ impl Compiler {
         {
             return self.compile_call(sc, &format!("__{name}"), args, line);
         }
+        if name == "notNull"
+            && args.is_empty()
+            && self.qualifier(sc, recv).as_deref() == Some("Delegates")
+        {
+            self.b.emit(Op::LoadUndef, line);
+            self.b.emit(Op::LoadUndef, line);
+            self.b.emit(Op::Extended(KT_OBSERVE, 2), line);
+            return Ok(Type::Obj);
+        }
         // `x::class` / `Type::class` and `x.javaClass` — the two class-object
         // spellings. Both need the receiver's STATIC type, which is the only
         // thing that separates `1.javaClass` (the primitive `int`) from
@@ -6684,6 +6732,24 @@ impl Compiler {
                         && args.len() == 1 =>
                 {
                     return self.compile_member(sc, &args[0], name, &[], false, line)
+                }
+                // `Regex.escape(s)` is `Pattern.quote`; `Regex.escapeReplacement(s)`
+                // backslash-escapes `\` and `$`.
+                "Regex" | "kotlin.text.Regex" if name == "fromLiteral" && args.len() == 1 => {
+                    let quoted = Expr::MethodCall {
+                        recv: recv.clone().into(),
+                        name: "escape".to_string(),
+                        args: args.to_vec(),
+                        safe: false,
+                        line,
+                    };
+                    return self.compile_call(sc, "Regex", &[quoted], line);
+                }
+                "Regex" | "kotlin.text.Regex"
+                    if matches!(name, "escape" | "escapeReplacement") && args.len() == 1 =>
+                {
+                    let member = format!("#regex{name}");
+                    return self.compile_member(sc, &args[0], &member, &[], false, line);
                 }
                 // The `Long` spellings read the 64-bit pattern.
                 "Long" | "java.lang.Long"
@@ -12142,7 +12208,7 @@ impl Compiler {
                 (first_extra().unwrap_or(Type::Unknown), Type::Unknown),
                 (elem, inner),
             ],
-            "reduce" => vec![(elem, inner), (elem, inner)],
+            "reduce" | "reduceOrNull" => vec![(elem, inner), (elem, inner)],
             // The index-first pairs.
             "mapIndexed" | "filterIndexed" | "forEachIndexed" => {
                 vec![(Type::Int, Type::Unknown), (elem, inner)]
@@ -13851,7 +13917,9 @@ fn is_coll_hof(name: &str) -> bool {
             | "fold"
             | "foldRight"
             | "reduce"
+            | "reduceOrNull"
             | "reduceRight"
+            | "reduceRightOrNull"
             | "any"
             | "all"
             | "none"
@@ -13870,6 +13938,7 @@ fn is_coll_hof(name: &str) -> bool {
             | "associateWith"
             | "groupBy"
             | "groupingBy"
+            | "aggregate"
             // The searching predicates. Each also has a no-argument member
             // spelling (`list.first()`), which the `!args.is_empty()` guard at
             // the call site keeps on the plain path.
