@@ -25,6 +25,8 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, compiled and run on the same JVM.
 | `mapOf("b" to 20, "c" to 3).forEach { k, v -> print(k) }` | `b=20c=3` — `k` was the entry | `bc` |
 | `val i = iterator { yield(1) }; println(i.hasNext())` | `unresolved reference: hasNext on List` | `true`, the block suspended between `hasNext` and `next` |
 | `val li = listOf(1, 2).iterator(); for (x in li) print(x)` | `for-in over a non-iterable value (Iterator)` | `12`, the iterator left exhausted |
+| `val x: Any = intArrayOf(1); println(x is Array<*>)` | `true` — every array matched every array type | `false` |
+| `listOf(1).toTypedArray() is Array<*>` | `false` — it was a `List` | `true` |
 
 ## Round 8 — constructors that have an object, defaults in the callee, receiver function types
 

@@ -7216,3 +7216,22 @@ fn iterator_builder_suspends_between_has_next_and_next() {
         "123\nbuilt\nstart\ntrue\ntrue\na\nmid\nb\nend\nfalse\nNSEE null\n[0, 1, 2, 3, 4]\n5\n234\nfalse\n20 30 \nfalse\n"
     );
 }
+
+#[test]
+fn array_type_tests_tell_reference_and_primitive_arrays_apart() {
+    // Measured on kotlinc 2.4.21 / JRE 21: each array type is its own class, so
+    // a primitive array is not `Array<*>`, and `toTypedArray()` IS an array.
+    assert_eq!(
+        stdout(
+            "fun t(x: Any) = listOf(x is Array<*>, x is IntArray, x is LongArray, x is DoubleArray, x is CharArray, x is ByteArray).joinToString(\"\") { if (it) \"1\" else \"0\" }\n\
+             fun j(vararg x: String) = x.joinToString(\"-\")\n\
+             fun main() {\n\
+             for (a in listOf<Any>(arrayOf(1), Array(2) { it }, intArrayOf(1), longArrayOf(1), doubleArrayOf(1.0), \"ab\".toCharArray(), byteArrayOf(1), listOf(1).toTypedArray())) println(t(a))\n\
+             val x: Any = intArrayOf(1)\n\
+             println(when (x) { is Array<*> -> \"array\"; is IntArray -> \"ints\"; else -> \"?\" })\n\
+             val a = listOf(\"a\", \"b\").toTypedArray(); a[0] = \"z\"; println(a.contentToString()); println(j(*a))\n\
+             }"
+        ),
+        "100000\n100000\n010000\n001000\n000100\n000010\n000001\n100000\nints\n[z, b]\nz-b\n"
+    );
+}

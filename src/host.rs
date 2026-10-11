@@ -13514,7 +13514,15 @@ fn sequence_member(
                 desc: desc.to_string(),
             })));
         }
-        "toMutableList" | "toTypedArray" | "asList" | "asIterable" => {
+        // `toTypedArray` answers a reference ARRAY (`Array<T>`), not a list: it
+        // is `is Array<*>`, prints as `[L…;@hash` and has no `List` members.
+        "toTypedArray" if args.is_empty() => {
+            return Some(Ok(alloc(HeapObj::Array {
+                items: items.to_vec(),
+                desc: array_desc(items),
+            })))
+        }
+        "toMutableList" | "asList" | "asIterable" => {
             return Some(Ok(alloc(HeapObj::List(items.to_vec()))))
         }
         // A LAZY pipeline over the elements, not a tagged copy of them: the
@@ -15436,9 +15444,24 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         "Map" | "MutableMap" => with_obj(v, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false),
         "Pair" => with_obj(v, |o| matches!(o, HeapObj::Pair(_, _))).unwrap_or(false),
         "Triple" => with_obj(v, |o| matches!(o, HeapObj::Triple(_, _, _))).unwrap_or(false),
+        // Each array type is its own JVM class, told apart by the descriptor:
+        // `Array<T>` is a reference array (`[L…;`), and a primitive array is
+        // NOT one — `intArrayOf(1) is Array<*>` is `false`.
         "Array" | "IntArray" | "DoubleArray" | "CharArray" | "BooleanArray" | "LongArray"
         | "FloatArray" | "ShortArray" | "ByteArray" => {
-            with_obj(v, |o| matches!(o, HeapObj::Array { .. })).unwrap_or(false)
+            let want = match ty {
+                "IntArray" => "[I",
+                "LongArray" => "[J",
+                "DoubleArray" => "[D",
+                "FloatArray" => "[F",
+                "CharArray" => "[C",
+                "BooleanArray" => "[Z",
+                "ShortArray" => "[S",
+                "ByteArray" => "[B",
+                _ => "[L",
+            };
+            with_obj(v, |o| matches!(o, HeapObj::Array { desc, .. } if desc.starts_with(want)))
+                .unwrap_or(false)
         }
         other => {
             // A class instance matches its own class and every supertype it
