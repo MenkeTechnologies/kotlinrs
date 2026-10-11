@@ -441,3 +441,14 @@ effects with the body's:
 `hasNext()`/`next()` driven by hand interleave correctly; only the `for`
 lowering pulls ahead. Closing it means a pull-based loop (`hasNext`/`next` per
 iteration) for a header whose static type is not known to be indexable.
+
+## Round 9: measured and not closed
+
+Each fails loudly. Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | kotlinrs | reference |
+| --- | --- | --- |
+| `listOf(5, 3).sumBy { it }` (deprecated, still compiles with a warning) | `unresolved reference: sumBy on List` | `8` |
+| `emptySequence<Int>()` | `unresolved reference: emptySequence` | an empty sequence |
+| `"a\nb\n".lineSequence().toList()` | `unresolved reference: lineSequence on String` | `[a, b, ]` |
+| `12.345.toBits()` | `unresolved reference: toBits on Double` | the IEEE-754 bits as a `Long` |
