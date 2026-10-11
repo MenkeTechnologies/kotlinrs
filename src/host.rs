@@ -280,7 +280,8 @@ pub const KT_DELEG_SET: u16 = 139;
 
 /// `KT_ITER_SRC`: normalize the value a `for (v in …)` header evaluated to into
 /// something the loop can index. Stack `[value]`; leaves it unchanged except
-/// for a lazy `Sequence`, which is pulled into a `List`.
+/// for a lazy `Sequence`, which is pulled into a `List`, and an `Iterator`, whose
+/// REMAINING elements are pulled into one and which is left exhausted.
 ///
 /// `for`-in walks a length and an index, and a `Sequence` has neither: it is a
 /// pull, and its length is not known until it ends. Pulling it here — once, at
@@ -1687,6 +1688,18 @@ enum HeapObj {
         /// Where the block resumes — the op after the `KT_YIELD` that parked it.
         ip: usize,
         state: CoroState,
+    },
+    /// The `Iterator` an `iterator { … }` builder answers: a `sequence { … }`
+    /// block driven one element at a time instead of by a pipeline. Unlike
+    /// `sequence { … }` it is NOT re-iterable — Kotlin hands back the
+    /// coroutine itself — so the [`HeapObj::Coro`] lives here for good.
+    ///
+    /// `hasNext` has to run the block up to its next `yield` to answer, and the
+    /// element that run produced is held in `ahead` until `next` takes it, so
+    /// the block runs once per element however often `hasNext` is asked.
+    CoroIter {
+        coro: Value,
+        ahead: Option<Value>,
     },
     /// A class object — `x::class` (a `kotlin.reflect.KClass`) or `x.javaClass`
     /// (a `java.lang.Class`). See [`KT_CLASS_REF`].
@@ -4536,13 +4549,26 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
         }
         KT_SEQ_NEW => {
             let body = vm.pop();
-            vm.push(alloc(HeapObj::Gen {
-                block: Some(body),
-                items: None,
-                seed: None,
-                step: Value::Undef,
-                stages: Vec::new(),
-            }));
+            // `arg == 1` is `iterator { … }`: the same block, entered once and
+            // driven by `hasNext`/`next` rather than by a pipeline.
+            if arg == 1 {
+                let coro = alloc(HeapObj::Coro {
+                    body,
+                    frames: Vec::new(),
+                    stack: Vec::new(),
+                    ip: 0,
+                    state: CoroState::Fresh,
+                });
+                vm.push(alloc(HeapObj::CoroIter { coro, ahead: None }));
+            } else {
+                vm.push(alloc(HeapObj::Gen {
+                    block: Some(body),
+                    items: None,
+                    seed: None,
+                    step: Value::Undef,
+                    stages: Vec::new(),
+                }));
+            }
         }
         KT_CLASS_REF => {
             let hint = vm.pop().to_str();
@@ -6843,9 +6869,66 @@ fn b_deleg_set(vm: &mut VM, _argc: u8) -> Value {
     Value::Undef
 }
 
+/// Advance an `iterator { … }` cursor ([`HeapObj::CoroIter`]): the element it
+/// is on, or `None` once the block has run off its end. `take` consumes the
+/// element (`next`); without it the element is parked in `ahead` (`hasNext`),
+/// so asking twice runs the block once. `None` for a value that is not one.
+fn coro_iter_step(vm: &mut VM, it: &Value, take: bool) -> Option<Result<Option<Value>, String>> {
+    let (coro, ahead) = with_obj(it, |o| match o {
+        HeapObj::CoroIter { coro, ahead } => Some((coro.clone(), ahead.clone())),
+        _ => None,
+    })
+    .flatten()?;
+    let cur = match ahead {
+        Some(v) => Some(v),
+        None => match coro_next(vm, &coro) {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e)),
+        },
+    };
+    let park = if take { None } else { cur.clone() };
+    with_obj_mut(it, |o| {
+        if let HeapObj::CoroIter { ahead, .. } = o {
+            *ahead = park;
+        }
+    });
+    Some(Ok(cur))
+}
+
 /// `KT_ITER_SRC` — see [`KT_ITER_SRC`].
 fn b_iter_src(vm: &mut VM, _argc: u8) -> Value {
     let v = vm.pop();
+    // `for (x in it)` over an ITERATOR (Kotlin's `Iterator<T>.iterator()` is
+    // the iterator itself) walks what is left of it and leaves it exhausted —
+    // pulled here at the head, as a `Sequence` is below.
+    if let Some((src, at)) = with_obj(&v, |o| match o {
+        HeapObj::Iter { src, at, .. } => Some((src.clone(), *at)),
+        _ => None,
+    })
+    .flatten()
+    {
+        let len = iter_len(&src).unwrap_or(0);
+        let rest: Vec<Value> = (at as i64..len).map(|i| iter_at(&src, i)).collect();
+        with_obj_mut(&v, |o| {
+            if let HeapObj::Iter { at, last, .. } = o {
+                *at = len.max(0) as usize;
+                *last = len - 1;
+            }
+        });
+        return alloc_ro_list(rest);
+    }
+    let mut rest = Vec::new();
+    loop {
+        match coro_iter_step(vm, &v, true) {
+            None => break,
+            Some(Ok(Some(x))) => rest.push(x),
+            Some(Ok(None)) => return alloc_ro_list(rest),
+            Some(Err(e)) => {
+                fault(vm, e);
+                return alloc_ro_list(Vec::new());
+            }
+        }
+    }
     if gen_parts(&v).is_none() {
         return v;
     }
@@ -11535,6 +11618,17 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             )),
         };
     }
+    // An `iterator { … }` cursor. `next` past the end is the no-argument
+    // `NoSuchElementException`, as `SequenceBuilderIterator` raises it.
+    if matches!(name, "hasNext" | "next") && args.is_empty() {
+        if let Some(step) = coro_iter_step(vm, recv, name == "next") {
+            return match (name, step?) {
+                ("hasNext", cur) => Ok(Value::Bool(cur.is_some())),
+                (_, Some(v)) => Ok(v),
+                (_, None) => Err("java.util.NoSuchElementException".to_string()),
+            };
+        }
+    }
     // The iterator cursor. It resolves first because `next` and `hasNext` are
     // its own and nothing else here declares them.
     if let Some((src, at, last)) = with_obj(recv, |o| match o {
@@ -13829,6 +13923,7 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
         | HeapObj::RegexMatch { .. }
         | HeapObj::MatchGroup { .. }
         | HeapObj::Coro { .. }
+        | HeapObj::CoroIter { .. }
         | HeapObj::Observed { .. }
         | HeapObj::F32(_)
         | HeapObj::I64(_)
@@ -14528,6 +14623,7 @@ fn obj_hash(recv: &Value) -> Option<i32> {
         | HeapObj::Res { .. }
         | HeapObj::Iter { .. }
         | HeapObj::Coro { .. }
+        | HeapObj::CoroIter { .. }
         | HeapObj::Observed { .. }
         | HeapObj::Klass { .. } => None,
         // `java.lang.Float.hashCode()` is `floatToIntBits`, which is NOT the
@@ -14618,6 +14714,7 @@ fn obj_label(recv: &Value) -> String {
         HeapObj::Iter { .. } => "Iterator".to_string(),
         HeapObj::Gen { .. } => "Sequence".to_string(),
         HeapObj::Coro { .. } => "SequenceScope".to_string(),
+        HeapObj::CoroIter { .. } => "Iterator".to_string(),
         HeapObj::Observed { .. } => "ObservableProperty".to_string(),
         HeapObj::Grouping { .. } => "Grouping".to_string(),
         HeapObj::Range(r) => match (r.is_char, r.progression) {
@@ -14820,6 +14917,7 @@ fn display_obj(id: u32) -> String {
                 }
             }
             HeapObj::Iter { at, .. } => format!("(iterator at={at})"),
+            HeapObj::CoroIter { .. } => "(iterator block)".to_string(),
             // `IntRange.toString` is `first..last`; `IntProgression.toString` is
             // `first..last step n` ascending and `first downTo last step n`
             // descending, where `last` is the last element actually reached

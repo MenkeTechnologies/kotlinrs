@@ -23,6 +23,8 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, compiled and run on the same JVM.
 | `l.runningFoldIndexed(1) { … }` / `scanIndexed` | unresolved | `[1, 5, 16, 130]` |
 | `l.mapIndexedNotNull { i, v -> if (i > 0) v * 2 else null }` | unresolved | `[6, 16]` |
 | `mapOf("b" to 20, "c" to 3).forEach { k, v -> print(k) }` | `b=20c=3` — `k` was the entry | `bc` |
+| `val i = iterator { yield(1) }; println(i.hasNext())` | `unresolved reference: hasNext on List` | `true`, the block suspended between `hasNext` and `next` |
+| `val li = listOf(1, 2).iterator(); for (x in li) print(x)` | `for-in over a non-iterable value (Iterator)` | `12`, the iterator left exhausted |
 
 ## Round 8 — constructors that have an object, defaults in the callee, receiver function types
 

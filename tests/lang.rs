@@ -7191,3 +7191,28 @@ fn map_for_each_with_two_parameters_gets_key_and_value() {
         "b:2 a:1 \nb=2 a=1 \nb2a1\n10a30c\n50\n"
     );
 }
+
+#[test]
+fn iterator_builder_suspends_between_has_next_and_next() {
+    // Measured on kotlinc 2.4.21 / JRE 21. `hasNext` runs the block to its next
+    // `yield` exactly once however often it is asked; an endless block is
+    // pulled only as far as asked; `for` over an iterator walks what is left.
+    assert_eq!(
+        stdout(
+            "fun main() {\n\
+             val it2 = iterator { yield(1); yieldAll(listOf(2, 3)) }\n\
+             while (it2.hasNext()) print(it2.next()); println()\n\
+             val lazy = iterator { println(\"start\"); yield(\"a\"); println(\"mid\"); yield(\"b\"); println(\"end\") }\n\
+             println(\"built\"); println(lazy.hasNext()); println(lazy.hasNext()); println(lazy.next()); println(lazy.next()); println(lazy.hasNext())\n\
+             try { lazy.next() } catch (e: NoSuchElementException) { println(\"NSEE ${e.message}\") }\n\
+             val nat = iterator { var n = 0; while (true) yield(n++) }\n\
+             println(List(5) { nat.next() }); println(nat.next())\n\
+             val li = listOf(1, 2, 3, 4).iterator(); li.next()\n\
+             for (x in li) print(x); println(); println(li.hasNext())\n\
+             val fin = iterator { yield(10); yield(20); yield(30) }; fin.next()\n\
+             for (x in fin) print(\"$x \"); println(); println(fin.hasNext())\n\
+             }"
+        ),
+        "123\nbuilt\nstart\ntrue\ntrue\na\nmid\nb\nend\nfalse\nNSEE null\n[0, 1, 2, 3, 4]\n5\n234\nfalse\n20 30 \nfalse\n"
+    );
+}

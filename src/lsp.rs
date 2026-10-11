@@ -1729,6 +1729,13 @@ const CORPUS: &[Entry] = &[
         "println(listOf(1, 2, 3).dropLast(1))   // [1, 2]\nprintln(\"abcde\".dropLast(2))            // abc",
     ),
     (
+        "iterator",
+        "Sequence Members",
+        "iterator(block: suspend SequenceScope<T>.() -> Unit): Iterator<T>",
+        "The `Iterator` form of `sequence { … }`: the block suspends at each `yield`/`yieldAll` and resumes on demand. `hasNext()` runs the block up to its next `yield` and holds that element for `next()`, so an endless block is fine as long as it is pulled a bounded number of times. Unlike a sequence it is one-shot. `next()` past the end raises `NoSuchElementException`. As the receiver of `for`, an iterator (this one or `xs.iterator()`) is walked from where it stands and left exhausted.",
+        "val nat = iterator { var n = 0; while (true) yield(n++) }\nprintln(List(3) { nat.next() })   // [0, 1, 2]",
+    ),
+    (
         "generateSequence",
         "Sequence Members",
         "generateSequence(seed: T?, next: (T) -> T?): Sequence<T>",

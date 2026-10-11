@@ -9581,7 +9581,7 @@ impl Compiler {
             // pipeline pulls from. See [`crate::host::KT_YIELD`].
             "sequence" | "iterator" if args.len() == 1 => {
                 self.compile_expr(sc, &args[0])?;
-                self.b.emit(Op::Extended(KT_SEQ_NEW, 0), line);
+                self.b.emit(Op::Extended(KT_SEQ_NEW, u8::from(name == "iterator")), line);
                 Ok(Type::Obj)
             }
             // `yieldAll(xs)` is `for (x in xs) yield(x)` — the stdlib declares
