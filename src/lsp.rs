@@ -2137,7 +2137,7 @@ const CORPUS: &[Entry] = &[
         "forEach",
         "Higher-Order Collection Functions",
         "forEach(action: (T) -> Unit): Unit",
-        "Runs the lambda once per element for its side effect and yields `Unit`.",
+        "Runs the lambda once per element for its side effect and yields `Unit`. On a `Map` a lambda of two parameters (`{ k, v -> … }`, Java's `BiConsumer` form) receives the key and the value; one parameter receives the entry.",
         "listOf(1, 2).forEach { print(it) }   // 12",
     ),
     (

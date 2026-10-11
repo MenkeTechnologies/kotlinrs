@@ -2412,7 +2412,7 @@ println(e.cause)   // java.lang.IllegalStateException: inner</code></pre>
         <article class="doc-entry" id="doc-higher-order-collection-functions-15">
           <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-15">#</a> <code>forEach</code></h3>
           <pre><code class="lang-kotlin">forEach(action: (T) -&gt; Unit): Unit</code></pre>
-          <p>Runs the lambda once per element for its side effect and yields <code>Unit</code>.</p>
+          <p>Runs the lambda once per element for its side effect and yields <code>Unit</code>. On a <code>Map</code> a lambda of two parameters (<code>{ k, v -&gt; … }</code>, Java's <code>BiConsumer</code> form) receives the key and the value; one parameter receives the entry.</p>
           <pre><code class="lang-kotlin">listOf(1, 2).forEach { print(it) }   // 12</code></pre>
         </article>
         <article class="doc-entry" id="doc-higher-order-collection-functions-16">

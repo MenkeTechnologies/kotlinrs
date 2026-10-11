@@ -7171,3 +7171,23 @@ fn indexed_folds_pass_the_position_first() {
          Empty collection can't be reduced.\nEmpty array can't be reduced.\nEmpty list can't be reduced.\n"
     );
 }
+
+#[test]
+fn map_for_each_with_two_parameters_gets_key_and_value() {
+    // `{ k, v -> }` is `java.util.Map.forEach(BiConsumer)`; `{ (k, v) -> }` and
+    // `{ e -> }` are Kotlin's one-parameter entry form. Measured on kotlinc
+    // 2.4.21 / JRE 21: before the fix `k` was the whole entry.
+    assert_eq!(
+        stdout(
+            "fun main() {\n\
+             val m = linkedMapOf(\"b\" to 2, \"a\" to 1)\n\
+             m.forEach { k, v -> print(\"$k:$v \") }; println()\n\
+             m.forEach { (k, v) -> print(\"$k=$v \") }; println()\n\
+             m.forEach { e -> print(e.key + e.value) }; println()\n\
+             val sm = sortedMapOf(3 to \"c\", 1 to \"a\"); sm.forEach { k, v -> print(k * 10); print(v) }; println()\n\
+             var total = 0; mapOf(1 to 10, 2 to 20).forEach { k, v -> total += k * v }; println(total)\n\
+             }"
+        ),
+        "b:2 a:1 \nb=2 a=1 \nb2a1\n10a30c\n50\n"
+    );
+}

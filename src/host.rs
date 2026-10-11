@@ -7656,6 +7656,23 @@ fn coll_hof(
         }
         return Ok(out);
     }
+    // `Map.forEach { k, v -> … }` — a lambda of TWO parameters — is
+    // `java.util.Map.forEach(BiConsumer)`, which hands the key and the value
+    // separately. Kotlin's own `forEach` takes ONE parameter, the entry
+    // (destructured or not), and that is the shared walk below.
+    if name == "forEach" && closure_meta(clo).is_some_and(|(_, params, _)| params == 2) {
+        let entries = with_obj(recv, |o| match o {
+            HeapObj::Map(entries) => Some(entries.clone()),
+            _ => None,
+        })
+        .flatten();
+        if let Some(entries) = entries {
+            for (k, v) in entries {
+                invoke_closure(vm, clo, &[k, v])?;
+            }
+            return Ok(Value::Undef);
+        }
+    }
     let items = list_snapshot(recv)
         .ok_or_else(|| format!("unresolved reference: {name} on {}", obj_label(recv)))?;
     match name {
