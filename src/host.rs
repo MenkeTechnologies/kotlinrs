@@ -1057,6 +1057,7 @@ fn sequence_preserving(name: &str) -> bool {
         name,
         "map"
             | "mapIndexed"
+            | "mapIndexedNotNull"
             | "mapNotNull"
             | "filter"
             | "filterNot"
@@ -7733,6 +7734,69 @@ fn coll_hof(
             }
             Ok(alloc(HeapObj::List(out)))
         }
+        // The indexed folds. Each is its plain twin with the element's POSITION
+        // passed first; the accumulator keeps the place it has in the plain form
+        // — second for the left folds (`index, acc, element`), last for the
+        // right ones (`index, element, acc`). In a reduction the first element
+        // seeds the accumulator, so the first index the lambda sees is 1 (and
+        // `size - 2` walking from the right).
+        "foldIndexed" | "runningFoldIndexed" | "scanIndexed" => {
+            let mut acc = extras.first().cloned().unwrap_or(Value::Undef);
+            let running = name != "foldIndexed";
+            let mut out = vec![acc.clone()];
+            for (i, it) in items.into_iter().enumerate() {
+                acc = invoke_closure(vm, clo, &[Value::Int(i as i64), acc, it])?;
+                if running {
+                    out.push(acc.clone());
+                }
+            }
+            Ok(if running { alloc(HeapObj::List(out)) } else { acc })
+        }
+        "foldRightIndexed" => {
+            let mut acc = extras.first().cloned().unwrap_or(Value::Undef);
+            for (i, it) in items.into_iter().enumerate().rev() {
+                acc = invoke_closure(vm, clo, &[Value::Int(i as i64), it, acc])?;
+            }
+            Ok(acc)
+        }
+        "reduceIndexed" | "reduceIndexedOrNull" | "runningReduceIndexed" => {
+            let running = name == "runningReduceIndexed";
+            let mut iter = items.into_iter().enumerate();
+            let Some((_, mut acc)) = iter.next() else {
+                return match name {
+                    "reduceIndexed" => Err(format!(
+                        "java.lang.UnsupportedOperationException: Empty {} can't be reduced.",
+                        kind.reduce_noun(name)
+                    )),
+                    "runningReduceIndexed" => Ok(alloc(HeapObj::List(Vec::new()))),
+                    _ => Ok(Value::Undef),
+                };
+            };
+            let mut out = vec![acc.clone()];
+            for (i, it) in iter {
+                acc = invoke_closure(vm, clo, &[Value::Int(i as i64), acc, it])?;
+                if running {
+                    out.push(acc.clone());
+                }
+            }
+            Ok(if running { alloc(HeapObj::List(out)) } else { acc })
+        }
+        "reduceRightIndexed" | "reduceRightIndexedOrNull" => {
+            let mut iter = items.into_iter().enumerate().rev();
+            let Some((_, mut acc)) = iter.next() else {
+                if name == "reduceRightIndexedOrNull" {
+                    return Ok(Value::Undef);
+                }
+                return Err(format!(
+                    "java.lang.UnsupportedOperationException: Empty {} can't be reduced.",
+                    kind.reduce_noun(name)
+                ));
+            };
+            for (i, it) in iter {
+                acc = invoke_closure(vm, clo, &[Value::Int(i as i64), it, acc])?;
+            }
+            Ok(acc)
+        }
         // `distinctBy` keeps the FIRST element for each distinct key, so what is
         // compared is the selector's answer and what is kept is the element. The
         // key comparison is hash-gated exactly as `distinct`'s is — both build a
@@ -7788,6 +7852,17 @@ fn coll_hof(
             let mut out = Vec::new();
             for it in items {
                 let v = invoke_closure(vm, clo, &[it])?;
+                if !matches!(v, Value::Undef) {
+                    out.push(v);
+                }
+            }
+            Ok(alloc(HeapObj::List(out)))
+        }
+        // `mapIndexedNotNull` is `mapIndexed` that drops the null results.
+        "mapIndexedNotNull" => {
+            let mut out = Vec::new();
+            for (i, it) in items.into_iter().enumerate() {
+                let v = invoke_closure(vm, clo, &[Value::Int(i as i64), it])?;
                 if !matches!(v, Value::Undef) {
                     out.push(v);
                 }

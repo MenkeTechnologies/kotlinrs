@@ -2064,6 +2064,27 @@ const CORPUS: &[Entry] = &[
         "println(listOf(1, 2).flatMapIndexed { i, v -> listOf(i, v) })   // [0, 1, 1, 2]",
     ),
     (
+        "mapIndexedNotNull",
+        "Higher-Order Collection Functions",
+        "mapIndexedNotNull(transform: (Int, T) -> R?): List<R>",
+        "Like `mapIndexed`, but a result that is `null` is dropped instead of collected.",
+        "println(listOf(5, 3, 8).mapIndexedNotNull { i, v -> if (i > 0) v else null })   // [3, 8]",
+    ),
+    (
+        "foldIndexed",
+        "Higher-Order Collection Functions",
+        "foldIndexed(initial: R, operation: (Int, R, T) -> R): R",
+        "`fold` with the element's index passed first. `runningFoldIndexed` (alias `scanIndexed`) keeps every accumulator; `foldRightIndexed` walks from the end and takes `(index, element, acc)`.",
+        "println(listOf(5, 3, 8).foldIndexed(0) { i, acc, v -> acc + i * v })   // 19",
+    ),
+    (
+        "reduceIndexed",
+        "Higher-Order Collection Functions",
+        "reduceIndexed(operation: (Int, T, T) -> T): T",
+        "`reduce` with the element's index passed first. Element 0 seeds the accumulator, so the first index the lambda sees is 1. `reduceIndexedOrNull`, `runningReduceIndexed`, `reduceRightIndexed` and `reduceRightIndexedOrNull` follow the same shape; an empty receiver raises `UnsupportedOperationException` for the non-`OrNull` forms.",
+        "println(listOf(5, 3, 8).reduceIndexed { i, acc, v -> acc + i * v })   // 24",
+    ),
+    (
         "mapNotNull",
         "Higher-Order Collection Functions",
         "mapNotNull(transform: (T) -> R?): List<R>",

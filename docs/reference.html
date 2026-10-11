@@ -1199,113 +1199,120 @@ fun main() { println(floor(-1.5)) }   // -2.0</code></pre>
 fun main() { println(ceil(1.2)) }   // 2.0</code></pre>
         </article>
         <article class="doc-entry" id="doc-math-5">
-          <h3><a class="doc-anchor" href="#doc-math-5">#</a> <code>round</code></h3>
+          <h3><a class="doc-anchor" href="#doc-math-5">#</a> <code>truncate</code></h3>
+          <pre><code class="lang-kotlin">truncate(x: Double): Double</code></pre>
+          <p>The argument rounded toward zero. Needs the <code>kotlin.math</code> import.</p>
+          <pre><code class="lang-kotlin">import kotlin.math.truncate
+fun main() { println(truncate(-2.7)) }   // -2.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-math-6">
+          <h3><a class="doc-anchor" href="#doc-math-6">#</a> <code>round</code></h3>
           <pre><code class="lang-kotlin">round(x: Double): Double</code></pre>
           <p>Rounds to the closest integer as a <code>Double</code>, with **ties to even** — <code>round(2.5)</code> is <code>2.0</code> and <code>round(3.5)</code> is <code>4.0</code>. This is <code>kotlin.math.round</code>; <code>Math.round</code> is the different, half-up, <code>Long</code>-returning one.</p>
           <pre><code class="lang-kotlin">import kotlin.math.round
 fun main() { println(round(2.5)) }   // 2.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-math-6">
-          <h3><a class="doc-anchor" href="#doc-math-6">#</a> <code>max</code></h3>
+        <article class="doc-entry" id="doc-math-7">
+          <h3><a class="doc-anchor" href="#doc-math-7">#</a> <code>max</code></h3>
           <pre><code class="lang-kotlin">max(a: Int, b: Int): Int
 max(a: Double, b: Double): Double</code></pre>
           <p>Larger of two values, keeping an <code>Int</code> result when both are integral. Lives in <code>kotlin.math</code> and needs the import; <code>maxOf</code> is the auto-imported spelling of the same operation.</p>
           <pre><code class="lang-kotlin">import kotlin.math.max
 fun main() { println(max(2, 9)) }   // 9</code></pre>
         </article>
-        <article class="doc-entry" id="doc-math-7">
-          <h3><a class="doc-anchor" href="#doc-math-7">#</a> <code>min</code></h3>
+        <article class="doc-entry" id="doc-math-8">
+          <h3><a class="doc-anchor" href="#doc-math-8">#</a> <code>min</code></h3>
           <pre><code class="lang-kotlin">min(a: Int, b: Int): Int
 min(a: Double, b: Double): Double</code></pre>
           <p>Smaller of two values, keeping an <code>Int</code> result when both are integral. Needs the <code>kotlin.math</code> import; <code>minOf</code> is the auto-imported spelling.</p>
           <pre><code class="lang-kotlin">import kotlin.math.min
 fun main() { println(min(2, 9)) }   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-math-8">
-          <h3><a class="doc-anchor" href="#doc-math-8">#</a> <code>maxOf</code></h3>
+        <article class="doc-entry" id="doc-math-9">
+          <h3><a class="doc-anchor" href="#doc-math-9">#</a> <code>maxOf</code></h3>
           <pre><code class="lang-kotlin">maxOf(a: T, b: T): T</code></pre>
           <p>Larger of its arguments. It lives in the auto-imported <code>kotlin</code> package, so unlike <code>max</code> it needs no import. Numbers take the numeric overloads (<code>max</code>'s implementation); anything else is the <code>Comparable&lt;T&gt;</code> overload, which answers an ARGUMENT by <code>compareTo</code> — a user <code>Comparable</code> by its own body — with the earlier argument winning a tie.</p>
           <pre><code class="lang-kotlin">println(maxOf(2, 9))   // 9</code></pre>
         </article>
-        <article class="doc-entry" id="doc-math-9">
-          <h3><a class="doc-anchor" href="#doc-math-9">#</a> <code>minOf</code></h3>
+        <article class="doc-entry" id="doc-math-10">
+          <h3><a class="doc-anchor" href="#doc-math-10">#</a> <code>minOf</code></h3>
           <pre><code class="lang-kotlin">minOf(a: T, b: T): T</code></pre>
           <p>Smaller of its arguments, auto-imported like <code>maxOf</code>: <code>min</code>'s implementation for numbers, <code>compareTo</code> for anything else.</p>
           <pre><code class="lang-kotlin">println(minOf(2, 9))   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-math-10">
-          <h3><a class="doc-anchor" href="#doc-math-10">#</a> <code>PI</code></h3>
+        <article class="doc-entry" id="doc-math-11">
+          <h3><a class="doc-anchor" href="#doc-math-11">#</a> <code>PI</code></h3>
           <pre><code class="lang-kotlin">PI: Double</code></pre>
           <p>The <code>kotlin.math</code> circle constant, in scope only under the import. It folds to a literal at compile time rather than paying a host dispatch. Also reachable as <code>Math.PI</code>, which needs no import.</p>
           <pre><code class="lang-kotlin">import kotlin.math.PI
 fun main() { println(PI) }   // 3.141592653589793</code></pre>
         </article>
-        <article class="doc-entry" id="doc-math-11">
-          <h3><a class="doc-anchor" href="#doc-math-11">#</a> <code>E</code></h3>
+        <article class="doc-entry" id="doc-math-12">
+          <h3><a class="doc-anchor" href="#doc-math-12">#</a> <code>E</code></h3>
           <pre><code class="lang-kotlin">E: Double</code></pre>
           <p>The <code>kotlin.math</code> base of the natural logarithm, in scope only under the import, and also reachable as <code>Math.E</code>.</p>
           <pre><code class="lang-kotlin">import kotlin.math.E
 fun main() { println(E) }   // 2.718281828459045</code></pre>
         </article>
-        <article class="doc-entry" id="doc-math-12">
-          <h3><a class="doc-anchor" href="#doc-math-12">#</a> <code>Math</code></h3>
+        <article class="doc-entry" id="doc-math-13">
+          <h3><a class="doc-anchor" href="#doc-math-13">#</a> <code>Math</code></h3>
           <pre><code class="lang-kotlin">Math.abs(…)  Math.max(…)  Math.min(…)
 Math.sqrt(…)  Math.floor(…)  Math.ceil(…)
 Math.round(…)  Math.PI  Math.E</code></pre>
           <p>The <code>java.lang.Math</code> statics. Kotlin auto-imports <code>java.lang.*</code> on the JVM, so these need no import line — which is the practical difference from the <code>kotlin.math</code> top-level spellings. A local binding or a user class named <code>Math</code> shadows the whole thing.</p>
           <pre><code class="lang-kotlin">println(Math.abs(-3))   // 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-math-13">
-          <h3><a class="doc-anchor" href="#doc-math-13">#</a> <code>Math.round</code></h3>
+        <article class="doc-entry" id="doc-math-14">
+          <h3><a class="doc-anchor" href="#doc-math-14">#</a> <code>Math.round</code></h3>
           <pre><code class="lang-kotlin">Math.round(x: Double): Long</code></pre>
           <p>The odd one out of the rounding family: **half-up** (<code>floor(x + 0.5)</code>) and returning a <code>Long</code>, where <code>kotlin.math.round</code> is ties-to-even and returns a <code>Double</code>. It dispatches under its own name for exactly that reason.</p>
           <pre><code class="lang-kotlin">println(Math.round(2.5))   // 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-math-14">
-          <h3><a class="doc-anchor" href="#doc-math-14">#</a> <code>ln</code></h3>
+        <article class="doc-entry" id="doc-math-15">
+          <h3><a class="doc-anchor" href="#doc-math-15">#</a> <code>ln</code></h3>
           <pre><code class="lang-kotlin">ln(x: Double): Double
 ln(x: Float): Float</code></pre>
           <p>Natural logarithm — <code>Math.log</code>, computed by a port of fdlibm's <code>StrictMath.log</code>, which is what the reference JVM answers bit for bit (a correctly rounded <code>ln</code> differs in the last place on about one input in a hundred). <code>ln(0.0)</code> is <code>-Infinity</code> and a negative argument <code>NaN</code>. Needs the <code>kotlin.math</code> import.</p>
           <pre><code class="lang-kotlin">import kotlin.math.*
 fun main() { println(ln(E)) }   // 1.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-math-15">
-          <h3><a class="doc-anchor" href="#doc-math-15">#</a> <code>log10</code></h3>
+        <article class="doc-entry" id="doc-math-16">
+          <h3><a class="doc-anchor" href="#doc-math-16">#</a> <code>log10</code></h3>
           <pre><code class="lang-kotlin">log10(x: Double): Double</code></pre>
           <p>Base-10 logarithm, fdlibm's <code>log10</code>. Needs the <code>kotlin.math</code> import; <code>Math.log10</code> needs none.</p>
           <pre><code class="lang-kotlin">import kotlin.math.log10
 fun main() { println(log10(1000.0)) }   // 3.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-math-16">
-          <h3><a class="doc-anchor" href="#doc-math-16">#</a> <code>log2</code></h3>
+        <article class="doc-entry" id="doc-math-17">
+          <h3><a class="doc-anchor" href="#doc-math-17">#</a> <code>log2</code></h3>
           <pre><code class="lang-kotlin">log2(x: Double): Double</code></pre>
           <p>Base-2 logarithm, as Kotlin defines it: <code>ln(x) / ln(2.0)</code>. Needs the <code>kotlin.math</code> import.</p>
           <pre><code class="lang-kotlin">import kotlin.math.log2
 fun main() { println(log2(8.0)) }   // 3.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-math-17">
-          <h3><a class="doc-anchor" href="#doc-math-17">#</a> <code>log</code></h3>
+        <article class="doc-entry" id="doc-math-18">
+          <h3><a class="doc-anchor" href="#doc-math-18">#</a> <code>log</code></h3>
           <pre><code class="lang-kotlin">log(x: Double, base: Double): Double</code></pre>
           <p>Logarithm to an arbitrary base, <code>ln(x) / ln(base)</code>; a base that is not positive, or is <code>1.0</code>, answers <code>NaN</code>. Needs the <code>kotlin.math</code> import. The one-argument <code>Math.log(x)</code> is the natural logarithm.</p>
           <pre><code class="lang-kotlin">import kotlin.math.log
 fun main() { println(log(8.0, 2.0)) }   // 3.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-math-18">
-          <h3><a class="doc-anchor" href="#doc-math-18">#</a> <code>ln1p</code></h3>
+        <article class="doc-entry" id="doc-math-19">
+          <h3><a class="doc-anchor" href="#doc-math-19">#</a> <code>ln1p</code></h3>
           <pre><code class="lang-kotlin">ln1p(x: Double): Double</code></pre>
           <p><code>ln(1 + x)</code>, accurate for <code>x</code> near zero — fdlibm's <code>log1p</code>, also reachable as <code>Math.log1p</code>. Needs the <code>kotlin.math</code> import.</p>
           <pre><code class="lang-kotlin">import kotlin.math.ln1p
 fun main() { println(ln1p(0.0)) }   // 0.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-math-19">
-          <h3><a class="doc-anchor" href="#doc-math-19">#</a> <code>exp</code></h3>
+        <article class="doc-entry" id="doc-math-20">
+          <h3><a class="doc-anchor" href="#doc-math-20">#</a> <code>exp</code></h3>
           <pre><code class="lang-kotlin">exp(x: Double): Double</code></pre>
           <p><code>e</code> raised to <code>x</code>, fdlibm's <code>exp</code> — so <code>exp(1.0)</code> is <code>2.7182818284590455</code>, the JVM's answer, not the correctly rounded <code>…045</code>. Needs the <code>kotlin.math</code> import.</p>
           <pre><code class="lang-kotlin">import kotlin.math.exp
 fun main() { println(exp(1.0)) }   // 2.7182818284590455</code></pre>
         </article>
-        <article class="doc-entry" id="doc-math-20">
-          <h3><a class="doc-anchor" href="#doc-math-20">#</a> <code>tan</code></h3>
+        <article class="doc-entry" id="doc-math-21">
+          <h3><a class="doc-anchor" href="#doc-math-21">#</a> <code>tan</code></h3>
           <pre><code class="lang-kotlin">tan(x: Double): Double
 asin(x: Double): Double
 acos(x: Double): Double
@@ -1314,15 +1321,15 @@ atan(x: Double): Double</code></pre>
           <pre><code class="lang-kotlin">import kotlin.math.*
 fun main() { println(tan(PI / 4)) }   // 0.9999999999999999</code></pre>
         </article>
-        <article class="doc-entry" id="doc-math-21">
-          <h3><a class="doc-anchor" href="#doc-math-21">#</a> <code>atan2</code></h3>
+        <article class="doc-entry" id="doc-math-22">
+          <h3><a class="doc-anchor" href="#doc-math-22">#</a> <code>atan2</code></h3>
           <pre><code class="lang-kotlin">atan2(y: Double, x: Double): Double</code></pre>
           <p>The angle of the point <code>(x, y)</code> in <code>(-pi, pi]</code>, fdlibm's <code>atan2</code>. Needs the <code>kotlin.math</code> import.</p>
           <pre><code class="lang-kotlin">import kotlin.math.atan2
 fun main() { println(atan2(1.0, 1.0)) }   // 0.7853981633974483</code></pre>
         </article>
-        <article class="doc-entry" id="doc-math-22">
-          <h3><a class="doc-anchor" href="#doc-math-22">#</a> <code>sinh</code></h3>
+        <article class="doc-entry" id="doc-math-23">
+          <h3><a class="doc-anchor" href="#doc-math-23">#</a> <code>sinh</code></h3>
           <pre><code class="lang-kotlin">sinh(x: Double): Double
 cosh(x: Double): Double
 tanh(x: Double): Double</code></pre>
@@ -1330,29 +1337,29 @@ tanh(x: Double): Double</code></pre>
           <pre><code class="lang-kotlin">import kotlin.math.sinh
 fun main() { println(sinh(1.0)) }   // 1.1752011936438014</code></pre>
         </article>
-        <article class="doc-entry" id="doc-math-23">
-          <h3><a class="doc-anchor" href="#doc-math-23">#</a> <code>cbrt</code></h3>
+        <article class="doc-entry" id="doc-math-24">
+          <h3><a class="doc-anchor" href="#doc-math-24">#</a> <code>cbrt</code></h3>
           <pre><code class="lang-kotlin">cbrt(x: Double): Double</code></pre>
           <p>The real cube root, negative for a negative argument — fdlibm's <code>cbrt</code>. Needs the <code>kotlin.math</code> import.</p>
           <pre><code class="lang-kotlin">import kotlin.math.cbrt
 fun main() { println(cbrt(27.0)) }   // 3.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-math-24">
-          <h3><a class="doc-anchor" href="#doc-math-24">#</a> <code>hypot</code></h3>
+        <article class="doc-entry" id="doc-math-25">
+          <h3><a class="doc-anchor" href="#doc-math-25">#</a> <code>hypot</code></h3>
           <pre><code class="lang-kotlin">hypot(x: Double, y: Double): Double</code></pre>
           <p><code>sqrt(x*x + y*y)</code> without the intermediate overflow or underflow; an infinite argument answers <code>Infinity</code> even beside a <code>NaN</code>. fdlibm's <code>hypot</code>. Needs the <code>kotlin.math</code> import.</p>
           <pre><code class="lang-kotlin">import kotlin.math.hypot
 fun main() { println(hypot(3.0, 4.0)) }   // 5.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-math-25">
-          <h3><a class="doc-anchor" href="#doc-math-25">#</a> <code>expm1</code></h3>
+        <article class="doc-entry" id="doc-math-26">
+          <h3><a class="doc-anchor" href="#doc-math-26">#</a> <code>expm1</code></h3>
           <pre><code class="lang-kotlin">expm1(x: Double): Double</code></pre>
           <p><code>e^x - 1</code>, accurate for <code>x</code> near zero — fdlibm's <code>expm1</code>. Needs the <code>kotlin.math</code> import.</p>
           <pre><code class="lang-kotlin">import kotlin.math.expm1
 fun main() { println(expm1(1e-10)) }   // 1.00000000005E-10</code></pre>
         </article>
-        <article class="doc-entry" id="doc-math-26">
-          <h3><a class="doc-anchor" href="#doc-math-26">#</a> <code>pow</code></h3>
+        <article class="doc-entry" id="doc-math-27">
+          <h3><a class="doc-anchor" href="#doc-math-27">#</a> <code>pow</code></h3>
           <pre><code class="lang-kotlin">Double.pow(x: Double): Double
 Double.pow(n: Int): Double
 Float.pow(x: Float): Float</code></pre>
@@ -2343,198 +2350,216 @@ println(e.cause)   // java.lang.IllegalStateException: inner</code></pre>
           <pre><code class="lang-kotlin">println(listOf(1, 2).flatMapIndexed { i, v -&gt; listOf(i, v) })   // [0, 1, 1, 2]</code></pre>
         </article>
         <article class="doc-entry" id="doc-higher-order-collection-functions-5">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-5">#</a> <code>mapNotNull</code></h3>
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-5">#</a> <code>mapIndexedNotNull</code></h3>
+          <pre><code class="lang-kotlin">mapIndexedNotNull(transform: (Int, T) -&gt; R?): List&lt;R&gt;</code></pre>
+          <p>Like <code>mapIndexed</code>, but a result that is <code>null</code> is dropped instead of collected.</p>
+          <pre><code class="lang-kotlin">println(listOf(5, 3, 8).mapIndexedNotNull { i, v -&gt; if (i &gt; 0) v else null })   // [3, 8]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-6">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-6">#</a> <code>foldIndexed</code></h3>
+          <pre><code class="lang-kotlin">foldIndexed(initial: R, operation: (Int, R, T) -&gt; R): R</code></pre>
+          <p><code>fold</code> with the element's index passed first. <code>runningFoldIndexed</code> (alias <code>scanIndexed</code>) keeps every accumulator; <code>foldRightIndexed</code> walks from the end and takes <code>(index, element, acc)</code>.</p>
+          <pre><code class="lang-kotlin">println(listOf(5, 3, 8).foldIndexed(0) { i, acc, v -&gt; acc + i * v })   // 19</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-7">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-7">#</a> <code>reduceIndexed</code></h3>
+          <pre><code class="lang-kotlin">reduceIndexed(operation: (Int, T, T) -&gt; T): T</code></pre>
+          <p><code>reduce</code> with the element's index passed first. Element 0 seeds the accumulator, so the first index the lambda sees is 1. <code>reduceIndexedOrNull</code>, <code>runningReduceIndexed</code>, <code>reduceRightIndexed</code> and <code>reduceRightIndexedOrNull</code> follow the same shape; an empty receiver raises <code>UnsupportedOperationException</code> for the non-<code>OrNull</code> forms.</p>
+          <pre><code class="lang-kotlin">println(listOf(5, 3, 8).reduceIndexed { i, acc, v -&gt; acc + i * v })   // 24</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-8">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-8">#</a> <code>mapNotNull</code></h3>
           <pre><code class="lang-kotlin">mapNotNull(transform: (T) -&gt; R?): List&lt;R&gt;</code></pre>
           <p>Like <code>map</code>, but a result that is <code>null</code> is dropped instead of collected.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).mapNotNull { if (it &gt; 1) it else null })   // [2, 3]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-6">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-6">#</a> <code>onEach</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-9">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-9">#</a> <code>onEach</code></h3>
           <pre><code class="lang-kotlin">onEach(action: (T) -&gt; Unit): C</code></pre>
           <p>Runs the lambda once per element for its side effect and answers the RECEIVER, so it chains where <code>forEach</code> (which answers <code>Unit</code>) cannot. On a <code>String</code> receiver the result is the string.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2).onEach { print(it) }.size)   // 122</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-7">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-7">#</a> <code>runningFold</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-10">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-10">#</a> <code>runningFold</code></h3>
           <pre><code class="lang-kotlin">runningFold(initial: R, operation: (R, T) -&gt; R): List&lt;R&gt;</code></pre>
           <p>Like <code>fold</code>, but collects every intermediate accumulator INCLUDING the initial one, so the result is one longer than the receiver. <code>scan</code> is the same function under its other name.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).runningFold(0) { a, n -&gt; a + n })   // [0, 1, 3, 6]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-8">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-8">#</a> <code>runningReduce</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-11">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-11">#</a> <code>runningReduce</code></h3>
           <pre><code class="lang-kotlin">runningReduce(operation: (T, T) -&gt; T): List&lt;T&gt;</code></pre>
           <p>Like <code>reduce</code>, but collects every intermediate accumulator. The first element seeds it, so an empty receiver answers an empty list rather than raising.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).runningReduce { a, n -&gt; a + n })   // [1, 3, 6]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-9">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-9">#</a> <code>withIndex</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-12">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-12">#</a> <code>withIndex</code></h3>
           <pre><code class="lang-kotlin">withIndex(): List&lt;IndexedValue&lt;T&gt;&gt;</code></pre>
           <p>Pairs every element with its position. Each entry is an <code>IndexedValue</code> whose <code>index</code> and <code>value</code> are read as ordinary properties, which is what makes it print as <code>IndexedValue(index=0, value=a)</code> rather than as a <code>Pair</code>.</p>
           <pre><code class="lang-kotlin">println("ab".withIndex().map { it.index.toString() + it.value })   // [0a, 1b]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-10">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-10">#</a> <code>filter</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-13">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-13">#</a> <code>filter</code></h3>
           <pre><code class="lang-kotlin">filter(predicate: (T) -&gt; Boolean): List&lt;T&gt;</code></pre>
           <p>Keeps the elements whose predicate returns exactly <code>true</code>; a <code>null</code> or non-Boolean result counts as false. The result is always a <code>List</code>, even from a <code>Set</code> receiver.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3, 4).filter { it % 2 == 0 })   // [2, 4]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-11">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-11">#</a> <code>filterNot</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-14">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-14">#</a> <code>filterNot</code></h3>
           <pre><code class="lang-kotlin">filterNot(predicate: (T) -&gt; Boolean): List&lt;T&gt;</code></pre>
           <p>Keeps the elements whose predicate does *not* hold. There is no <code>filterNotNull</code> or <code>filterIsInstance</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).filterNot { it &gt; 2 })   // [1, 2]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-12">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-12">#</a> <code>forEach</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-15">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-15">#</a> <code>forEach</code></h3>
           <pre><code class="lang-kotlin">forEach(action: (T) -&gt; Unit): Unit</code></pre>
           <p>Runs the lambda once per element for its side effect and yields <code>Unit</code>.</p>
           <pre><code class="lang-kotlin">listOf(1, 2).forEach { print(it) }   // 12</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-13">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-13">#</a> <code>fold</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-16">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-16">#</a> <code>fold</code></h3>
           <pre><code class="lang-kotlin">fold(initial: R, operation: (R, T) -&gt; R): R</code></pre>
           <p>Threads an accumulator through the sequence left to right, starting from the given initial value. The lambda takes the accumulator first. It is the one higher-order function here that takes a non-lambda argument as well.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).fold(0) { acc, n -&gt; acc + n })   // 6</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-14">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-14">#</a> <code>foldRight</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-17">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-17">#</a> <code>foldRight</code></h3>
           <pre><code class="lang-kotlin">foldRight(initial: R, operation: (T, R) -&gt; R): R</code></pre>
           <p><code>fold</code> from the END, and — the part that catches people — its lambda takes the ELEMENT first and the accumulator second, the opposite of <code>fold</code>. Both differences show at once on the same lambda.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).foldRight("") { a, b -&gt; "$a$b" })   // 123</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-15">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-15">#</a> <code>reduce</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-18">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-18">#</a> <code>reduce</code></h3>
           <pre><code class="lang-kotlin">reduce(operation: (T, T) -&gt; T): T</code></pre>
           <p>Like <code>fold</code> but seeded with the first element instead of an explicit initial. An empty receiver raises <code>UnsupportedOperationException: Empty collection can't be reduced.</code></p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).reduce { a, b -&gt; a * b })   // 6</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-16">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-16">#</a> <code>reduceRight</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-19">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-19">#</a> <code>reduceRight</code></h3>
           <pre><code class="lang-kotlin">reduceRight(operation: (T, T) -&gt; T): T</code></pre>
           <p><code>reduce</code> from the end: seeded with the LAST element, walking backwards, with the lambda taking <code>(element, acc)</code>. Same error on an empty receiver.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).reduceRight { a, b -&gt; a - b })   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-17">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-17">#</a> <code>any</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-20">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-20">#</a> <code>any</code></h3>
           <pre><code class="lang-kotlin">any(predicate: (T) -&gt; Boolean): Boolean</code></pre>
           <p>True as soon as one element satisfies the predicate, short-circuiting on the first hit. The no-argument <code>any()</code> overload is not implemented — use <code>isNotEmpty()</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).any { it &gt; 2 })   // true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-18">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-18">#</a> <code>all</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-21">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-21">#</a> <code>all</code></h3>
           <pre><code class="lang-kotlin">all(predicate: (T) -&gt; Boolean): Boolean</code></pre>
           <p>True when every element satisfies the predicate, short-circuiting on the first failure. Vacuously true for an empty receiver.</p>
           <pre><code class="lang-kotlin">println(listOf(2, 4).all { it % 2 == 0 })   // true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-19">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-19">#</a> <code>none</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-22">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-22">#</a> <code>none</code></h3>
           <pre><code class="lang-kotlin">none(predicate: (T) -&gt; Boolean): Boolean</code></pre>
           <p>True when no element satisfies the predicate, short-circuiting on the first hit.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2).none { it &gt; 5 })   // true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-20">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-20">#</a> <code>count</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-23">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-23">#</a> <code>count</code></h3>
           <pre><code class="lang-kotlin">count(predicate: (T) -&gt; Boolean): Int</code></pre>
           <p>How many elements satisfy the predicate. Called with no argument, <code>count()</code> is instead the sequence member that reports <code>size</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).count { it &gt; 1 })   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-21">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-21">#</a> <code>sumOf</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-24">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-24">#</a> <code>sumOf</code></h3>
           <pre><code class="lang-kotlin">sumOf(selector: (T) -&gt; Int): Int
 sumOf(selector: (T) -&gt; Double): Double</code></pre>
           <p>Sums the lambda's results, yielding an <code>Int</code> when every one is integral and a <code>Double</code> otherwise — the same rule <code>sum()</code> uses.</p>
           <pre><code class="lang-kotlin">println(listOf("ab", "c").sumOf { it.length })   // 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-22">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-22">#</a> <code>maxByOrNull</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-25">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-25">#</a> <code>maxByOrNull</code></h3>
           <pre><code class="lang-kotlin">maxByOrNull(selector: (T) -&gt; R): T?</code></pre>
           <p>The element whose selector value is largest, or <code>null</code> when the receiver is empty. Ties keep the first such element. The selector runs once per element.</p>
           <pre><code class="lang-kotlin">println(listOf("a", "abc").maxByOrNull { it.length })   // abc</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-23">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-23">#</a> <code>minByOrNull</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-26">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-26">#</a> <code>minByOrNull</code></h3>
           <pre><code class="lang-kotlin">minByOrNull(selector: (T) -&gt; R): T?</code></pre>
           <p>The element whose selector value is smallest, or <code>null</code> on an empty receiver, keeping the first of any tie.</p>
           <pre><code class="lang-kotlin">println(listOf("abc", "a").minByOrNull { it.length })   // a</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-24">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-24">#</a> <code>sortedBy</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-27">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-27">#</a> <code>sortedBy</code></h3>
           <pre><code class="lang-kotlin">sortedBy(selector: (T) -&gt; R): List&lt;T&gt;</code></pre>
           <p>Ascending sort by the selector's value, evaluated once per element and stable — equal keys keep their input order.</p>
           <pre><code class="lang-kotlin">println(listOf("abc", "a").sortedBy { it.length })   // [a, abc]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-25">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-25">#</a> <code>sortedByDescending</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-28">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-28">#</a> <code>sortedByDescending</code></h3>
           <pre><code class="lang-kotlin">sortedByDescending(selector: (T) -&gt; R): List&lt;T&gt;</code></pre>
           <p>Descending sort by the selector's value. The comparison is flipped rather than the result reversed, so ties still come out in input order as Kotlin requires.</p>
           <pre><code class="lang-kotlin">println(listOf("a", "abc").sortedByDescending { it.length })   // [abc, a]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-26">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-26">#</a> <code>sortedWith</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-29">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-29">#</a> <code>sortedWith</code></h3>
           <pre><code class="lang-kotlin">sortedWith(comparator: Comparator&lt;T&gt;): List&lt;T&gt;
 sortedWith(compare: (T, T) -&gt; Int): List&lt;T&gt;</code></pre>
           <p>Stable sort under an explicit ordering — either a <code>Comparator</code> from <code>compareBy</code> or a plain two-argument lambda answering a negative/zero/positive <code>Int</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(3, 1, 2).sortedWith(compareBy { it }))       // [1, 2, 3]
 println(listOf(3, 1, 2).sortedWith { a, b -&gt; b - a })       // [3, 2, 1]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-27">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-27">#</a> <code>compareBy</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-30">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-30">#</a> <code>compareBy</code></h3>
           <pre><code class="lang-kotlin">compareBy(vararg selectors: (T) -&gt; R): Comparator&lt;T&gt;</code></pre>
           <p>Builds a <code>Comparator</code> from one or more key selectors, compared left to right with the first non-equal key deciding. Extend it with <code>thenBy</code>/<code>thenByDescending</code>.</p>
           <pre><code class="lang-kotlin">println(listOf(3, 1, 2).sortedWith(compareBy { it }))   // [1, 2, 3]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-28">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-28">#</a> <code>compareByDescending</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-31">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-31">#</a> <code>compareByDescending</code></h3>
           <pre><code class="lang-kotlin">compareByDescending(vararg selectors: (T) -&gt; R): Comparator&lt;T&gt;</code></pre>
           <p><code>compareBy</code> with every key reversed.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 3, 2).sortedWith(compareByDescending { it }))   // [3, 2, 1]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-29">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-29">#</a> <code>thenBy</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-32">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-32">#</a> <code>thenBy</code></h3>
           <pre><code class="lang-kotlin">Comparator&lt;T&gt;.thenBy(selector: (T) -&gt; R): Comparator&lt;T&gt;</code></pre>
           <p>A NEW comparator with one more key appended as a tiebreak — the receiver is unchanged, as Kotlin's immutable comparators are. The added key is consulted only when every earlier key ties.</p>
           <pre><code class="lang-kotlin">val byLen = compareBy&lt;String&gt; { it.length }
 println(listOf("cc", "a", "bb").sortedWith(byLen.thenBy { it }))   // [a, bb, cc]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-30">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-30">#</a> <code>thenByDescending</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-33">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-33">#</a> <code>thenByDescending</code></h3>
           <pre><code class="lang-kotlin">Comparator&lt;T&gt;.thenByDescending(selector: (T) -&gt; R): Comparator&lt;T&gt;</code></pre>
           <p><code>thenBy</code> with the added key reversed. Each key carries its own direction, so an ascending key can be broken by a descending one.</p>
           <pre><code class="lang-kotlin">val byLen = compareBy&lt;String&gt; { it.length }
 println(listOf("cc", "a", "bb").sortedWith(byLen.thenByDescending { it }))   // [a, cc, bb]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-31">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-31">#</a> <code>associate</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-34">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-34">#</a> <code>associate</code></h3>
           <pre><code class="lang-kotlin">associate(transform: (T) -&gt; Pair&lt;K, V&gt;): Map&lt;K, V&gt;</code></pre>
           <p>Builds a <code>Map</code> from the <code>Pair</code> each lambda call returns. A lambda result that is not a <code>Pair</code> raises <code>kotlin: associate expects a Pair</code>. Later duplicate keys overwrite earlier ones.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2).associate { it to it * it })   // {1=1, 2=4}</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-32">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-32">#</a> <code>associateBy</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-35">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-35">#</a> <code>associateBy</code></h3>
           <pre><code class="lang-kotlin">associateBy(keySelector: (T) -&gt; K): Map&lt;K, T&gt;</code></pre>
           <p>Builds a <code>Map</code> whose keys are the lambda's results and whose values are the elements — the mirror image of <code>associateWith</code>.</p>
           <pre><code class="lang-kotlin">println(listOf("ab", "c").associateBy { it.length })   // {2=ab, 1=c}</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-33">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-33">#</a> <code>associateWith</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-36">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-36">#</a> <code>associateWith</code></h3>
           <pre><code class="lang-kotlin">associateWith(valueSelector: (T) -&gt; V): Map&lt;T, V&gt;</code></pre>
           <p>Builds a <code>Map</code> keyed by the elements, with the lambda's results as the values.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3).associateWith { it * 2 })   // {1=2, 2=4, 3=6}</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-34">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-34">#</a> <code>groupBy</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-37">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-37">#</a> <code>groupBy</code></h3>
           <pre><code class="lang-kotlin">groupBy(keySelector: (T) -&gt; K): Map&lt;K, List&lt;T&gt;&gt;</code></pre>
           <p>Buckets the elements by the lambda's result. Keys appear in first-encounter order and each bucket keeps its elements in input order.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3, 4).groupBy { it % 2 })   // {1=[1, 3], 0=[2, 4]}</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-35">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-35">#</a> <code>groupingBy</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-38">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-38">#</a> <code>groupingBy</code></h3>
           <pre><code class="lang-kotlin">groupingBy(keySelector: (T) -&gt; K): Grouping&lt;T, K&gt;</code></pre>
           <p>Pairs the source with a key selector and does no work yet — the result is consumed by a terminal operation such as <code>eachCount</code>. That laziness is the difference from <code>groupBy</code>, which materializes the per-key lists.</p>
           <pre><code class="lang-kotlin">println(listOf(1, 2, 3, 4).groupingBy { it % 2 }.eachCount())   // {1=2, 0=2}</code></pre>
         </article>
-        <article class="doc-entry" id="doc-higher-order-collection-functions-36">
-          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-36">#</a> <code>eachCount</code></h3>
+        <article class="doc-entry" id="doc-higher-order-collection-functions-39">
+          <h3><a class="doc-anchor" href="#doc-higher-order-collection-functions-39">#</a> <code>eachCount</code></h3>
           <pre><code class="lang-kotlin">eachCount(): Map&lt;K, Int&gt;</code></pre>
           <p>How many elements fell under each key of a <code>Grouping</code>. The keys come out in first-encounter order, as the <code>LinkedHashMap</code> it fills.</p>
           <pre><code class="lang-kotlin">println(listOf("a", "bb", "cc").groupingBy { it.length }.eachCount())   // {1=1, 2=2}</code></pre>

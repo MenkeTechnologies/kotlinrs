@@ -7141,3 +7141,33 @@ fn char_classes_come_from_the_jdks_tables() {
         "[false, false, false, true, true]\n[false, false, true, false]\n10\n15\nnull\nChar 8 is not a digit in the given radix=8\n"
     );
 }
+
+#[test]
+fn indexed_folds_pass_the_position_first() {
+    // Expected values measured on kotlinc 2.4.21 / JRE 21. A reduction's first
+    // index is 1 (the seed is element 0); a right fold walks from `size - 2`
+    // and takes `(index, element, acc)`; `Int` accumulators still wrap.
+    assert_eq!(
+        stdout(
+            "fun main() {\n\
+             val l = listOf(5, 3, 8)\n\
+             println(l.foldIndexed(0) { i, a, v -> a + i * v })\n\
+             println(l.foldRightIndexed(\"\") { i, v, a -> a + \"$i$v\" })\n\
+             println(l.reduceIndexed { i, a, v -> a + i * v })\n\
+             println(emptyList<Int>().reduceIndexedOrNull { i, a, v -> a + v })\n\
+             println(l.reduceRightIndexed { i, v, a -> a - i * v })\n\
+             println(l.runningFoldIndexed(1) { i, a, v -> a * v + i }); println(l.scanIndexed(0) { i, a, v -> a + i })\n\
+             println(l.runningReduceIndexed { i, a, v -> a + i * v })\n\
+             println(l.mapIndexedNotNull { i, v -> if (i > 0) v * 2 else null })\n\
+             println(\"abc\".foldIndexed(\"\") { i, a, c -> a + i + c })\n\
+             println(sequenceOf(1, 2, 3).mapIndexedNotNull { i, v -> if (i == 1) null else v }.toList())\n\
+             println(listOf(Int.MAX_VALUE, 1).foldIndexed(0) { i, a, v -> a + v + i })\n\
+             println(runCatching { emptyList<Int>().reduceIndexed { i, a, v -> a + v } }.exceptionOrNull()?.message)\n\
+             println(runCatching { emptyArray<String>().reduceIndexed { i, a, v -> a } }.exceptionOrNull()?.message)\n\
+             println(runCatching { emptyList<Int>().reduceRightIndexed { i, a, v -> a } }.exceptionOrNull()?.message)\n\
+             }"
+        ),
+        "19\n281305\n24\nnull\n5\n[1, 5, 16, 130]\n[0, 0, 1, 3]\n[5, 8, 24]\n[6, 16]\n0a1b2c\n[1, 3]\n-2147483647\n\
+         Empty collection can't be reduced.\nEmpty array can't be reduced.\nEmpty list can't be reduced.\n"
+    );
+}

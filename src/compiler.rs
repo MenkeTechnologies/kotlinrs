@@ -12210,8 +12210,24 @@ impl Compiler {
             ],
             "reduce" | "reduceOrNull" => vec![(elem, inner), (elem, inner)],
             // The index-first pairs.
-            "mapIndexed" | "filterIndexed" | "forEachIndexed" => {
+            "mapIndexed" | "filterIndexed" | "forEachIndexed" | "mapIndexedNotNull" => {
                 vec![(Type::Int, Type::Unknown), (elem, inner)]
+            }
+            // The indexed folds: the position first, then the plain form's
+            // accumulator and element in their usual order.
+            "foldIndexed" | "runningFoldIndexed" | "scanIndexed" => vec![
+                (Type::Int, Type::Unknown),
+                (first_extra().unwrap_or(Type::Unknown), Type::Unknown),
+                (elem, inner),
+            ],
+            "foldRightIndexed" => vec![
+                (Type::Int, Type::Unknown),
+                (elem, inner),
+                (first_extra().unwrap_or(Type::Unknown), Type::Unknown),
+            ],
+            "reduceIndexed" | "reduceIndexedOrNull" | "runningReduceIndexed" | "reduceRightIndexed"
+            | "reduceRightIndexedOrNull" => {
+                vec![(Type::Int, Type::Unknown), (elem, inner), (elem, inner)]
             }
             // `zip(other) { a, b }` — one element from each side.
             "zip" => vec![
@@ -13910,6 +13926,7 @@ fn is_coll_hof(name: &str) -> bool {
             | "onEach"
             | "mapNotNull"
             | "flatMapIndexed"
+            | "mapIndexedNotNull"
             | "runningFold"
             | "scan"
             | "runningReduce"
@@ -13920,6 +13937,15 @@ fn is_coll_hof(name: &str) -> bool {
             | "reduceOrNull"
             | "reduceRight"
             | "reduceRightOrNull"
+            | "foldIndexed"
+            | "foldRightIndexed"
+            | "runningFoldIndexed"
+            | "scanIndexed"
+            | "reduceIndexed"
+            | "reduceIndexedOrNull"
+            | "runningReduceIndexed"
+            | "reduceRightIndexed"
+            | "reduceRightIndexedOrNull"
             | "any"
             | "all"
             | "none"

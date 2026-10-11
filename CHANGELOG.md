@@ -11,6 +11,18 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Round 9 — indexed folds and other missing stdlib members
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, compiled and run on the same JVM.
+
+| program | before | reference |
+| --- | --- | --- |
+| `listOf(5, 3, 8).foldIndexed(0) { i, a, v -> a + i * v }` | `unresolved reference: foldIndexed on List` | `19` |
+| `l.reduceIndexed { i, a, v -> a + i * v }`, `reduceIndexedOrNull`, `runningReduceIndexed` | unresolved | `24`, the first index is 1 |
+| `l.foldRightIndexed("") { i, v, a -> a + "$i$v" }`, `reduceRightIndexed(OrNull)` | unresolved | `281305` |
+| `l.runningFoldIndexed(1) { … }` / `scanIndexed` | unresolved | `[1, 5, 16, 130]` |
+| `l.mapIndexedNotNull { i, v -> if (i > 0) v * 2 else null }` | unresolved | `[6, 16]` |
+
 ## Round 8 — constructors that have an object, defaults in the callee, receiver function types
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12, compiled and run on the same JVM.
