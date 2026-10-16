@@ -220,6 +220,10 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 - **`ArrayDeque`** — `addFirst`/`addLast`/`removeFirst`/`removeLast` and the
   `OrNull` pair over a mutable list, with the deque's own fault wording
   (`ArrayDeque is empty.`, `index: 5, size: 2`).
+  Under `import java.util.ArrayDeque` the `Deque` members work too (`offer…`/`push`/
+  `poll…`/`pop`/`peek…`/`element`, the throwing ones with the JDK's messageless
+  `NoSuchElementException`). `java.util.Objects` supplies `hash`, `equals`,
+  `isNull`, `nonNull` and one-argument `requireNonNull`.
 - **`java.util.PriorityQueue`** — under `import java.util.PriorityQueue` (or
   `java.util.*`, or written qualified): natural order, a comparator lambda or
   `compareBy` chain, or a source collection; `add`/`offer`/`addAll`,

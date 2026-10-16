@@ -12313,6 +12313,50 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 )),
             };
         }
+        // `java.util.ArrayDeque`'s `Deque` members, which a program reaches
+        // under `import java.util.ArrayDeque`. The throwing forms fault with the
+        // JDK's MESSAGELESS `NoSuchElementException`, not Kotlin's wording.
+        "offer" | "offerLast" | "offerFirst" | "push" | "poll" | "pollFirst" | "pollLast"
+        | "pop" | "peek" | "peekFirst" | "peekLast" | "element" | "getFirst" | "getLast"
+            if is_deque(Some(recv)) && args.len() == usize::from(name.starts_with("offer") || name == "push") =>
+        {
+            let v = args.first().cloned();
+            let front = matches!(
+                name,
+                "offerFirst" | "push" | "poll" | "pollFirst" | "pop" | "peek" | "peekFirst"
+                    | "element" | "getFirst"
+            );
+            let take = matches!(name, "poll" | "pollFirst" | "pollLast" | "pop");
+            let out = with_obj_mut(recv, |o| match o {
+                HeapObj::List(items) => Some(match v {
+                    Some(v) => {
+                        if front {
+                            items.insert(0, v);
+                        } else {
+                            items.push(v);
+                        }
+                        None
+                    }
+                    None if items.is_empty() => None,
+                    None if take && front => Some(items.remove(0)),
+                    None if take => items.pop(),
+                    None if front => items.first().cloned(),
+                    None => items.last().cloned(),
+                }),
+                _ => None,
+            })
+            .flatten()
+            .flatten();
+            return match (out, name) {
+                (Some(v), _) => Ok(v),
+                (None, "offer" | "offerLast" | "offerFirst") => Ok(Value::Bool(true)),
+                (None, "push") => Ok(Value::Undef),
+                (None, "pop" | "element" | "getFirst" | "getLast") if deque_len(recv) == 0 => {
+                    Err("java.util.NoSuchElementException".into())
+                }
+                (None, _) => Ok(Value::Undef),
+            };
+        }
         // `entries` is the `Map.Entry` SET — a `Set`, not a list, which is what
         // makes `entries.hashCode()` the sum of the entry hashes rather than a
         // 31-fold and `keys == setOf(…)` order-insensitive. Each entry is a
@@ -16419,4 +16463,13 @@ fn system_nanos() -> i64 {
         .get_or_init(std::time::Instant::now)
         .elapsed()
         .as_nanos() as i64
+}
+
+/// The element count of a list-backed receiver, 0 for anything else.
+fn deque_len(recv: &Value) -> usize {
+    with_obj(recv, |o| match o {
+        HeapObj::List(items) => items.len(),
+        _ => 0,
+    })
+    .unwrap_or(0)
 }

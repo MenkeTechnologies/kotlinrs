@@ -7426,3 +7426,40 @@ fn long_width_survives_seeds_equals_and_collection_operators() {
         "L\n[L, L, L]\n[3]\n[4]\n[L, L, L, L]\n[2]\n[2]\ntrue\ntrue\nfalse\ntrue\n[1]\n[1]\n[1]\n[1]\n[]\n4000000000\n8000000000\n[1, 2]\n[3, 5]\n[1, 3]\n[1]\n[L]\n"
     );
 }
+
+#[test]
+fn java_deque_members_and_objects_statics() {
+    // Measured on kotlinc 2.4.21 / JRE 21: under `import java.util.ArrayDeque` the
+    // deque answers `offer`/`push`/`poll`/`pop`/`peek…`/`element` with the JDK's
+    // messageless `NoSuchElementException`, and `java.util.Objects` supplies
+    // `hash`/`equals`/`isNull`/`nonNull`/`requireNonNull`.
+    assert_eq!(
+        stdout(
+            "import java.util.ArrayDeque\n\
+             import java.util.Objects\n\
+             data class Pt(val x: Int, val y: String?) {\n\
+                 override fun hashCode() = Objects.hash(x, y)\n\
+                 override fun equals(other: Any?) = other is Pt && Objects.equals(x, other.x) && Objects.equals(y, other.y)\n\
+             }\n\
+             fun main() {\n\
+                 val dq = ArrayDeque<Int>()\n\
+                 println(dq.offer(1)); dq.offerFirst(0); dq.offerLast(2); dq.push(-1)\n\
+                 println(dq); println(dq.peek()); println(dq.peekFirst()); println(dq.peekLast())\n\
+                 println(dq.poll()); println(dq.pollLast()); println(dq.pop()); println(dq)\n\
+                 println(dq.size); println(dq.isEmpty()); println(dq.element())\n\
+                 dq.clear()\n\
+                 val n1: Int? = dq.poll(); val n2: Int? = dq.peek(); val n3: Int? = dq.pollFirst(); val n4: Int? = dq.peekLast(); val n5: Int? = dq.pollLast(); println(\"$n1 $n2 $n3 $n4 $n5\")\n\
+                 try { dq.pop() } catch (e: NoSuchElementException) { println(\"pop: ${e.message}\") }\n\
+                 try { dq.element() } catch (e: NoSuchElementException) { println(\"element: ${e.message}\") }\n\
+                 val bfs = ArrayDeque<Int>(); bfs.add(1); val seen = mutableSetOf(1)\n\
+                 while (bfs.isNotEmpty()) { val n = bfs.poll(); if (n < 20) for (m in listOf(n * 2, n * 3)) if (seen.add(m)) bfs.offer(m) }\n\
+                 println(seen.sorted())\n\
+                 println(Objects.hash(1, 2, 3)); println(Objects.hash(\"a\", null)); println(Objects.hash()); println(Pt(1, \"a\").hashCode())\n\
+                 println(Pt(1, \"a\") == Pt(1, \"a\")); println(Objects.equals(null, null)); println(Objects.equals(\"a\", null))\n\
+                 println(Objects.isNull(null)); println(Objects.nonNull(3)); println(Objects.requireNonNull(\"z\"))\n\
+                 try { Objects.requireNonNull<String?>(null) } catch (e: NullPointerException) { println(\"npe\") }\n\
+             }"
+        ),
+        "true\n[-1, 0, 1, 2]\n-1\n-1\n2\n-1\n2\n0\n[1]\n1\nfalse\n1\nnull null null null null\npop: null\nelement: null\n[1, 2, 3, 4, 6, 8, 9, 12, 16, 18, 24, 27, 32, 36, 48, 54]\n30817\n3968\n1\n1089\ntrue\ntrue\nfalse\ntrue\ntrue\nz\nnpe\n"
+    );
+}

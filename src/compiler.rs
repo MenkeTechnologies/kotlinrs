@@ -6855,6 +6855,44 @@ impl Compiler {
                         return self.compile_member(sc, &args[0], m, &[], false, line);
                     }
                 }
+                // `java.util.Objects` statics, as the Kotlin forms they abbreviate.
+                // `hash` is `Arrays.hashCode`, which is `List.hashCode` of the
+                // arguments.
+                "Objects" | "java.util.Objects" if name == "hash" => {
+                    let list = Expr::Call {
+                        name: "listOf".to_string(),
+                        args: args.to_vec(),
+                        line,
+                    };
+                    return self.compile_member(sc, &list, "hashCode", &[], false, line);
+                }
+                "Objects" | "java.util.Objects" if name == "equals" && args.len() == 2 => {
+                    let eq = Expr::Binary {
+                        op: BinOp::Eq,
+                        l: Box::new(args[0].clone()),
+                        r: Box::new(args[1].clone()),
+                    };
+                    return self.compile_expr(sc, &eq);
+                }
+                "Objects" | "java.util.Objects" if name == "isNull" && args.len() == 1 => {
+                    let test = Expr::Binary {
+                        op: BinOp::Eq,
+                        l: Box::new(args[0].clone()),
+                        r: Box::new(Expr::Null),
+                    };
+                    return self.compile_expr(sc, &test);
+                }
+                "Objects" | "java.util.Objects" if name == "nonNull" && args.len() == 1 => {
+                    let test = Expr::Binary {
+                        op: BinOp::Ne,
+                        l: Box::new(args[0].clone()),
+                        r: Box::new(Expr::Null),
+                    };
+                    return self.compile_expr(sc, &test);
+                }
+                "Objects" | "java.util.Objects" if name == "requireNonNull" && args.len() == 1 => {
+                    return self.compile_expr(sc, &Expr::NotNull(Box::new(args[0].clone())));
+                }
                 // `java.lang.System` — auto-imported on the JVM like `Math` —
                 // and `kotlin.system`, written out instead of imported.
                 "System" | "java.lang.System" | "kotlin.system"
