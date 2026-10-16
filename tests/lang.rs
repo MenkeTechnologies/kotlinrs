@@ -7284,3 +7284,50 @@ fn component_n_past_the_end_of_a_list_or_array_raises_the_get_fault() {
          IndexOutOfBoundsException: Index: 1, Size: 1\n"
     );
 }
+
+#[test]
+fn exit_process_ends_the_run_with_its_status_and_skips_finally() {
+    // Measured on kotlinc 2.4.21 / JRE 21: `exitProcess(7)` inside `try` ends the
+    // JVM with status 7 without running `finally`; `main`'s `args` is an empty
+    // array; the `System` statics and `System.out`/`System.err` resolve with no
+    // import; and a default-imported package may be spelled out in full.
+    let out = eval(
+        "import kotlin.system.exitProcess\n\
+         import kotlin.system.measureTimeMillis\n\
+         fun main(args: Array<String>) {\n\
+         println(args.size)\n\
+         println(args.isEmpty())\n\
+         println(measureTimeMillis { var s = 0L; for (i in 1..100) s += i } >= 0L)\n\
+         println(System.currentTimeMillis() > 1_600_000_000_000L)\n\
+         println(System.nanoTime() - System.nanoTime() <= 0L)\n\
+         println(System.lineSeparator() == \"\\n\")\n\
+         println(System.getenv(\"NO_SUCH_VAR_X_Y_Z\") == null)\n\
+         System.out.println(\"out \" + 1)\n\
+         System.out.print(\"a\"); System.out.print('b'); System.out.println()\n\
+         System.err.println(\"to stderr\")\n\
+         println(kotlin.collections.listOf(1, 2).map { it * 2 })\n\
+         try {\n\
+         println(\"in try\")\n\
+         if (args.isEmpty()) exitProcess(7)\n\
+         } finally {\n\
+         println(\"finally must not run\")\n\
+         }\n\
+         println(\"not reached\")\n\
+         }",
+    );
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "0\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\nout 1\nab\n[2, 4]\nin try\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "to stderr\n");
+}
+
+#[test]
+fn system_exit_flushes_pending_output() {
+    // Measured on kotlinc 2.4.21 / JRE 21: `System.exit(3)` ends the run with
+    // status 3 after a `print` that had not yet seen its newline.
+    let out = eval("fun main() { print(\"partial\"); System.exit(3) }");
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "partial");
+}

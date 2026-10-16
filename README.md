@@ -554,6 +554,13 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   and the `java.lang.Math` statics, which need no import. `round` and
   `Math.round` differ as they do in Kotlin — half-to-even returning `Double`
   versus half-up returning `Long`.
+- **Process and clock** — `exitProcess(n)` / `System.exit(n)` end the run with
+  that status (no `finally` runs, pending output is flushed), `System.currentTimeMillis()`,
+  `System.nanoTime()`, `System.lineSeparator()`, `System.getenv(name)`,
+  `measureTimeMillis { … }` / `measureNanoTime { … }`, and
+  `System.out`/`System.err` `print`/`println`. `main(args)` receives an empty
+  `Array<String>`. A default-imported package may be spelled out
+  (`kotlin.collections.listOf(1)`).
 - **First-class lambdas** — `{ it * 2 }`, `{ a, b -> a + b }`, function-type
   values (`val f: (Int) -> Int = …`) and parameters (`fun apply(f: (Int) -> Int, x: Int) = f(x)`);
   store, pass, return, and invoke (`f(3)`); trailing-lambda call syntax; captures

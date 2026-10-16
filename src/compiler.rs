@@ -34,7 +34,7 @@ use crate::host::{
     KT_MATH, KT_METHOD_VM, KT_NEW, KT_NLR_MATCH, KT_NLR_RAISE, KT_NLR_TAKE, KT_NOTNULL,
     KT_OBJEQ_VM, KT_OBSERVE, KT_OPER_REG, KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN,
     KT_RANDOM, KT_RANGE, KT_RANGE_STEP, KT_REIFIED, KT_REIFY, KT_RESULT_HOF, KT_RUN_CATCHING,
-    KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_STR_ORDER, KT_TOSTRING_REG, KT_TO_STRING,
+    KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_STR_ORDER, KT_SYSTEM, KT_TOSTRING_REG, KT_TO_STRING,
     KT_TYPE_REG, KT_YIELD,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
@@ -3071,8 +3071,12 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
     }
 
     let main_idx = c.b.add_name("main");
+    // `main(args: Array<String>)` receives an empty `String` array: the script
+    // runner passes the program no arguments.
     for _ in &main.params {
-        c.b.emit(Op::MakeArray(0), main.line);
+        let didx = c.b.add_constant(Value::str("[Ljava.lang.String;"));
+        c.b.emit(Op::LoadConst(didx), main.line);
+        c.b.emit(Op::Extended(KT_ARRAY, 0), main.line);
     }
     c.b.emit(Op::Call(main_idx, main.params.len() as u8), main.line);
     c.b.emit(Op::Pop, main.line);
@@ -6834,6 +6838,35 @@ impl Compiler {
                         return self.compile_member(sc, &args[0], m, &[], false, line);
                     }
                 }
+                // `java.lang.System` — auto-imported on the JVM like `Math` —
+                // and `kotlin.system`, written out instead of imported.
+                "System" | "java.lang.System" | "kotlin.system"
+                    if is_system_member(name, args.len()) =>
+                {
+                    return self.compile_system(sc, name, args, line);
+                }
+                "System.out" | "java.lang.System.out"
+                    if matches!(name, "println" | "print") && args.len() <= 1 =>
+                {
+                    return self.compile_call(sc, name, args, line);
+                }
+                "System.out" | "java.lang.System.out" if name == "flush" && args.is_empty() => {
+                    self.b.emit(Op::LoadUndef, line);
+                    return Ok(Type::Unit);
+                }
+                "System.err" | "java.lang.System.err"
+                    if matches!(name, "println" | "print") && args.len() <= 1 =>
+                {
+                    return self.compile_system(sc, &format!("err.{name}"), args, line);
+                }
+                // A default-imported package spelled out:
+                // `kotlin.collections.listOf(1)` is the free function `listOf(1)`.
+                "kotlin" | "kotlin.collections" | "kotlin.text" | "kotlin.io" | "kotlin.ranges"
+                | "kotlin.sequences" | "kotlin.comparisons"
+                    if name.starts_with(|c: char| c.is_ascii_lowercase()) =>
+                {
+                    return self.compile_call(sc, name, args, line);
+                }
                 // `Integer.MAX_VALUE`, `java.lang.Long.MIN_VALUE`, … — the JDK
                 // box classes' constants are the Kotlin primitives' own.
                 _ if args.is_empty() => {
@@ -9219,6 +9252,11 @@ impl Compiler {
                 self.compile_expr(sc, &args[0])?;
                 self.b.emit(Op::CallBuiltin(KT_RUN_CATCHING, 0), line);
                 Ok(Type::Obj)
+            }
+            "exitProcess" | "measureTimeMillis" | "measureNanoTime"
+                if is_system_member(name, args.len()) =>
+            {
+                self.compile_system(sc, name, args, line)
             }
             // `run { … }` with no receiver: a block evaluated on the spot for
             // its value. The closure takes no parameter at all, which is what
@@ -14693,4 +14731,66 @@ fn recv_lambda(p: &Param, a: &Expr) -> Option<Expr> {
         ],
         line: 0,
     })
+}
+
+/// Whether `name` with `argc` arguments is a `java.lang.System` static or a
+/// `kotlin.system` function [`Compiler::compile_system`] lowers.
+fn is_system_member(name: &str, argc: usize) -> bool {
+    matches!(
+        (name, argc),
+        ("exit" | "exitProcess" | "getenv" | "measureTimeMillis" | "measureNanoTime", 1)
+            | ("currentTimeMillis" | "nanoTime" | "lineSeparator", 0)
+    )
+}
+
+impl Compiler {
+    /// The `System` statics, `exitProcess` and the `measure…` timers — all one
+    /// host builtin ([`KT_SYSTEM`]) keyed by member name. The `measure…` forms
+    /// read the clock, run the block, and ask the host for the elapsed time.
+    fn compile_system(
+        &mut self,
+        sc: &mut Scope,
+        name: &str,
+        args: &[Expr],
+        line: u32,
+    ) -> Result<Type, String> {
+        let (member, ty) = match name {
+            "exit" | "exitProcess" => ("exit", Type::Unit),
+            "currentTimeMillis" | "nanoTime" => (name, Type::Long),
+            "lineSeparator" => (name, Type::String),
+            "getenv" => (name, Type::Unknown),
+            "err.println" | "err.print" => (name, Type::Unit),
+            "measureTimeMillis" | "measureNanoTime" => {
+                let elapsed = if name == "measureTimeMillis" {
+                    "elapsedMillis"
+                } else {
+                    "elapsedNanos"
+                };
+                let start = sc.temp();
+                let nidx = self.b.add_constant(Value::str("nanoTime"));
+                self.b.emit(Op::LoadConst(nidx), line);
+                self.b.emit(Op::CallBuiltin(KT_SYSTEM, 0), line);
+                self.b.emit(Op::SetSlot(start), line);
+                self.compile_expr(sc, &args[0])?;
+                self.b.emit(Op::CallBuiltin(KT_CLOSURE_CALL, 0), line);
+                self.b.emit(Op::Pop, line);
+                self.b.emit(Op::GetSlot(start), line);
+                let eidx = self.b.add_constant(Value::str(elapsed));
+                self.b.emit(Op::LoadConst(eidx), line);
+                self.b.emit(Op::CallBuiltin(KT_SYSTEM, 1), line);
+                return Ok(Type::Long);
+            }
+            _ => return Err(format!("unresolved reference: System.{name}")),
+        };
+        for a in args {
+            let t = self.compile_expr(sc, a)?;
+            if member.starts_with("err.") {
+                self.emit_display(t);
+            }
+        }
+        let nidx = self.b.add_constant(Value::str(member));
+        self.b.emit(Op::LoadConst(nidx), line);
+        self.b.emit(Op::CallBuiltin(KT_SYSTEM, args.len() as u8), line);
+        Ok(ty)
+    }
 }

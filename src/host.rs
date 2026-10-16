@@ -560,6 +560,11 @@ pub const KT_OPER_REG: u16 = 148;
 /// and `true` by bytes. Stack: `[a, b]`; the payload picks the operator
 /// (0 `<`, 1 `>`, 2 `<=`, 3 `>=`); pushes a `Bool`.
 pub const KT_STR_ORDER: u16 = 149;
+/// Builtin id for the `java.lang.System` statics and `kotlin.system.exitProcess`.
+/// Stack: `[arg0 .. argN, nameStr]` with the member name on top; pushes the
+/// result (`Undef` for a `Unit` member). `exit` flushes both streams and ends the
+/// process with the given status, as the JVM does: no `finally` block runs.
+pub const KT_SYSTEM: u16 = 150;
 /// Builtin id for `throw e`: pops the throwable and makes it the in-flight
 /// exception. Returns `Undef` (a `throw` expression's value is never observed).
 pub const KT_EXC_THROW: u16 = 111;
@@ -4733,6 +4738,7 @@ fn register_builtins(vm: &mut VM) {
     vm.register_builtin(KT_ARRAY_INIT, b_array_init);
     vm.register_builtin(KT_PRINTLN, b_println);
     vm.register_builtin(KT_PRINT, b_print);
+    vm.register_builtin(KT_SYSTEM, b_system);
     vm.register_builtin(KT_DISPLAY, b_display);
     vm.register_builtin(KT_JOIN, b_join);
     vm.register_builtin(KT_OBJEQ_VM, b_objeq);
@@ -16348,4 +16354,63 @@ fn range_ends(v: &Value) -> Option<(i64, i64)> {
         _ => None,
     })
     .flatten()
+}
+
+/// `KT_SYSTEM` — see [`KT_SYSTEM`].
+fn b_system(vm: &mut VM, argc: u8) -> Value {
+    use std::io::Write;
+    let name = vm.pop().to_str();
+    let mut args = Vec::with_capacity(argc as usize);
+    for _ in 0..argc {
+        args.push(vm.pop());
+    }
+    args.reverse();
+    let text = |args: &[Value]| args.first().map(|v| v.to_str()).unwrap_or_default();
+    match name.as_str() {
+        "exit" => {
+            let code = args.first().map_or(0, |v| v.to_int()) as i32;
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            std::process::exit(code);
+        }
+        "currentTimeMillis" => {
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis());
+            Value::Int(ms as i64)
+        }
+        "nanoTime" => Value::Int(system_nanos()),
+        "elapsedMillis" | "elapsedNanos" => {
+            let since = args.first().map_or(0, |v| v.to_int());
+            let ns = system_nanos() - since;
+            Value::Int(if name == "elapsedMillis" { ns / 1_000_000 } else { ns })
+        }
+        "lineSeparator" => Value::str("\n"),
+        "getenv" => match std::env::var(text(&args)) {
+            Ok(v) => Value::str(v),
+            Err(_) => Value::Undef,
+        },
+        "err.println" | "err.print" => {
+            if !unwinding() {
+                let _ = std::io::stdout().flush();
+                if name == "err.println" {
+                    eprintln!("{}", text(&args));
+                } else {
+                    eprint!("{}", text(&args));
+                }
+            }
+            Value::Undef
+        }
+        _ => Value::Undef,
+    }
+}
+
+/// `System.nanoTime()`: nanoseconds on a monotonic clock whose origin is the
+/// first read, which is all the JVM promises about the value.
+fn system_nanos() -> i64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos() as i64
 }
