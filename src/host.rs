@@ -13944,7 +13944,19 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
         | HeapObj::Exc { .. } => None,
     })
     .flatten()
-    .ok_or_else(|| format!("no component{n} on {}", obj_label(recv)))
+    .ok_or_else(|| {
+        // `List.componentN` / `Array.componentN` are `get(N - 1)`, so a short
+        // receiver raises the same index fault `get` does.
+        let len = with_obj(recv, |o| match o {
+            HeapObj::List(items) | HeapObj::Array { items, .. } => Some(items.len()),
+            _ => None,
+        })
+        .flatten();
+        match len {
+            Some(len) => index_fault(seq_kind_of(recv), Some(recv), n as i64 - 1, len),
+            None => format!("no component{n} on {}", obj_label(recv)),
+        }
+    })
 }
 
 /// Whether `v` is an `IntArray` (or a `ShortArray`/`ByteArray`, which Kotlin

@@ -7235,3 +7235,52 @@ fn array_type_tests_tell_reference_and_primitive_arrays_apart() {
         "100000\n100000\n010000\n001000\n000100\n000010\n000001\n100000\nints\n[z, b]\nz-b\n"
     );
 }
+
+#[test]
+fn yielded_long_keeps_its_width_through_sequence_stages() {
+    // Measured on kotlinc 2.4.21 / JRE 21: a `Long` handed to `yield` is a
+    // `java.lang.Long`, so `it == 2L` in a later stage is true. Unboxed, the
+    // element read as an `Int` and every such comparison was false (an
+    // infinite `filter` then ran into the element cap).
+    assert_eq!(
+        stdout(
+            "fun main() {\n\
+             val s = sequence { var a = 0L; while (true) { yield(a); a++ } }\n\
+             println(s.filter { it % 2L == 0L }.take(3).toList())\n\
+             val v = sequence { yield(0L); yield(2L) }\n\
+             println(v.filter { it == 2L }.toList())\n\
+             println(v.toList().contains(2L))\n\
+             println(v.toList() == listOf(0L, 2L))\n\
+             val it2 = iterator { yield(5L) }\n\
+             println(it2.next() == 5L)\n\
+             }"
+        ),
+        "[0, 2, 4]\n[2]\ntrue\ntrue\ntrue\n"
+    );
+}
+
+#[test]
+fn component_n_past_the_end_of_a_list_or_array_raises_the_get_fault() {
+    // Measured on kotlinc 2.4.21 / JRE 21: `List.componentN` is `get(N - 1)`
+    // and `Array.componentN` is the array load, so a short receiver raises the
+    // same fault `get` does, catchable as an ordinary exception.
+    assert_eq!(
+        stdout(
+            "fun t(f: () -> Unit) { try { f() } catch (e: Exception) { println(\"${e::class.simpleName}: ${e.message}\") } }\n\
+             fun main() {\n\
+             t { val (a, b) = listOf(1); println(\"$a $b\") }\n\
+             t { val (a, b) = arrayOf(1); println(\"$a $b\") }\n\
+             t { val (a, b, c) = listOf<Int>() }\n\
+             t { val (a, b) = mutableListOf(1) }\n\
+             t { val (a, b) = intArrayOf(1) }\n\
+             t { val (a, b) = listOf(1).sorted() }\n\
+             }"
+        ),
+        "IndexOutOfBoundsException: Index: 1, Size: 1\n\
+         ArrayIndexOutOfBoundsException: Index 1 out of bounds for length 1\n\
+         IndexOutOfBoundsException: Empty list doesn't contain element at index 0.\n\
+         IndexOutOfBoundsException: Index 1 out of bounds for length 1\n\
+         ArrayIndexOutOfBoundsException: Index 1 out of bounds for length 1\n\
+         IndexOutOfBoundsException: Index: 1, Size: 1\n"
+    );
+}

@@ -9617,7 +9617,9 @@ impl Compiler {
             // free name, and a program that declares its own `fun yield` shadows
             // it through the local/global lookup that precedes this match.
             "yield" if args.len() == 1 => {
-                self.compile_expr(sc, &args[0])?;
+                // Erased: a `Long` element must carry its width into the sequence, or
+                // a later `it == 2L` compares an `Int` against a `Long`.
+                self.compile_erased(sc, &args[0])?;
                 self.b.emit(Op::Extended(KT_YIELD, 0), line);
                 Ok(Type::Unit)
             }
