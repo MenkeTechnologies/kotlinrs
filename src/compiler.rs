@@ -182,6 +182,7 @@ fn width_erasing_member(name: &str) -> bool {
             | "addAll"
             | "put"
             | "putIfAbsent"
+            | "equals"
             | "get"
             | "getOrDefault"
             | "getValue"
@@ -4956,7 +4957,14 @@ impl Compiler {
         // Loop counter (Kotlin's `for` variable is read-only `val`; the
         // compiler-emitted increment writes the slot directly, bypassing the
         // user-facing `val` reassignment check).
-        let vslot = sc.declare(var, Type::Int, false);
+        // A bound of either width makes a `LongRange`, and its variable a `Long`:
+        // `for (i in 1L..n) i * 2_000_000_000` must not wrap at 32 bits.
+        let var_ty = if self.infer(sc, start) == Type::Long || self.infer(sc, end) == Type::Long {
+            Type::Long
+        } else {
+            Type::Int
+        };
+        let vslot = sc.declare(var, var_ty, false);
         self.compile_expr(sc, start)?;
         self.b.emit(Op::SetSlot(vslot), 0);
         let eslot = sc.temp();
@@ -6616,9 +6624,11 @@ impl Compiler {
         // `java.lang.Double`'s, so an unboxed query misses a boxed element.
         // `format`'s `vararg args: Any?` is the same position by another name.
         if width_erasing_member(name)
-            && args
+            && (args
                 .iter()
                 .any(|a| matches!(self.infer(sc, a), Type::Float | Type::Long))
+                || (name == "equals"
+                    && matches!(self.infer(sc, recv), Type::Float | Type::Long)))
         {
             return self.compile_member_boxed(sc, recv, name, args, line);
         }
@@ -7703,7 +7713,7 @@ impl Compiler {
         self.b.emit(Op::LoadConst(nidx), line);
         self.b
             .emit(Op::CallBuiltin(KT_METHOD_VM, args.len() as u8), line);
-        Ok(method_ret_type(name))
+        Ok(self.long_member_ret(sc, recv, name))
     }
 
     /// Lower a `data class` `copy(...)`: build a fresh instance whose fields are
@@ -8166,7 +8176,7 @@ impl Compiler {
         let sum_int = name == "sumOf" && self.infer_lambda_result(sc, closure, &hint) == Type::Int;
         self.compile_expr(sc, recv)?;
         for e in extras {
-            self.compile_expr(sc, e)?;
+            self.compile_erased(sc, e)?;
         }
         if !hint.is_empty() {
             self.lambda_hint = Some(hint);
@@ -9290,7 +9300,7 @@ impl Compiler {
             // two builders from drifting.
             "sequenceOf" => {
                 for a in args {
-                    self.compile_expr(sc, a)?;
+                    self.compile_erased(sc, a)?;
                 }
                 self.b
                     .emit(Op::Extended(KT_LIST_RO, args.len() as u8), line);
@@ -9303,7 +9313,7 @@ impl Compiler {
             // genuinely lazy here, because it is the one that can be endless.
             // The step answers Kotlin `null` to end it.
             "generateSequence" if args.len() == 2 && is_lambda(&args[1]) => {
-                self.compile_expr(sc, &args[0])?;
+                self.compile_erased(sc, &args[0])?;
                 self.lambda_hint = Some(vec![(Type::Unknown, Type::Unknown)]);
                 self.compile_expr(sc, &args[1])?;
                 self.lambda_hint = None;
@@ -10505,6 +10515,18 @@ impl Compiler {
                 _ => a.clone(),
             })
             .collect();
+        // `equals` sees BOTH operands boxed: `5L.equals(5L)` is `Long.equals(Object)`.
+        let boxed_recv;
+        let recv = if name == "equals" && matches!(self.infer(sc, recv), Type::Float | Type::Long) {
+            boxed_recv = Expr::Call {
+                name: BOX_WIDTH.to_string(),
+                args: vec![recv.clone()],
+                line,
+            };
+            &boxed_recv
+        } else {
+            recv
+        };
         self.compile_member(sc, recv, name, &boxed, false, line)
     }
 
@@ -11592,6 +11614,11 @@ impl Compiler {
 
     fn infer(&self, sc: &Scope, e: &Expr) -> Type {
         match e {
+            // `emptyList<Int>()`: the parser wraps a generic call in the reification
+            // intrinsic, which changes nothing about what the call evaluates to.
+            Expr::Call { name, args, .. } if name == REIFY_CALL && args.len() == 2 => {
+                self.infer(sc, &args[1])
+            }
             // `Sd.Circ(2)` / `Sd.Empty` — a nested class reached by its
             // qualified spelling, which `compile_member` rewrites to the
             // top-level construction or singleton read the hoist made of it.
@@ -11979,7 +12006,7 @@ impl Compiler {
                         return nullable_if_safe(self.method_ret(sc, recv, sig, args), *safe);
                     }
                 }
-                nullable_if_safe(method_ret_type(name), *safe)
+                nullable_if_safe(self.long_member_ret(sc, recv, name), *safe)
             }
             Expr::Elvis { left, right } => {
                 let lt = self.infer(sc, left);
@@ -12732,8 +12759,20 @@ impl Compiler {
         r: &Expr,
         name: &str,
     ) -> Result<(), String> {
+        // An operand that is a collection takes its element in an erased position:
+        // `xs - 1L` removes a boxed `Long`. An untyped left operand may be a user
+        // class whose `operator` declares a `Long` parameter, which wants the bare value.
+        let coll = self.infer(sc, l) == Type::Obj
+            || matches!(
+                self.infer_class(sc, l).as_deref(),
+                Some("List" | "Set" | "Map")
+            );
         self.compile_expr(sc, l)?;
-        self.compile_expr(sc, r)?;
+        if coll {
+            self.compile_erased(sc, r)?;
+        } else {
+            self.compile_expr(sc, r)?;
+        }
         let n = self.b.add_constant(Value::str(name));
         self.b.emit(Op::LoadConst(n), 0);
         self.b.emit(Op::CallBuiltin(KT_OPER_VM, 3), 0);
@@ -12777,6 +12816,9 @@ impl Compiler {
     /// not claim.
     fn infer_class_plain(&self, sc: &Scope, e: &Expr) -> Option<String> {
         match e {
+            Expr::Call { name, args, .. } if name == REIFY_CALL && args.len() == 2 => {
+                self.infer_class_plain(sc, &args[1])
+            }
             // `a + b` on a class declaring `operator fun plus` IS `a.plus(b)`, so
             // its class is that call's — which is what lets the next operator in
             // a chain (`V(1) + V(2) + V(3)`) find `plus` on it too.
@@ -14507,7 +14549,6 @@ fn builtin_binary_member(ty: &str, name: &str) -> bool {
                 | "times"
                 | "div"
                 | "rem"
-                | "mod"
                 | "floorDiv"
                 | "compareTo"
                 | "coerceAtLeast"
@@ -14799,5 +14840,45 @@ impl Compiler {
         self.b.emit(Op::LoadConst(nidx), line);
         self.b.emit(Op::CallBuiltin(KT_SYSTEM, args.len() as u8), line);
         Ok(ty)
+    }
+}
+
+impl Compiler {
+    /// The static result type of `recv.name(..)` when the table in
+    /// [`method_ret_type`] has none: a `Long` receiver's arithmetic, bitwise and
+    /// clamping members answer a `Long` too, and naming it lets the value be
+    /// boxed (`xs.map { it.toLong().coerceAtMost(3) }`) where a result of
+    /// unknown width reads back as an `Int`.
+    fn long_member_ret(&self, sc: &Scope, recv: &Expr, name: &str) -> Type {
+        let ty = method_ret_type(name);
+        let preserves_long = matches!(
+            name,
+            "plus"
+                | "minus"
+                | "times"
+                | "div"
+                | "rem"
+                | "mod"
+                | "floorDiv"
+                | "inc"
+                | "dec"
+                | "unaryMinus"
+                | "unaryPlus"
+                | "and"
+                | "or"
+                | "xor"
+                | "inv"
+                | "shl"
+                | "shr"
+                | "ushr"
+                | "coerceAtLeast"
+                | "coerceAtMost"
+                | "coerceIn"
+        );
+        if ty == Type::Unknown && preserves_long && self.infer(sc, recv) == Type::Long {
+            Type::Long
+        } else {
+            ty
+        }
     }
 }

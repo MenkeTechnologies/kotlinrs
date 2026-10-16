@@ -7389,3 +7389,40 @@ fn long_keys_look_up_boxed_through_get_getordefault_and_getvalue() {
         "L\nL\nL\nL\nL\nL\n4\n1\n1\n9\n8\n"
     );
 }
+
+#[test]
+fn long_width_survives_seeds_equals_and_collection_operators() {
+    // Measured on kotlinc 2.4.21 / JRE 21: a `Long` seed, a `Long` element handed to
+    // `sequenceOf`, `equals` on either side, and a collection-valued
+    // `emptyList<T>()` as the left operand of `+`/`-` all keep their width or
+    // their list-ness. A `for` variable over a `Long` bound is a `Long`, and
+    // `Math.abs`/`max`/`min` read a `Long` out of a collection.
+    assert_eq!(
+        stdout(
+            "fun isL(x: Any?) = if (x is Long) \"L\" else if (x is Int) \"I\" else if (x == null) \"N\" else \"?\"\n\
+             fun main() {\n\
+                 println(isL(listOf(1, 2).asSequence().fold(0L) { a, b -> a + b }))\n\
+                 println(listOf(1, 2).runningFold(0L) { a, b -> a + b }.map { isL(it) })\n\
+                 println(listOf(1, 2).scan(0L) { a, b -> a + b }.filter { it == 3L })\n\
+                 println(generateSequence(1L) { if (it < 8) it * 2 else null }.filter { it == 4L }.toList())\n\
+                 println(generateSequence(1L) { it * 2 }.take(4).map { isL(it) }.toList())\n\
+                 println(sequenceOf(1L, 2L).filter { it == 2L }.toList())\n\
+                 println(listOf(2L).filter { it.equals(2L) })\n\
+                 val y: Long = 5L\n\
+                 println(5L.equals(5L)); println(y.equals(5L)); println(y.equals(5)); println(y.equals(y as Any))\n\
+                 println(emptyList<Int>() + 1)\n\
+                 println(mutableListOf<Int>() + 1)\n\
+                 println(emptySet<Int>() + 1)\n\
+                 println(emptyList<Long>() + 1L)\n\
+                 println(listOf(1L) - 1L)\n\
+                 for (i in 1L..2L) println(i * 2_000_000_000 * 2)\n\
+                 println(listOf(1L, -2L).map { Math.abs(it) })\n\
+                 println(listOf(1L, 5L).map { Math.max(it, 3L) })\n\
+                 println(listOf(1L, 5L).map { Math.min(it, 3L) })\n\
+                 println(listOf(1L).map { it.coerceAtMost(3) }.filter { it == 1L })\n\
+                 println(listOf(1).map { it.toLong().plus(3) }.map { isL(it) })\n\
+             }"
+        ),
+        "L\n[L, L, L]\n[3]\n[4]\n[L, L, L, L]\n[2]\n[2]\ntrue\ntrue\nfalse\ntrue\n[1]\n[1]\n[1]\n[1]\n[]\n4000000000\n8000000000\n[1, 2]\n[3, 5]\n[1, 3]\n[1]\n[L]\n"
+    );
+}

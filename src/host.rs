@@ -4961,6 +4961,12 @@ fn array_desc(items: &[Value]) -> String {
 /// (`round(2.5) == 2.0`), whereas `java.lang.Math.round` is round-half-up and
 /// returns a `Long` (`Math.round(2.5) == 3`).
 fn math_call(name: &str, args: &[Value]) -> Result<Value, String> {
+    // A `Long` read out of a collection is boxed; the math below reads plain numbers.
+    let unboxed: Vec<Value> = args
+        .iter()
+        .map(|v| i64_box(v).map_or_else(|| v.clone(), Value::Int))
+        .collect();
+    let args = unboxed.as_slice();
     let a = args.first().cloned().unwrap_or(Value::Int(0));
     match name {
         "abs" if is_int(&a) => Ok(Value::Int(a.to_int().wrapping_abs())),
