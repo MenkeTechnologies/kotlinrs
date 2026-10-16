@@ -4028,6 +4028,11 @@ impl Parser {
 
     fn unary(&mut self) -> Result<Expr, String> {
         match self.peek() {
+            Tok::Minus if matches!(self.peek_at(1), Tok::Int(n) if *n == i32::MAX as i64 + 1) => {
+                self.advance();
+                self.advance();
+                Ok(Expr::Int(i32::MIN as i64))
+            }
             Tok::Minus => {
                 self.advance();
                 Ok(Expr::Unary {
@@ -4687,7 +4692,8 @@ impl Parser {
             }
             Tok::Int(n) => {
                 self.advance();
-                Ok(Expr::Int(n))
+                // Only `-2147483648` (see `unary`) is an `Int` this large.
+                Ok(if n > i32::MAX as i64 { Expr::Long(n) } else { Expr::Int(n) })
             }
             Tok::Long(n) => {
                 self.advance();

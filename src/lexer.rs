@@ -243,7 +243,10 @@ impl<'a> Lexer<'a> {
             let n = u64::from_str_radix(&raw, radix)
                 .map(|u| u as i64)
                 .unwrap_or(0);
-            return if long { Tok::Long(n) } else { Tok::Int(n) };
+            // An unsuffixed literal that does not fit an `Int` is a `Long`
+            // (`0xFFFFFFFF` is 4294967295, not -1).
+            let wide = long || u64::from_str_radix(&raw, radix).is_ok_and(|u| u > i32::MAX as u64);
+            return if wide { Tok::Long(n) } else { Tok::Int(n) };
         }
         while self.peek().is_ascii_digit() || self.peek() == b'_' {
             self.bump();
@@ -293,7 +296,14 @@ impl<'a> Lexer<'a> {
         if is_float {
             Tok::Float(raw.parse().unwrap_or(0.0))
         } else {
-            Tok::Int(raw.parse().unwrap_or(0))
+            // An unsuffixed decimal that overflows `Int` is a `Long`.
+            match raw.parse::<i64>() {
+                // Exactly `2147483648` stays an `Int` token: the parser makes it a
+                // `Long`, except under a unary minus, where Kotlin folds
+                // `-2147483648` into the `Int` it names.
+                Ok(n) if n > i32::MAX as i64 + 1 => Tok::Long(n),
+                other => Tok::Int(other.unwrap_or(0)),
+            }
         }
     }
 

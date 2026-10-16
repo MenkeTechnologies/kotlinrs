@@ -182,6 +182,13 @@ fn width_erasing_member(name: &str) -> bool {
             | "addAll"
             | "put"
             | "putIfAbsent"
+            | "get"
+            | "getOrDefault"
+            | "getValue"
+            | "getOrPut"
+            | "getOrElse"
+            | "set"
+            | "replace"
             | "remove"
             | "format"
     )

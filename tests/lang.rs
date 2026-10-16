@@ -7331,3 +7331,61 @@ fn system_exit_flushes_pending_output() {
     assert_eq!(out.status.code(), Some(3));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "partial");
 }
+
+#[test]
+fn unsuffixed_literal_past_int_range_is_a_long() {
+    // Measured on kotlinc 2.4.21 / JRE 21: a decimal, hex or binary literal that does
+    // not fit an `Int` is a `Long`, so `i * 3_000_000_000` and `i * 0xFFFFFFFF`
+    // widen instead of wrapping at 32 bits. The one exception is `-2147483648`,
+    // which Kotlin folds into the `Int` it names.
+    assert_eq!(
+        stdout(
+            "fun k(x: Any) = x.javaClass.simpleName\n\
+             fun main() {\n\
+                 val i = 7\n\
+                 println(i * 3_000_000_000)\n\
+                 println(5 * 3_000_000_000)\n\
+                 println(i + 2_147_483_648)\n\
+                 println(i * 0xFFFFFFFF)\n\
+                 println(k(3_000_000_000)); println(k(2147483647)); println(k(2147483648))\n\
+                 println(k(-2147483648)); println(-2147483648 - 1)\n\
+                 println(k(0x7FFFFFFF)); println(k(0x80000000)); println(0x80000000.toInt())\n\
+                 println(k(0b11111111111111111111111111111111))\n\
+                 val big = 4_000_000_000\n\
+                 println(big + 1); println(big.toInt()); println(big shl 2)\n\
+                 for (j in 1..2) println(j * 3_000_000_000)\n\
+                 println(i * 3_000_000_000 % 1_000_000_007)\n\
+                 println(1_000_000_007 * 1_000_000_007)\n\
+             }"
+        ),
+        "21000000000\n15000000000\n2147483655\n30064771065\nLong\nInteger\nLong\nInteger\n2147483647\nInteger\nLong\n-2147483648\nLong\n4000000001\n-294967296\n16000000000\n3000000000\n6000000000\n999999860\n-371520463\n"
+    );
+}
+
+#[test]
+fn long_keys_look_up_boxed_through_get_getordefault_and_getvalue() {
+    // Measured on kotlinc 2.4.21 / JRE 21: a `Long` key handed to `get`,
+    // `getOrDefault`, `getValue`, `getOrPut` or `getOrElse` is looked up as a
+    // `java.lang.Long`, the shape `m[k] = v` stored it in. Unboxed, `get`
+    // answered null and `getValue` threw.
+    assert_eq!(
+        stdout(
+            "fun isL(x: Any?) = if (x is Long) \"L\" else if (x is Int) \"I\" else if (x == null) \"N\" else \"?\"\n\
+             class Acc { var t = 0L; fun get(x: Long): Long = x * 2 }\n\
+             fun main() {\n\
+                 val mm = mutableMapOf<Long, Long>(); mm[1L] = 2L; mm.put(3L, 4L)\n\
+                 println(isL(mm.get(1L)))\n\
+                 println(isL(mm.getOrDefault(1L, 0L)))\n\
+                 println(isL(mm.getOrDefault(7L, 0L)))\n\
+                 println(isL(mm.getOrElse(8L) { 7L }))\n\
+                 println(isL(mm.getOrPut(9L) { 10L }))\n\
+                 println(isL(mm.getValue(1L)))\n\
+                 println(mm.getValue(3L))\n\
+                 val h = HashMap<Long, Int>(); h[5L] = 1\n\
+                 println(h.get(5L)); println(h.getOrDefault(5L, 9)); println(h.getOrDefault(6L, 9))\n\
+                 println(Acc().get(4L))\n\
+             }"
+        ),
+        "L\nL\nL\nL\nL\nL\n4\n1\n1\n9\n8\n"
+    );
+}
