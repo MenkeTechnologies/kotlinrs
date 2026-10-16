@@ -7463,3 +7463,24 @@ fn java_deque_members_and_objects_statics() {
         "true\n[-1, 0, 1, 2]\n-1\n-1\n2\n-1\n2\n0\n[1]\n1\nfalse\n1\nnull null null null null\npop: null\nelement: null\n[1, 2, 3, 4, 6, 8, 9, 12, 16, 18, 24, 27, 32, 36, 48, 54]\n30817\n3968\n1\n1089\ntrue\ntrue\nfalse\ntrue\ntrue\nz\nnpe\n"
     );
 }
+
+#[test]
+fn assert_is_a_no_op_that_still_evaluates_its_condition() {
+    // Measured on kotlinc 2.4.21 / JRE 21: neither `kotlin` nor `java` passes
+    // `-ea`, so `assert(false)` never fires, its condition is still evaluated,
+    // and `Throwable.localizedMessage` is `message`.
+    assert_eq!(
+        stdout(
+            "fun main() {\n\
+                 val e = IllegalStateException(\"m\"); println(e.localizedMessage)\n\
+                 println(RuntimeException().localizedMessage)\n\
+                 var n = 0\n\
+                 assert(n++ == 0) { \"never built\" }\n\
+                 assert(false) { \"asrt\" }\n\
+                 assert(false)\n\
+                 println(\"assertions are off: $n\")\n\
+             }"
+        ),
+        "m\nnull\nassertions are off: 1\n"
+    );
+}

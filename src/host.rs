@@ -11811,7 +11811,7 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         }
     }
     // `Throwable.message` — the constructor message, or Kotlin `null`.
-    if name == "message" {
+    if name == "message" || name == "localizedMessage" {
         if let Some(m) = with_obj(recv, |o| match o {
             HeapObj::Exc { msg, .. } => Some(match msg {
                 Some(m) => Value::str(m.clone()),

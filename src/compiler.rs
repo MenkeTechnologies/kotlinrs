@@ -9308,6 +9308,16 @@ impl Compiler {
                 self.b.emit(Op::CallBuiltin(KT_RUN_CATCHING, 0), line);
                 Ok(Type::Obj)
             }
+            // `assert(cond) { msg }`: JVM assertions are off unless `-ea` is passed,
+            // and neither `kotlin` nor `java` passes it, so the check never fires.
+            // The condition is still evaluated (it is an ordinary argument);
+            // the message lambda is lazy and never runs.
+            "assert" if matches!(args.len(), 1 | 2) => {
+                self.compile_expr(sc, &args[0])?;
+                self.b.emit(Op::Pop, line);
+                self.b.emit(Op::LoadUndef, line);
+                Ok(Type::Unit)
+            }
             "exitProcess" | "measureTimeMillis" | "measureNanoTime"
                 if is_system_member(name, args.len()) =>
             {
