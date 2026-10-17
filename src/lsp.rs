@@ -2505,7 +2505,7 @@ const CORPUS: &[Entry] = &[
         "Regex",
         "Types",
         "Regex(pattern: String)",
-        "A compiled regular expression with `java.util.regex` semantics — look-around, back-references, named groups `(?<name>…)`, inline flags `(?i)`. `toString()` and `pattern` are the source pattern. A pattern the engine refuses raises `java.util.regex.PatternSyntaxException` (an `IllegalArgumentException`), whose description is the Rust engine's rather than `Pattern`'s. `RegexOption` and `Regex.escape` are not modelled.",
+        "A compiled regular expression with `java.util.regex` semantics — look-around, back-references, named groups `(?<name>…)`, inline flags `(?i)`. `toString()` and `pattern` are the source pattern. A pattern the engine refuses raises `java.util.regex.PatternSyntaxException` (an `IllegalArgumentException`), whose description is the Rust engine's rather than `Pattern`'s. `RegexOption` (constant arguments: a single option or a `setOf`/`listOf` of them) folds into inline flags; `Regex.escape` is modelled.",
         "val r = Regex(\"(\\\\w+)@(\\\\w+)\")\nprintln(r.find(\"to: bob@site\")?.groupValues)   // [bob@site, bob, site]",
     ),
     (

@@ -6094,6 +6094,12 @@ impl Compiler {
         safe: bool,
         line: u32,
     ) -> Result<Type, String> {
+        // `pattern.toRegex(option)` / `toRegex(setOf(options))`.
+        if name == "toRegex" && args.len() == 1 && !safe {
+            if let Some(src) = regex_with_options(recv, &args[0], line) {
+                return self.compile_call(sc, "Regex", &[src], line);
+            }
+        }
         // `recv.f(args)` where `f` is a local of a function type with a receiver:
         // the receiver is the closure's first argument.
         if sc.fn_recv_of(name) == Some(args.len()) && !safe {
@@ -9420,6 +9426,14 @@ impl Compiler {
             }
             // `Regex(pattern)` — the same value `pattern.toRegex()` builds, so it
             // lowers to that member call.
+            // `Regex(pattern, option)` / `Regex(pattern, setOf(options))`: the
+            // options are static, so they fold into the pattern as inline flags.
+            "Regex" if args.len() == 2 && !self.classes.contains_key("Regex") => {
+                let Some(src) = regex_with_options(&args[0], &args[1], line) else {
+                    return Err("unresolved reference: RegexOption".to_string());
+                };
+                self.compile_call(sc, "Regex", &[src], line)
+            }
             "Regex" if args.len() == 1 && !self.classes.contains_key("Regex") => {
                 self.compile_expr(sc, &args[0])?;
                 let nidx = self.b.add_constant(Value::str("toRegex"));
@@ -14935,4 +14949,75 @@ impl Compiler {
             ty
         }
     }
+}
+
+/// The `(?flags)` prefix and the literal-quoting bit for a statically known
+/// `RegexOption` or collection of them (`setOf`/`listOf`/`mutableSetOf`/
+/// `hashSetOf`/`emptySet`). `None` when any element is not a `RegexOption.X`.
+fn regex_option_flags(opts: &Expr) -> Option<(String, bool)> {
+    let mut flags = String::new();
+    let mut literal = false;
+    let mut one = |e: &Expr| -> Option<()> {
+        let Expr::Member { recv, name, .. } = e else {
+            return None;
+        };
+        if !matches!(&**recv, Expr::Var(v) if v == "RegexOption") {
+            return None;
+        }
+        let f = match name.as_str() {
+            "IGNORE_CASE" => "i",
+            "MULTILINE" => "m",
+            "DOT_MATCHES_ALL" => "s",
+            "COMMENTS" => "x",
+            "UNIX_LINES" => "d",
+            "LITERAL" => {
+                literal = true;
+                ""
+            }
+            "CANON_EQ" => "",
+            _ => return None,
+        };
+        if !flags.contains(f) {
+            flags.push_str(f);
+        }
+        Some(())
+    };
+    match opts {
+        Expr::Call { name, args, .. }
+            if matches!(
+                name.as_str(),
+                "setOf" | "listOf" | "mutableSetOf" | "hashSetOf" | "emptySet" | "emptyList"
+            ) =>
+        {
+            for a in args {
+                one(a)?;
+            }
+        }
+        e => one(e)?,
+    }
+    Some((flags, literal))
+}
+
+/// `pattern` with the options of `opts` applied: quoted first for `LITERAL`
+/// (as `Pattern.LITERAL` does), then prefixed with the inline flags.
+fn regex_with_options(pattern: &Expr, opts: &Expr, line: u32) -> Option<Expr> {
+    let (flags, literal) = regex_option_flags(opts)?;
+    let body = if literal {
+        Expr::MethodCall {
+            recv: Box::new(Expr::Var("Regex".to_string())),
+            name: "escape".to_string(),
+            args: vec![pattern.clone()],
+            safe: false,
+            line,
+        }
+    } else {
+        pattern.clone()
+    };
+    if flags.is_empty() {
+        return Some(body);
+    }
+    Some(Expr::Str(vec![
+        StrExpr::Text(format!("(?{flags})")),
+        StrExpr::Expr(Box::new(body)),
+    ]))
 }

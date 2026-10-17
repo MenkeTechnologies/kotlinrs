@@ -126,19 +126,13 @@ the next round starts from a measurement rather than a guess.
 
 The `infix` row is a parser gap.
 
-## `Regex` — what is not modelled
+## `Regex` — what differs
 
-`Regex` runs on `fancy-regex`, not `java.util.regex.Pattern`, and three parts of
-the Kotlin surface are absent. Each fails loudly:
-
-| program | kotlinrs | reference |
-| --- | --- | --- |
-| `Regex("a", RegexOption.IGNORE_CASE).matches("A")` | `unresolved reference: Regex` | `true` |
-| `Regex.escape("a.b")` | `unresolved reference: Regex` | `\Qa.b\E` |
-| `"7" matches Regex("\\d")` | `expected RParen, found Ident("matches")` | `true` |
-
-`(?i)` inline flags cover the first; the member spelling `"7".matches(r)` covers
-the last. One divergence is a different MESSAGE rather than a refusal: a pattern
+`Regex` runs on `fancy-regex`, not `java.util.regex.Pattern`. `RegexOption`
+arguments are folded into inline flags at compile time, so only constant
+options (a single `RegexOption.X`, or `setOf`/`listOf` of them) are accepted; an
+option held in a variable is refused as `unresolved reference: RegexOption`.
+`CANON_EQ` is accepted and has no effect. One divergence is a different MESSAGE rather than a refusal: a pattern
 the engine rejects raises `java.util.regex.PatternSyntaxException` (catchable as
 the `IllegalArgumentException` it is), but the description after the class name
 is the Rust engine's, not `Pattern`'s `… near index N` with its caret line.

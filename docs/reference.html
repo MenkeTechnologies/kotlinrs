@@ -864,7 +864,7 @@ fun main() { println(try { fail() } catch (e: Exception) { "caught" }) }</code><
         <article class="doc-entry" id="doc-types-21">
           <h3><a class="doc-anchor" href="#doc-types-21">#</a> <code>Regex</code></h3>
           <pre><code class="lang-kotlin">Regex(pattern: String)</code></pre>
-          <p>A compiled regular expression with <code>java.util.regex</code> semantics — look-around, back-references, named groups <code>(?&lt;name&gt;…)</code>, inline flags <code>(?i)</code>. <code>toString()</code> and <code>pattern</code> are the source pattern. A pattern the engine refuses raises <code>java.util.regex.PatternSyntaxException</code> (an <code>IllegalArgumentException</code>), whose description is the Rust engine's rather than <code>Pattern</code>'s. <code>RegexOption</code> and <code>Regex.escape</code> are not modelled.</p>
+          <p>A compiled regular expression with <code>java.util.regex</code> semantics — look-around, back-references, named groups <code>(?&lt;name&gt;…)</code>, inline flags <code>(?i)</code>. <code>toString()</code> and <code>pattern</code> are the source pattern. A pattern the engine refuses raises <code>java.util.regex.PatternSyntaxException</code> (an <code>IllegalArgumentException</code>), whose description is the Rust engine's rather than <code>Pattern</code>'s. <code>RegexOption</code> (constant arguments: a single option or a <code>setOf</code>/<code>listOf</code> of them) folds into inline flags; <code>Regex.escape</code> is modelled.</p>
           <pre><code class="lang-kotlin">val r = Regex("(\\w+)@(\\w+)")
 println(r.find("to: bob@site")?.groupValues)   // [bob@site, bob, site]</code></pre>
         </article>

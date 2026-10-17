@@ -7484,3 +7484,17 @@ fn assert_is_a_no_op_that_still_evaluates_its_condition() {
         "m\nnull\nassertions are off: 1\n"
     );
 }
+
+#[test]
+fn regex_options_fold_into_the_pattern() {
+    assert_eq!(
+        stdout(
+            "println(Regex(\"a\", RegexOption.IGNORE_CASE).matches(\"A\"))\n\
+             println(Regex(\"^b$\", setOf(RegexOption.IGNORE_CASE, RegexOption.MULTILINE)).findAll(\"a\\nB\\nc\").count())\n\
+             println(\"A.B\".toRegex(RegexOption.LITERAL).containsMatchIn(\"xA.By\"))\n\
+             println(\"A.B\".toRegex(RegexOption.LITERAL).containsMatchIn(\"xAxBy\"))\n\
+             println(\"a.b\".toRegex(setOf(RegexOption.DOT_MATCHES_ALL)).matches(\"a\\nb\"))"
+        ),
+        "true\n1\ntrue\nfalse\ntrue\n"
+    );
+}

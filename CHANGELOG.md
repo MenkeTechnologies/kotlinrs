@@ -11,6 +11,13 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Regex options
+
+`Regex(p, RegexOption.X)`, `Regex(p, setOf(...))` and `p.toRegex(option)` now
+compile (constant options only), as does the infix `input matches regex`;
+the `IGNORE_CASE`, `MULTILINE`, `DOT_MATCHES_ALL`, `COMMENTS`, `UNIX_LINES` and
+`LITERAL` options are honoured.
+
 ## Round 9 — indexed folds and other missing stdlib members
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, compiled and run on the same JVM.

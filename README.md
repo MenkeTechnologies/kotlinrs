@@ -239,7 +239,7 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `containsMatchIn`, `replace`/`replaceFirst` with `Matcher.appendReplacement`
   group references or a transform lambda, `split`, `MatchResult` (`value`,
   `range`, `groupValues`, `groups`, `destructured`, `next()`), and the `String`
-  members that take a `Regex`. `RegexOption` and `Regex.escape` are not modelled.
+  members that take a `Regex`. `RegexOption` (constant arguments: a single option or a `setOf`/`listOf` of them) folds into inline flags; `Regex.escape` is modelled.
 - **Sorted collections with a comparator** — `sortedSetOf(cmp, …)`,
   `sortedMapOf(cmp, …)`, `TreeSet(cmp)`, `TreeMap(cmp)` order by the comparator
   and identify elements by it, as `java.util.TreeMap` does.
@@ -1743,7 +1743,7 @@ every column doubles with the input out to 40 000; the 80 000 `hashMapOf` cell
 varied from 0.81 s to 1.32 s across repetitions and is reported as the minimum
 rather than trusted to three digits.
 
-Next: `RegexOption` and `Regex.escape`, variance and bounds, and a growing standard-library surface —
+Next: variance and bounds, and a growing standard-library surface —
 alongside the sibling parity tooling (LSP/DAP, reference generator, differential
 harness). Open divergences are tracked in [BUGS.md](BUGS.md); the round-by-round
 record continues in [CHANGELOG.md](CHANGELOG.md).
