@@ -4693,7 +4693,11 @@ impl Parser {
             Tok::Int(n) => {
                 self.advance();
                 // Only `-2147483648` (see `unary`) is an `Int` this large.
-                Ok(if n > i32::MAX as i64 { Expr::Long(n) } else { Expr::Int(n) })
+                Ok(if n > i32::MAX as i64 {
+                    Expr::Long(n)
+                } else {
+                    Expr::Int(n)
+                })
             }
             Tok::Long(n) => {
                 self.advance();

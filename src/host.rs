@@ -7862,7 +7862,11 @@ fn coll_hof(
                     out.push(acc.clone());
                 }
             }
-            Ok(if running { alloc(HeapObj::List(out)) } else { acc })
+            Ok(if running {
+                alloc(HeapObj::List(out))
+            } else {
+                acc
+            })
         }
         "foldRightIndexed" => {
             let mut acc = extras.first().cloned().unwrap_or(Value::Undef);
@@ -7891,7 +7895,11 @@ fn coll_hof(
                     out.push(acc.clone());
                 }
             }
-            Ok(if running { alloc(HeapObj::List(out)) } else { acc })
+            Ok(if running {
+                alloc(HeapObj::List(out))
+            } else {
+                acc
+            })
         }
         "reduceRightIndexed" | "reduceRightIndexedOrNull" => {
             let mut iter = items.into_iter().enumerate().rev();
@@ -12318,13 +12326,21 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // JDK's MESSAGELESS `NoSuchElementException`, not Kotlin's wording.
         "offer" | "offerLast" | "offerFirst" | "push" | "poll" | "pollFirst" | "pollLast"
         | "pop" | "peek" | "peekFirst" | "peekLast" | "element" | "getFirst" | "getLast"
-            if is_deque(Some(recv)) && args.len() == usize::from(name.starts_with("offer") || name == "push") =>
+            if is_deque(Some(recv))
+                && args.len() == usize::from(name.starts_with("offer") || name == "push") =>
         {
             let v = args.first().cloned();
             let front = matches!(
                 name,
-                "offerFirst" | "push" | "poll" | "pollFirst" | "pop" | "peek" | "peekFirst"
-                    | "element" | "getFirst"
+                "offerFirst"
+                    | "push"
+                    | "poll"
+                    | "pollFirst"
+                    | "pop"
+                    | "peek"
+                    | "peekFirst"
+                    | "element"
+                    | "getFirst"
             );
             let take = matches!(name, "poll" | "pollFirst" | "pollLast" | "pop");
             let out = with_obj_mut(recv, |o| match o {
@@ -15528,8 +15544,11 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
                 "ByteArray" => "[B",
                 _ => "[L",
             };
-            with_obj(v, |o| matches!(o, HeapObj::Array { desc, .. } if desc.starts_with(want)))
-                .unwrap_or(false)
+            with_obj(
+                v,
+                |o| matches!(o, HeapObj::Array { desc, .. } if desc.starts_with(want)),
+            )
+            .unwrap_or(false)
         }
         other => {
             // A class instance matches its own class and every supertype it
@@ -16433,7 +16452,11 @@ fn b_system(vm: &mut VM, argc: u8) -> Value {
         "elapsedMillis" | "elapsedNanos" => {
             let since = args.first().map_or(0, |v| v.to_int());
             let ns = system_nanos() - since;
-            Value::Int(if name == "elapsedMillis" { ns / 1_000_000 } else { ns })
+            Value::Int(if name == "elapsedMillis" {
+                ns / 1_000_000
+            } else {
+                ns
+            })
         }
         "lineSeparator" => Value::str("\n"),
         "getenv" => match std::env::var(text(&args)) {

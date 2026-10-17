@@ -34,8 +34,8 @@ use crate::host::{
     KT_MATH, KT_METHOD_VM, KT_NEW, KT_NLR_MATCH, KT_NLR_RAISE, KT_NLR_TAKE, KT_NOTNULL,
     KT_OBJEQ_VM, KT_OBSERVE, KT_OPER_REG, KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN,
     KT_RANDOM, KT_RANGE, KT_RANGE_STEP, KT_REIFIED, KT_REIFY, KT_RESULT_HOF, KT_RUN_CATCHING,
-    KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_STR_ORDER, KT_SYSTEM, KT_TOSTRING_REG, KT_TO_STRING,
-    KT_TYPE_REG, KT_YIELD,
+    KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_STR_ORDER, KT_SYSTEM, KT_TOSTRING_REG,
+    KT_TO_STRING, KT_TYPE_REG, KT_YIELD,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
@@ -6627,8 +6627,7 @@ impl Compiler {
             && (args
                 .iter()
                 .any(|a| matches!(self.infer(sc, a), Type::Float | Type::Long))
-                || (name == "equals"
-                    && matches!(self.infer(sc, recv), Type::Float | Type::Long)))
+                || (name == "equals" && matches!(self.infer(sc, recv), Type::Float | Type::Long)))
         {
             return self.compile_member_boxed(sc, recv, name, args, line);
         }
@@ -9684,7 +9683,8 @@ impl Compiler {
             // pipeline pulls from. See [`crate::host::KT_YIELD`].
             "sequence" | "iterator" if args.len() == 1 => {
                 self.compile_expr(sc, &args[0])?;
-                self.b.emit(Op::Extended(KT_SEQ_NEW, u8::from(name == "iterator")), line);
+                self.b
+                    .emit(Op::Extended(KT_SEQ_NEW, u8::from(name == "iterator")), line);
                 Ok(Type::Obj)
             }
             // `yieldAll(xs)` is `for (x in xs) yield(x)` — the stdlib declares
@@ -12347,7 +12347,10 @@ impl Compiler {
                 (elem, inner),
                 (first_extra().unwrap_or(Type::Unknown), Type::Unknown),
             ],
-            "reduceIndexed" | "reduceIndexedOrNull" | "runningReduceIndexed" | "reduceRightIndexed"
+            "reduceIndexed"
+            | "reduceIndexedOrNull"
+            | "runningReduceIndexed"
+            | "reduceRightIndexed"
             | "reduceRightIndexedOrNull" => {
                 vec![(Type::Int, Type::Unknown), (elem, inner), (elem, inner)]
             }
@@ -14834,8 +14837,10 @@ fn recv_lambda(p: &Param, a: &Expr) -> Option<Expr> {
 fn is_system_member(name: &str, argc: usize) -> bool {
     matches!(
         (name, argc),
-        ("exit" | "exitProcess" | "getenv" | "measureTimeMillis" | "measureNanoTime", 1)
-            | ("currentTimeMillis" | "nanoTime" | "lineSeparator", 0)
+        (
+            "exit" | "exitProcess" | "getenv" | "measureTimeMillis" | "measureNanoTime",
+            1
+        ) | ("currentTimeMillis" | "nanoTime" | "lineSeparator", 0)
     )
 }
 
@@ -14886,7 +14891,8 @@ impl Compiler {
         }
         let nidx = self.b.add_constant(Value::str(member));
         self.b.emit(Op::LoadConst(nidx), line);
-        self.b.emit(Op::CallBuiltin(KT_SYSTEM, args.len() as u8), line);
+        self.b
+            .emit(Op::CallBuiltin(KT_SYSTEM, args.len() as u8), line);
         Ok(ty)
     }
 }
