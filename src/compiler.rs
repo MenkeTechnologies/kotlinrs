@@ -8983,7 +8983,7 @@ impl Compiler {
                 || (lt == Type::Unknown
                     && matches!(
                         self.infer_class(sc, l).as_deref(),
-                        Some("List" | "Set" | "Map")
+                        Some("List" | "Set" | "Map" | "Sequence")
                     ))
                 // An untyped operand in a program where some user class
                 // declares this operator: only the value knows whether it is
@@ -12279,6 +12279,9 @@ impl Compiler {
                 // yields the plain `String` its `toString()` produced.
                 "StringBuilder" | "StringBuffer" if args.len() <= 1 => Type::Obj,
                 "buildList" | "buildMap" | "buildSet" | "listOfNotNull" => Type::Obj,
+                // A sequence is a heap object too: left unknown, `seq - 2` lowered to
+                // the numeric `Sub` and answered a `Double`.
+                "sequenceOf" | "generateSequence" | "sequence" => Type::Obj,
                 "buildString" => Type::String,
                 // `with(x) { … }` / `run { … }` evaluate to their block, whose
                 // type the frontend does not track.

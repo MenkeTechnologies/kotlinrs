@@ -7735,3 +7735,64 @@ fun main() {
          toList1.add: EX java.lang.UnsupportedOperationException\n"
     );
 }
+
+#[test]
+fn a_sequence_block_entered_mid_expression_keeps_the_operands_below_it() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. The block is a lambda with a
+    // `SequenceScope` receiver, and entering it pushed no value for that
+    // parameter, so its prologue took the consumer's top operand instead:
+    // `listOf(7, 8, s.first())` printed `[7, null, 2]` and a string
+    // concatenation lost its left side.
+    assert_eq!(
+        stdout(
+            r#"fun t(name: String, f: () -> Any?) { println("$name: ${f()}") }
+fun main() {
+    val s = sequence { yield(2) }
+    println(listOf(7, 8, s.first()))
+    println("x" + iterator { yield(5) }.next())
+    t("built") { sequence { yield(1); yieldAll(listOf(2, 3)) }.toList() }
+}"#
+        ),
+        "[7, 8, 2]\nx5\nbuilt: [1, 2, 3]\n"
+    );
+}
+
+#[test]
+fn sequence_operators_and_shuffled_follow_the_sequence_members() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. `seq - x` lowered to the
+    // numeric `Sub`, and `Sequence.shuffled` draws over a shrinking buffer —
+    // not the `Iterable` walk — so the same seed permutes differently.
+    assert_eq!(
+        stdout(
+            r#"import kotlin.random.Random
+fun main() {
+    println((sequenceOf(1, 2, 3) - 2).toList())
+    println((generateSequence(1) { if (it < 3) it + 1 else null } + 9).toList())
+    println(sequenceOf(1, 2, 3, 4).shuffled(Random(42)).toList())
+    println((1..10).asSequence().shuffled(Random(5)).toList())
+    val r = Random(3); println(sequenceOf(1, 2, 3).shuffled(r).toList()); println(r.nextInt(1000))
+    println((1..10).shuffled(Random(3)))
+}"#
+        ),
+        "[1, 3]\n[1, 2, 3, 9]\n[1, 4, 2, 3]\n[2, 4, 6, 10, 1, 7, 9, 5, 3, 8]\n[1, 2, 3]\n346\n\
+         [3, 2, 10, 9, 6, 5, 4, 8, 7, 1]\n"
+    );
+}
+
+#[test]
+fn to_map_with_a_destination_fills_and_answers_that_map() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1: `toMap(destination)` is
+    // `destination.apply { putAll(this) }`, so the destination's own class
+    // decides the iteration order.
+    assert_eq!(
+        stdout(
+            r#"fun main() {
+    println((1..20).associate { "k$it" to it }.toMap(HashMap()).keys.take(8))
+    println(listOf(3 to "c", 1 to "a").toMap(java.util.TreeMap()))
+    println(mapOf(5 to 1, 2 to 2).toMap(sortedMapOf(9 to 9)))
+    val d = mutableMapOf(0 to 0); val r = listOf(1 to 1).toMap(d); println(r === d); println(d)
+}"#
+        ),
+        "[k1, k2, k3, k20, k4, k5, k11, k6]\n{1=a, 3=c}\n{2=2, 5=1, 9=9}\ntrue\n{0=0, 1=1}\n"
+    );
+}

@@ -6066,6 +6066,13 @@ fn map_upsert(vm: &mut VM, entries: &mut Vec<(Value, Value)>, k: Value, v: Value
 /// drops only the FIRST match (`listOf(1, 2, 2, 3) - 2` is `[1, 2, 3]`), while
 /// `minus(elements)` drops every occurrence of every listed element.
 fn operator_apply(vm: &mut VM, lhs: &Value, name: &str, rhs: &Value) -> Result<Value, String> {
+    // A lazy `Sequence`'s `plus`/`minus` are its members, which the method
+    // spelling already reaches.
+    if matches!(name, "plus" | "minus")
+        && with_obj(lhs, |o| matches!(o, HeapObj::Gen { .. })).unwrap_or(false)
+    {
+        return kt_method(vm, lhs, name, std::slice::from_ref(rhs));
+    }
     // Only `plus`/`minus` are conventions the built-in collections define.
     // `times`/`div`/`rem` are NOT, so `listOf(1) * 2` has to fail the way the
     // reference compiler fails it — matching a prefix instead would have made
@@ -6817,13 +6824,19 @@ fn coro_next(vm: &mut VM, handle: &Value) -> Result<Option<Value>, String> {
     match state {
         CoroState::Fresh => {
             // Enter the block for the first time, with the closure prologue the
-            // ordinary lambda call uses: no parameters, then the captures.
-            let Some((name_idx, _params, captures)) = closure_meta(&body) else {
+            // ordinary lambda call uses: its parameters, then the captures.
+            // Every parameter is pushed even though nothing in the body reads
+            // one: the prologue pops exactly the declared count, so a short
+            // push takes the consumer's operand below for it.
+            let Some((name_idx, params, captures)) = closure_meta(&body) else {
                 return Err("kotlin: sequence block is not a function".to_string());
             };
             let Some(entry) = vm.chunk.find_sub(name_idx) else {
                 return Err("kotlin: sequence block body not found".to_string());
             };
+            for _ in 0..params {
+                vm.stack.push(Value::Undef);
+            }
             for cap in &captures {
                 vm.stack.push(cap.clone());
             }
@@ -12605,6 +12618,16 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // idiomatic way to get a writable map without disturbing `m`. Both were
         // `unresolved reference` here; the `Iterable<Pair>.toMap()` below is a
         // different receiver and does not reach a map.
+        // `toMap(destination)` — for a `Map` and an `Iterable<Pair>` alike — is
+        // `destination.apply { putAll(this) }`, so the destination's own class
+        // (a `HashMap`'s order, a `TreeMap`'s sorting) decides the result.
+        "toMap"
+            if args.len() == 1
+                && with_obj(&args[0], |o| matches!(o, HeapObj::Map(_))).unwrap_or(false) =>
+        {
+            kt_method(vm, &args[0], "putAll", std::slice::from_ref(recv))?;
+            return Ok(args[0].clone());
+        }
         "toMap" | "toMutableMap" if args.is_empty() => {
             if let Some(entries) = with_obj(recv, |o| match o {
                 HeapObj::Map(entries) => Some(entries.clone()),
@@ -13953,6 +13976,26 @@ fn sequence_member(
         // array (which has only the in-place `shuffle`) does not answer it.
         "shuffled" if args.len() <= 1 && !matches!(kind, SeqKind::Array | SeqKind::CharSeq) => {
             let rng = args.first().cloned().unwrap_or_else(random_default);
+            // `Sequence.shuffled` is NOT the `Iterable` walk: it draws
+            // `j = nextInt(buffer.size)` over a shrinking buffer, takes the
+            // LAST element off, puts it at `j` and yields what was there —
+            // a different permutation for the same seed.
+            if kind == SeqKind::Seq {
+                let mut buffer = items.to_vec();
+                let mut out = Vec::with_capacity(buffer.len());
+                while let Some(last) = buffer.pop() {
+                    let j = match random_index(&rng, buffer.len() + 1) {
+                        Ok(j) => j,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    out.push(if j < buffer.len() {
+                        std::mem::replace(&mut buffer[j], last)
+                    } else {
+                        last
+                    });
+                }
+                return Some(Ok(tag_sequence(alloc(HeapObj::List(out)))));
+            }
             let mut out = items.to_vec();
             if let Err(e) = shuffle_with(&mut out, &rng) {
                 return Some(Err(e));

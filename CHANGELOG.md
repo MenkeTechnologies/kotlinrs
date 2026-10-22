@@ -11,6 +11,26 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## `sequence { }` mid-expression, sequence operators, `Sequence.shuffled`, `toMap(destination)`
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, compiled and run on the same JVM.
+
+| program | before | reference |
+| --- | --- | --- |
+| `val s = sequence { yield(2) }; println(listOf(7, 8, s.first()))` | `[7, null, 2]` | `[7, 8, 2]` |
+| `println("x" + iterator { yield(5) }.next())` | `5` | `x5` |
+| `(sequenceOf(1, 2, 3) - 2).toList()`, `(generateSequence(…) + 9).toList()` | `unresolved reference: toList on Double` | `[1, 3]`, `[1, 2, 3, 9]` |
+| `sequenceOf(1, 2, 3, 4).shuffled(Random(42)).toList()` | `[3, 2, 4, 1]` | `[1, 4, 2, 3]` |
+| `(1..20).associate { "k$it" to it }.toMap(HashMap()).keys.take(8)` | `unresolved reference: toMap on Map` | `[k1, k2, k3, k20, k4, k5, k11, k6]` |
+
+A `sequence { }`/`iterator { }` block is a lambda with a `SequenceScope`
+receiver, so its prologue pops one parameter; entering the coroutine pushed
+none, and the prologue took the consumer's operand below instead.
+`Sequence.shuffled` is its own algorithm — `j = nextInt(buffer.size)` over a
+shrinking buffer, the last element moved to `j` — not the `Iterable` walk.
+`toMap(destination)` is `destination.apply { putAll(this) }`, so the
+destination's class decides the order.
+
 ## A read-only `List` written through a `MutableList` cast
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, compiled and run on the same JVM.
