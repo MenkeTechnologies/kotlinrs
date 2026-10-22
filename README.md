@@ -796,9 +796,8 @@ a name-based lookup falls into) would be silently wrong — so it is a compile
 error. A `reified` T does have an answer and is compiled: the call site binds
 the type argument and the body reads it back.
 
-Not yet (see roadmap): variance and bounds, an explicit `: super(args)` from a
-secondary constructor (the primary constructor is the only thing that chains to
-the superclass here), and the rest of the standard-library surface.
+Not yet (see roadmap): variance and bounds, `vararg` in a secondary
+constructor's parameter list, and the rest of the standard-library surface.
 Each fails loudly rather than answering wrong.
 
 One limitation is a **representation** limit rather than a missing feature, and
@@ -1742,6 +1741,26 @@ comparison to make is 5 000 -> 20 000 — 6.9x for four times the data. After,
 every column doubles with the input out to 40 000; the 80 000 `hashMapOf` cell
 varied from 0.81 s to 1.32 s across repetitions and is reported as the minimum
 rather than trusted to three digits.
+
+Also landed: **`: super(args)` from a secondary constructor**, in a class that
+declares no primary constructor — `class Kid : Base { constructor(n: Int, t:
+String) : super(n) { tag = t } }`, the shape of every `Exception` subclass with
+more than one constructor. Each such secondary gets a constructor of the
+primary's shape over the same class, taking the secondary's own parameters,
+which is what the superclass arguments are written in terms of; the body
+properties and `init` blocks run once, between the superclass constructor and
+the secondary's body, as Kotlin orders them. With it, a superclass constructor
+is now SELECTED rather than assumed: a `: Super(args)` header, or a
+`: super(args)` clause, picks the primary or the secondary of `Super` that the
+arguments fit — by arity, then by parameter type, with defaults filled — exactly
+as a `Super(args)` call site does, so `class NotFound(w: String) :
+AppError("$w not found", 404)` reaches `AppError`'s two-argument secondary and
+`constructor() : super()` reaches a no-argument one. On the in-place
+initialization scheme every secondary also has an `into` form that runs over
+the already-allocated instance, which is what lets a grandchild chain through
+it. A secondary that says `super(…)` beside a primary constructor is rejected
+with Kotlin's own diagnostic (`primary constructor call expected`); the four
+corpus records that pin the rest were captured from the reference toolchain.
 
 Next: variance and bounds, and a growing standard-library surface —
 alongside the sibling parity tooling (LSP/DAP, reference generator, differential

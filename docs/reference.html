@@ -158,7 +158,7 @@ println(when (x) { is String -&gt; "str"; is Int -&gt; "int"; else -&gt; "?" }) 
         <article class="doc-entry" id="doc-keywords-declarations-15">
           <h3><a class="doc-anchor" href="#doc-keywords-declarations-15">#</a> <code>class</code></h3>
           <pre><code class="lang-kotlin">class Name(val p: T, …) : Super(args), Iface { … }</code></pre>
-          <p>Declares a class. Only the primary constructor exists — there are no secondary constructors and no <code>init</code> block. A <code>val</code>/<code>var</code> primary-constructor parameter becomes a stored property; a plain parameter does not. The supertype list may name one class and any number of interfaces.</p>
+          <p>Declares a class. A <code>val</code>/<code>var</code> primary-constructor parameter becomes a stored property; a plain parameter does not. The body may declare properties, <code>init</code> blocks and secondary constructors (<code>constructor(…) : this(…)</code>, or <code>: super(…)</code> when the class has no primary constructor). The supertype list may name one class and any number of interfaces; its constructor arguments select the primary or a secondary constructor of that class the way a call does.</p>
           <pre><code class="lang-kotlin">open class Animal(val name: String)
 class Dog(n: String) : Animal(n)
 fun main() { println(Dog("rex").name) }   // rex</code></pre>

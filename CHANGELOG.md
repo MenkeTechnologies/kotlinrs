@@ -1,4 +1,4 @@
-# Changelog
+`Sub().b` — a default filled in the superclass call | `superclass constructor Base expects 2 argument(s), got 0` | `14` |`Circle().name` | `superclass constructor Shape expects 1 argument(s), got 0` | `anon` || `class E2 : RuntimeException { constructor(m: String, c: Throwable) : super(m, c) }`; `e.cause?.message` | `: super(2 argument(s))` from a secondary constructor is not supported | `c` || `open class AppError : Exception { val code: Int; constructor(m: String, code: Int) : super(m) { this.code = code } }`; `class NotFound(w: String) : AppError("$w not found", 404)` — a header selecting a SECONDARY of the superclass | `: super(1 argument(s))` from a secondary constructor is not supported | `user not found 404` |# Changelog
 
 Every expected value quoted here was measured, not recalled. The reference is
 `kotlinc` 2.4.10 running on **JRE 21.0.12**, with the program **compiled** by
@@ -10,6 +10,29 @@ on.
 
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
+
+## Secondary constructors that call `super(args)`
+
+Measured on `kotlinc` 2.4.21 / JRE 25.0.4.1, compiled and run on the same JVM.
+
+| program | before | reference |
+| --- | --- | --- |
+| `open class Base(val n: Int)`; `class Kid : Base { val tag: String; constructor(n: Int, t: String) : super(n) { tag = t } }`; `Kid(1, "x").tag` | `superclass constructor Base expects 1 argument(s), got 0` | `x` |
+| `class E2 : RuntimeException { constructor(m: String, c: Throwable) : super(m, c) }`; `e.cause?.message` | `: super(2 argument(s))` from a secondary constructor is not supported | `c` |
+| `open class AppError : Exception { val code: Int; constructor(m: String, code: Int) : super(m) { this.code = code } }`; `class NotFound(w: String) : AppError("$w not found", 404)` — a header selecting a SECONDARY of the superclass | `: super(1 argument(s))` from a secondary constructor is not supported | `user not found 404` |
+| `open class Shape(val name: String) { constructor() : this("anon") }`; `class Circle : Shape { constructor() : super() }`; `Circle().name` | `superclass constructor Shape expects 1 argument(s), got 0` | `anon` |
+| `open class Base(val a: Int, val b: Int = a * 2)`; `class Sub : Base { constructor() : super(7) }`; `Sub().b` — a default filled in the superclass call | `superclass constructor Base expects 2 argument(s), got 0` | `14` |
+| `class C(val v: Int) { constructor(s: String) : super() }` | `constructor C has no argument for v` | rejected: `primary constructor call expected` |
+
+A class with no primary constructor now gets one constructor of the primary's
+shape PER `: super(args)` secondary, over that secondary's own parameters, so
+the superclass arguments evaluate against them and the property initializers
+and `init` blocks still run exactly once. The superclass constructor is selected
+the way a `Super(args)` call site selects one — primary or secondary, by arity
+then parameter type, defaults filled — in both the `: Super(args)` header and
+the `: super(args)` clause. On the in-place initialization scheme every
+secondary constructor also has an `into` form (`Class#$ctorN$into`) that runs
+over an already-allocated instance, which is what a subclass chains through.
 
 ## Regex options
 

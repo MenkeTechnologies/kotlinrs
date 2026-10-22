@@ -1799,6 +1799,102 @@ fn sec_ctor_sub_name(class: &str, idx: usize) -> String {
     format!("{class}#$ctor{idx}")
 }
 
+/// The chained scheme's into form of a secondary constructor
+/// (`Person#$ctor0$into`) — see `Compiler::compile_secondary_ctor`.
+fn sec_ctor_into_sub_name(class: &str, idx: usize) -> String {
+    format!("{class}#$ctor{idx}$into")
+}
+
+/// The constructor a secondary constructor that says `: super(args)` chains
+/// through — `Person#$init$super0` / `Person#$into$super0`, numbered like the
+/// secondary itself. Kotlin only allows that clause in a class with NO primary
+/// constructor, where the secondary takes the primary's place: its own
+/// parameters are what the superclass arguments are written in terms of, so it
+/// gets a constructor of the primary's shape with those parameters and those
+/// arguments, built by the same lowering (see [`CtorShape`]).
+fn sec_super_init_sub_name(class: &str, idx: usize) -> String {
+    format!("{class}#$init$super{idx}")
+}
+
+fn sec_super_into_sub_name(class: &str, idx: usize) -> String {
+    format!("{class}#$into$super{idx}")
+}
+
+/// The arguments of a secondary constructor's `: super(args)` clause, when it
+/// has one WITH arguments. An empty `: super()` chains through the implicit
+/// primary constructor exactly as an absent clause does, so it is not one.
+fn super_delegation(sec: &SecondaryCtor) -> Option<&[Expr]> {
+    sec.deleg
+        .as_ref()
+        .filter(|d| d.is_super && !d.args.is_empty())
+        .map(|d| d.args.as_slice())
+}
+
+/// What a class-constructor subroutine is built FROM: the sub names it is
+/// published under and the parameters and superclass arguments it binds.
+///
+/// The primary constructor's shape is the class's own (`Class#$init`, its
+/// `ctor_params`, its `: Super(args)`). A secondary that delegates with
+/// `: super(args)` supplies a second shape over the same class — its own
+/// parameters and its own argument list — so that one lowering serves both
+/// and the property initializers and `init` blocks run once either way.
+struct CtorShape {
+    init_name: String,
+    /// Chained scheme only: the entry that runs the constructors over an
+    /// already-allocated instance (see `Compiler::compile_ctor_chained`).
+    into_name: String,
+    params: Vec<CtorProp>,
+    super_args: Vec<Expr>,
+}
+
+impl CtorShape {
+    /// The primary constructor's shape.
+    fn primary(meta: &ClassMeta) -> Self {
+        CtorShape {
+            init_name: ctor_sub_name(&meta.name),
+            into_name: ctor_into_sub_name(&meta.name),
+            params: meta.ctor_params.clone(),
+            super_args: meta.super_args.clone(),
+        }
+    }
+
+    /// The shape of the `idx`th secondary's `: super(args)` chain: the
+    /// secondary's parameters, none of them a stored property, and the
+    /// arguments it wrote.
+    fn secondary_super(class: &str, idx: usize, sec: &SecondaryCtor, args: &[Expr]) -> Self {
+        let params = sec
+            .params
+            .iter()
+            .map(|p| CtorProp {
+                name: p.name.clone(),
+                ty: p.ty,
+                class: p.class.clone(),
+                kind: PropKind::None,
+                // The secondary's own frame has already filled every default
+                // and forwards complete values.
+                default: None,
+                type_param_of: p.type_param_of,
+                type_args: p.type_args.clone(),
+            })
+            .collect();
+        CtorShape {
+            init_name: sec_super_init_sub_name(class, idx),
+            into_name: sec_super_into_sub_name(class, idx),
+            params,
+            super_args: args.to_vec(),
+        }
+    }
+
+    /// The class metadata with this shape's parameters and superclass
+    /// arguments in place of the primary's, which is all the two constructor
+    /// lowerings read.
+    fn meta(&self, mut meta: ClassMeta) -> ClassMeta {
+        meta.ctor_params = self.params.clone();
+        meta.super_args = self.super_args.clone();
+        meta
+    }
+}
+
 /// The synthetic field a class extending a built-in throwable stores its
 /// `Exception(message)` argument in, so `e.message` and the `Class: message`
 /// display form both work.
@@ -3141,12 +3237,26 @@ impl Compiler {
             self.build_object_in_place(cd, true)?;
         }
         if !cd.is_object && !cd.is_interface {
-            if self.ctor_chained(&cd.name) {
-                self.compile_ctor_chained(cd)?;
-            } else {
-                self.compile_ctor(cd)?;
+            let meta = self.classes[&cd.name].clone();
+            if self.implicit_primary_needed(cd, &meta) {
+                self.compile_ctor_shape(cd, &CtorShape::primary(&meta))?;
             }
             for (i, sec) in cd.secondaries.iter().enumerate() {
+                // Kotlin's `primary constructor call expected`: with a primary
+                // constructor declared, every secondary must reach it, and the
+                // superclass call belongs to the header — `: super()` included.
+                if cd.has_primary && sec.deleg.as_ref().is_some_and(|d| d.is_super) {
+                    return Err(format!(
+                        "class {}: a secondary constructor may not call `super(…)` when the \
+                         class has a primary constructor; delegate with `this(…)` instead \
+                         (line {})",
+                        cd.name, sec.line
+                    ));
+                }
+                if let Some(args) = super_delegation(sec) {
+                    let shape = CtorShape::secondary_super(&cd.name, i, sec, args);
+                    self.compile_ctor_shape(cd, &shape)?;
+                }
                 self.compile_secondary_ctor(cd, i, sec)?;
             }
         }
@@ -3399,6 +3509,42 @@ impl Compiler {
             && m.base.as_deref().map_or(true, |b| self.ctor_chained(b))
     }
 
+    /// Emit one constructor of `cd` under the scheme the class is on.
+    fn compile_ctor_shape(&mut self, cd: &ClassDecl, shape: &CtorShape) -> Result<(), String> {
+        if self.ctor_chained(&cd.name) {
+            self.compile_ctor_chained(cd, shape)
+        } else {
+            self.compile_ctor(cd, shape)
+        }
+    }
+
+    /// Whether the class's own `Class#$init` has to exist.
+    ///
+    /// Kotlin synthesizes the implicit no-argument primary constructor only
+    /// when a class declares no constructor at all. A class with secondaries
+    /// alone has no primary, and building one anyway would check an empty
+    /// `: Super()` against a superclass that takes arguments — a compile error
+    /// for a program Kotlin accepts (`class Kid : Base { constructor(n: Int) :
+    /// super(n) }`). It is still built when a secondary reaches it: one with no
+    /// delegation clause or an empty `: super()`, or a `: this(…)` that no
+    /// secondary takes.
+    fn implicit_primary_needed(&self, cd: &ClassDecl, meta: &ClassMeta) -> bool {
+        if cd.has_primary || cd.secondaries.is_empty() {
+            return true;
+        }
+        cd.secondaries.iter().any(|sec| match &sec.deleg {
+            None => true,
+            Some(d) if d.is_super => d.args.is_empty(),
+            Some(d) => {
+                let mut sc = Scope::new();
+                for p in &sec.params {
+                    sc.declare_obj(&p.name, p.ty, false, p.class.clone());
+                }
+                self.select_ctor(&sc, meta, &d.args).0.is_none()
+            }
+        })
+    }
+
     /// The type whose zero a property of `class` holds before its initializer
     /// runs: the declared one, or — for an unannotated property — what its
     /// initializer infers to.
@@ -3431,42 +3577,30 @@ impl Compiler {
     /// initializer reaches the subclass's override, and that override reads the
     /// subclass's fields at their zero values (`null`/`0`) because its own
     /// initializers have not run.
-    fn compile_ctor_chained(&mut self, cd: &ClassDecl) -> Result<(), String> {
-        let meta = self.classes[&cd.name].clone();
+    ///
+    /// `shape` names the subroutines and supplies the parameters and superclass
+    /// arguments: the class's own for the primary constructor, a secondary's
+    /// for its `: super(args)` chain (see [`CtorShape`]).
+    fn compile_ctor_chained(&mut self, cd: &ClassDecl, shape: &CtorShape) -> Result<(), String> {
+        let meta = shape.meta(self.classes[&cd.name].clone());
         let n = meta.ctor_params.len();
 
         // `Class#$init(args…)` — allocate, then initialize into the instance.
         let entry = self.b.current_pos();
-        let name_idx = self.b.add_name(&ctor_sub_name(&cd.name));
+        let name_idx = self.b.add_name(&shape.init_name);
         self.b.add_sub_entry(name_idx, entry);
         for i in (0..n).rev() {
             self.b.emit(Op::SetSlot(i as u16), cd.line);
         }
         self.emit_companion_first_use(&cd.name);
-        let mut chain = vec![cd.name.clone()];
-        while let Some(b) = self.classes[chain.last().expect("non-empty")].base.clone() {
-            chain.push(b);
-        }
-        let mut sc = Scope::new();
-        for (k, class) in chain.iter().rev().enumerate() {
-            let m = self.classes[class].clone();
-            let midx = self.b.add_constant(Value::str(m.meta_string()));
-            self.b.emit(Op::LoadConst(midx), cd.line);
-            let own: Vec<&PropMeta> = m.own_props.iter().collect();
-            for p in &own {
-                let ty = self.field_zero_type(class, p);
-                self.compile_expr(&mut sc, &jvm_default(ty))?;
-            }
-            let op = if k == 0 { KT_NEW } else { KT_EXTEND };
-            self.b.emit(Op::Extended(op, own.len() as u8), cd.line);
-        }
+        self.emit_alloc_whole_instance(cd)?;
         let this = n as u16;
         self.b.emit(Op::SetSlot(this), cd.line);
         self.b.emit(Op::GetSlot(this), cd.line);
         for i in 0..n {
             self.b.emit(Op::GetSlot(i as u16), cd.line);
         }
-        let into = self.b.add_name(&ctor_into_sub_name(&cd.name));
+        let into = self.b.add_name(&shape.into_name);
         self.b.emit(Op::Call(into, (n + 1) as u8), cd.line);
         self.b.emit(Op::Pop, cd.line);
         self.b.emit(Op::GetSlot(this), cd.line);
@@ -3475,7 +3609,7 @@ impl Compiler {
         // `Class#$into(this, args…)` — the constructor proper.
         let entry = self.b.current_pos();
         let this = 0u16;
-        let name_idx = self.b.add_name(&ctor_into_sub_name(&cd.name));
+        let name_idx = self.b.add_name(&shape.into_name);
         self.b.add_sub_entry(name_idx, entry);
         let mut sc = Scope::new();
         sc.declare_obj("this", Type::Obj, false, Some(cd.name.clone()));
@@ -3503,21 +3637,13 @@ impl Compiler {
             self.emit_callee_defaults(&mut sc, &ctor_params, &defaults, cd.line)?;
             // The superclass constructor runs first, over the same instance.
             if let Some(base) = &meta.base {
-                let bmeta = self.classes[base].clone();
-                if meta.super_args.len() != bmeta.ctor_params.len() {
-                    return Err(format!(
-                        "superclass constructor {base} expects {} argument(s), got {}",
-                        bmeta.ctor_params.len(),
-                        meta.super_args.len()
-                    ));
-                }
+                let (sub, full) = self.select_super_ctor(&sc, base, &meta.super_args, true)?;
                 self.b.emit(Op::GetSlot(this), cd.line);
-                for a in &meta.super_args {
+                for a in &full {
                     self.compile_expr(&mut sc, a)?;
                 }
-                let idx = self.b.add_name(&ctor_into_sub_name(base));
-                self.b
-                    .emit(Op::Call(idx, (meta.super_args.len() + 1) as u8), cd.line);
+                let idx = self.b.add_name(&sub);
+                self.b.emit(Op::Call(idx, (full.len() + 1) as u8), cd.line);
                 self.b.emit(Op::Pop, cd.line);
             }
             // Constructor properties take their arguments before any initializer.
@@ -3557,6 +3683,61 @@ impl Compiler {
         self.b.emit(Op::LoadUndef, cd.line);
         self.b.emit(Op::ReturnValue, cd.line);
         Ok(())
+    }
+
+    /// Allocate the WHOLE instance of a chained-scheme class `cd` and leave it
+    /// on the stack: every field of every class up the chain at its zero value,
+    /// tagged with `cd`. The constructors then run over it — see
+    /// `Compiler::compile_ctor_chained`.
+    fn emit_alloc_whole_instance(&mut self, cd: &ClassDecl) -> Result<(), String> {
+        let mut chain = vec![cd.name.clone()];
+        while let Some(b) = self.classes[chain.last().expect("non-empty")].base.clone() {
+            chain.push(b);
+        }
+        let mut sc = Scope::new();
+        for (k, class) in chain.iter().rev().enumerate() {
+            let m = self.classes[class].clone();
+            let midx = self.b.add_constant(Value::str(m.meta_string()));
+            self.b.emit(Op::LoadConst(midx), cd.line);
+            let own: Vec<&PropMeta> = m.own_props.iter().collect();
+            for p in &own {
+                let ty = self.field_zero_type(class, p);
+                self.compile_expr(&mut sc, &jvm_default(ty))?;
+            }
+            let op = if k == 0 { KT_NEW } else { KT_EXTEND };
+            self.b.emit(Op::Extended(op, own.len() as u8), cd.line);
+        }
+        Ok(())
+    }
+
+    /// The superclass constructor a `: Super(args)` header or a secondary's
+    /// `: super(args)` runs, selected the way a `Super(args)` call site selects
+    /// one — the primary, or a secondary of the matching arity and parameter
+    /// types — together with the arguments as that constructor takes them,
+    /// defaults filled and named arguments placed. `into` asks for the chained
+    /// scheme's `$into` form, which runs over an instance that already exists.
+    fn select_super_ctor(
+        &mut self,
+        sc: &Scope,
+        base: &str,
+        args: &[Expr],
+        into: bool,
+    ) -> Result<(String, Vec<Expr>), String> {
+        let bmeta = self.classes[base].clone();
+        let (sec, params) = self.select_ctor(sc, &bmeta, args);
+        let full = self.expand_args(
+            &format!("superclass constructor {base}"),
+            None,
+            &params,
+            args,
+        )?;
+        let sub = match (sec, into) {
+            (Some(i), true) => sec_ctor_into_sub_name(base, i),
+            (Some(i), false) => sec_ctor_sub_name(base, i),
+            (None, true) => ctor_into_sub_name(base),
+            (None, false) => ctor_sub_name(base),
+        };
+        Ok((sub, full))
     }
 
     /// Store the value in slot `value` into the field `name` that class `cd`
@@ -3603,10 +3784,13 @@ impl Compiler {
     /// * **built-in throwable superclass** — no base instance exists, so the
     ///   `Exception(message)` argument lands in the synthetic `message` field.
     /// * **no superclass** — a plain `KT_NEW` over the class's own fields.
-    fn compile_ctor(&mut self, cd: &ClassDecl) -> Result<(), String> {
-        let meta = self.classes[&cd.name].clone();
+    ///
+    /// `shape` names the subroutine and supplies the parameters and superclass
+    /// arguments — see [`CtorShape`] and `Compiler::compile_ctor_chained`.
+    fn compile_ctor(&mut self, cd: &ClassDecl, shape: &CtorShape) -> Result<(), String> {
+        let meta = shape.meta(self.classes[&cd.name].clone());
         let entry = self.b.current_pos();
-        let name_idx = self.b.add_name(&ctor_sub_name(&cd.name));
+        let name_idx = self.b.add_name(&shape.init_name);
         self.b.add_sub_entry(name_idx, entry);
 
         // Bind the primary-constructor parameters to slots, deepest last.
@@ -3639,20 +3823,12 @@ impl Compiler {
 
         // The base instance, when there is a superclass to chain to.
         if let Some(base) = &meta.base {
-            let bmeta = self.classes[base].clone();
-            if meta.super_args.len() != bmeta.ctor_params.len() {
-                return Err(format!(
-                    "superclass constructor {base} expects {} argument(s), got {}",
-                    bmeta.ctor_params.len(),
-                    meta.super_args.len()
-                ));
-            }
-            for a in &meta.super_args {
+            let (sub, full) = self.select_super_ctor(&sc, base, &meta.super_args, false)?;
+            for a in &full {
                 self.compile_expr(&mut sc, a)?;
             }
-            let idx = self.b.add_name(&ctor_sub_name(base));
-            self.b
-                .emit(Op::Call(idx, meta.super_args.len() as u8), cd.line);
+            let idx = self.b.add_name(&sub);
+            self.b.emit(Op::Call(idx, full.len() as u8), cd.line);
             // Bind the INHERITED properties to slots, read off the base
             // instance the call just returned. A body property initializer and
             // an `init` block may both name one — `class Sub(x: Int) : Base(x)
@@ -3822,21 +3998,64 @@ impl Compiler {
     /// secondary's body included — and only then does this body run, on the
     /// instance that came back. The instance is bound as `this`, so the body
     /// assigns properties through the ordinary field path.
+    ///
+    /// On the chained scheme (see `Compiler::compile_ctor_chained`) the
+    /// constructor proper is the INTO form, `Class#$ctorN$into(this, params…)`,
+    /// which runs over an instance that already exists — the form a subclass's
+    /// `: Super(args)` that selects this secondary calls, exactly as it calls
+    /// the primary's `$into` — and `Class#$ctorN` is allocate-then-into, like
+    /// `$init`. On the extending scheme there is only `Class#$ctorN`, and the
+    /// constructor it delegates to hands back the instance.
     fn compile_secondary_ctor(
         &mut self,
         cd: &ClassDecl,
         idx: usize,
         sec: &SecondaryCtor,
     ) -> Result<(), String> {
+        let chained = self.ctor_chained(&cd.name);
+        let n = sec.params.len();
+        if chained {
+            // `Class#$ctorN(params…)` — allocate, then initialize into the instance.
+            let entry = self.b.current_pos();
+            let name_idx = self.b.add_name(&sec_ctor_sub_name(&cd.name, idx));
+            self.b.add_sub_entry(name_idx, entry);
+            for i in (0..n).rev() {
+                self.b.emit(Op::SetSlot(i as u16), sec.line);
+            }
+            self.emit_companion_first_use(&cd.name);
+            self.emit_alloc_whole_instance(cd)?;
+            let this = n as u16;
+            self.b.emit(Op::SetSlot(this), sec.line);
+            self.b.emit(Op::GetSlot(this), sec.line);
+            for i in 0..n {
+                self.b.emit(Op::GetSlot(i as u16), sec.line);
+            }
+            let into = self.b.add_name(&sec_ctor_into_sub_name(&cd.name, idx));
+            self.b.emit(Op::Call(into, (n + 1) as u8), sec.line);
+            self.b.emit(Op::Pop, sec.line);
+            self.b.emit(Op::GetSlot(this), sec.line);
+            self.b.emit(Op::ReturnValue, sec.line);
+        }
+
+        // The constructor proper.
         let entry = self.b.current_pos();
-        let name_idx = self.b.add_name(&sec_ctor_sub_name(&cd.name, idx));
+        let name = if chained {
+            sec_ctor_into_sub_name(&cd.name, idx)
+        } else {
+            sec_ctor_sub_name(&cd.name, idx)
+        };
+        let name_idx = self.b.add_name(&name);
         self.b.add_sub_entry(name_idx, entry);
 
         let mut sc = Scope::new();
+        // The into form takes the instance first; the extending form binds
+        // `this` only once the delegated constructor has built it.
+        let this_slot =
+            chained.then(|| sc.declare_obj("this", Type::Obj, false, Some(cd.name.clone())));
         for p in &sec.params {
             sc.declare_obj(&p.name, p.ty, false, p.class.clone());
         }
-        for i in (0..sec.params.len()).rev() {
+        for i in (0..n + usize::from(chained)).rev() {
             self.b.emit(Op::SetSlot(i as u16), sec.line);
         }
         let defaults: Vec<Option<Expr>> = sec
@@ -3851,75 +4070,104 @@ impl Compiler {
             .collect();
         self.emit_callee_defaults(&mut sc, &sec.params, &defaults, sec.line)?;
 
-        // The delegation target. `: super(…)` is not a separate object here —
-        // the primary constructor is the one that chains to the superclass — so
-        // both spellings run the primary, which is also what an absent clause
-        // does. `: this(…)` with an arity no primary can take picks the
-        // secondary of that arity instead.
         let meta = self.classes[&cd.name].clone();
         // Where the delegation goes:
         //
-        // * no clause — the primary, with no arguments. This is the shape a
-        //   class with no primary constructor has, and it is what makes its
-        //   property initializers and `init` blocks run exactly once, before
-        //   this body.
+        // * no clause, or an empty `: super()` — the primary, with no
+        //   arguments. This is the shape a class with no primary constructor
+        //   has, and it is what makes its property initializers and `init`
+        //   blocks run exactly once, before this body.
         // * `: this(…)` — the same selection a `C(args)` call site uses, so
         //   defaults are filled and named arguments reordered identically. A
         //   secondary that selected ITSELF would recurse forever, which Kotlin
         //   rejects outright.
-        // * `: super(…)` — the primary is the only thing that chains to the
-        //   superclass here, so a NON-EMPTY argument list has nowhere to go.
+        // * `: super(args)` — this secondary's own constructor of the primary's
+        //   shape (`Class#$init$superN`, see [`CtorShape::secondary_super`]),
+        //   which takes the secondary's parameters as they are — every default
+        //   is filled above — and evaluates the superclass arguments against
+        //   them. `None` for the argument list says "forward the parameters".
         let explicit_this = sec.deleg.as_ref().filter(|d| !d.is_super);
-        if let Some(d) = sec
-            .deleg
-            .as_ref()
-            .filter(|d| d.is_super && !d.args.is_empty())
-        {
-            return Err(format!(
-                "class {}: `: super({} argument(s))` from a secondary constructor is not \
-                 supported; delegate through the primary constructor instead (line {})",
-                cd.name,
-                d.args.len(),
-                sec.line
-            ));
-        }
-        let args: Vec<Expr> = explicit_this.map(|d| d.args.clone()).unwrap_or_default();
-        let (target_sec, params) = match explicit_this {
-            Some(_) => self.select_ctor(&sc, &meta, &args),
-            None => (
-                None,
-                meta.ctor_params.iter().map(|p| p.as_param()).collect(),
-            ),
-        };
-        if target_sec == Some(idx) {
-            return Err(format!(
-                "class {}: secondary constructor delegates to itself (line {})",
-                cd.name, sec.line
-            ));
-        }
-        let target = match target_sec {
-            Some(i) => sec_ctor_sub_name(&cd.name, i),
-            None => ctor_sub_name(&cd.name),
-        };
+        let (target, params, args): (String, Vec<Param>, Option<Vec<Expr>>) =
+            if super_delegation(sec).is_some() {
+                let target = if chained {
+                    sec_super_into_sub_name(&cd.name, idx)
+                } else {
+                    sec_super_init_sub_name(&cd.name, idx)
+                };
+                (target, sec.params.clone(), None)
+            } else {
+                let args: Vec<Expr> = explicit_this.map(|d| d.args.clone()).unwrap_or_default();
+                let (target_sec, params) = match explicit_this {
+                    Some(_) => self.select_ctor(&sc, &meta, &args),
+                    None => (
+                        None,
+                        meta.ctor_params.iter().map(|p| p.as_param()).collect(),
+                    ),
+                };
+                if target_sec == Some(idx) {
+                    return Err(format!(
+                        "class {}: secondary constructor delegates to itself (line {})",
+                        cd.name, sec.line
+                    ));
+                }
+                let target = match (target_sec, chained) {
+                    (Some(i), true) => sec_ctor_into_sub_name(&cd.name, i),
+                    (Some(i), false) => sec_ctor_sub_name(&cd.name, i),
+                    (None, true) => ctor_into_sub_name(&cd.name),
+                    (None, false) => ctor_sub_name(&cd.name),
+                };
+                (target, params, Some(args))
+            };
         self.cur_class = Some(cd.name.clone());
         let outer_boxed = std::mem::replace(&mut self.boxed_vars, shared_captures(&sec.body));
         let res: Result<(), String> = (|| {
-            let full =
-                self.expand_args(&format!("constructor {}", cd.name), None, &params, &args)?;
-            for a in &full {
-                self.compile_expr(&mut sc, a)?;
+            if let Some(this) = this_slot {
+                self.b.emit(Op::GetSlot(this), sec.line);
+            }
+            match &args {
+                Some(args) => {
+                    let full =
+                        self.expand_args(&format!("constructor {}", cd.name), None, &params, args)?;
+                    for a in &full {
+                        self.compile_expr(&mut sc, a)?;
+                    }
+                }
+                None => {
+                    for p in &params {
+                        let slot = sc.slot(&p.name).expect("parameter bound above");
+                        self.b.emit(Op::GetSlot(slot), sec.line);
+                    }
+                }
             }
             let tidx = self.b.add_name(&target);
-            self.b.emit(Op::Call(tidx, params.len() as u8), sec.line);
-            // The delegated constructor's result is the instance; bind it as
-            // `this` so the body's property reads and writes resolve.
-            let this = sc.declare_obj("this", Type::Obj, false, Some(cd.name.clone()));
-            self.b.emit(Op::SetSlot(this), sec.line);
+            self.b.emit(
+                Op::Call(tidx, (params.len() + usize::from(chained)) as u8),
+                sec.line,
+            );
+            let this = match this_slot {
+                // The into form ran over the instance it was handed.
+                Some(this) => {
+                    self.b.emit(Op::Pop, sec.line);
+                    this
+                }
+                // The delegated constructor's result is the instance; bind it
+                // as `this` so the body's property reads and writes resolve.
+                None => {
+                    let this = sc.declare_obj("this", Type::Obj, false, Some(cd.name.clone()));
+                    self.b.emit(Op::SetSlot(this), sec.line);
+                    this
+                }
+            };
             for s in &sec.body {
                 self.compile_stmt(&mut sc, s)?;
             }
-            // A constructor evaluates to the instance it built.
-            self.b.emit(Op::GetSlot(this), sec.line);
+            // A constructor evaluates to the instance it built; the into form
+            // leaves that to its caller.
+            if chained {
+                self.b.emit(Op::LoadUndef, sec.line);
+            } else {
+                self.b.emit(Op::GetSlot(this), sec.line);
+            }
             Ok(())
         })();
         self.boxed_vars = outer_boxed;

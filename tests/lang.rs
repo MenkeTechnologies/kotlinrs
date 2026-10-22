@@ -2559,6 +2559,71 @@ fn secondary_constructor_delegating_to_itself_is_rejected() {
 }
 
 #[test]
+fn a_secondary_constructor_calling_super_beside_a_primary_is_rejected() {
+    // kotlinc 2.4.21: `error: primary constructor call expected.` With a
+    // primary constructor declared, the superclass call belongs to the header
+    // and every secondary must reach the primary through `this(…)`. An empty
+    // `super()` is rejected the same way, not routed through the primary.
+    for src in [
+        "open class B(val n: Int)\n\
+         class C(v: Int) : B(v) {\n\
+         \x20   constructor(s: String) : super(s.length)\n\
+         }\n\
+         fun main() { println(C(\"x\").n) }",
+        "class C(val v: Int) {\n\
+         \x20   constructor(s: String) : super() { }\n\
+         }\n\
+         fun main() { println(C(\"x\").v) }",
+    ] {
+        let out = eval(src);
+        assert!(!out.status.success(), "accepted: {src}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("may not call `super(…)` when the class has a primary constructor"),
+            "stderr was: {err}"
+        );
+    }
+}
+
+#[test]
+fn a_secondary_constructor_calls_super_with_its_own_parameters() {
+    // Measured on kotlinc 2.4.21 / JRE 25.0.4.1. A class with no primary
+    // constructor chains to the superclass from each secondary, with the
+    // arguments written in terms of THAT secondary's parameters; the body
+    // properties and `init` blocks run once, before the secondary's body; and
+    // a `: Super(args)` header selects a SECONDARY of the superclass when that
+    // is what fits, including through a grandchild on the in-place scheme.
+    assert_eq!(
+        stdout(
+            "open class Base(val n: Int) {\n\
+             \x20   constructor(s: String) : this(s.length) { println(\"Base(String)\") }\n\
+             \x20   open fun show() = \"Base$n\"\n\
+             }\n\
+             open class Kid : Base {\n\
+             \x20   val tag: String\n\
+             \x20   init { println(\"Kid init\") }\n\
+             \x20   constructor(n: Int, t: String) : super(n) { tag = t }\n\
+             \x20   constructor(s: String) : super(s) { tag = \"s\" }\n\
+             \x20   override fun show() = \"Kid$n$tag\"\n\
+             }\n\
+             class Grand : Kid {\n\
+             \x20   constructor() : super(5, \"g\") { println(\"Grand after ${show()}\") }\n\
+             }\n\
+             class E : IllegalStateException {\n\
+             \x20   constructor(m: String, c: Throwable) : super(m, c)\n\
+             }\n\
+             fun main() {\n\
+             \x20   println(Kid(1, \"x\").show())\n\
+             \x20   println(Kid(\"abcd\").show())\n\
+             \x20   println(Grand().show())\n\
+             \x20   try { throw E(\"m\", RuntimeException(\"c\")) } catch (e: RuntimeException) { println(\"${e.message} <- ${e.cause?.message}\") }\n\
+             }"
+        ),
+        "Kid init\nKid1x\nBase(String)\nKid init\nKid4s\nKid init\nGrand after Kid5g\nKid5g\nm <- c\n"
+    );
+}
+
+#[test]
 fn a_class_property_may_delegate_to_the_stdlib_observable() {
     // This pinned a compile error for a program the reference accepts (`1`,
     // measured on kotlinc 2.4.21): `Delegates.observable` is supplied by the
