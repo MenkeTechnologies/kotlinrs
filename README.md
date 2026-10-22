@@ -412,6 +412,10 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   calls the primary constructor — re-running the `: Super(args)` header, which
   is what makes `data class W(val s: String) : Base(s.length)` recompute its base
   field on a copy rather than carry the old one over.
+  An ARRAY-typed property renders and hashes by CONTENT (`Arrays.toString`,
+  `Arrays.hashCode`, as the generated members do) and compares by identity,
+  so `data class Q(val a: IntArray)` prints `Q(a=[1, 2])`; a property of any
+  other declared type holding an array keeps the array's identity form.
 
   `hashCode()` follows the **JVM contract exactly**, so the number a program
   prints matches the reference toolchain rather than merely being consistent

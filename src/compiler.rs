@@ -1651,6 +1651,11 @@ impl ClassMeta {
     /// `Long` fold differs from the `Int` one and the two types share a runtime
     /// representation, so the declared width has to travel with the class (see
     /// [`crate::host`]'s `LONG_FIELDS`).
+    ///
+    /// An ARRAY-typed property is `'a'`: the generated `toString` renders it
+    /// with `Arrays.toString` and `hashCode` folds it with `Arrays.hashCode`,
+    /// where a property of any other declared type holding the same array keeps
+    /// the array's own identity `toString`/`hashCode`.
     fn meta_string(&self) -> String {
         let mut s = self.name.clone();
         s.push('\u{1f}');
@@ -1659,7 +1664,13 @@ impl ClassMeta {
         s.push_str(&self.data_len.to_string());
         s.push('\u{1f}');
         for p in &self.own_props {
-            s.push(if p.ty == Type::Long { 'l' } else { '.' });
+            s.push(if p.ty == Type::Long {
+                'l'
+            } else if p.class.as_deref().is_some_and(is_array_class) {
+                'a'
+            } else {
+                '.'
+            });
         }
         for p in &self.own_props {
             s.push('\u{1f}');
@@ -1671,6 +1682,24 @@ impl ClassMeta {
     fn instantiable(&self) -> bool {
         !self.is_object && !self.is_interface && !self.is_abstract
     }
+}
+
+/// Whether a declared class name is one of Kotlin's array types — the
+/// properties a `data class` renders and hashes by CONTENT (see
+/// [`ClassMeta::meta_string`]).
+fn is_array_class(name: &str) -> bool {
+    matches!(
+        name,
+        "Array"
+            | "IntArray"
+            | "LongArray"
+            | "ShortArray"
+            | "ByteArray"
+            | "CharArray"
+            | "BooleanArray"
+            | "FloatArray"
+            | "DoubleArray"
+    )
 }
 
 /// The class an unannotated body property's initializer produces, where the
@@ -2068,6 +2097,10 @@ pub struct Compiler {
     /// enclosing lambda's. Identified by the body slice's address, which is
     /// the literal's own and unique while it is being lowered.
     zero_arity_body: Option<*const Stmt>,
+    /// The receiver expression of the member call that is the FALLBACK half of
+    /// an extension's runtime receiver check (see [`Compiler::compile_member`]),
+    /// which must not pick the same extension again. Identified by address.
+    skip_ext_recv: Option<*const Expr>,
     /// The `kotlin.math` names the program's imports brought into scope, as
     /// *visible spelling* → *runtime name*. Kotlin does NOT auto-import
     /// `kotlin.math`, so `abs`/`sqrt`/`PI` are compile errors without an import,
@@ -3040,6 +3073,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         lambda_recv: None,
         lambda_recv_it: false,
         zero_arity_body: None,
+        skip_ext_recv: None,
         math_scope: HashMap::new(),
         math_star: false,
         random_imported: false,
@@ -7301,8 +7335,25 @@ impl Compiler {
                 .and_then(|m| m.methods.get(name))
                 .is_some_and(|s| s.accepts(args.len()))
         });
+        let skip_ext = self.skip_ext_recv == Some(recv as *const Expr);
         if !member_wins {
-            if let Some((sub, sig)) = self.resolve_ext(sc, recv, name) {
+            // A receiver the frontend cannot type, in a program declaring
+            // extensions of this name on USER classes: which one applies — or
+            // none, `3.also { }.plus(1)` being `Int.plus` beside an
+            // `operator fun Box.plus(o: Box)` — is a RUNTIME question.
+            let cands = self.class_ext_candidates(sc, recv, name, args.len());
+            if !cands.is_empty() && !skip_ext {
+                return self.compile_ext_chain(sc, recv, name, args, safe, line, cands);
+            }
+            // The chain's own fallback half must not land on one of those
+            // class extensions again.
+            let resolved = self.resolve_ext(sc, recv, name).filter(|(_, s)| {
+                !(skip_ext
+                    && s.owner
+                        .as_ref()
+                        .is_some_and(|o| self.classes.contains_key(o)))
+            });
+            if let Some((sub, sig)) = resolved {
                 let full = self.expand_args(name, sig.owner.as_deref(), &sig.params, args)?;
                 self.compile_expr(sc, recv)?;
                 self.compile_call_args(sc, &sig.params, &full)?;
@@ -8026,8 +8077,21 @@ impl Compiler {
         self.compile_expr(sc, recv)?; // [recv]
         let rslot = sc.temp();
         self.b.emit(Op::SetSlot(rslot), 0);
+        // The arguments run in WRITTEN order after the receiver —
+        // `d.copy(b = g(), a = h())` runs `g` first — so a reordered list is
+        // bound to hidden locals here and read back in declaration order.
+        let hoisted = hoist_written_order(&slots, args, false);
+        if let Some((binds, _)) = &hoisted {
+            for (name, init) in binds {
+                let ty = self.compile_expr(sc, init)?;
+                let class = self.infer_class(sc, init);
+                let slot = sc.declare_obj(name, ty, false, class);
+                self.b.emit(Op::SetSlot(slot), 0);
+            }
+        }
         for (i, p) in meta.ctor_params.iter().enumerate() {
-            match slots[i] {
+            let read = hoisted.as_ref().and_then(|h| h.1[i].as_ref());
+            match read.or(slots[i]) {
                 Some(a) => {
                     self.compile_expr(sc, a)?;
                 }
@@ -8900,6 +8964,14 @@ impl Compiler {
             if self.declares_operator(sc, l, fname) {
                 return self.compile_member(sc, l, fname, std::slice::from_ref(r), false, 0);
             }
+            // An operand of no known class where user-class EXTENSIONS supply
+            // the convention: the runtime-tested chain of
+            // [`Compiler::compile_ext_chain`], ending in the built-in operator.
+            if matches!(lt, Type::Unknown | Type::Obj)
+                && !self.class_ext_candidates(sc, l, fname, 1).is_empty()
+            {
+                return self.compile_member(sc, l, fname, std::slice::from_ref(r), false, 0);
+            }
             // Any other heap receiver — a `List`, `Set`, `Map` or range.
             // Dispatched at run time because the frontend tracks these as one
             // `Type::Obj` and only the value knows which it is.
@@ -8919,6 +8991,15 @@ impl Compiler {
                 || (lt == Type::Unknown
                     && matches!(fname, "plus" | "minus" | "times" | "div" | "rem")
                     && self.method_index.get(fname).is_some_and(|v| !v.is_empty()))
+                // An untyped left operand against a HEAP right one: a native op
+                // would coerce the handle to a number (`id(listOf(1)) +
+                // listOf(2)` answered `0.0`), so the value decides.
+                || (lt == Type::Unknown
+                    && (rt == Type::Obj
+                        || matches!(
+                            self.infer_class(sc, r).as_deref(),
+                            Some("List" | "Set" | "Map")
+                        )))
             {
                 self.emit_operator_call(sc, l, r, fname)?;
                 return Ok(Type::Obj);
@@ -10626,6 +10707,93 @@ impl Compiler {
         hits.next().is_none().then_some(first)
     }
 
+    /// The extensions named `name` on USER classes that a call on an UNTYPED
+    /// receiver might mean: `(owner, sub, sig)`.
+    /// Empty when the receiver's type is known — static resolution decides
+    /// then (see [`Compiler::resolve_ext`]).
+    fn class_ext_candidates(
+        &self,
+        sc: &Scope,
+        recv: &Expr,
+        name: &str,
+        argc: usize,
+    ) -> Vec<(String, String, FnSig)> {
+        if self.extensions.is_empty() || self.recv_type_name(sc, recv).is_some() {
+            return Vec::new();
+        }
+        let mut cands: Vec<(String, String, FnSig)> = self
+            .extensions
+            .iter()
+            .filter(|((r, n), s)| n == name && self.classes.contains_key(r) && s.accepts(argc))
+            .map(|((r, n), s)| (r.clone(), ext_sub_name(r, n), s.clone()))
+            .collect();
+        // Kotlin picks between extensions by the STATIC type, which is exactly
+        // what is missing here. Where one instance could match two candidates
+        // (`M.plus` and `N.plus` with `N : M`), the runtime class does not say
+        // which the source meant, so the chain declines and the call resolves
+        // as before. Otherwise at most one candidate can match any value.
+        let overlap = self
+            .classes
+            .values()
+            .any(|m| cands.iter().filter(|(o, _, _)| m.mro.contains(o)).count() > 1);
+        if overlap {
+            return Vec::new();
+        }
+        cands.sort_by(|a, b| a.0.cmp(&b.0));
+        cands
+    }
+
+    /// Lower `recv.name(args)` on an untyped receiver as a runtime test of its
+    /// class against each candidate extension's receiver type, in order, with
+    /// the ordinary member dispatch when none matches. The receiver runs once.
+    #[allow(clippy::too_many_arguments)]
+    fn compile_ext_chain(
+        &mut self,
+        sc: &mut Scope,
+        recv: &Expr,
+        name: &str,
+        args: &[Expr],
+        safe: bool,
+        line: u32,
+        cands: Vec<(String, String, FnSig)>,
+    ) -> Result<Type, String> {
+        let mark = sc.enter();
+        let tmp = format!(
+            "$extrecv{}",
+            HOIST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        self.compile_expr(sc, recv)?;
+        let slot = sc.declare_obj(&tmp, Type::Unknown, false, None);
+        self.b.emit(Op::SetSlot(slot), line);
+        let mut done = Vec::new();
+        for (owner, sub, sig) in &cands {
+            let full = self.expand_args(name, sig.owner.as_deref(), &sig.params, args)?;
+            self.b.emit(Op::GetSlot(slot), line);
+            let nidx = self.b.add_constant(Value::str(self.canon_class(owner)));
+            self.b.emit(Op::LoadConst(nidx), line);
+            self.b.emit(Op::Extended(KT_IS, 0), line);
+            let next = self.b.emit(Op::JumpIfFalse(0), line);
+            self.b.emit(Op::GetSlot(slot), line);
+            self.compile_call_args(sc, &sig.params, &full)?;
+            let idx = self.b.add_name(sub);
+            self.b.emit(Op::Call(idx, (full.len() + 1) as u8), line);
+            done.push(self.b.emit(Op::Jump(0), line));
+            let here = self.b.current_pos();
+            self.b.patch_jump(next, here);
+        }
+        let var = Expr::Var(tmp);
+        let saved = self.skip_ext_recv.replace(&var as *const Expr);
+        let res = self.compile_member(sc, &var, name, args, safe, line);
+        self.skip_ext_recv = saved;
+        res?;
+        let end = self.b.current_pos();
+        for j in done {
+            self.b.patch_jump(j, end);
+        }
+        sc.exit(mark);
+        Ok(Type::Unknown)
+    }
+
     /// The declared `(return type, return class)` of the extension a call
     /// `recv.name(…)` resolves to, or `None` when it resolves to something else.
     ///
@@ -10647,6 +10815,11 @@ impl Compiler {
                 .is_some_and(|s| s.accepts(argc))
         });
         if member_wins {
+            return None;
+        }
+        // The runtime-checked chain `compile_member` emits for an untyped
+        // receiver has no single static result.
+        if !self.class_ext_candidates(sc, recv, name, argc).is_empty() {
             return None;
         }
         let (_, sig) = self.resolve_ext(sc, recv, name)?;
@@ -12306,6 +12479,15 @@ impl Compiler {
                     if elem != Type::Unknown {
                         return nullable_if_safe(elem, *safe);
                     }
+                }
+                // `s.takeIf { … }` on a `String` is a `String?`: the receiver
+                // or null. Typed so `.orEmpty()` and display on it know the
+                // empty value and the `null` spelling.
+                if matches!(name.as_str(), "takeIf" | "takeUnless")
+                    && args.len() == 1
+                    && self.infer(sc, recv).is_str()
+                {
+                    return Type::NullableString;
                 }
                 // A higher-order collection method's result type is fixed.
                 if is_coll_hof(name) {
@@ -14608,6 +14790,10 @@ fn bind_named_builtin(name: &str, args: &[Expr]) -> Result<Vec<Expr>, String> {
         slots[at] = Some(value);
     }
 
+    // Written order, as for a user call: `joinToString(postfix = p(),
+    // separator = s())` runs `p` first. See [`hoist_written_order`].
+    let hoisted = hoist_written_order(&slots, args, false);
+
     // Trailing defaults are dropped rather than passed: several host members
     // distinguish "absent" from "the default value" (`substring`'s `endIndex`
     // is the receiver's length, which no literal here knows).
@@ -14621,7 +14807,8 @@ fn bind_named_builtin(name: &str, args: &[Expr]) -> Result<Vec<Expr>, String> {
             Some(l) if i > l => break,
             Some(_) => {}
         }
-        out.push(match slots[i] {
+        let read = hoisted.as_ref().and_then(|h| h.1[i].as_ref());
+        out.push(match read.or(slots[i]) {
             Some(e) => e.clone(),
             None => match dflt {
                 Dflt::Required => {
@@ -14633,6 +14820,13 @@ fn bind_named_builtin(name: &str, args: &[Expr]) -> Result<Vec<Expr>, String> {
                 Dflt::Bool(b) => Expr::Bool(*b),
             },
         });
+    }
+    if let (Some((binds, _)), Some(first)) = (hoisted, out.first_mut()) {
+        let value = std::mem::replace(first, Expr::Null);
+        *first = Expr::Seq {
+            binds,
+            value: Box::new(value),
+        };
     }
     Ok(out)
 }

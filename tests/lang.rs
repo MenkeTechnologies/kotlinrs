@@ -7563,3 +7563,117 @@ fn regex_options_fold_into_the_pattern() {
         "true\n1\ntrue\nfalse\ntrue\n"
     );
 }
+
+#[test]
+fn data_class_array_properties_render_and_hash_by_content() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1: a `data class`'s generated
+    // `toString` renders an array-typed property with `Arrays.toString` and its
+    // `hashCode` folds it with `Arrays.hashCode`, while `equals` keeps the
+    // array's identity. A property of another declared type holding an array
+    // keeps the identity `toString`.
+    assert_eq!(
+        stdout(
+            r#"data class Q(val a: IntArray, val s: Array<String>, val d: DoubleArray, val n: IntArray?)
+data class A(val l: LongArray, val f: FloatArray, val c: CharArray, val b: BooleanArray, val bl: Array<Long>, val by: ByteArray, val sh: ShortArray)
+data class R(val a: Any, val l: List<IntArray>)
+data class V(var x: IntArray) { val y = intArrayOf(9) }
+fun main() {
+    val x = intArrayOf(1, 2)
+    val q1 = Q(x, arrayOf("a"), doubleArrayOf(1.5), null)
+    val q2 = Q(intArrayOf(1, 2), arrayOf("a"), doubleArrayOf(1.5), null)
+    println(q1)
+    println(q1 == q2)
+    println(q1 == q1.copy())
+    println(q1.hashCode() == q2.hashCode())
+    println(Q(intArrayOf(1, 2), arrayOf("a", "b"), doubleArrayOf(), intArrayOf(3)).hashCode())
+    val a = A(longArrayOf(3000000000L, -1), floatArrayOf(0.1f, 1f), charArrayOf('x', 'y'), booleanArrayOf(true, false), arrayOf(5000000000L, 2L), byteArrayOf(-1, 2), shortArrayOf(300))
+    println(a)
+    println(a.hashCode())
+    val r = R(intArrayOf(1), listOf(intArrayOf(2)))
+    println(r.toString().startsWith("R(a=[I@"))
+    println(r.toString().contains("l=[[I@"))
+    val v = V(intArrayOf(1, 2))
+    v.x = intArrayOf(7)
+    println(v)
+    println(v.hashCode())
+}"#
+        ),
+        "Q(a=[1, 2], s=[a], d=[1.5], n=null)\nfalse\ntrue\ntrue\n33519745\n\
+         A(l=[3000000000, -1], f=[0.1, 1.0], c=[x, y], b=[true, false], bl=[5000000000, 2], by=[-1, 2], sh=[300])\n\
+         -1063542991\ntrue\ntrue\nV(x=[7])\n38\n"
+    );
+}
+
+#[test]
+fn named_arguments_run_in_written_order_for_copy_and_stdlib_members() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1: arguments evaluate in the
+    // order they are WRITTEN, for a `data class`'s `copy` and for a stdlib
+    // member's named parameters alike.
+    assert_eq!(
+        stdout(
+            r#"data class D(val a: Int, val b: Int)
+fun g(n: Int): Int { println("g$n"); return n }
+fun main() {
+    println(D(1, 2).copy(b = g(6), a = g(7)))
+    println(listOf(1, 2).joinToString(postfix = "!".also { println("pf") }, separator = "-".also { println("sep") }))
+}"#
+        ),
+        "g6\ng7\nD(a=7, b=6)\npf\nsep\n1-2!\n"
+    );
+}
+
+#[test]
+fn a_user_class_extension_applies_only_to_its_own_instances() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. A receiver the frontend
+    // cannot type (`3.also { }`, a lambda parameter of `reduce`) used to take
+    // the program's sole extension of that name even when the value was an
+    // `Int`, and an operator extension was never found for one.
+    assert_eq!(
+        stdout(
+            r#"class Box(var v: Int)
+operator fun Box.plus(o: Box) = Box(v + o.v)
+fun Box.size() = 99
+interface Animal { val n: String }
+class Dog(override val n: String) : Animal
+fun Animal.greet() = "hi $n"
+class Money(val c: Int)
+operator fun Money.plus(o: Money) = Money(c + o.c)
+fun Money.times(k: Int) = Money(c * k)
+fun Money.show() = "$" + c
+fun main() {
+    println(3.also { }.plus(1))
+    val xs: List<Any> = listOf(1, Box(2))
+    println(xs.map { if (it is Box) it.size() else it })
+    println(5.plus(2))
+    println(listOf(Dog("a"), Dog("b")).map { it.greet() })
+    println(Money(2).also { }.plus(Money(3)).show())
+    println(3.also { }.times(4))
+    println(listOf(Money(1), Money(2)).reduce { a, b -> a + b }.show())
+    println(listOf(1, 2).reduce { a, b -> a.plus(b) })
+    println(mapOf(1 to Money(5)).getValue(1).times(2).show())
+    println(mapOf(1 to 5).getValue(1).times(2))
+}"#
+        ),
+        "4\n[1, 99]\n7\n[hi a, hi b]\n$5\n12\n$3\n3\n$10\n10\n"
+    );
+}
+
+#[test]
+fn an_untyped_left_operand_against_a_collection_dispatches_on_the_value() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. The native `Add` coerced the
+    // left handle to a number, so these printed `0.0`.
+    assert_eq!(
+        stdout(
+            r#"fun <T> id(x: T) = x
+fun main() {
+    println(id(listOf(1)) + listOf(2))
+    println(id(listOf(1, 2, 3)) - listOf(2))
+    println(id(setOf(1)) + setOf(2))
+    println(id(mapOf(1 to 2)) + mapOf(3 to 4))
+    println(id("s") + listOf(2))
+    println(id(mutableListOf(1)) + arrayOf(4).toList())
+}"#
+        ),
+        "[1, 2]\n[1, 3]\n[1, 2]\n{1=2, 3=4}\ns[2]\n[1, 4]\n"
+    );
+}

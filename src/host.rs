@@ -5833,6 +5833,14 @@ fn b_operator(vm: &mut VM, _argc: u8) -> Value {
     if let Some(r) = run_operator(vm, &name, &lhs, &rhs) {
         return r;
     }
+    // `String.plus(Any?)` concatenates the right operand's `toString()`,
+    // whatever it is — `id("s") + listOf(2)` is `s[2]`.
+    if let (Value::Str(s), "plus") = (&lhs, name.as_str()) {
+        if !matches!(rhs, Value::Int(_) | Value::Float(_) | Value::Str(_)) {
+            let shown = display_vm(vm, &rhs);
+            return Value::str(format!("{s}{shown}"));
+        }
+    }
     // Numbers, `Char`s and `String`s reach here from the same untyped site
     // (`a + b` in a lambda over values of no tracked type); they keep the
     // arithmetic the native operators and `KT_IDIV`/`KT_IMOD` give them.
@@ -14659,6 +14667,15 @@ fn value_hash(v: &Value, long: bool) -> i32 {
     }
 }
 
+/// The descriptor and elements of an array value, or `None` for anything else.
+fn array_items(v: &Value) -> Option<(String, Vec<Value>)> {
+    with_obj(v, |o| match o {
+        HeapObj::Array { items, desc } => Some((desc.clone(), items.clone())),
+        _ => None,
+    })
+    .flatten()
+}
+
 /// The `hashCode()` of a heap object, or `None` when the object is one of the
 /// identity-hashed kinds (see [`value_hash`]).
 fn obj_hash(recv: &Value) -> Option<i32> {
@@ -14685,7 +14702,18 @@ fn obj_hash(recv: &Value) -> Option<i32> {
                     .as_ref()
                     .and_then(|w| w.as_bytes().get(i))
                     .is_some_and(|c| *c == b'l');
-                let e = value_hash(v, long);
+                // An array-typed property folds with `Arrays.hashCode`: seed
+                // 1, `h = 31 * h + element`, each element at the array's width.
+                let arr = widths
+                    .as_ref()
+                    .and_then(|w| w.as_bytes().get(i))
+                    .is_some_and(|c| *c == b'a');
+                let e = match array_items(v).filter(|_| arr) {
+                    Some((desc, items)) => items.iter().fold(1i32, |h, x| {
+                        h.wrapping_mul(31).wrapping_add(value_hash(x, desc == "[J"))
+                    }),
+                    None => value_hash(v, long),
+                };
                 h = if i == 0 {
                     e
                 } else {
@@ -14846,11 +14874,27 @@ fn display_obj(id: u32) -> String {
                     // recurses here, and the JVM's generated `toString` has no
                     // self-check — it raises `StackOverflowError`, which is what
                     // `RENDER_DEPTH_LIMIT` delivers.
+                    //
+                    // An ARRAY-typed property renders through
+                    // `Arrays.toString`, element by element; any other declared
+                    // type holding an array keeps the identity form.
                     let me = Value::Obj(id);
+                    let widths = long_fields(class.clone()).unwrap_or_default();
                     rendering(&me, || {
                         let body = data_slice(fields, *data_from, *data_len)
                             .iter()
-                            .map(|(n, v)| format!("{n}={}", kotlin_string(v)))
+                            .enumerate()
+                            .map(|(i, (n, v))| {
+                                let content = (widths.as_bytes().get(i) == Some(&b'a'))
+                                    .then(|| array_items(v))
+                                    .flatten()
+                                    .map(|(_, items)| {
+                                        let parts: Vec<String> =
+                                            items.iter().map(kotlin_string).collect();
+                                        format!("[{}]", parts.join(", "))
+                                    });
+                                format!("{n}={}", content.unwrap_or_else(|| kotlin_string(v)))
+                            })
                             .collect::<Vec<_>>()
                             .join(", ");
                         // The SIMPLE name: Kotlin's generated `toString` calls

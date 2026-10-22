@@ -400,7 +400,6 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
 | `open class A { init { println("A " + name()) }; abstract fun name(): String }` with `class B : A() { val nm = "b"; override fun name() = nm }` | `A ` | `A null` |
 | `println(mutableListOf(1).clear())`, `val f = { }; println(f())` | `null` | `kotlin.Unit` |
 | `IntRange.EMPTY`, `sequence.constrainOnce()`, `Integer.reverse(1)`, `java.lang.String.valueOf(5)` | `unresolved reference` | `1..0`, the sequence, `-2147483648`, `5` |
-| `data class D(val a: Int, val b: Int)`; `d.copy(b = g(), a = h())` | `h` before `g` | `g` before `h` |
 
 **A `String`-typed field read before its initializer.** A field the JVM has not
 yet written is `null`, and a value statically typed `String` concatenates as
@@ -465,3 +464,23 @@ enters an erased position, and these producers (a range's elements, a typed
 generic constructor's literal arguments, a property read on a `Long`) do not box
 it. Only identity-sensitive uses (`is Long`, `== 2L` against an untyped value,
 `equals`) can see it; arithmetic is unaffected.
+
+## Round 21: measured and not closed
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | kotlinrs | reference |
+| --- | --- | --- |
+| `fun <T> id(x: T) = x`; `println(id(listOf(1)) + 5)` | `5.0` | `[1, 5]` |
+| `open class M(val c: Int)`; `class N(c: Int) : M(c)`; `operator fun M.plus(o: M)` and `operator fun N.plus(o: M)`; `listOf<M>(N(1), M(2)).reduce { a, b -> a + b }` | `unresolved reference: plus on N` | `M.plus`, chosen by the static type `M` |
+
+The first is an untyped left operand against a PRIMITIVE right one: the native
+`Add` coerces a heap handle to a number. Routing every untyped arithmetic site
+through the runtime operator would close it at the cost of a builtin call on
+each one; an untyped left operand against a heap right one is already routed.
+
+The second is extension choice by static type. A receiver of no static type
+picks among user-class extensions by the value's runtime class, which is only
+sound when no one instance could match two candidates; where it could (an
+extension on a class and on its subclass), the chain declines and the call
+fails loudly, because the runtime class does not say which the source meant.

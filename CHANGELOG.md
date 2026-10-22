@@ -1,4 +1,4 @@
-`Sub().b` — a default filled in the superclass call | `superclass constructor Base expects 2 argument(s), got 0` | `14` |`Circle().name` | `superclass constructor Shape expects 1 argument(s), got 0` | `anon` || `class E2 : RuntimeException { constructor(m: String, c: Throwable) : super(m, c) }`; `e.cause?.message` | `: super(2 argument(s))` from a secondary constructor is not supported | `c` || `open class AppError : Exception { val code: Int; constructor(m: String, code: Int) : super(m) { this.code = code } }`; `class NotFound(w: String) : AppError("$w not found", 404)` — a header selecting a SECONDARY of the superclass | `: super(1 argument(s))` from a secondary constructor is not supported | `user not found 404` |# Changelog
+# Changelog
 
 Every expected value quoted here was measured, not recalled. The reference is
 `kotlinc` 2.4.10 running on **JRE 21.0.12**, with the program **compiled** by
@@ -10,6 +10,29 @@ on.
 
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
+
+## Array properties of a `data class`, written-order named arguments, untyped extension receivers
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, compiled and run on the same JVM.
+
+| program | before | reference |
+| --- | --- | --- |
+| `data class Q(val a: IntArray, val s: Array<String>)`; `println(Q(intArrayOf(1, 2), arrayOf("a")))` | `Q(a=[I@0, s=[Ljava.lang.String;@1)` | `Q(a=[1, 2], s=[a])` |
+| `data class V(var x: IntArray)`; `V(intArrayOf(7)).hashCode()`, and two instances over equal arrays | an identity hash; the two hashes differ | `38`; the hashes agree (`equals` stays identity on the array) |
+| `D(1, 2).copy(b = g(6), a = g(7))` | `g7` before `g6` | `g6` before `g7` |
+| `listOf(1, 2).joinToString(postfix = p(), separator = s())` | `s` before `p` | `p` before `s` |
+| `operator fun Box.plus(o: Box)`; `3.also { }.plus(1)` | `unresolved reference: v` (the extension ran on the `Int`) | `4` |
+| `operator fun Money.plus(o: Money)`; `listOf(Money(1), Money(2)).reduce { a, b -> a + b }` | `unresolved reference: plus on Money` | `Money(3)` |
+| `fun <T> id(x: T) = x`; `id(listOf(1)) + listOf(2)`, `id("s") + listOf(2)` | `0.0`, `unresolved reference` | `[1, 2]`, `s[2]` |
+
+An array-typed property is marked in the class metadata the compiler already
+publishes for `Long` fields, so the generated `toString`/`hashCode` follow the
+DECLARED type, as Kotlin's do. A `copy` call and a stdlib member with named
+parameters now bind their arguments through the same written-order hoist user
+calls use. A call on a receiver of no static type, in a program that declares
+extensions of that name on user classes, tests the value's class against each
+candidate at run time and falls back to the ordinary member dispatch; the
+binary operators take the same path for an untyped left operand.
 
 ## Secondary constructors that call `super(args)`
 
