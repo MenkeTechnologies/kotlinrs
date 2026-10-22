@@ -7677,3 +7677,61 @@ fun main() {
         "[1, 2]\n[1, 3]\n[1, 2]\n{1=2, 3=4}\ns[2]\n[1, 4]\n"
     );
 }
+
+#[test]
+fn a_read_only_list_behind_a_mutable_list_cast_faults_as_its_jvm_class() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. `listOf(1)` is a
+    // `SingletonList`, `listOf(1, 2)` and `sorted()` an `Arrays$ArrayList`
+    // (`set` works, a size change does not), `buildList` a sealed
+    // `ListBuilder`, and an empty one `EmptyList`, which is not a
+    // `MutableList` at all. A `toList()` of two or more is a real `ArrayList`,
+    // and stays one after a write shrinks it.
+    assert_eq!(
+        stdout(
+            r#"fun t(name: String, f: () -> Any?) { try { println("$name: ${f()}") } catch (e: Throwable) { println("$name: EX $e") } }
+@Suppress("UNCHECKED_CAST")
+fun <T> m(l: List<T>) = l as MutableList<T>
+fun main() {
+    t("one.add") { m(listOf(1)).add(7) }
+    t("one.removeAbsent") { m(listOf(1)).remove(9) }
+    t("one.reverse") { val l = listOf(1); m(l).reverse(); l }
+    t("one.removeIf") { m(listOf(1)).removeIf { it == 9 } }
+    t("two.set") { val l = listOf(1, 2); m(l)[0] = 9; l }
+    t("two.add") { m(listOf(1, 2)).add(7) }
+    t("two.removePresent") { m(listOf(1, 2)).remove(1) }
+    t("two.addAllEmpty") { m(listOf(1, 2)).addAll(listOf()) }
+    t("two.plusAssign") { val q = m(listOf(1, 2)); q += 4; q }
+    t("two.iterRemove") { val it = m(listOf(1, 2)).iterator(); it.next(); it.remove() }
+    val a = listOf(1, 2, 3, 4)
+    t("two.removeAllLambda") { m(a).removeAll { it % 2 == 1 } }
+    println(a)
+    t("sorted.add") { m(listOf(3, 1).sorted()).add(1) }
+    t("built.sortBy") { m(buildList { add(2); add(1) }).sortBy { it } }
+    t("built.removeAbsent") { m(buildList { add(1) }).remove(9) }
+    t("empty.cast") { m(listOf<Int>()).add(1) }
+    println(listOf<Int>() is MutableList<*>)
+    t("toList.shrink") { val l = listOf(1, 2, 3).take(2); m(l).clear(); m(l).add(5); l }
+    t("toList1.add") { m(listOf(5).toList()).add(2) }
+}"#
+        ),
+        "one.add: EX java.lang.UnsupportedOperationException\n\
+         one.removeAbsent: false\n\
+         one.reverse: [1]\n\
+         one.removeIf: EX java.lang.UnsupportedOperationException\n\
+         two.set: [9, 2]\n\
+         two.add: EX java.lang.UnsupportedOperationException\n\
+         two.removePresent: EX java.lang.UnsupportedOperationException: remove\n\
+         two.addAllEmpty: false\n\
+         two.plusAssign: EX java.lang.UnsupportedOperationException\n\
+         two.iterRemove: EX java.lang.UnsupportedOperationException: remove\n\
+         two.removeAllLambda: EX java.lang.UnsupportedOperationException\n\
+         [2, 4, 3, 4]\n\
+         sorted.add: EX java.lang.UnsupportedOperationException\n\
+         built.sortBy: EX java.lang.UnsupportedOperationException\n\
+         built.removeAbsent: EX java.lang.UnsupportedOperationException\n\
+         empty.cast: EX java.lang.ClassCastException: kotlin.collections.EmptyList cannot be cast to kotlin.collections.MutableList\n\
+         false\n\
+         toList.shrink: [5]\n\
+         toList1.add: EX java.lang.UnsupportedOperationException\n"
+    );
+}

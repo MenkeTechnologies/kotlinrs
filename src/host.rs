@@ -1015,6 +1015,124 @@ fn is_deque(v: Option<&Value>) -> bool {
     matches!(v, Some(Value::Obj(id)) if LIST_IMPL.with(|t| t.borrow().get(id).copied()) == Some(ListImpl::Deque))
 }
 
+/// How far a READ-ONLY `List` reached through a `MutableList` cast lets itself
+/// be written — the JVM class behind it decides, not the Kotlin type. See
+/// [`ListImpl`] for which class each tag and size is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RoList {
+    /// `kotlin.collections.EmptyList` — not a `MutableList` at all; the cast
+    /// itself fails on the JVM, so any write that reaches here is refused.
+    Empty,
+    /// `java.util.Collections$SingletonList`: no write of any kind, but the
+    /// in-place reorderings are no-ops at size 1 and never ask.
+    Singleton,
+    /// `java.util.Arrays$ArrayList`: `set` and everything built on it work;
+    /// a change of SIZE does not.
+    Arrays,
+    /// `kotlin.collections.builders.ListBuilder` after `build()`: every
+    /// mutator checks first, and an in-place reordering of two or more
+    /// elements writes through it.
+    Builder,
+}
+
+const UOE: &str = "java.lang.UnsupportedOperationException";
+/// `AbstractList.Itr.remove` — what a removal that walks an `Arrays$ArrayList`
+/// with an iterator raises.
+const UOE_REMOVE: &str = "java.lang.UnsupportedOperationException: remove";
+
+/// The [`RoList`] class behind `recv`, or `None` for a list every write works on.
+fn ro_list(recv: &Value) -> Option<RoList> {
+    let Value::Obj(id) = recv else { return None };
+    let tag = LIST_IMPL.with(|t| t.borrow().get(id).copied())?;
+    let len = with_obj(recv, |o| match o {
+        HeapObj::List(items) => Some(items.len()),
+        _ => None,
+    })
+    .flatten()?;
+    match (tag, len) {
+        (ListImpl::Builder, _) => Some(RoList::Builder),
+        (ListImpl::Literal | ListImpl::ReadOnly | ListImpl::Sorted, 0) => Some(RoList::Empty),
+        (ListImpl::Literal | ListImpl::ReadOnly | ListImpl::Sorted, 1) => Some(RoList::Singleton),
+        (ListImpl::Literal | ListImpl::Sorted, _) => Some(RoList::Arrays),
+        _ => None,
+    }
+}
+
+/// [`ro_list`] at a WRITE site. A `ReadOnly` list of two or more elements is
+/// the `ArrayList` its member built, and stays one whatever size a write
+/// leaves it at, so its tag — which reads the collapse off the CURRENT size —
+/// is dropped at its first write.
+fn ro_list_write(recv: &Value) -> Option<RoList> {
+    let kind = ro_list(recv);
+    if kind.is_none() {
+        if let Value::Obj(id) = recv {
+            LIST_IMPL.with(|t| {
+                let mut t = t.borrow_mut();
+                if t.get(id) == Some(&ListImpl::ReadOnly) {
+                    t.remove(id);
+                }
+            });
+        }
+    }
+    kind
+}
+
+/// The fault a mutating `MutableList` member raises on a read-only list, or
+/// `None` when the JVM class behind it performs the call. Measured member by
+/// member on kotlinc 2.4.21 / JRE 21.0.12.1: a removal that finds nothing to
+/// remove, an `addAll` of nothing and a reordering of at most one element all
+/// succeed even where every real change faults.
+fn ro_list_fault(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Option<&'static str> {
+    let kind = ro_list_write(recv)?;
+    let items = list_snapshot(recv).unwrap_or_default();
+    let len = items.len();
+    let arg_items = || args.last().and_then(list_snapshot).unwrap_or_default();
+    let structural = matches!(
+        name,
+        "add"
+            | "removeAt"
+            | "removeFirst"
+            | "removeLast"
+            | "removeFirstOrNull"
+            | "removeLastOrNull"
+            | "addFirst"
+            | "addLast"
+            | "clear"
+    );
+    let reorder = matches!(name, "sort" | "sortDescending" | "reverse" | "shuffle");
+    match kind {
+        RoList::Builder => {
+            let refuse = match name {
+                "addAll" | "remove" | "removeAll" | "retainAll" | "set" => true,
+                "removeFirst" | "removeLast" | "removeFirstOrNull" | "removeLastOrNull" => len > 0,
+                "fill" => len > 0,
+                _ if reorder => len > 1,
+                _ => structural,
+            };
+            refuse.then_some(UOE)
+        }
+        RoList::Empty | RoList::Singleton | RoList::Arrays => {
+            let arrays = kind == RoList::Arrays;
+            let removal = if arrays { UOE_REMOVE } else { UOE };
+            match name {
+                "remove" if args.len() == 1 => position_eq(vm, &items, &args[0]).map(|_| removal),
+                "addAll" => (!arg_items().is_empty()).then_some(UOE),
+                "removeAll" | "retainAll" if args.len() == 1 => {
+                    let other = arg_items();
+                    let want = name == "retainAll";
+                    let changes = items
+                        .iter()
+                        .any(|it| position_eq(vm, &other, it).is_some() != want);
+                    changes.then_some(removal)
+                }
+                "set" | "fill" => (!arrays).then_some(UOE),
+                _ if structural => Some(UOE),
+                _ => None,
+            }
+        }
+    }
+}
+
 /// Record `list`'s implementation class. A no-op for a non-handle.
 fn tag_list_impl(list: &Value, which: ListImpl) {
     if let Value::Obj(id) = list {
@@ -4348,7 +4466,13 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             } else if arg & 1 == 1 {
                 vm.push(Value::Undef);
             } else {
-                fault(vm, cast_failure(&v, &ty));
+                // Kotlin's own `TypeIntrinsics` check, spelled its own way.
+                let msg = if ty == "MutableList" && ro_list(&v) == Some(RoList::Empty) {
+                    "java.lang.ClassCastException: kotlin.collections.EmptyList cannot be cast to kotlin.collections.MutableList".to_string()
+                } else {
+                    cast_failure(&v, &ty)
+                };
+                fault(vm, msg);
                 vm.push(Value::Undef);
             }
         }
@@ -5959,6 +6083,20 @@ fn operator_apply(vm: &mut VM, lhs: &Value, name: &str, rhs: &Value) -> Result<V
             ))
         }
     };
+    // `xs += x` on a `MutableList` is `add`/`addAll`, `-=` is
+    // `remove`/`removeAll`, so a read-only list behind it faults as those do.
+    if assign {
+        let many = as_iterable(rhs).is_some();
+        let member = match (adding, many) {
+            (true, false) => "add",
+            (true, true) => "addAll",
+            (false, false) => "remove",
+            (false, true) => "removeAll",
+        };
+        if let Some(e) = ro_list_fault(vm, lhs, member, std::slice::from_ref(rhs)) {
+            return Err(e.to_string());
+        }
+    }
 
     // A `Map` receiver keys on entries rather than elements, so it resolves
     // first: `map + pair` upserts, `map - key` removes.
@@ -8148,6 +8286,9 @@ fn coll_hof(
         // and the same stability, written back through the handle instead of
         // into a fresh list.
         "sortBy" | "sortByDescending" => {
+            if items.len() > 1 && ro_list_write(recv) == Some(RoList::Builder) {
+                return Err(UOE.to_string());
+            }
             let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(items.len());
             for it in items {
                 let key = invoke_closure(vm, clo, std::slice::from_ref(&it))?;
@@ -8497,6 +8638,39 @@ fn coll_hof(
             for it in &items {
                 keep.push(truthy(&invoke_closure(vm, clo, std::slice::from_ref(it))?) == want);
             }
+            if let Some(kind) = ro_list_write(recv) {
+                let removes = keep.iter().any(|k| !k);
+                match (kind, name) {
+                    // `Collections$SingletonList.removeIf` refuses outright.
+                    (RoList::Singleton | RoList::Empty, "removeIf") => return Err(UOE.to_string()),
+                    // `Collection.removeIf` walks an iterator whose `remove`
+                    // refuses at the first match.
+                    (RoList::Arrays, "removeIf") if removes => return Err(UOE_REMOVE.to_string()),
+                    // Kotlin's `filterInPlace` over a random-access list
+                    // compacts the kept elements forward with `set`, which an
+                    // `Arrays$ArrayList` allows, and faults at the first
+                    // `removeAt` of the tail — leaving the compacted prefix
+                    // over the untouched rest.
+                    (RoList::Arrays, _) if removes => {
+                        let kept: Vec<Value> = items
+                            .iter()
+                            .zip(&keep)
+                            .filter(|(_, k)| **k)
+                            .map(|(it, _)| it.clone())
+                            .collect();
+                        with_obj_mut(recv, |o| {
+                            if let HeapObj::List(xs) = o {
+                                for (slot, v) in xs.iter_mut().zip(kept) {
+                                    *slot = v;
+                                }
+                            }
+                        });
+                        return Err(UOE.to_string());
+                    }
+                    _ if removes => return Err(UOE.to_string()),
+                    _ => {}
+                }
+            }
             let changed = with_obj_mut(recv, |o| match o {
                 HeapObj::List(xs) | HeapObj::Set(xs) => {
                     let before = xs.len();
@@ -8520,6 +8694,13 @@ fn coll_hof(
         // `MutableMap.replaceAll { k, v -> }` rewrites every VALUE.
         "replaceAll" => {
             let is_map = with_obj(recv, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false);
+            // `SingletonList.replaceAll` refuses; a built list refuses any
+            // write; an `Arrays$ArrayList` writes through `set`.
+            match ro_list_write(recv) {
+                Some(RoList::Singleton | RoList::Empty) => return Err(UOE.to_string()),
+                Some(RoList::Builder) if !items.is_empty() => return Err(UOE.to_string()),
+                _ => {}
+            }
             let mut fresh = Vec::with_capacity(items.len());
             for it in &items {
                 let args = if is_map {
@@ -8689,6 +8870,10 @@ fn coll_hof(
         // `sortWith` is the IN-PLACE twin: the same stable order, written back
         // through the handle, answering `Unit`.
         "sortedWith" | "sortWith" => {
+            if name == "sortWith" && items.len() > 1 && ro_list_write(recv) == Some(RoList::Builder)
+            {
+                return Err(UOE.to_string());
+            }
             // A comparison that raises must not be swallowed by `sort_by`, so
             // the ordering is computed up front over an index permutation.
             let mut order: Vec<usize> = (0..items.len()).collect();
@@ -11703,6 +11888,11 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             "remove" | "set" if last < 0 => Err("java.lang.IllegalStateException".to_string()),
             "remove" => {
                 let is_set = with_obj(&src, |o| matches!(o, HeapObj::Set(_))).unwrap_or(false);
+                // `Arrays$ArrayList`'s own iterator inherits `Iterator.remove`,
+                // which refuses with a message of its own.
+                if ro_list(&src) == Some(RoList::Arrays) {
+                    return Err(UOE_REMOVE.to_string());
+                }
                 if is_set {
                     let v = iter_at(&src, last);
                     kt_method(vm, &src, "remove", &[v])?;
@@ -11908,6 +12098,11 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         _ => {}
     }
 
+    // A read-only list reached through a `MutableList` cast faults the way
+    // the JVM class behind it does.
+    if let Some(e) = ro_list_fault(vm, recv, name, args) {
+        return Err(e.to_string());
+    }
     // Mutating list operations need a mutable borrow.
     match name {
         // `MutableList.add` always appends and answers `true`; `MutableSet.add`
@@ -14365,6 +14560,9 @@ fn store_at(items: &mut [Value], i: i64, value: Value, kind: &str) -> Result<(),
 
 /// `recv[index] = value` — list set (bounds-checked) or map put.
 fn index_set(vm: &mut VM, recv: &Value, index: &Value, value: Value) -> Result<(), String> {
+    if let Some(e) = ro_list_fault(vm, recv, "set", &[index.clone(), value.clone()]) {
+        return Err(e.to_string());
+    }
     // Only a `Map` looks its slot up by equality; a list/array indexes by
     // position, so it must not pay for the scan.
     let is_map = with_obj(recv, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false);
@@ -15558,7 +15756,15 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         //
         // A `Set` is a `Collection` but NOT a `List`, so the two names cannot
         // share an arm: `setOf(1) is List<*>` is `false` in Kotlin.
-        "List" | "MutableList" => with_obj(v, |o| matches!(o, HeapObj::List(_))).unwrap_or(false),
+        "List" => with_obj(v, |o| matches!(o, HeapObj::List(_))).unwrap_or(false),
+        // `kotlin.collections.EmptyList` — what an empty `listOf()`,
+        // `emptyList()` and every collapsing member answer — implements the
+        // read-only `List` only, where every other list class is a
+        // `java.util.List` and so passes as a `MutableList`.
+        "MutableList" => {
+            with_obj(v, |o| matches!(o, HeapObj::List(_))).unwrap_or(false)
+                && ro_list(v) != Some(RoList::Empty)
+        }
         // A range is an `Iterable` but not a `Collection`: `IntRange` implements
         // no `size`.
         "Iterable" => with_obj(v, |o| {

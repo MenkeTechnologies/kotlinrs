@@ -11,6 +11,31 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## A read-only `List` written through a `MutableList` cast
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, compiled and run on the same JVM.
+`fun <T> m(l: List<T>) = l as MutableList<T>`:
+
+| program | before | reference |
+| --- | --- | --- |
+| `m(listOf(1)).add(7)`, `.set(0, 9)`, `.clear()` | the write happened | `UnsupportedOperationException` (`SingletonList`) |
+| `val l = listOf(1, 2); m(l)[0] = 9; l` | `[9, 2]` | `[9, 2]` — `Arrays$ArrayList` allows `set` |
+| `m(listOf(1, 2)).add(7)`, `m(listOf(3, 1).sorted()).add(1)` | the write happened | `UnsupportedOperationException` |
+| `m(listOf(1, 2)).remove(1)`, an iterator's `remove()` | `true` | `UnsupportedOperationException: remove` |
+| `m(listOf(1, 2)).remove(9)`, `.addAll(listOf())`, `m(listOf(1)).reverse()` | as before | succeed: nothing changes, so nothing is refused |
+| `val a = listOf(1, 2, 3, 4); m(a).removeAll { it % 2 == 1 }; a` | `true`, `[2, 4]` | `UnsupportedOperationException`, then `[2, 4, 3, 4]` |
+| `m(buildList { add(1) }).remove(9)`, `m(buildList { add(2); add(1) }).sortBy { it }` | succeeded | `UnsupportedOperationException` (`ListBuilder`) |
+| `m(listOf<Int>())`, `listOf<Int>() is MutableList<*>` | the cast passed, `true` | `ClassCastException: kotlin.collections.EmptyList cannot be cast to kotlin.collections.MutableList`, `false` |
+
+The class behind a read-only list was already tracked for its index-fault
+wording (`ListImpl`); the mutating members, `xs[i] = v`, `+=`/`-=`, the
+iterator's `remove`, `removeIf`/`removeAll { }`/`retainAll { }`,
+`replaceAll` and the in-place sorts now consult it. `removeAll { }` over an
+`Arrays$ArrayList` reproduces Kotlin's `filterInPlace`: the kept elements are
+compacted forward with `set` before the first tail `removeAt` faults. A
+`toList()` of two or more elements is a real `ArrayList` and keeps accepting
+writes after one shrinks it.
+
 ## Array properties of a `data class`, written-order named arguments, untyped extension receivers
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, compiled and run on the same JVM.
