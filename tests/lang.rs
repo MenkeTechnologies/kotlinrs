@@ -8493,3 +8493,93 @@ fun extra6() {
         "filterTo: [0, 5, 9, 6]\nmapTo: [0, 1, 2]\ntoCollection: [1, 2, 3, 4, 5, 6, 9]\nassociateTo: {1=1, 2=4, 3=9, 4=16, 5=25, 6=36, 9=81}\nassociateByTo: {0=z, 1=a, 2=bb}\ngroupByTo: {0=[4, 2, 6], 1=[3, 1, 1, 5, 9]}\nflatMapTo: [-1, 1, 1, 2, 2]\nmapNotNullTo: [1]\nfilterIndexedTo: [3, 1]\nmapIndexedNotNull: [3, 1, 2]\nfilterNotTo: [5, 6, 9]\nzipTransform: [11, 22]\nfoldRight: ab!\nfoldIndexed: 131\nscan: [0, 1, 3, 6]\nrunningFoldIndexed: [10, 11, 14]\nreduceRightIndexed: 1\nreduceOrNull: null\nassociateByKV: {1=A, 2=BB}\ngroupByKV: {1=[A, C], 2=[BB]}\nmapKeys: {10=a}\nmapValuesTo: {0=0, 1=3}\nmapKeysTo: {-1=2, 5=5}\nmapFilterMap: [12]\nmapMinBy: b\nmapForEachBi: 3\nmapToSorted: {3=c, 1=a}\nmapEntriesSorted: [2, 1]\nmapFlatMap: [1a, 1b]\nmapNotNullMap: [b]\nmapAll: true\nmapAsIterable: [1]\nmapFilterNot: {3=4}\nmapMaxOf: 4\nmapSumOf: 14\nmapToMutable: {1=2, 3=4}\nmapPlusMap: {1=3, 4=5}\nmapPlusList: {1=2, 5=6}\nmapMinusList: {3=4}\nlistOfPairsToMap: {1=b}\nzipToMap: {a=1, b=2}\nMutableListInit: [0, 2, 4, 9]\nListInit: [x0, x1, x2]\narrayListCap: [1]\nlinkedListLike: [2, 1, 3]\narrayListNeg: EX java.lang.IllegalArgumentException: Illegal Capacity: -1\narrayListCopy: [1, 2, 3]\ntoCollectionList: [9, 2, 1, 2]\ngroupByToExisting: {1=[100, 1, 3], 0=[2]}\nmapToSeq: [3, 6]\nfilterToStr: 12\nassociateWithTo: {a=0, x=1}\n"
     );
 }
+
+#[test]
+fn a_user_class_implementing_iterable_gets_the_iterable_extensions() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. `: Iterable<T>` was an
+    // unresolved supertype; an `object : Iterator<T>` handed back through an
+    // `Iterator`-typed value could not be called; and `a..b` over a class
+    // declaring `rangeTo` typed as an `IntRange`, so `x in r` skipped the
+    // user `contains`.
+    assert_eq!(
+        stdout(
+            r##"import kotlin.reflect.KProperty
+class Ver(val major: Int, val minor: Int) : Comparable<Ver> {
+    override fun compareTo(other: Ver) = compareValuesBy(this, other, { it.major }, { it.minor })
+    operator fun rangeTo(o: Ver) = VerRange(this, o)
+    override fun toString() = "$major.$minor"
+}
+class VerRange(val start: Ver, val end: Ver) : Iterable<Ver> {
+    operator fun contains(v: Ver) = v >= start && v <= end
+    override fun iterator(): Iterator<Ver> = object : Iterator<Ver> {
+        var cur = start
+        override fun hasNext() = cur <= end
+        override fun next(): Ver { val r = cur; cur = Ver(cur.major, cur.minor + 1); return r }
+    }
+}
+class Countdown(val from: Int) { operator fun iterator() = (from downTo 1).iterator() }
+class Logged<T>(var v: T) { operator fun getValue(r: Any?, p: KProperty<*>): T { println("get ${p.name}"); return v }
+    operator fun setValue(r: Any?, p: KProperty<*>, nv: T) { println("set ${p.name}=$nv"); v = nv } }
+class Holder { var x: Int by Logged(1) }
+class Key(val k: String) { override fun equals(other: Any?) = other is Key && other.k.lowercase() == k.lowercase(); override fun hashCode() = k.lowercase().hashCode() }
+data class Cell(val r: Int, val c: Int)
+class Grid { operator fun get(c: Cell) = c.r * 10 + c.c; operator fun invoke(r: Int) = "row $r" }
+fun main() {
+    val r = Ver(1, 0)..Ver(1, 3)
+    println(Ver(1, 2) in r); println(Ver(2, 0) in r); println(r.map { it.toString() })
+    for (v in r) print("$v "); println()
+    for (i in Countdown(3)) print(i); println()
+    val h = Holder(); h.x = 5; println(h.x + 1)
+    println(setOf(Key("A"), Key("a"), Key("b")).size); println(mapOf(Key("X") to 1)[Key("x")])
+    val g = Grid(); println(g[Cell(2, 3)]); println(g(7))
+    val cells = listOf(Cell(1, 2), Cell(3, 4)); for ((a, b) in cells) print("${a + b} "); println()
+    println(listOf(Ver(1, 5), Ver(1, 2), Ver(0, 9)).sorted()); println(listOf(Ver(1, 5), Ver(0, 9)).maxOrNull())
+    println(Ver(1, 1) == Ver(1, 1)); println(Ver(1, 1).compareTo(Ver(1, 1)) == 0)
+}"##
+        ),
+        "true\nfalse\n[1.0, 1.1, 1.2, 1.3]\n1.0 1.1 1.2 1.3 \n321\nset x=5\nget x\n6\n2\n1\n23\nrow 7\n3 7 \n[0.9, 1.2, 1.5]\n1.5\nfalse\ntrue\n"
+    );
+    assert_eq!(
+        stdout(
+            r##"class Bag(private val xs: List<Int>) : Iterable<Int> {
+    override fun iterator() = xs.iterator()
+    fun total() = sum()
+    fun evens() = this.filter { it % 2 == 0 }
+}
+class Fib(val n: Int) : Iterable<Long> {
+    override fun iterator(): Iterator<Long> = object : Iterator<Long> {
+        var a = 0L; var b = 1L; var i = 0
+        override fun hasNext() = i < n
+        override fun next(): Long { val r = a; a = b; b += r; i++; return r }
+    }
+}
+fun main() {
+    val b = Bag(listOf(3, 1, 4, 1, 5))
+    println(b.map { it * 2 }); println(b.sum()); println(b.total()); println(b.evens())
+    println(b.toList()); println(b.sorted()); println(b.count { it > 1 }); println(b.first()); println(b.joinToString("-"))
+    println(4 in b); println(9 in b); println(b.contains(5)); println(b.any { it > 4 }); println(b.maxOrNull())
+    println(b.toSet()); println(b.groupBy { it % 2 }); println(b.zip(listOf("a", "b"))); println(b.withIndex().toList())
+    var s = 0; b.forEach { s += it }; println(s)
+    for (x in b) print(x); println()
+    println(Fib(10).toList()); println(Fib(10).sum()); println(Fib(5).map { it * it })
+    println(Fib(90).last()); println(Fib(3).joinToString())
+    val it2: Iterable<Int> = b; println(it2.map { it + 1 })
+    println(b.asSequence().filter { it > 2 }.toList())
+    println(b.chunked(2)); println(b.reversed()); println(b.distinct()); println(b.indexOf(4)); println(b.elementAt(2))
+}"##
+        ),
+        "[6, 2, 8, 2, 10]\n14\n14\n[4]\n[3, 1, 4, 1, 5]\n[1, 1, 3, 4, 5]\n3\n3\n3-1-4-1-5\ntrue\nfalse\ntrue\ntrue\n5\n[3, 1, 4, 5]\n{1=[3, 1, 1, 5], 0=[4]}\n[(3, a), (1, b)]\n[IndexedValue(index=0, value=3), IndexedValue(index=1, value=1), IndexedValue(index=2, value=4), IndexedValue(index=3, value=1), IndexedValue(index=4, value=5)]\n14\n31415\n[0, 1, 1, 2, 3, 5, 8, 13, 21, 34]\n88\n[0, 1, 1, 4, 9]\n1779979416004714189\n0, 1, 1\n[4, 2, 5, 2, 6]\n[3, 4, 5]\n[[3, 1], [4, 1], [5]]\n[5, 1, 4, 1, 3]\n[3, 1, 4, 5]\n2\n4\n"
+    );
+    assert_eq!(
+        stdout(
+            r##"class C : Iterator<Int> { var n = 0; override fun hasNext() = n < 2; override fun next() = n++ }
+fun mk(): Iterator<Int> = object : Iterator<Int> { var n = 0; override fun hasNext() = n < 2; override fun next() = n++ }
+fun main() {
+    val a: Iterator<Int> = C(); println(a.hasNext())
+    val b = mk(); println(b.hasNext()); println(b.next())
+    val c: Any = C(); println((c as Iterator<*>).hasNext())
+}"##
+        ),
+        "true\ntrue\n0\ntrue\n"
+    );
+}

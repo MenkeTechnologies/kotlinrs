@@ -11,6 +11,24 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## User classes implementing `Iterable`
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | before | reference |
+| --- | --- | --- |
+| `class Bag(private val xs: List<Int>) : Iterable<Int> { override fun iterator() = xs.iterator() }`; `b.map { it * 2 }`, `b.sum()`, `4 in b`, `b.sorted()` | `unresolved supertype Iterable of class Bag` | the `Iterable` extensions over its elements |
+| `fun total() = sum()` inside `Bag` | `unresolved reference: sum` | the elements' total |
+| `fun mk(): Iterator<Int> = object : Iterator<Int> { … }`; `mk().hasNext()` | `unresolved reference: hasNext on <anonymous>$1` | dispatched to the object |
+| `operator fun rangeTo(o: Ver) = VerRange(this, o)`; `Ver(1, 2) in Ver(1, 0)..Ver(1, 3)` | `false` — the range typed as an `IntRange` | `true` — the user `contains` |
+
+An `Iterable` extension on a receiver whose static class implements
+`Iterable` and does not declare the member is lowered over
+`run { val it = recv.iterator(); val l = mutableListOf(); while (it.hasNext())
+l.add(it.next()); l }`, once per call as Kotlin walks the iterator. A value
+typed by a marker interface (`Iterator`, `Comparable`, …) dispatches to every
+implementor at run time.
+
 ## The `…To(destination)` family; `ArrayList(initialCapacity)`
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1. Each `…To` member was

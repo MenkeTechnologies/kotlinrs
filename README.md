@@ -612,7 +612,9 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   forms (`filterTo`, `mapTo`, `mapNotNullTo`, `flatMapTo`, `associateTo`,
   `associateByTo`, `associateWithTo`, `groupByTo`, `mapKeysTo`, `mapValuesTo`,
   …) and `toCollection(destination)` fill and answer the destination, whose own
-  kind decides order and repeats. `it` is the implicit
+  kind decides order and repeats. A user class implementing `Iterable<T>`
+  gets these extensions over the elements its `iterator()` yields — called on
+  it, or unqualified inside it. `it` is the implicit
   parameter, and `mapIndexed` takes `(index, element)`. A `Map` receiver feeds
   them one `Map.Entry` per element (`m.map { it.key }`), and `filter` re-wraps
   into the receiver's own kind — a filtered `Map` is a `Map`, a filtered `Set` a

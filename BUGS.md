@@ -66,6 +66,15 @@ time. Depth 50000 completes and is pinned. Making the VM's frame stack bounded
 to imitate the JVM's would trade a slow correct answer for a fast wrong one at
 every depth in between.
 
+The UNBOUNDED case is different, and measured on `kotlinc` 2.4.21 / JRE
+21.0.12.1: `fun f(n: Int): Int = f(n + 1) + 1; println(f(0))` raises
+`java.lang.StackOverflowError` at once on the reference, where kotlinrs grows
+its frame stack until the process is killed (exit 137, after minutes). A frame
+limit far above any depth the JVM survives (millions) would turn that into
+the same `StackOverflowError` without a wrong answer at any finite depth the
+reference completes; it needs a depth test on the call path, which fusevm's
+`Op::Call` does not offer and a per-call host op would pay for on every call.
+
 ### `"ab".repeat(2000000000)` and `"a".padStart(2000000000)`
 
 Both exceeded the 25 s timeout in kotlinrs. The reference answers
@@ -278,7 +287,6 @@ Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 
 | program | kotlinrs | reference |
 | --- | --- | --- |
-| `class S : Iterable<Int> { override fun iterator() = … }; S().map { … }` | `unresolved supertype Iterable of class S` | the `Iterable` extensions over `S` |
 | `java.util.LinkedList<Int>()` | `unresolved reference: java` | the JDK list |
 | `(-1).toUInt()` / `5u + 3u` | `unresolved reference: toUInt on Int` / parse error | `4294967295` / `8` |
 
@@ -464,6 +472,7 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
 | `object O { init { throw IllegalStateException("in init") }; val x = 1 }`; `O.x` | `IllegalStateException: in init` | `ExceptionInInitializerError` (its `cause` the `IllegalStateException`) |
 | `mutableListOf(1, 2, 3, 4).also { it.subList(1, 3).reverse() }` | `[1, 2, 3, 4]` | `[1, 3, 2, 4]` — the view writes through |
 | `'a'.category` | `unresolved reference: category on Char` | `LOWERCASE_LETTER` |
+| `class Bag(…) : Iterable<Int>`; `b.let { it.toList() }` — an `Iterable` user object reached through a receiver of no static class | `unresolved reference: toList on Bag` | the list — the extensions route only where the static class says `Iterable` |
 
 The first is an untyped left operand against a PRIMITIVE right one: the native
 `Add` coerces a heap handle to a number. Routing every untyped arithmetic site

@@ -48,12 +48,12 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 /// `<` operator resolves against is the class's own override either way.
 ///
 /// `Iterator` is here because `for` drives a user iterator through its own
-/// `hasNext`/`next` (see `Compiler::user_iterator_loop`). The collection
-/// interfaces are deliberately absent: declaring `: Iterable<T>` also promises
-/// every `Iterable` extension (`map`, `filter`, `toList`, …) over the class,
-/// which this frontend does not route, so accepting one would trade a loud
-/// error for a silent gap. A class that declares `operator fun iterator()`
-/// without the supertype iterates under `for` all the same.
+/// `hasNext`/`next` (see `Compiler::user_iterator_loop`). `Iterable` is here
+/// because its one member is `iterator()`, and every `Iterable` EXTENSION
+/// (`map`, `filter`, `toList`, …) called on such a class runs over the
+/// elements its iterator yields (see `Compiler::drained_iterable`). The other
+/// collection interfaces promise members (`size`, `get`, …) that are not
+/// modelled, and stay unresolved.
 fn is_marker_supertype(name: &str) -> bool {
     matches!(
         name,
@@ -66,6 +66,8 @@ fn is_marker_supertype(name: &str) -> bool {
             | "Closeable"
             | "Iterator"
             | "MutableIterator"
+            | "Iterable"
+            | "MutableIterable"
     )
 }
 
@@ -86,6 +88,7 @@ fn marker_member(parent: &str, name: &str, arity: usize) -> bool {
         "Iterator" | "MutableIterator" => {
             matches!((name, arity), ("hasNext", 0) | ("next", 0) | ("remove", 0))
         }
+        "Iterable" | "MutableIterable" => name == "iterator" && arity == 0,
         _ => false,
     }
 }
@@ -6019,6 +6022,22 @@ impl Compiler {
                     }
                     return Ok(Type::Boolean);
                 }
+                // A user `Iterable` with no `contains` of its own: the
+                // `Iterable.contains` extension over its elements.
+                if let Some(drained) = self.drained_iterable(sc, container, "contains", 0) {
+                    self.compile_member(
+                        sc,
+                        &drained,
+                        "contains",
+                        std::slice::from_ref(value),
+                        false,
+                        0,
+                    )?;
+                    if *negated {
+                        self.b.emit(Op::LogNot, 0);
+                    }
+                    return Ok(Type::Boolean);
+                }
                 self.compile_expr(sc, value)?;
                 self.compile_expr(sc, container)?;
                 self.b.emit(Op::CallBuiltin(KT_IN_VM, 2), 0);
@@ -6570,6 +6589,15 @@ impl Compiler {
                 return Ok(Type::Int);
             }
             return Ok(Type::Double);
+        }
+        // An `Iterable` EXTENSION on a user class that implements `Iterable`
+        // and does not declare the member itself: the elements its iterator
+        // yields, drained into a list the member then runs over. `Any`'s own
+        // members and the scope functions keep the object.
+        if !safe && !self.is_iterable_receiver_member(name) {
+            if let Some(drained) = self.drained_iterable(sc, recv, name, line) {
+                return self.compile_member(sc, &drained, name, args, false, line);
+            }
         }
         // `minOfWith(cmp) { sel }` and its three siblings are the selector's
         // results reduced by the comparator: `map(sel).minWith(cmp)`, with the
@@ -7939,6 +7967,10 @@ impl Compiler {
         // class's subtypes.
         let narrowed_from = match static_cls.as_deref() {
             None | Some("Any") => Some(None),
+            // A marker interface (`Iterator`, `Comparable`, …) is not a class
+            // here, so a value typed as one — an `object : Iterator<T>` handed
+            // back from a function — may be an instance of any implementor.
+            Some(c) if is_marker_supertype(c) => Some(None),
             Some(c) => self
                 .classes
                 .get(c)
@@ -10934,6 +10966,30 @@ impl Compiler {
                         );
                     }
                 }
+                // Implicit `this.sum()` inside a class implementing `Iterable`:
+                // an `Iterable` extension called on the instance itself.
+                if let Some(cls) = self.cur_class.clone() {
+                    let iterable = self.classes.get(&cls).is_some_and(|m| {
+                        m.mro
+                            .iter()
+                            .chain(&m.parents)
+                            .any(|p| matches!(p.as_str(), "Iterable" | "MutableIterable"))
+                    });
+                    if iterable
+                        && sc.slot("this").is_some()
+                        && !self.local_sigs.contains_key(name)
+                        && is_iterable_extension(name)
+                    {
+                        return self.compile_member(
+                            sc,
+                            &Expr::Var("this".into()),
+                            name,
+                            args,
+                            false,
+                            line,
+                        );
+                    }
+                }
                 // Inside an `inner class`, a method (or function-valued
                 // property) of an enclosing class.
                 if let Some(recv) = self.outer_receiver(sc, |m| {
@@ -11216,6 +11272,103 @@ impl Compiler {
             .map(|((r, n), s)| (ext_sub_name(r, n), s.clone()));
         let first = hits.next()?;
         hits.next().is_none().then_some(first)
+    }
+
+    /// The members that act on an `Iterable` user object ITSELF rather than on
+    /// its elements — `Any`'s and the scope functions — and so are never
+    /// rerouted through [`Compiler::drained_iterable`].
+    fn is_iterable_receiver_member(&self, name: &str) -> bool {
+        is_scope_fn(name)
+            || matches!(
+                name,
+                "toString" | "equals" | "hashCode" | "iterator" | "javaClass" | "with"
+            )
+    }
+
+    /// `recv`'s elements as a list, when `recv` is statically an instance of a
+    /// user class implementing `Iterable` that declares no member `name`:
+    /// `run { val it = recv.iterator(); val l = mutableListOf(); while
+    /// (it.hasNext()) l.add(it.next()); l }`. Kotlin's `Iterable` extensions
+    /// walk the iterator the same way, once per call.
+    fn drained_iterable(&mut self, sc: &Scope, recv: &Expr, name: &str, line: u32) -> Option<Expr> {
+        let cls = self.infer_class(sc, recv)?;
+        let meta = self.classes.get(&cls)?;
+        let iterable = meta
+            .mro
+            .iter()
+            .chain(&meta.parents)
+            .any(|p| matches!(p.as_str(), "Iterable" | "MutableIterable"));
+        if !iterable
+            || meta.methods.contains_key(name)
+            || meta.prop(name).is_some()
+            || !meta.methods.contains_key("iterator")
+        {
+            return None;
+        }
+        let id = self.lambdas_seen;
+        self.lambdas_seen += 1;
+        let (cursor, list) = (format!("$drain_it{id}"), format!("$drain_l{id}"));
+        let call = |recv: Expr, name: &str, args: Vec<Expr>| Expr::MethodCall {
+            recv: Box::new(recv),
+            name: name.to_string(),
+            args,
+            safe: false,
+            line,
+        };
+        let let_ = |name: &str, init: Expr| {
+            Stmt::new(
+                line,
+                StmtKind::Let {
+                    name: name.to_string(),
+                    ty: None,
+                    class: None,
+                    fn_params: Vec::new(),
+                    fn_ret: None,
+                    fn_recv: None,
+                    type_args: Vec::new(),
+                    init,
+                    mutable: false,
+                    lazy: false,
+                    delegated: false,
+                },
+            )
+        };
+        let body = vec![
+            let_(&cursor, call(recv.clone(), "iterator", Vec::new())),
+            let_(
+                &list,
+                Expr::Call {
+                    name: "mutableListOf".to_string(),
+                    args: Vec::new(),
+                    line,
+                },
+            ),
+            Stmt::new(
+                line,
+                StmtKind::While {
+                    cond: call(Expr::Var(cursor.clone()), "hasNext", Vec::new()),
+                    body: vec![Stmt::new(
+                        line,
+                        StmtKind::Expr(call(
+                            Expr::Var(list.clone()),
+                            "add",
+                            vec![call(Expr::Var(cursor), "next", Vec::new())],
+                        )),
+                    )],
+                    label: None,
+                },
+            ),
+            Stmt::new(line, StmtKind::Expr(Expr::Var(list))),
+        ];
+        Some(Expr::Call {
+            name: "run".to_string(),
+            args: vec![Expr::Lambda {
+                params: Vec::new(),
+                body,
+                catch_tag: None,
+            }],
+            line,
+        })
     }
 
     /// The extensions named `name` on USER classes that a call on an UNTYPED
@@ -14219,6 +14372,24 @@ impl Compiler {
                 ty, safe: false, ..
             } if Type::from_name(ty) == Type::Unknown => Some(ty.clone()),
             Expr::Pair { .. } => Some("Pair".to_string()),
+            // `a..b` over a class declaring `operator fun rangeTo` IS that call,
+            // so its class is the operator's result class — the same rule
+            // the lowering follows.
+            Expr::Range { start, end, kind }
+                if *kind == RangeKind::Inclusive
+                    && self.declares_operator(sc, start, "rangeTo") =>
+            {
+                self.infer_class(
+                    sc,
+                    &Expr::MethodCall {
+                        recv: start.clone(),
+                        name: "rangeTo".to_string(),
+                        args: vec![(**end).clone()],
+                        safe: false,
+                        line: 0,
+                    },
+                )
+            }
             // Container names for dispatch. None of these is a user class, so
             // member access on them falls through to the host method table.
             Expr::Range { .. } | Expr::Step { .. } => Some("IntRange".to_string()),
@@ -16366,4 +16537,48 @@ fn sequence_keeps_kind(name: &str) -> bool {
             | "requireNoNulls"
             | "ifEmpty"
     )
+}
+
+/// The stdlib extensions on `Iterable<T>` a class implementing it may call on
+/// itself without a qualifier — the higher-order members and the no-lambda
+/// ones. An unqualified name outside this list stays unresolved.
+fn is_iterable_extension(name: &str) -> bool {
+    is_coll_hof(name)
+        || is_optional_hof(name)
+        || matches!(
+            name,
+            "sum"
+                | "count"
+                | "toList"
+                | "toSet"
+                | "toMutableList"
+                | "toMutableSet"
+                | "first"
+                | "last"
+                | "firstOrNull"
+                | "lastOrNull"
+                | "single"
+                | "singleOrNull"
+                | "sorted"
+                | "sortedDescending"
+                | "reversed"
+                | "distinct"
+                | "max"
+                | "min"
+                | "maxOrNull"
+                | "minOrNull"
+                | "average"
+                | "contains"
+                | "indexOf"
+                | "elementAt"
+                | "take"
+                | "drop"
+                | "withIndex"
+                | "asSequence"
+                | "shuffled"
+                | "plus"
+                | "minus"
+                | "none"
+                | "any"
+        )
 }
