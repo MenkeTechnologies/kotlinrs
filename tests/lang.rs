@@ -8873,3 +8873,32 @@ fun main() {
         "adding a\nadding b\n3\nA\nA, B, c\ntrue\n[a, b, c]\nABc\n2\nfalse\n2\n1\n[x, y]\n0\n[ANN, BO]\nann\n2\n1\ntrue\n"
     );
 }
+
+#[test]
+fn an_iterable_user_object_without_a_static_class_reaches_the_extensions() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1: `b.let { it.toList() }`, a
+    // generic `id(b)`, an `Any` cast to `Iterable<*>` and a list of
+    // `Iterable<Int>` all walk the object's own iterator.
+    assert_eq!(
+        stdout(
+            r##"class Bag(private val xs: List<Int>) : Iterable<Int> { override fun iterator() = xs.iterator() }
+class Fib(val n: Int) : Iterable<Long> {
+    override fun iterator(): Iterator<Long> = object : Iterator<Long> {
+        var a = 0L; var b = 1L; var i = 0
+        override fun hasNext() = i < n
+        override fun next(): Long { val r = a; a = b; b += r; i++; return r }
+    }
+}
+fun <T> id(x: T) = x
+fun main() {
+    val b = Bag(listOf(3, 1, 2))
+    println(b.let { it.toList().size }); println(b.also { }.count())
+    println(id(b).sorted()); println(id(b).map { it * 10 }); println(id(Fib(6)).toList()); println(id(Fib(5)).filter { it % 2 == 0L })
+    val any: Any = b; println((any as Iterable<*>).joinToString())
+    val xs: List<Iterable<Int>> = listOf(b, Bag(listOf(9))); println(xs.map { it.sum() })
+    println(xs.flatMap { it.toList() })
+}"##
+        ),
+        "3\n3\n[1, 2, 3]\n[30, 10, 20]\n[0, 1, 1, 2, 3, 5]\n[0, 2]\n3, 1, 2\n[6, 9]\n[3, 1, 2, 9]\n"
+    );
+}

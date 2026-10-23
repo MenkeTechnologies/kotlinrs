@@ -5981,6 +5981,56 @@ fn run_override(
     run_sub(vm, entry, base).ok()
 }
 
+/// Call the zero-argument method `name` a user class registered for the
+/// iterator protocol (see the compiler's member registry). `None` when the
+/// value's class did not.
+fn run_user_method(vm: &mut VM, recv: &Value, name: &str) -> Option<Result<Value, String>> {
+    let tag = instance_tag(recv)?;
+    let idx = OPER_SUBS.with(|t| t.borrow().get(&(tag, name.to_string())).copied())?;
+    let entry = vm.chunk.find_sub(idx)?;
+    let base = vm.stack.len();
+    vm.stack.push(recv.clone());
+    Some(run_sub(vm, entry, base))
+}
+
+/// The elements of a user object whose class implements `Iterable`, drained
+/// through its own `iterator()` — and that iterator's `hasNext`/`next`, user
+/// or built-in — for a collection member that reached it with no static type.
+/// `None` for anything else.
+fn drain_user_iterable(vm: &mut VM, recv: &Value) -> Option<Result<Vec<Value>, String>> {
+    let tag = instance_tag(recv)?;
+    if !type_is_a(&tag, "Iterable") && !type_is_a(&tag, "MutableIterable") {
+        return None;
+    }
+    let it = match run_user_method(vm, recv, "iterator")? {
+        Ok(it) => it,
+        Err(e) => return Some(Err(e)),
+    };
+    let mut out = Vec::new();
+    loop {
+        let more = match run_user_method(vm, &it, "hasNext") {
+            Some(r) => r,
+            None => kt_method(vm, &it, "hasNext", &[]),
+        };
+        match more {
+            Ok(v) if truthy(&v) => {}
+            Ok(_) => return Some(Ok(out)),
+            Err(e) => return Some(Err(e)),
+        }
+        if unwinding() {
+            return Some(Ok(out));
+        }
+        let next = match run_user_method(vm, &it, "next") {
+            Some(r) => r,
+            None => kt_method(vm, &it, "next", &[]),
+        };
+        match next {
+            Ok(v) => out.push(v),
+            Err(e) => return Some(Err(e)),
+        }
+    }
+}
+
 /// Run the arithmetic operator `name` a user class declared, when `lhs` is an
 /// instance of one (see [`KT_OPER_REG`]). `None` when it is not.
 fn run_operator(vm: &mut VM, name: &str, lhs: &Value, rhs: &Value) -> Option<Value> {
@@ -7101,6 +7151,15 @@ fn b_coll_hof_inner(
 ) -> Value {
     let name = name.to_string();
     let recv = recv.clone();
+    // An `Iterable` user object with no static type: over its elements.
+    let recv = match drain_user_iterable(vm, &recv) {
+        Some(Ok(items)) => alloc(HeapObj::List(items)),
+        Some(Err(e)) => {
+            fault(vm, e);
+            return Value::Undef;
+        }
+        None => recv,
+    };
     // `Regex.find(input)` shares its name with the collection predicate, so a
     // call on a `Regex` (or a `String` member taking one) arrives here with its
     // last argument in the lambda's place. Put it back and dispatch as a member.
@@ -11351,6 +11410,21 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
 }
 
 fn kt_method_inner(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    // An `Iterable` user object with no static type: the member runs over the
+    // elements its iterator yields, unless the class declares the member.
+    if !matches!(
+        name,
+        "iterator" | "hasNext" | "next" | "toString" | "equals" | "hashCode"
+    ) {
+        let declared = instance_tag(recv)
+            .is_some_and(|t| OPER_SUBS.with(|s| s.borrow().contains_key(&(t, name.to_string()))));
+        if !declared {
+            if let Some(items) = drain_user_iterable(vm, recv) {
+                let list = alloc(HeapObj::List(items?));
+                return kt_method(vm, &list, name, args);
+            }
+        }
+    }
     if let Some(r) = jdk_integral_static(recv, name, args) {
         return r;
     }
@@ -17394,8 +17468,11 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         }
         // A range is an `Iterable` but not a `Collection`: `IntRange` implements
         // no `size`.
-        "Iterable" => with_obj(v, |o| {
-            matches!(o, HeapObj::List(_) | HeapObj::Set(_) | HeapObj::Range(_))
+        "Iterable" => with_obj(v, |o| match o {
+            HeapObj::List(_) | HeapObj::Set(_) | HeapObj::Range(_) => true,
+            // A user class implementing `Iterable`.
+            HeapObj::Instance { class, .. } => type_is_a(class, "Iterable"),
+            _ => false,
         })
         .unwrap_or(false),
         // `IntRange`/`CharRange` and the floating-point ranges implement

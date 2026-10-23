@@ -452,7 +452,6 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
 | `class C { fun f(a: String) = "s"; fun f(a: Int) = "i" }`; `C().f(1)` | `class C: method f is declared more than once — member overloads are not supported` | `i` |
 | `val a = arrayOf(1, 2); val l = a.asList(); a[0] = 7; println(l)` | `[1, 2]` | `[7, 2]` — a write to the ARRAY shows through the view; writes through the view reach the array since round 21 |
 | `'a'.category` | `unresolved reference: category on Char` | `LOWERCASE_LETTER` |
-| `class Bag(…) : Iterable<Int>`; `b.let { it.toList() }` — an `Iterable` user object reached through a receiver of no static class | `unresolved reference: toList on Bag` | the list — the extensions route only where the static class says `Iterable` |
 
 The first is an untyped left operand against a PRIMITIVE right one: the native
 `Add` coerces a heap handle to a number. Routing every untyped arithmetic site

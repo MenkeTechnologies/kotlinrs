@@ -4392,6 +4392,27 @@ impl Compiler {
             };
             self.emit_member_registry(name, op);
         }
+        // The iterator protocol, for an `Iterable` user object that reaches a
+        // collection member with no static type (`b.let { it.toList() }`):
+        // the host drains it through these (see `host::drain_user_iterable`).
+        for name in ["iterator", "hasNext", "next"] {
+            for (tag, owner) in self.method_index.get(name).cloned().unwrap_or_default() {
+                let arity_ok = self.classes[&tag]
+                    .methods
+                    .get(name)
+                    .is_some_and(|s| s.arity == 0);
+                if !arity_ok {
+                    continue;
+                }
+                let t = self.b.add_constant(Value::str(tag));
+                self.b.emit(Op::LoadConst(t), 0);
+                let n = self.b.add_constant(Value::str(name));
+                self.b.emit(Op::LoadConst(n), 0);
+                let sub = self.b.add_name(&method_sub_name(&owner, name));
+                self.b.emit(Op::LoadInt(sub as i64), 0);
+                self.b.emit(Op::Extended(KT_OPER_REG, 0), 0);
+            }
+        }
         // The arithmetic conventions, for an operand that reaches `+` with no
         // static type — a lambda parameter over a list of a user class.
         for name in ["plus", "minus", "times", "div", "rem"] {

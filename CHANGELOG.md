@@ -11,6 +11,21 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## An `Iterable` user object with no static class
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | before | reference |
+| --- | --- | --- |
+| `class Bag(…) : Iterable<Int>`; `b.let { it.toList().size }`, `id(b).sorted()`, `id(b).map { … }` | `unresolved reference: toList on Bag` | the elements' list |
+| `val any: Any = b; (any as Iterable<*>).joinToString()` | `ClassCastException: class Bag cannot be cast to class java.lang.Iterable` | `3, 1, 2` |
+| `listOf<Iterable<Int>>(b, Bag(listOf(9))).map { it.sum() }` | `unresolved reference` | `[6, 9]` |
+
+The compiler now publishes every class's `iterator()`/`hasNext()`/`next()` to
+the host's member registry, so a collection member that reaches an `Iterable`
+user object with no static type drains it through its own iterator and runs
+over the elements; `is`/`as Iterable` accept such an object.
+
 ## A collection interface implemented `by` a delegate
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
