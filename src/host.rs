@@ -10742,6 +10742,37 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
     if let Some(r) = jdk_integral_static(recv, name, args) {
         return r;
     }
+    // The `content…` members are declared on the NULLABLE array receiver:
+    // `null.contentHashCode()` is `0`, its `toString` forms are `null`.
+    if matches!(recv, Value::Undef) && args.is_empty() {
+        match name {
+            "contentHashCode" | "contentDeepHashCode" => return Ok(Value::Int(0)),
+            "contentToString" | "contentDeepToString" => return Ok(Value::str("null")),
+            _ => {}
+        }
+    }
+    // `contentDeepHashCode()` is `java.util.Arrays.deepHashCode`: a nested
+    // array folds by ITS content, recursively, where `contentHashCode` takes
+    // the nested array's identity hash.
+    if name == "contentDeepHashCode" && args.is_empty() && array_items(recv).is_some() {
+        fn deep(v: &Value) -> i32 {
+            match array_items(v) {
+                Some((desc, items)) if desc.starts_with("[L") || desc.is_empty() => items
+                    .iter()
+                    .fold(1i32, |h, x| h.wrapping_mul(31).wrapping_add(deep_elem(x))),
+                Some((desc, items)) => array_content_hash(&desc, &items),
+                None => value_hash(v, false),
+            }
+        }
+        fn deep_elem(x: &Value) -> i32 {
+            if array_items(x).is_some() {
+                deep(x)
+            } else {
+                value_hash(x, false)
+            }
+        }
+        return Ok(Value::Int(deep(recv) as i64));
+    }
     // `seq.constrainOnce()` — a NEW sequence over the same source that allows
     // one traversal; the receiver itself stays re-iterable.
     if name == "constrainOnce" && args.is_empty() {
@@ -11388,6 +11419,29 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
                 name.ends_with("Last"),
                 &missing,
             )))
+        }
+        // `replaceAfter`/`replaceBefore` and their `…Last` pair: the part after
+        // (before) the first (last) delimiter replaced, the delimiter kept; an
+        // absent delimiter answers `missingDelimiterValue`, the receiver by
+        // default.
+        (
+            Value::Str(s),
+            "replaceAfter" | "replaceBefore" | "replaceAfterLast" | "replaceBeforeLast",
+        ) if (2..=3).contains(&args.len()) => {
+            let delim = arg_str(args, 0);
+            let rep = kotlin_string(&args[1]);
+            let at = if name.ends_with("Last") {
+                s.rfind(delim.as_str())
+            } else {
+                s.find(delim.as_str())
+            };
+            Ok(Value::str(match at {
+                None => args.get(2).map_or_else(|| s.to_string(), kotlin_string),
+                Some(i) if name.starts_with("replaceAfter") => {
+                    format!("{}{rep}", &s[..i + delim.len()])
+                }
+                Some(i) => format!("{rep}{}", &s[i..]),
+            }))
         }
         // `String.reversed()` reverses whole characters, not code units — the
         // JVM's `StringBuilder.reverse` keeps surrogate pairs intact.
@@ -14919,6 +14973,15 @@ fn sequence_member(
             deep_to_string(recv.unwrap(), &mut Vec::new(), &mut out);
             return Some(Ok(Value::str(out)));
         }
+        // `contentHashCode()` is `java.util.Arrays.hashCode`: seed 1, folded
+        // `31 * h + element` at the array's element width.
+        "contentHashCode" if args.is_empty() && recv.is_some_and(|r| array_items(r).is_some()) => {
+            let desc = recv
+                .and_then(array_items)
+                .map(|(d, _)| d)
+                .unwrap_or_default();
+            return Some(Ok(Value::Int(array_content_hash(&desc, items) as i64)));
+        }
         // `contentEquals` compares two arrays ELEMENT-WISE with `equals`, where
         // `==` on arrays is identity. A null argument is unequal.
         "contentEquals" if args.len() == 1 => {
@@ -15660,6 +15723,14 @@ fn value_hash(v: &Value, long: bool) -> i32 {
     }
 }
 
+/// `java.util.Arrays.hashCode` over an array's elements: seed 1, folded
+/// `31 * h + element`, a `long[]`'s elements at the `Long` fold.
+fn array_content_hash(desc: &str, items: &[Value]) -> i32 {
+    items.iter().fold(1i32, |h, x| {
+        h.wrapping_mul(31).wrapping_add(value_hash(x, desc == "[J"))
+    })
+}
+
 /// The descriptor and elements of an array value, or `None` for anything else.
 fn array_items(v: &Value) -> Option<(String, Vec<Value>)> {
     with_obj(v, |o| match o {
@@ -15702,9 +15773,7 @@ fn obj_hash(recv: &Value) -> Option<i32> {
                     .and_then(|w| w.as_bytes().get(i))
                     .is_some_and(|c| *c == b'a');
                 let e = match array_items(v).filter(|_| arr) {
-                    Some((desc, items)) => items.iter().fold(1i32, |h, x| {
-                        h.wrapping_mul(31).wrapping_add(value_hash(x, desc == "[J"))
-                    }),
+                    Some((desc, items)) => array_content_hash(&desc, &items),
                     None => value_hash(v, long),
                 };
                 h = if i == 0 {

@@ -6586,6 +6586,21 @@ impl Compiler {
                 return self.compile_member(sc, &mapped, &reduce, &args[..1], false, line);
             }
         }
+        // `s.chunkedSequence(n)` / `s.windowedSequence(n, …)` over a string are
+        // the `chunked`/`windowed` parts as a sequence.
+        if matches!(name, "chunkedSequence" | "windowedSequence")
+            && !safe
+            && self.infer(sc, recv).is_str()
+        {
+            let parts = Expr::MethodCall {
+                recv: Box::new(recv.clone()),
+                name: name.trim_end_matches("Sequence").to_string(),
+                args: args.to_vec(),
+                safe: false,
+                line,
+            };
+            return self.compile_member(sc, &parts, "asSequence", &[], false, line);
+        }
         // `s.lineSequence()` is `s.lines().asSequence()`: the same split, lazily.
         if name == "lineSequence" && args.is_empty() && !safe && self.infer(sc, recv).is_str() {
             let lines = Expr::MethodCall {

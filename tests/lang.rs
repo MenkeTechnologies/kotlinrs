@@ -8261,3 +8261,136 @@ fun main() {
         "lastIndexOfStart: (1, 1)\nindexOfStart: (3, 2)\nstartsWithIdx: (true, false)\nendsWithCI: true\nreplaceCI: xxbB\nreplaceChar: a+b+c\nreplaceCharCI: bbb\ncontainsChar: true\nsplitChar: [a, b, , c]\nsplitCI: [a, b, c]\nsplitLimitNeg: [a, b]\nbinSearchRange: -4\nfillRange: [0, 9, 9, 0, 0]\ncopyOf: [1, 2, 0, 0]\ncopyOfRange: [2, 3]\ncopyOfRangeBad: EX java.lang.IndexOutOfBoundsException: toIndex (5) is greater than size (2).\nsortRange: [5, 2, 3, 4, 1]\ncopyInto: [0, 2, 3, 0, 0]\narrCopyOfStr: [a, b, null]\njoinLimit: 1, 2, 3, …\njoinTransform: = (1) + (2);\nchunkTransform: [6, 15, 7]\nwindowedPartialTransform: [12, 34, 5]\ntakeLast: [1, 2, 3]\ndropLastWhile: [1, 2]\nelementAtOrElse: 50\ngetOrElseList: 99\nindexOfLast: 2\nlastOrNullPred: 2\nfindLast: 3\nrandomSeeded: 2\ntoStringRadix: (-ff, 73)\ntoLongRadix: -1295\ntoIntRadixBad: EX java.lang.IllegalArgumentException: radix 1 was not in valid range 2..36\nstrSubSeq: el\nremoveRange: hlo\nreplaceRange: hXYZlo\ninsertSB: 12abc\nmutableAddAllIdx: [1, 2, 3, 4]\nremoveAtNeg: EX java.lang.IndexOutOfBoundsException: Index -1 out of bounds for length 1\nsetNeg: EX java.lang.IndexOutOfBoundsException: Index 3 out of bounds for length 1\nlistOfNulls: [null, null]\nsumOfLong: 6442450941\naverageEmpty: NaN\nmaxOrNullD: NaN\nminOfNaN: NaN\n"
     );
 }
+
+#[test]
+fn array_content_hashes_and_string_replace_around_a_delimiter() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. `contentHashCode`,
+    // `contentDeepHashCode`, the null-receiver `content…` members,
+    // `replaceAfter`/`replaceBefore`(`Last`) and `chunkedSequence`/
+    // `windowedSequence` over a string were `unresolved reference`.
+    assert_eq!(
+        stdout(
+            r##"fun main() {
+    println(listOf(longArrayOf(3000000000L, -1).contentHashCode(), doubleArrayOf(1.5, -0.0).contentHashCode(), floatArrayOf(0.1f, 2f).contentHashCode(), arrayOf("a", null, "bc").contentHashCode(), charArrayOf('x', 'y').contentHashCode(), booleanArrayOf(true, false).contentHashCode(), byteArrayOf(-1, 2).contentHashCode(), shortArrayOf(300).contentHashCode(), intArrayOf().contentHashCode()))
+    val n: IntArray? = null
+    println(n.contentHashCode())
+    println(arrayOf<Any>(intArrayOf(1, 2), arrayOf("x")).contentDeepHashCode())
+    println(arrayOf(listOf(1), 5).contentHashCode())
+    more()
+}
+fun more() {
+    val n: IntArray? = null
+    println(n.contentToString())
+    println(arrayOf<Any>(arrayOf(arrayOf(1)), 2).contentDeepHashCode())
+}"##
+        ),
+        "[-1489279551, 1057489857, -1144205164, 126145, 4802, 40359, 932, 331, 1]\n0\n31926\n1958\nnull\n2916\n"
+    );
+    assert_eq!(
+        stdout(
+            r##"fun t(name: String, f: () -> Any?) { try { println("$name: ${f()}") } catch (e: Throwable) { println("$name: EX $e") } }
+fun main() {
+    t("indexOfFrom") { listOf(1, 2, 1, 2).subList(1, 4).indexOf(1) }
+    t("strIndexOfCI") { "Hello".indexOf("L", ignoreCase = true) to "Hello".indexOf('L', 0, true) }
+    t("strLastIndexOfCI") { "Hello".lastIndexOf("L", ignoreCase = true) }
+    t("strCountSub") { "banana".windowed(3).count { it == "ana" } }
+    t("arrFillAll") { arrayOf(1, 2, 3).also { it.fill(0) }.toList() }
+    t("arrIndexOf") { intArrayOf(1, 2, 3).indexOf(3) to arrayOf("a", "b").lastIndexOf("a") }
+    t("arrContains") { 2 in intArrayOf(1, 2) }
+    t("arrSum") { longArrayOf(1, 2).sum() }
+    t("arrMaxOrNull") { intArrayOf().maxOrNull() }
+    t("arrReversed") { intArrayOf(1, 2, 3).reversedArray().toList() }
+    t("arrSortedArray") { intArrayOf(3, 1).sortedArray().toList() }
+    t("arrTakeDrop") { intArrayOf(1, 2, 3, 4).take(2) to intArrayOf(1, 2, 3).drop(1) }
+    t("arrSlice") { intArrayOf(1, 2, 3, 4).sliceArray(1..2).toList() }
+    t("arrPlus") { (intArrayOf(1) + 2 + intArrayOf(3, 4)).toList() }
+    t("arrAll") { intArrayOf(2, 4).all { it % 2 == 0 } }
+    t("arrMap") { intArrayOf(1, 2).map { it * 1.5 } }
+    t("arrWithIndex") { arrayOf("a", "b").withIndex().toList() }
+    t("arrForEachIdx") { var s = ""; charArrayOf('x', 'y').forEachIndexed { i, c -> s += "$i$c" }; s }
+    t("arrEquals") { intArrayOf(1) contentEquals intArrayOf(1) }
+    t("arrHash") { intArrayOf(1, 2).contentHashCode() }
+    t("arr2dDeep") { arrayOf(intArrayOf(1), intArrayOf(2, 3)).contentDeepToString() }
+    t("arrCountPred") { intArrayOf(1, 2, 3).count { it > 1 } }
+    t("arrDistinct") { intArrayOf(1, 1, 2).distinct() }
+    t("arrToSet") { intArrayOf(2, 1, 2).toSet() }
+    t("arrFirstLast") { intArrayOf(5, 6).first() to intArrayOf(5, 6).last() }
+    t("arrGetOrNull") { intArrayOf(5).getOrNull(3) }
+    t("arrIsEmpty") { emptyArray<Int>().isEmpty() }
+    t("arrOfNullsSize") { arrayOfNulls<Int>(3).size }
+    t("arrAverage") { intArrayOf(1, 2).average() }
+    t("arrJoin") { intArrayOf(1, 2).joinToString("-", "<", ">") }
+    t("arrFold") { intArrayOf(1, 2, 3).fold(10) { a, b -> a - b } }
+    t("arrReduceIdx") { intArrayOf(1, 2, 3).reduceIndexed { i, a, b -> a + i * b } }
+    t("arrZip") { intArrayOf(1, 2) zip arrayOf("a", "b") }
+    t("arrAsList") { arrayOf(1, 2).asList() }
+    t("arrToMutable") { intArrayOf(1).toMutableList().apply { add(2) } }
+    t("arrSortBy") { arrayOf("bb", "a").also { it.sortBy { s -> s.length } }.toList() }
+    t("arrBinSearch") { intArrayOf(1, 3, 5).binarySearch(4) }
+    t("arrFillRangeBad") { IntArray(3).also { it.fill(1, 2, 5) } }
+    t("arrCopyOfNeg") { intArrayOf(1).copyOf(-1) }
+    t("charArrStr") { charArrayOf('a', 'b').joinToString("") }
+    t("byteArr") { byteArrayOf(127, -128).map { it + 1 } }
+    t("shortArr") { shortArrayOf(1, 2).sum() }
+    t("boolArr") { BooleanArray(3) { it % 2 == 0 }.toList() }
+    t("floatArr") { floatArrayOf(1.5f, 2.25f).sum() }
+}"##
+        ),
+        "indexOfFrom: 1\nstrIndexOfCI: (2, 2)\nstrLastIndexOfCI: 3\nstrCountSub: 2\narrFillAll: [0, 0, 0]\narrIndexOf: (2, 0)\narrContains: true\narrSum: 3\narrMaxOrNull: null\narrReversed: [3, 2, 1]\narrSortedArray: [1, 3]\narrTakeDrop: ([1, 2], [2, 3])\narrSlice: [2, 3]\narrPlus: [1, 2, 3, 4]\narrAll: true\narrMap: [1.5, 3.0]\narrWithIndex: [IndexedValue(index=0, value=a), IndexedValue(index=1, value=b)]\narrForEachIdx: 0x1y\narrEquals: true\narrHash: 994\narr2dDeep: [[1], [2, 3]]\narrCountPred: 2\narrDistinct: [1, 2]\narrToSet: [2, 1]\narrFirstLast: (5, 6)\narrGetOrNull: null\narrIsEmpty: true\narrOfNullsSize: 3\narrAverage: 1.5\narrJoin: <1-2>\narrFold: 4\narrReduceIdx: 9\narrZip: [(1, a), (2, b)]\narrAsList: [1, 2]\narrToMutable: [1, 2]\narrSortBy: [a, bb]\narrBinSearch: -3\narrFillRangeBad: EX java.lang.ArrayIndexOutOfBoundsException: Array index out of range: 5\narrCopyOfNeg: EX java.lang.NegativeArraySizeException: -1\ncharArrStr: ab\nbyteArr: [128, -127]\nshortArr: 3\nboolArr: [true, false, true]\nfloatArr: 3.75\n"
+    );
+    assert_eq!(
+        stdout(
+            r##"fun t(name: String, f: () -> Any?) { try { println("$name: ${f()}") } catch (e: Throwable) { println("$name: EX $e") } }
+fun main() {
+    t("splitChars") { "a,b;c d".split(',', ';', ' ') }
+    t("splitCharsLimit") { "a,b,c,d".split(',', limit = 2) }
+    t("splitCharCI") { "aXbxc".split('x', ignoreCase = true) }
+    t("splitMultiStrLimit") { "a--b==c--d".split("--", "==", limit = 3) }
+    t("trimEndChars") { "abcxyx".trimEnd('x', 'y') }
+    t("trimStartChars") { "xxyab".trimStart('x', 'y') }
+    t("startsWithChar") { "abc".startsWith('a') to "abc".endsWith('C', true) }
+    t("removeSurroundingSame") { "\"q\"".removeSurrounding("\"") }
+    t("substringAfterLast") { "a/b/c".substringAfterLast("/") to "abc".substringAfterLast("/", "none") }
+    t("substringBeforeChar") { "a.b.c".substringBefore('.') to "a.b.c".substringAfter('.') }
+    t("replaceAfter") { "a.b.c".replaceAfter(".", "X") to "a.b.c".replaceBefore(".", "Y") }
+    t("replaceAfterLast") { "a.b.c".replaceAfterLast(".", "Z") to "a.b.c".replaceBeforeLast(".", "W") }
+    t("padEndChar") { "ab".padEnd(5, '*') }
+    t("chunkedSeqStr") { "abcdefg".chunkedSequence(3).toList() }
+    t("takeLastStr") { "hello".takeLast(3) to "hello".dropLast(2) }
+    t("takeWhileStr") { "aab".takeWhile { it == 'a' } to "aab".dropWhile { it == 'a' } }
+    t("takeLastWhileStr") { "abb".takeLastWhile { it == 'b' } }
+    t("filterIndexedStr") { "abcd".filterIndexed { i, _ -> i % 2 == 0 } }
+    t("mapIndexedStr") { "ab".mapIndexed { i, c -> "$i$c" } }
+    t("anyStr") { "abc".any { it == 'b' } to "abc".none { it == 'z' } }
+    t("firstOrNullStr") { "abc".firstOrNull { it > 'a' } to "".firstOrNull() }
+    t("singleStr") { "a".single() }
+    t("singleStrBad") { "ab".single() }
+    t("reduceStr") { "abc".reduce { acc, c -> maxOf(acc, c) } }
+    t("charRangeStep") { ('a'..'k' step 3).joinToString("") }
+    t("stringCompareNull") { (null as String?).equals(null) }
+    t("toUpperChar") { "ß".uppercase() to 'ß'.uppercaseChar() }
+    t("lowercaseTurkish") { "İ".lowercase().length }
+    t("isLetterDigit") { listOf('٣'.isDigit(), '٣'.digitToIntOrNull(), 'Ⅻ'.isLetter()) }
+    t("ifBlank") { "  ".ifBlank { "dflt" } to "x".ifEmpty { "e" } }
+    t("orEmptyStr") { (null as String?).orEmpty().length }
+    t("strLinesSeq") { "a\r\nb\rc".lines() }
+    t("indent") { "a\nb".prependIndent("> ") }
+    t("replaceIndent") { "  a\n    b".replaceIndent("|") }
+    t("trimMarginCustom") { "#a\n  #b".trimMargin("#") }
+    t("format0") { String.format("%3$2s %1$2s %2$2s", "a", "b", "c") }
+    extra4()
+    extra5()
+}
+fun extra4() {
+    t("replaceAfterChar") { "a.b".replaceAfter('.', "Q") }
+    t("replaceAfterMissing") { "abc".replaceAfter("/", "Q") to "abc".replaceBefore("/", "Q", "miss") }
+    t("replaceBeforeLastMulti") { "x::y::z".replaceBeforeLast("::", "W") }
+}
+fun extra5() {
+    t("windowedSeqStr") { "abcde".windowedSequence(2, 2, true).toList() }
+    t("chunkedSeqTransform") { "abcdef".chunkedSequence(2) { it.reversed() }.toList() }
+}"##
+        ),
+        "splitChars: [a, b, c, d]\nsplitCharsLimit: [a, b,c,d]\nsplitCharCI: [a, b, c]\nsplitMultiStrLimit: [a, b, c--d]\ntrimEndChars: abc\ntrimStartChars: ab\nstartsWithChar: (true, true)\nremoveSurroundingSame: q\nsubstringAfterLast: (c, none)\nsubstringBeforeChar: (a, b.c)\nreplaceAfter: (a.X, Y.b.c)\nreplaceAfterLast: (a.b.Z, W.c)\npadEndChar: ab***\nchunkedSeqStr: [abc, def, g]\ntakeLastStr: (llo, hel)\ntakeWhileStr: (aa, b)\ntakeLastWhileStr: bb\nfilterIndexedStr: ac\nmapIndexedStr: [0a, 1b]\nanyStr: (true, true)\nfirstOrNullStr: (b, null)\nsingleStr: a\nsingleStrBad: EX java.lang.IllegalArgumentException: Char sequence has more than one element.\nreduceStr: c\ncharRangeStep: adgj\nstringCompareNull: true\ntoUpperChar: (SS, ß)\nlowercaseTurkish: 2\nisLetterDigit: [true, 3, false]\nifBlank: (dflt, x)\norEmptyStr: 0\nstrLinesSeq: [a, b, c]\nindent: > a\n> b\nreplaceIndent: |a\n|  b\ntrimMarginCustom: a\nb\nformat0:  c  a  b\nreplaceAfterChar: a.Q\nreplaceAfterMissing: (abc, miss)\nreplaceBeforeLastMulti: W::z\nwindowedSeqStr: [ab, cd, e]\nchunkedSeqTransform: [ba, dc, fe]\n"
+    );
+}

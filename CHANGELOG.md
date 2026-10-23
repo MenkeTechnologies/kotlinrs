@@ -11,6 +11,18 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Array content hashes; `replaceAfter`/`replaceBefore`; string sequences
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1. Each was `unresolved reference`.
+
+| program | reference |
+| --- | --- |
+| `intArrayOf(1, 2).contentHashCode()`, `longArrayOf(3000000000L, -1).contentHashCode()`, `arrayOf("a", null, "bc").contentHashCode()` | `994`, `-1489279551`, `126145` — `java.util.Arrays.hashCode` |
+| `arrayOf<Any>(intArrayOf(1, 2), arrayOf("x")).contentDeepHashCode()` | `31926` — nested arrays by content |
+| `(null as IntArray?).contentHashCode()`, `.contentToString()` | `0`, `null` |
+| `"a.b.c".replaceAfter(".", "X")`, `.replaceBefore(".", "Y")`, `.replaceAfterLast(".", "Z")`, `"abc".replaceBefore("/", "Q", "miss")` | `a.X`, `Y.b.c`, `a.b.Z`, `miss` |
+| `"abcdefg".chunkedSequence(3).toList()`, `"abcde".windowedSequence(2, 2, true).toList()` | `[abc, def, g]`, `[ab, cd, e]` |
+
 ## Arguments that were ignored: ranges, `addAll(index, …)`, `toCharArray(…)`
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, compiled and run on the same JVM.

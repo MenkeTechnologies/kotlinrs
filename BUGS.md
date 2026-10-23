@@ -464,6 +464,7 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
 | `object O { init { throw IllegalStateException("in init") }; val x = 1 }`; `O.x` | `IllegalStateException: in init` | `ExceptionInInitializerError` (its `cause` the `IllegalStateException`) |
 | `mutableListOf(1, 2, 3, 4).also { it.subList(1, 3).reverse() }` | `[1, 2, 3, 4]` | `[1, 3, 2, 4]` — the view writes through |
 | `"a😀b".codePointCount(0, 4)` | `unresolved reference: codePointCount on String` | `3` |
+| `'a'.category` | `unresolved reference: category on Char` | `LOWERCASE_LETTER` |
 
 The first is an untyped left operand against a PRIMITIVE right one: the native
 `Add` coerces a heap handle to a number. Routing every untyped arithmetic site
