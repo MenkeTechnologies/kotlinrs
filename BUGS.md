@@ -66,14 +66,12 @@ time. Depth 50000 completes and is pinned. Making the VM's frame stack bounded
 to imitate the JVM's would trade a slow correct answer for a fast wrong one at
 every depth in between.
 
-The UNBOUNDED case is different, and measured on `kotlinc` 2.4.21 / JRE
-21.0.12.1: `fun f(n: Int): Int = f(n + 1) + 1; println(f(0))` raises
-`java.lang.StackOverflowError` at once on the reference, where kotlinrs grows
-its frame stack until the process is killed (exit 137, after minutes). A frame
-limit far above any depth the JVM survives (millions) would turn that into
-the same `StackOverflowError` without a wrong answer at any finite depth the
-reference completes; it needs a depth test on the call path, which fusevm's
-`Op::Call` does not offer and a per-call host op would pay for on every call.
+The UNBOUNDED case is closed since round 21: a function that can reach
+itself by name tests its depth on entry (`KT_DEPTH_GUARD`) and raises
+`StackOverflowError` past a million frames, twenty times the ~45 000 at which
+the reference overflows a one-parameter recursion, so no depth the reference
+completes is cut short. The test costs about 12% on a call-bound benchmark
+(`fib(30)`, debug build: 3.71 s to 4.18 s).
 
 ### `"ab".repeat(2000000000)` and `"a".padStart(2000000000)`
 

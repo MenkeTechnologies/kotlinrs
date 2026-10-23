@@ -24,9 +24,9 @@ use crate::host::{
     COLL_COPY, COLL_DEFAULT_CAP, COLL_HASH, COLL_LITERAL, COLL_SORTED, KT_ARRAY, KT_ARRAY_INIT,
     KT_ARRAY_NEW, KT_AS, KT_BOX_F32, KT_BOX_I64, KT_BUILDER, KT_CHR_STRING, KT_CLASSOF,
     KT_CLASS_REF, KT_CLOSURE_CALL, KT_COLL_HOF, KT_COMPARATOR, KT_COMPARE_REG, KT_COMPARE_VM,
-    KT_DBG_LINE, KT_DDIV, KT_DELEG_GET, KT_DELEG_SET, KT_DISPLAY, KT_ENUM_REG, KT_EQUALS_REG,
-    KT_EXC_ABORT, KT_EXC_CAUSE_SET, KT_EXC_CUT, KT_EXC_DEPTH, KT_EXC_MATCH, KT_EXC_NEW,
-    KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND,
+    KT_DBG_LINE, KT_DDIV, KT_DELEG_GET, KT_DELEG_SET, KT_DEPTH_GUARD, KT_DISPLAY, KT_ENUM_REG,
+    KT_EQUALS_REG, KT_EXC_ABORT, KT_EXC_CAUSE_SET, KT_EXC_CUT, KT_EXC_DEPTH, KT_EXC_MATCH,
+    KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND,
     KT_EXTREMUM_VM, KT_F32, KT_F32_ARITH, KT_F32_STR, KT_FFI_CALL, KT_FFI_COMPILE, KT_GENSEQ,
     KT_GETFIELD, KT_HASH_REG, KT_IDENTITY, KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM,
     KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_END, KT_ITER_GET, KT_ITER_MORE, KT_ITER_PULL, KT_ITER_SIZE,
@@ -2014,6 +2014,10 @@ pub struct Compiler {
     /// [`mangle_overloads`]). Each lives in `fun_sig` under its mangled name;
     /// a call selects one with [`Compiler::select_overload`].
     overloads: HashMap<String, Vec<String>>,
+    /// The function names that can reach themselves through calls by name —
+    /// the ones whose entry carries the `KT_DEPTH_GUARD` test (see
+    /// [`recursive_names`]).
+    recursive: HashSet<String>,
     /// `(receiver type name, function name)` → signature, for the extension
     /// functions the program declares (`fun Int.dbl()`). Keyed on the receiver
     /// because the same name may be extended onto several types.
@@ -3130,6 +3134,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         b: ChunkBuilder::new(),
         fun_sig,
         overloads,
+        recursive: recursive_names(program),
         extensions,
         classes,
         class_alias,
@@ -4513,6 +4518,17 @@ impl Compiler {
         };
         let name_idx = self.b.add_name(&sub_name);
         self.b.add_sub_entry(name_idx, entry);
+        // A function that can recurse tests its depth on entry, so an
+        // unbounded recursion raises `StackOverflowError` as on the JVM; while
+        // that error unwinds, the frame returns at once instead of recursing.
+        if self.recursive.contains(unmangled(&f.name)) {
+            self.b.emit(Op::Extended(KT_DEPTH_GUARD, 0), f.line);
+            let body = self.b.emit(Op::JumpIfFalse(0), f.line);
+            self.b.emit(Op::LoadUndef, f.line);
+            self.b.emit(Op::ReturnValue, f.line);
+            let at = self.b.current_pos();
+            self.b.patch_jump(body, at);
+        }
 
         let mut sc = Scope::new();
         let mut nslots = f.params.len();
@@ -16647,4 +16663,62 @@ fn is_iterable_extension(name: &str) -> bool {
                 | "none"
                 | "any"
         )
+}
+
+/// The names of the functions — top-level, extension, member and local — that
+/// can reach themselves through calls BY NAME. Names stand for every function
+/// spelled so (overloads, the same method on several classes), which errs
+/// toward guarding more; a recursion through a lambda is bounded separately
+/// by the nested-run limit.
+fn recursive_names(program: &Program) -> HashSet<String> {
+    fn collect<'a>(body: &'a [Stmt], out: &mut Vec<&'a FunDecl>) {
+        for s in body {
+            if let StmtKind::LocalFun(lf) = &s.kind {
+                out.push(lf);
+                collect(&lf.body, out);
+            }
+        }
+    }
+    let mut decls: Vec<&FunDecl> = Vec::new();
+    for f in &program.funs {
+        decls.push(f);
+        collect(&f.body, &mut decls);
+    }
+    for c in &program.classes {
+        for m in &c.methods {
+            decls.push(m);
+            collect(&m.body, &mut decls);
+        }
+    }
+    let mut calls: HashMap<String, HashSet<String>> = HashMap::new();
+    for f in &decls {
+        let names = RefCell::new(HashSet::new());
+        body_any(&f.body, &|e| {
+            if let Expr::Call { name, .. } | Expr::MethodCall { name, .. } = e {
+                names.borrow_mut().insert(name.clone());
+            }
+            false
+        });
+        calls
+            .entry(unmangled(&f.name).to_string())
+            .or_default()
+            .extend(names.into_inner());
+    }
+    let mut out = HashSet::new();
+    for start in calls.keys() {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut todo: Vec<&str> = calls[start].iter().map(|s| s.as_str()).collect();
+        while let Some(n) = todo.pop() {
+            if n == start {
+                out.insert(start.clone());
+                break;
+            }
+            if seen.insert(n) {
+                if let Some(next) = calls.get(n) {
+                    todo.extend(next.iter().map(|s| s.as_str()));
+                }
+            }
+        }
+    }
+    out
 }

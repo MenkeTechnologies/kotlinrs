@@ -8718,3 +8718,32 @@ fun main() {
         "clearRange: [1, 4, 5]\nreverseRange: [1, 3, 2, 4]\nsortRange: [3, 4, 5, 2, 1]\nsetThrough: [1, 9, 3]\n[1, 7]\naddThrough: [1, 7, 2, 3]\nremoveIfThrough: [1, 3]\nfillThrough: [0, 8, 8, 0, 0]\n[3, 5]\ntwoWrites: [1, 3, 5, 4]\nroSubAdd: EX java.lang.UnsupportedOperationException\nroSubSet: [9, 2, 3]\nsortWithThrough: [1, 3, 2, 0]\nshuffleNoop: [1, 2]\nreadOnlyView: 3\n"
     );
 }
+
+#[test]
+fn unbounded_plain_recursion_raises_stack_overflow_error() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. Direct, mutual and method
+    // recursion without a base case grew the frame stack until the process
+    // was killed; the JVM raises a catchable `StackOverflowError` (near 45 000
+    // frames there, a million here). A deep FINITE recursion still completes.
+    assert_eq!(
+        stdout(
+            r##"var depth = 0
+fun f(n: Int): Int { depth = n; return f(n + 1) + 1 }
+fun even(n: Int): Boolean = if (n == 0) true else odd(n - 1)
+fun odd(n: Int): Boolean = if (n == 0) false else even(n - 1)
+class Node { fun walk(): Int = walk() + 1 }
+fun main() {
+    try { f(0) } catch (e: StackOverflowError) { println("caught ${e}") }
+    println(depth > 40000)
+    try { println(even(-1)) } catch (e: StackOverflowError) { println("mutual $e") }
+    try { Node().walk() } catch (e: Throwable) { println("method $e") }
+    println(even(10000))
+    println("after")
+}"##
+        ),
+        "caught java.lang.StackOverflowError\ntrue\nmutual java.lang.StackOverflowError\nmethod java.lang.StackOverflowError\ntrue\nafter\n"
+    );
+    let out = eval("fun f(n: Int): Int = f(n + 1) + 1\nfun main() { println(f(0)) }");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("java.lang.StackOverflowError"));
+}

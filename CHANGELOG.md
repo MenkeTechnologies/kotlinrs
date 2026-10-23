@@ -11,6 +11,23 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Unbounded recursion raises `StackOverflowError`
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | before | reference |
+| --- | --- | --- |
+| `fun f(n: Int): Int = f(n + 1) + 1; println(f(0))` | the process grew until killed (exit 137) | `Exception in thread "main" java.lang.StackOverflowError` |
+| the same inside `try { … } catch (e: StackOverflowError)`, mutual recursion, a method calling itself | never returned | caught |
+
+A function that can reach itself through calls by name (computed over every
+top-level, extension, member and local function) carries a `KT_DEPTH_GUARD`
+test on entry: past `MAX_CALL_DEPTH` (1 000 000) frames it raises the error,
+and every frame entered while it unwinds returns at once. The reference
+overflows near 45 000 frames, so no finite depth it completes is affected.
+Measured cost: `fib(30)` (2.7 M guarded calls) 3.71 s → 4.18 s in a debug
+build, about 0.17 µs per call. Functions that cannot recurse pay nothing.
+
 ## A write through `subList` reaches the backing list
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.

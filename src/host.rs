@@ -333,6 +333,22 @@ pub const KT_OBJ_INIT_EXIT: u16 = 155;
 /// `ConcurrentModificationException`, which is what `next()`'s modification
 /// check raises there.
 pub const KT_ITER_MORE: u16 = 156;
+/// `KT_DEPTH_GUARD`: the entry test of a function that can recurse. Pushes
+/// whether the call is to return at once: past [`MAX_CALL_DEPTH`] frames it
+/// raises `java.lang.StackOverflowError` — the JVM's answer to unbounded
+/// recursion — and every frame entered while that error unwinds returns
+/// immediately instead of recursing again. Stack-neutral otherwise.
+pub const KT_DEPTH_GUARD: u16 = 157;
+
+/// How many VM frames a call chain may hold before `StackOverflowError`.
+///
+/// The JVM overflows a one-`Int`-parameter recursion near 45 000 frames
+/// (measured on JRE 21.0.12.1), so this is far past any depth a program that
+/// completes on the reference reaches: no finite recursion it finishes is
+/// cut short here. What it bounds is the UNBOUNDED one, which used to grow
+/// the frame stack until the process was killed. A million frames is about
+/// 300 MB and 1.5 s in a debug build.
+pub const MAX_CALL_DEPTH: usize = 1_000_000;
 
 /// `KT_SEQ_NEW`: build the lazy `Sequence` a `sequence { … }` block denotes.
 /// Stack `[blockClosure]`; pushes a `Gen` whose source is a fresh coroutine.
@@ -5094,6 +5110,13 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
                 return;
             }
             vm.push(Value::Bool(false));
+        }
+        KT_DEPTH_GUARD => {
+            let over = vm.frames.len() > MAX_CALL_DEPTH;
+            if over && !unwinding() {
+                fault(vm, "java.lang.StackOverflowError");
+            }
+            vm.push(Value::Bool(over && unwinding()));
         }
         KT_ITER_MORE => {
             let n0 = vm.pop().to_int();
