@@ -9066,3 +9066,117 @@ fn the_depth_guard_is_one_op_ahead_of_the_body() {
         "leaf in:\n{asm}"
     );
 }
+
+/// `mutableListOf<Long>(1)`, `ArrayDeque<Long>()`, `mutableMapOf<Long, Long>()` and their\nannotated spellings (`val xs: MutableList<Long> = mutableListOf(1)`) type every\ninteger literal passed as an element, key or value as a `Long` — Kotlin types a\nliteral by its expected type. Each element below answered `is Long` false\nbefore, and a `Map<String, Int>`'s `m[k]!! + m[k]!!` skipped the 32-bit wrap.
+#[test]
+fn explicit_and_annotated_element_types_make_literal_elements_long() {
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    val a = mutableListOf<Long>(1)
+    println(a[0] is Long)
+    a.add(2)
+    println(a)
+    println(a.sum())
+    val d = ArrayDeque<Long>()
+    d.addLast(5)
+    println(d.first() is Long)
+    val s = setOf<Long>(1, 2)
+    println(s.first() is Long)
+    val m = mutableMapOf<Long, Long>(1L to 2L)
+    m[3] = 4
+    println(m[3] is Long)
+    println(m.keys.last() is Long)
+    val l = listOf<Double>(1.0, 2.0)
+    println(l.sum())
+    val x = arrayListOf<Long>(7)
+    println(x[0] is Long)
+    val e = emptyList<Long>()
+    println(e.size)
+    val ml = mutableListOf<Byte>(1, 2)
+    println(ml[0] is Byte)
+    val sh = mutableListOf<Short>(1)
+    println(sh[0] is Short)
+    val big = mutableListOf<Long>(3000000000)
+    println(big[0] + 1)
+    println(listOf<Long>(1, 2).map { it * 3000000000 })
+}"##
+        ),
+        "true\n[1, 2]\n3\ntrue\ntrue\ntrue\ntrue\n3.0\ntrue\n0\ntrue\ntrue\n3000000001\n[3000000000, 6000000000]\n"
+    );
+    assert_eq!(
+        prog(
+            r##"fun sumAll(xs: List<Long>): Long = xs.sum()
+fun main() {
+    val m = mutableMapOf<Long, String>()
+    m[1] = "a"; m.put(2, "b")
+    println(m.keys.map { it is Long })
+    println(m[1] + m.get(2) + m.containsKey(2) + m.getOrDefault(3, "z"))
+    val n = HashMap<String, Long>()
+    n["x"] = 5
+    n["x"] = n["x"]!! + 1
+    println(n["x"] is Long)
+    println(n)
+    val q: MutableMap<Long, Long> = mutableMapOf()
+    q[7] = 8
+    q[7] = q.getValue(7) * 3000000000
+    println(q)
+    println(q.keys.first() is Long)
+    val c = mutableMapOf(1L to 2L)
+    c[5] = 6
+    println(c.entries.map { it.key is Long && it.value is Long })
+    val l = mutableListOf<Long>()
+    l.add(1); l.add(0, 2); l += 3
+    println(l.map { it is Long })
+    println(l.contains(3))
+    println(l.indexOf(1))
+    l.remove(2)
+    println(l)
+    println(sumAll(listOf(1, 2, 3)))
+    val s = mutableSetOf<Long>(1, 2)
+    s.add(3)
+    println(s.map { it is Long })
+    println(3 in s)
+    val arr = arrayOf<Long>(1, 2)
+    println(arr[0] is Long)
+    val e = emptyList<Long>()
+    println(e + 4L)
+    val str = listOf<String>("a")
+    println(str)
+    val nested = listOf<List<Long>>(listOf(1L))
+    println(nested[0][0] is Long)
+}"##
+        ),
+        "[true, true]\nabtruez\ntrue\n{x=6}\n{7=24000000000}\ntrue\n[true, true]\n[true, true, true]\ntrue\n1\n[1, 3]\n6\n[true, true, true]\ntrue\ntrue\n[4]\n[a]\ntrue\n"
+    );
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    val big: MutableMap<String, Int> = mutableMapOf()
+    big["k"] = 2000000000
+    println(big["k"]!! + big["k"]!!)
+    println(big["zz"])
+    println(big["zz"] ?: 7)
+    println((big["zz"] ?: 2000000000) + 2000000000)
+    val x = big["zz"]
+    println(x == null)
+    val m = mutableMapOf("a" to 2000000000)
+    println(m["a"]!! * 2)
+    println("v=${m["a"]} ${m["q"]}")
+    val d = mapOf("a" to 1.5)
+    println(d["a"]!! / 2)
+    val i = mapOf(1 to 7)
+    println(i[1]!! / 2)
+    val s = mapOf("k" to "v")
+    println(s["k"] + "!")
+    println(s["q"] + "!")
+    val l = mapOf("k" to 3000000000L)
+    println(l["k"]!! + 1)
+    val cc = mapOf('a' to 'b')
+    println(cc['a'])
+    println(cc['z'])
+}"##
+        ),
+        "-294967296\nnull\n7\n-294967296\ntrue\n-294967296\nv=2000000000 null\n0.75\n3\nv!\nnull!\n3000000001\nb\nnull\n"
+    );
+}

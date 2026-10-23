@@ -4631,8 +4631,33 @@ impl Parser {
         let generic = len > 3 && matches!(self.toks[start + 2].tok, Tok::Lt);
         match &self.toks[start + 1].tok {
             Tok::Ident(n) if len == 3 || generic => Some(n.clone()),
-            _ => None,
+            _ => self.type_arg_names(start + 1, self.pos - 1),
         }
+    }
+
+    /// The names of a type-argument list of SEVERAL arguments, comma-joined —
+    /// `<Long, String>` is `Long,String` — when every argument starts with a
+    /// name (`Map<K, V>`, `Long?` count; a function type does not). It is the
+    /// static type `mutableMapOf<Long, Long>()` gives its keys and values.
+    fn type_arg_names(&self, from: usize, to: usize) -> Option<String> {
+        let mut names = Vec::new();
+        let mut depth = 0;
+        let mut at_start = true;
+        for t in &self.toks[from..to] {
+            match &t.tok {
+                Tok::Ident(n) if at_start => names.push(n.clone()),
+                Tok::Lt => depth += 1,
+                Tok::Gt => depth -= 1,
+                Tok::Comma if depth == 0 => {
+                    at_start = true;
+                    continue;
+                }
+                _ if at_start => return None,
+                _ => {}
+            }
+            at_start = false;
+        }
+        (names.len() > 1).then(|| names.join(","))
     }
 
     fn skip_call_type_args(&mut self) {

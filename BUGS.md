@@ -430,16 +430,15 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
 
 | program | kotlinrs | reference |
 | --- | --- | --- |
-| `mutableListOf<Long>(1)[0] is Long`, `ArrayDeque<Long>().apply { addLast(1L) }.first() is Long` | `Int` | `Long` |
+| `(listOf(1) as List<Any>)[0] is Byte` | `true` | `false` |
 | `Any()`, `generateSequence { 5L }`, `Throwable().stackTrace`, `5L.toULong()` | `unresolved reference` | the value |
 | `import java.util.*` then `kotlin.collections.ArrayDeque` `.push(0)` | `unresolved reference: push` | `java.util.ArrayDeque` wins the star import |
 | `java.util.LinkedList`, `java.util.BitSet`, `java.util.Optional`, `System.getProperty` | `unresolved reference` | the JDK member |
 
-The first three rows are one cause: a `Long` is an unboxed `Value::Int` until it
-enters an erased position, and these producers (a range's elements, a typed
-generic constructor's literal arguments, a property read on a `Long`) do not box
-it. Only identity-sensitive uses (`is Long`, `== 2L` against an untyped value,
-`equals`) can see it; arithmetic is unaffected.
+The typed-builder row this table opened with (`mutableListOf<Long>(1)[0] is
+Long`) is closed: a written or annotated element, key or value type now types
+the literal arguments. The first row is its mirror for `Byte`/`Short`: they have
+no box of their own, so `is Byte` accepts any `Int` that fits.
 
 ## Round 21: measured and not closed
 

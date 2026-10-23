@@ -11,6 +11,25 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Explicit and annotated collection type arguments
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1. Kotlin gives an integer literal
+the type it is passed as, so a written element, key or value type of `Long`
+makes every literal element a `Long`.
+
+| program | before | reference |
+| --- | --- | --- |
+| `mutableListOf<Long>(1)[0] is Long`, `setOf<Long>(1, 2)`, `arrayOf<Long>(1)` | `false` | `true` |
+| `ArrayDeque<Long>()` then `addLast(5)`; `mutableListOf<Long>()` then `add(1)`, `add(0, 2)`, `+= 3`, `xs[0] = 4` | the elements were `Int` | `Long` |
+| `mutableMapOf<Long, String>()` then `m[1] = "a"`, `m.put(2, "b")`, `m[1]`, `m.containsKey(2)` | `Int` keys, lookups missed | `Long` keys |
+| `val xs: MutableList<Long> = mutableListOf(1)`, `val m: MutableMap<Long, Long> = mutableMapOf()` | `Int` | `Long` |
+| `3 in mutableSetOf<Long>(3)`, `2L in mutableListOf(1L, 2L)`, `ArrayDeque(listOf(1L)).addFirst(7L)` | `false`, `false`, unboxed | `true`, `true`, `Long` |
+| `val m: MutableMap<String, Int>`; `m["k"] = 2000000000`; `m["k"]!! + m["k"]!!` | `4000000000` | `-294967296` |
+
+The parser now keeps a call's several type arguments (`<Long, Long>`) as well as
+one; a map's key and value types also come from its `a to b` literals. A map
+index read has the value type (nullable), which gives `m[k]!! + 1` its width.
+
 ## The recursion depth guard is one op
 
 `KT_DEPTH_GUARD` was the entry op of a recursive function followed by a

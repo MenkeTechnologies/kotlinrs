@@ -127,10 +127,22 @@ fn is_primitive_type_name(name: &str) -> bool {
 fn reify_arg_name(e: &Expr) -> Option<String> {
     match e {
         Expr::Str(parts) => match parts.as_slice() {
-            [StrExpr::Text(n)] => Some(n.clone()),
+            [StrExpr::Text(n)] if !n.contains(',') => Some(n.clone()),
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Every type-argument name a [`REIFY_CALL`] wrapper carries: one, or the
+/// comma-joined several the parser writes for `mutableMapOf<Long, Long>()`.
+fn reify_arg_list(e: &Expr) -> Vec<String> {
+    match e {
+        Expr::Str(parts) => match parts.as_slice() {
+            [StrExpr::Text(n)] => n.split(',').map(str::to_string).collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
     }
 }
 
@@ -184,6 +196,12 @@ fn width_erasing_member(name: &str) -> bool {
             | "lastIndexOf"
             | "add"
             | "addAll"
+            | "addFirst"
+            | "addLast"
+            | "offer"
+            | "offerFirst"
+            | "offerLast"
+            | "push"
             | "put"
             | "putIfAbsent"
             | "equals"
@@ -196,6 +214,79 @@ fn width_erasing_member(name: &str) -> bool {
             | "replace"
             | "remove"
             | "format"
+    )
+}
+
+/// The builders whose ARGUMENTS are the elements, so a written element type
+/// (`listOf<Long>(1)`, `val xs: List<Long> = listOf(1)`) types each of them.
+fn element_builder(name: &str) -> bool {
+    matches!(
+        name,
+        "listOf"
+            | "mutableListOf"
+            | "arrayListOf"
+            | "setOf"
+            | "mutableSetOf"
+            | "hashSetOf"
+            | "linkedSetOf"
+            | "sortedSetOf"
+            | "listOfNotNull"
+            | "sequenceOf"
+            | "arrayOf"
+    )
+}
+
+/// The collection builders and constructors whose ONE type argument is the
+/// element type: the element builders and the ones that take none
+/// (`emptyList<Long>()`, `ArrayDeque<Long>()`).
+fn element_typed_builder(name: &str) -> bool {
+    element_builder(name)
+        || matches!(
+            name,
+            "emptyList"
+                | "emptySet"
+                | "emptySequence"
+                | "ArrayDeque"
+                | "ArrayList"
+                | "HashSet"
+                | "LinkedHashSet"
+                | "TreeSet"
+                | "arrayOfNulls"
+        )
+}
+
+/// The `Map` builders and constructors, whose two type arguments are the key
+/// and value types.
+fn map_builder(name: &str) -> bool {
+    matches!(
+        name,
+        "mapOf"
+            | "mutableMapOf"
+            | "hashMapOf"
+            | "linkedMapOf"
+            | "sortedMapOf"
+            | "emptyMap"
+            | "HashMap"
+            | "LinkedHashMap"
+            | "TreeMap"
+    )
+}
+
+/// The members whose LAST argument is an element of the receiver: what a
+/// `MutableList<Long>`'s `add(1)` types as a `Long` — Kotlin types an integer
+/// literal by the parameter it is passed to.
+fn element_param_member(name: &str) -> bool {
+    matches!(
+        name,
+        "add"
+            | "addFirst"
+            | "addLast"
+            | "set"
+            | "contains"
+            | "indexOf"
+            | "lastIndexOf"
+            | "remove"
+            | "fill"
     )
 }
 
@@ -4863,6 +4954,23 @@ impl Compiler {
                 lazy,
                 delegated,
             } => {
+                // `val xs: List<Long> = listOf(1)` is `listOf<Long>(1)`: the
+                // annotation is the expected type the literal elements take.
+                let written_elem = annotated_elem(annotated_class.as_deref(), annotated);
+                let typed_init;
+                let init = match init {
+                    Expr::Call { name: b, .. }
+                        if written_elem == Type::Long && element_builder(b) =>
+                    {
+                        typed_init = Expr::Call {
+                            name: REIFY_CALL.to_string(),
+                            args: vec![Expr::Str(vec![StrExpr::Text("Long".into())]), init.clone()],
+                            line: 0,
+                        };
+                        &typed_init
+                    }
+                    _ => init,
+                };
                 // The initializer names the class where it can, and the
                 // annotation stands in where it cannot. `= null` is the case
                 // that needs it: `val l: List<Int>? = null` has to know `l` is a
@@ -4876,7 +4984,10 @@ impl Compiler {
                 // Read the initializer's element type BEFORE lowering, while
                 // the initializer expression is still in hand: it is what a
                 // later `xs.map { … }` types its parameter from.
-                let elem = self.infer_elem(sc, init);
+                let elem = match written_elem {
+                    Type::Unknown => self.infer_elem(sc, init),
+                    t => t,
+                };
                 // Likewise the TYPE ARGUMENTS, when the initializer constructs a
                 // generic class: `val b = Box(65536)` binds `T` to `Int` for
                 // every read of a `T`-typed member through `b`.
@@ -6066,7 +6177,10 @@ impl Compiler {
                 args,
                 safe,
                 line,
-            } => self.compile_member(sc, recv, name, args, *safe, *line),
+            } => match self.long_element_args(sc, recv, name, args) {
+                Some(widened) => self.compile_member(sc, recv, name, &widened, *safe, *line),
+                None => self.compile_member(sc, recv, name, args, *safe, *line),
+            },
             Expr::Elvis { left, right } => self.compile_elvis(sc, left, right),
             Expr::NotNull(inner) => {
                 let t = self.compile_expr(sc, inner)?;
@@ -6097,8 +6211,10 @@ impl Compiler {
                 self.compile_expr(sc, recv)?;
                 // A `Float` INDEX can only be a `Map` key — a list indexes by
                 // `Int` — and a hashed lookup asks `hashCode` first, so the
-                // query has to be the same boxed shape the stored key is.
-                self.compile_erased(sc, index)?;
+                // query has to be the same boxed shape the stored key is — a
+                // `Map<Long, _>`'s `m[1]` asks with the `Long` `1`.
+                let key = self.as_long_if(sc, index, self.map_kv(sc, recv).0);
+                self.compile_erased(sc, &key)?;
                 self.b.emit(Op::CallBuiltin(KT_INDEX_GET_VM, 2), *line);
                 Ok(ty)
             }
@@ -6187,7 +6303,24 @@ impl Compiler {
                     }
                     return Ok(Type::Boolean);
                 }
-                self.compile_expr(sc, value)?;
+                // Against a collection the test is `equals` on each element, and
+                // a `Long` element is a box, so a `Long` value is boxed to match;
+                // a range compares the number and takes it unboxed.
+                let elements = self
+                    .infer_class(sc, container)
+                    .is_some_and(|c| is_element_collection(&c) || is_map_class(&c));
+                if elements {
+                    // `3 in xs` on a `Set<Long>` asks for the `Long` `3`; on a
+                    // `Map<Long, _>` for that key.
+                    let want = match self.map_kv(sc, container).0 {
+                        Type::Unknown => self.infer_elem(sc, container),
+                        key => key,
+                    };
+                    let value = &self.as_long_if(sc, value, want);
+                    self.compile_erased(sc, value)?;
+                } else {
+                    self.compile_expr(sc, value)?;
+                }
                 self.compile_expr(sc, container)?;
                 self.b.emit(Op::CallBuiltin(KT_IN_VM, 2), 0);
                 if *negated {
@@ -9295,12 +9428,21 @@ impl Compiler {
             self.b.emit(Op::Pop, 0);
             return Ok(());
         }
+        // `xs[0] = 5` into a `MutableList<Long>` stores a `Long`, and
+        // `m[1] = 2` into a `MutableMap<Long, Long>` a `Long` under a `Long`.
+        let (key, val) = self.map_kv(sc, recv);
+        let elem = match (key, val) {
+            (Type::Unknown, Type::Unknown) => self.infer_elem(sc, recv),
+            _ => val,
+        };
         self.compile_expr(sc, recv)?; // [recv]
                                       // The KEY erases the same way the value below does, and it has to: a
                                       // stored key that is not the shape a later lookup asks with would never
                                       // be found again.
-        self.compile_erased(sc, index)?; // [recv, index]
+        let key_expr = self.as_long_if(sc, index, key);
+        self.compile_erased(sc, &key_expr)?; // [recv, index]
         let store = self.compound_value(recv, "", Some(index), op, value);
+        let store = self.as_long_if(sc, &store, elem);
         // The stored value lands in a container that keeps no static type, so a
         // `Float` is boxed on the way in — `m["a"] = 1.0f / 3.0f` then
         // `println(m)` reads its width off the value and nothing else.
@@ -10032,6 +10174,37 @@ impl Compiler {
                     return self.compile_expr(sc, &call);
                 }
             }
+        }
+        // `listOf<Long>(1, 2)`: Kotlin types each integer literal by the
+        // element type written, so the elements are `Long`s.
+        if name == REIFY_CALL && args.len() == 2 {
+            if let (
+                Some(ty),
+                Expr::Call {
+                    name: inner,
+                    args: elems,
+                    line: l,
+                },
+            ) = (reify_arg_name(&args[0]), &args[1])
+            {
+                if ty == "Long"
+                    && element_builder(inner)
+                    && elems.iter().any(|a| self.infer(sc, a) == Type::Int)
+                {
+                    let call = Expr::Call {
+                        name: inner.clone(),
+                        args: self.widen_to_long(sc, elems),
+                        line: *l,
+                    };
+                    let wrapped = [args[0].clone(), call];
+                    return self.compile_call(sc, REIFY_CALL, &wrapped, line);
+                }
+            }
+        }
+        // `mutableMapOf<Long, Long>()`: several type arguments are static
+        // types only (see [`reify_arg_list`]) and bind nothing.
+        if name == REIFY_CALL && args.len() == 2 && reify_arg_list(&args[0]).len() > 1 {
+            return self.compile_expr(sc, &args[1]);
         }
         if name == REIFY_CALL && args.len() == 2 {
             // `tagged<U>(x)` inside a `reified U` body passes U's OWN binding
@@ -12132,6 +12305,94 @@ impl Compiler {
     /// Nothing on the native path passes through here, which is what makes the
     /// `Long` box affordable: `listOf(1, 2, 3)` holds `Int`s and boxes nothing,
     /// and every `Op::Add` still sees a `Value::Int`.
+    /// `args` with every `Int`-typed one converted to `Long` — the arguments
+    /// passed where a `Long` element is expected. Kotlin accepts only an
+    /// integer LITERAL there (an `Int` expression is a type error), and types
+    /// it `Long`; the conversion is what makes the stored element a `Long`.
+    fn widen_to_long(&self, sc: &Scope, args: &[Expr]) -> Vec<Expr> {
+        args.iter()
+            .map(|a| {
+                if self.infer(sc, a) == Type::Int {
+                    Expr::MethodCall {
+                        recv: Box::new(a.clone()),
+                        name: "toLong".to_string(),
+                        args: Vec::new(),
+                        safe: false,
+                        line: 0,
+                    }
+                } else {
+                    a.clone()
+                }
+            })
+            .collect()
+    }
+
+    /// `xs.add(1)` on a receiver whose elements are `Long`, or `m.put(1, 2)`
+    /// on a `Map<Long, Long>`: the arguments with each one that takes a `Long`
+    /// element, key or value widened (see [`Compiler::widen_to_long`]), or
+    /// `None` when nothing changes. Of a list member only the LAST argument is
+    /// an element — the first of `add(i, x)` and `set(i, x)` is an `Int` index.
+    fn long_element_args(
+        &self,
+        sc: &Scope,
+        recv: &Expr,
+        name: &str,
+        args: &[Expr],
+    ) -> Option<Vec<Expr>> {
+        let (key, value) = self.map_kv(sc, recv);
+        let wanted: Vec<Type> = if key != Type::Unknown || value != Type::Unknown {
+            match name {
+                "put" | "putIfAbsent" | "getOrDefault" | "replace" => vec![key, value],
+                "containsKey" | "get" | "remove" | "getValue" | "getOrPut" | "getOrElse" => {
+                    vec![key]
+                }
+                "containsValue" => vec![value],
+                _ => return None,
+            }
+        } else if element_param_member(name) && !args.is_empty() {
+            let mut w = vec![Type::Unknown; args.len() - 1];
+            w.push(self.infer_elem(sc, recv));
+            w
+        } else {
+            return None;
+        };
+        let widen = |i: usize, a: &Expr| {
+            wanted.get(i) == Some(&Type::Long) && self.infer(sc, a) == Type::Int
+        };
+        if !args.iter().enumerate().any(|(i, a)| widen(i, a)) {
+            return None;
+        }
+        Some(
+            args.iter()
+                .enumerate()
+                .map(|(i, a)| match widen(i, a) {
+                    true => self.widen_to_long(sc, std::slice::from_ref(a)).remove(0),
+                    false => a.clone(),
+                })
+                .collect(),
+        )
+    }
+
+    /// The static key and value types of a `Map` receiver, from its written
+    /// or inferred type arguments; `Unknown` for each one not known, and for
+    /// a receiver that is not a map.
+    fn map_kv(&self, sc: &Scope, recv: &Expr) -> (Type, Type) {
+        let g = self.gen_ty(sc, recv);
+        match g.args.as_slice() {
+            [k, v] if g.class.as_deref().is_some_and(is_map_class) => (k.ty, v.ty),
+            _ => (Type::Unknown, Type::Unknown),
+        }
+    }
+
+    /// `e` as a `Long` when it is an `Int` passed where `want` is `Long`.
+    fn as_long_if(&self, sc: &Scope, e: &Expr, want: Type) -> Expr {
+        if want == Type::Long && self.infer(sc, e) == Type::Int {
+            self.widen_to_long(sc, std::slice::from_ref(e)).remove(0)
+        } else {
+            e.clone()
+        }
+    }
+
     fn compile_erased(&mut self, sc: &mut Scope, e: &Expr) -> Result<Type, String> {
         let t = self.compile_expr(sc, e)?;
         // A member the lowering answers untyped (a range's `first()`, a
@@ -13688,9 +13949,10 @@ impl Compiler {
             Some("FloatArray") => Type::Float,
             Some("CharArray") => Type::Char,
             Some("BooleanArray") => Type::Boolean,
+            // `m[k]` on a `Map<K, V>` is a `V?` — the value type, which is
+            // what `m[k]!! + 1` takes its width from.
+            Some(c) if is_map_class(c) => nullable_if_safe(self.map_kv(sc, recv).1, true),
             // `xs[i]` is one element, so it has the receiver's element type.
-            // A `Map` is excluded: `m[k]` is `V?`, not an element of the
-            // entry sequence `infer_elem` describes.
             _ => self.infer_elem(sc, recv),
         }
     }
@@ -13782,6 +14044,16 @@ impl Compiler {
 
     fn infer_elem(&self, sc: &Scope, e: &Expr) -> Type {
         match e {
+            // `mutableListOf<Long>()` / `ArrayDeque<Long>()`: the written type
+            // argument IS the element type.
+            Expr::Call { name, args, .. } if name == REIFY_CALL && args.len() == 2 => {
+                match (reify_arg_name(&args[0]), &args[1]) {
+                    (Some(t), Expr::Call { name: inner, .. }) if element_typed_builder(inner) => {
+                        Type::from_name(&t)
+                    }
+                    _ => self.infer_elem(sc, &args[1]),
+                }
+            }
             // A binding whose initializer did not show its elements may still
             // have them written in its annotation — `fun f(xs: List<Int>)`.
             Expr::Var(n) => match sc.elem_of(n) {
@@ -14093,6 +14365,54 @@ impl Compiler {
                     args: nonempty(g.type_args.clone())?,
                 })
             }
+            // `mutableMapOf<Long, Long>()` / `ArrayDeque<Long>()`: the written
+            // type arguments of a stdlib collection builder.
+            Expr::Call { name, args, .. } if name == REIFY_CALL && args.len() == 2 => {
+                let Expr::Call { name: inner, .. } = &args[1] else {
+                    return None;
+                };
+                if !element_typed_builder(inner) && !map_builder(inner) {
+                    return None;
+                }
+                let targs = reify_arg_list(&args[0])
+                    .iter()
+                    .map(|n| match Type::from_name(n) {
+                        Type::Unknown if self.classes.contains_key(n) => {
+                            TypeArg::plain(Type::Obj, Some(n.clone()))
+                        }
+                        t => TypeArg::plain(t, None),
+                    })
+                    .collect();
+                Some(TypeArg {
+                    ty: Type::Obj,
+                    class: self.infer_class(sc, &args[1]),
+                    args: targs,
+                })
+            }
+            // `mutableMapOf(1L to 2L)`: the pairs' agreeing key and value types.
+            Expr::Call { name, args, .. }
+                if map_builder(name)
+                    && !args.is_empty()
+                    && args.iter().all(|a| matches!(a, Expr::Pair { .. })) =>
+            {
+                let part = |second: bool| {
+                    let types: Vec<Type> = args
+                        .iter()
+                        .map(|a| match a {
+                            Expr::Pair { first, second: s } => {
+                                self.infer(sc, if second { s } else { first })
+                            }
+                            _ => Type::Unknown,
+                        })
+                        .collect();
+                    TypeArg::plain(elem_of_args(&types), None)
+                };
+                Some(TypeArg {
+                    ty: Type::Obj,
+                    class: self.infer_class(sc, e),
+                    args: vec![part(false), part(true)],
+                })
+            }
             Expr::Call { name, args, .. } if self.classes.contains_key(name) => Some(TypeArg {
                 ty: Type::Obj,
                 class: Some(name.clone()),
@@ -14366,6 +14686,8 @@ impl Compiler {
             );
         self.compile_expr(sc, l)?;
         if coll {
+            // `xs += 3` on a `MutableList<Long>` adds the `Long` `3`.
+            let r = &self.as_long_if(sc, r, self.infer_elem(sc, l));
             self.compile_erased(sc, r)?;
         } else {
             self.compile_expr(sc, r)?;
@@ -14827,13 +15149,31 @@ fn range_form(kind: RangeKind) -> u8 {
 /// elements are entries, so it answers `Unknown`, as does every other class.
 fn annotated_elem(class: Option<&str>, type_args: &[TypeArg]) -> Type {
     match class {
-        Some(
-            "List" | "MutableList" | "ArrayList" | "Set" | "MutableSet" | "HashSet"
-            | "LinkedHashSet" | "Collection" | "MutableCollection" | "Iterable" | "MutableIterable"
-            | "Sequence" | "Array" | "ArrayDeque",
-        ) => type_args.first().map_or(Type::Unknown, |a| a.ty),
+        Some(c) if is_element_collection(c) => type_args.first().map_or(Type::Unknown, |a| a.ty),
         _ => Type::Unknown,
     }
+}
+
+/// The classes whose one type argument is an element type, and whose `in` is
+/// an `equals` search over those elements.
+fn is_element_collection(class: &str) -> bool {
+    matches!(
+        class,
+        "List"
+            | "MutableList"
+            | "ArrayList"
+            | "Set"
+            | "MutableSet"
+            | "HashSet"
+            | "LinkedHashSet"
+            | "Collection"
+            | "MutableCollection"
+            | "Iterable"
+            | "MutableIterable"
+            | "Sequence"
+            | "Array"
+            | "ArrayDeque"
+    )
 }
 
 fn elem_of_args(types: &[Type]) -> Type {
