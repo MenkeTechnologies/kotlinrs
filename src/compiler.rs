@@ -2193,6 +2193,9 @@ pub struct Compiler {
     /// regions after all functions/methods (a queue because emitting one lambda
     /// may enqueue further nested lambdas). See [`Compiler::compile_lambda`].
     pending_lambdas: Vec<PendingLambda>,
+    /// The function or lambda body being lowered, innermost last, for the JVM
+    /// name each lambda literal inside it gets (see [`LambdaCtx`]).
+    lambda_ctx: Vec<LambdaCtx>,
     /// Monotonic id for synthetic lambda sub names (`$lambda$0`, `$lambda$1`, …).
     lambdas_seen: u32,
     /// Local `fun`s discovered while lowering, awaiting emission as ordinary
@@ -2399,8 +2402,25 @@ struct PendingLocalFun {
 /// same order the make-closure site pushed their values and the body's prologue
 /// pops them into slots. `class` carries the enclosing class context so a lambda
 /// defined inside a method can still reach `this`/fields.
+/// Where a lambda literal sits, for the name `kotlinc` gives its class:
+/// `main$lambda$1` for the second literal in `main`, `main$lambda$3$0` for
+/// the first one inside that. Every literal counts, inlined or not.
+struct LambdaCtx {
+    /// The owning class's JVM name, empty for the file facade.
+    class: String,
+    /// The JVM method name of the function or lambda.
+    method: String,
+    /// The body's own token (`fn:<sub>` / `lam:<id>`) — what a literal inside
+    /// it records as its parent.
+    token: String,
+    /// Literals seen in this body so far.
+    next: usize,
+}
+
 struct PendingLambda {
     name_idx: u16,
+    /// `(class, JVM method, own id)` — this lambda's own [`LambdaCtx`].
+    jvm: Option<(String, String, u32)>,
     /// `(name, type, element type)` per parameter — the element type is what a
     /// lambda nested one level deeper types ITS parameter from.
     params: Vec<(String, Type, Type)>,
@@ -3332,6 +3352,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         has_ffi,
         loops: Vec::new(),
         pending_lambdas: Vec::new(),
+        lambda_ctx: Vec::new(),
         lambdas_seen: 0,
         pending_local_funs: Vec::new(),
         local_funs: HashMap::new(),
@@ -4694,6 +4715,29 @@ impl Compiler {
     /// after the declared ones (see [`LocalCap`]), and `class_ctx` is the user
     /// class whose members were in implicit scope where it was declared.
     fn compile_fun_captured(
+        &mut self,
+        f: &FunDecl,
+        class: Option<&str>,
+        caps: &[LocalCap],
+        class_ctx: Option<&str>,
+    ) -> Result<(), String> {
+        let sub_name = match (class, &f.recv) {
+            (Some(cls), _) => method_sub_name(cls, &f.name),
+            (None, Some((recv, _, _))) => ext_sub_name(recv, &f.name),
+            (None, None) => f.name.clone(),
+        };
+        self.lambda_ctx.push(LambdaCtx {
+            class: class.map(|c| c.replace('.', "$")).unwrap_or_default(),
+            method: unmangled(&f.name).to_string(),
+            token: format!("fn:{sub_name}"),
+            next: 0,
+        });
+        let r = self.compile_fun_captured_inner(f, class, caps, class_ctx);
+        self.lambda_ctx.pop();
+        r
+    }
+
+    fn compile_fun_captured_inner(
         &mut self,
         f: &FunDecl,
         class: Option<&str>,
@@ -9059,10 +9103,32 @@ impl Compiler {
         }
         let id = self.lambdas_seen;
         self.lambdas_seen += 1;
-        let name_idx = self.b.add_name(&format!("$lambda${id}"));
+        // The sub name carries the JVM frame the lambda runs as and the body it
+        // was written in, which the host reads for a stack trace: the frame is
+        // left out where the literal was invoked by its own enclosing body
+        // (an inlined stdlib call), as the JVM leaves it out.
+        let jvm = self.lambda_ctx.last_mut().map(|c| {
+            let i = c.next;
+            c.next += 1;
+            let method = if c.token.starts_with("lam:") {
+                format!("{}${i}", c.method)
+            } else {
+                format!("{}$lambda${i}", c.method)
+            };
+            (c.class.clone(), method, c.token.clone())
+        });
+        let sub = match &jvm {
+            Some((class, method, parent)) => {
+                format!("$lambda${id}\x1f{class}\x1f{method}\x1f{parent}")
+            }
+            None => format!("$lambda${id}"),
+        };
+        let name_idx = self.b.add_name(&sub);
+        let jvm = jvm.map(|(class, method, _)| (class, method, id));
         let recv_class = recv.as_ref().and_then(|(_, c)| c.clone());
         self.pending_lambdas.push(PendingLambda {
             name_idx,
+            jvm,
             params: effective.clone(),
             captures: caps.clone(),
             body: body.to_vec(),
@@ -9318,6 +9384,24 @@ impl Compiler {
     }
 
     fn compile_lambda_body(&mut self, pl: PendingLambda) -> Result<(), String> {
+        let ctx = pl.jvm.clone().map(|(class, method, id)| LambdaCtx {
+            class,
+            method,
+            token: format!("lam:{id}"),
+            next: 0,
+        });
+        let pushed = ctx.is_some();
+        if let Some(c) = ctx {
+            self.lambda_ctx.push(c);
+        }
+        let r = self.compile_lambda_body_inner(pl);
+        if pushed {
+            self.lambda_ctx.pop();
+        }
+        r
+    }
+
+    fn compile_lambda_body_inner(&mut self, pl: PendingLambda) -> Result<(), String> {
         let entry = self.b.current_pos();
         self.b.add_sub_entry(pl.name_idx, entry);
 

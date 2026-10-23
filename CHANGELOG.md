@@ -11,6 +11,25 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Stack traces: runtime-raised throwables, lambda frames, `printStackTrace`, uncaught reports
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, the program compiled as `main.kt`.
+
+| program | before | reference |
+| --- | --- | --- |
+| `div(1, 0)` / `s!!` / `a as Int` / `require(false)` / `IntArray(1)[3]` caught, then `e.stackTrace` | `unresolved reference: stackTrace of a … the runtime raised` | the user frames |
+| `listOf(1, 2)[5]`, `mutableListOf(1)[5]`, `"x".toInt()`, `"abc"[5]`, `emptyList<Int>().first()`, `mapOf(1 to 2).getValue(3)`, … | refused | `java.base/java.util.Arrays$ArrayList.get(Arrays.java:4266)` … then the user frames |
+| a lambda passed to a non-inline `t(f)`; one nested in it; one in a method of `K` | no lambda frame, `t`'s line wrong | `MainKt.main$lambda$1(main.kt:5)`, `MainKt.main$lambda$3$0(…)`, `K.m$lambda$0(…)` |
+| `e.printStackTrace()`, `e.stackTraceToString()` with a cause and a suppressed exception | `unresolved reference` | `Caused by: …`, `\tSuppressed: …`, `... n more` |
+| an exception reaching the top of `main` | `kotlin: Exception in thread "main" …` | `Exception in thread "main" …` then `\tat …` lines (1024 at most, as the JVM keeps) |
+
+A lambda's sub name now carries the JVM name `kotlinc` gives it (every literal
+in a body numbered in order, nested ones after their parent) and the body it
+was written in; a lambda run by that same body was run by an inlined stdlib
+call and has no frame. The JDK and Kotlin-stdlib frames in front of a
+runtime-raised throwable come from a measured table keyed by the raising
+operation and the throwable's message (`jdk_prefix`). Limits are in BUGS.md.
+
 ## Sorted-collection ranges are live views
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.

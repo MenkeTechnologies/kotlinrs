@@ -423,8 +423,9 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
 | program | kotlinrs | reference |
 | --- | --- | --- |
 | `(listOf(1) as List<Any>)[0] is Byte` | `true` | `false` |
-| `listOf(1)[5]` caught, then `e.stackTrace` | `unresolved reference: stackTrace of a …` | frames inside the JDK |
-| `stackTrace` of a throwable built inside a lambda passed to a user (non-inline) function | the lambda frame and `invoke` missing | `MainKt.main$lambda$0(…)` and its caller |
+| `stackTrace` inside a user `inline fun`'s lambda (`twice { throw … }`) | `main$lambda$0`, `twice` and `main` frames | `main` only: both are inlined |
+| `val g = { throw Exception() }; g()` | `MainKt.main(…)` only | `MainKt$main$g$1.invoke(…)` twice, then `main` |
+| a runtime-raised throwable from an operation not in `jdk_prefix`'s table (e.g. `mutableListOf(1).iterator()` past its end through a view) | the user frames only | the JDK frames in front |
 | `import java.util.*` then `kotlin.collections.ArrayDeque` `.push(0)` | `unresolved reference: push` | `java.util.ArrayDeque` wins the star import |
 | `java.util.LinkedList`, `java.util.BitSet`, `java.util.Optional`, `System.getProperty` | `unresolved reference` | the JDK member |
 

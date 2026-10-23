@@ -2872,6 +2872,8 @@ fn reset_heap() {
     FAILED_INIT.with(|f| f.borrow_mut().clear());
     SUPPRESSED.with(|s| s.borrow_mut().clear());
     STACK_TRACES.with(|t| t.borrow_mut().clear());
+    LAMBDA_LINES.with(|t| t.borrow_mut().clear());
+    STACK_PREFIX.with(|t| t.borrow_mut().clear());
     INIT_DEPTH.with(|d| d.set(0));
     TYPES.with(|t| t.borrow_mut().clear());
     TOSTRING_SUBS.with(|t| t.borrow_mut().clear());
@@ -2967,8 +2969,17 @@ fn facade_class() -> String {
 /// that has no frame of its own there: a lambda (inlined into its caller by
 /// `run`/`let`/…), or an internal entry.
 fn jvm_frame(sub: &str) -> Option<(String, String)> {
+    // A lambda's sub name carries its JVM class and method (see the
+    // compiler's `LambdaCtx`); one compiled outside any function has none.
     if sub.starts_with("$lambda$") {
-        return None;
+        let mut parts = sub.split('\x1f').skip(1);
+        let (class, method) = (parts.next()?, parts.next()?);
+        let class = if class.is_empty() {
+            facade_class()
+        } else {
+            class.to_string()
+        };
+        return Some((class, method.to_string()));
     }
     let base = sub.split_once("$ov").map_or(sub, |(b, _)| b);
     if let Some((class, member)) = base.split_once('#') {
@@ -2983,6 +2994,534 @@ fn jvm_frame(sub: &str) -> Option<(String, String)> {
         return Some((facade_class(), name.to_string()));
     }
     Some((facade_class(), base.to_string()))
+}
+
+/// One JDK or Kotlin-stdlib frame a runtime-raised throwable's JVM trace
+/// starts with: `(module, class, method, file, line)`, the module empty for
+/// the stdlib. Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+type JdkFrame = (&'static str, &'static str, &'static str, &'static str, u32);
+
+/// `Objects.checkIndex`'s own frames, in front of every `ArrayList` index check.
+const CHECK_INDEX: [JdkFrame; 4] = [
+    (
+        "java.base",
+        "jdk.internal.util.Preconditions",
+        "outOfBounds",
+        "Preconditions.java",
+        100,
+    ),
+    (
+        "java.base",
+        "jdk.internal.util.Preconditions",
+        "outOfBoundsCheckIndex",
+        "Preconditions.java",
+        106,
+    ),
+    (
+        "java.base",
+        "jdk.internal.util.Preconditions",
+        "checkIndex",
+        "Preconditions.java",
+        302,
+    ),
+    (
+        "java.base",
+        "java.util.Objects",
+        "checkIndex",
+        "Objects.java",
+        385,
+    ),
+];
+
+/// The `Preconditions` frames in front of a `String` bounds check.
+const STRING_PRECONDITIONS: [JdkFrame; 5] = [
+    (
+        "java.base",
+        "jdk.internal.util.Preconditions$1",
+        "apply",
+        "Preconditions.java",
+        55,
+    ),
+    (
+        "java.base",
+        "jdk.internal.util.Preconditions$1",
+        "apply",
+        "Preconditions.java",
+        52,
+    ),
+    (
+        "java.base",
+        "jdk.internal.util.Preconditions$4",
+        "apply",
+        "Preconditions.java",
+        213,
+    ),
+    (
+        "java.base",
+        "jdk.internal.util.Preconditions$4",
+        "apply",
+        "Preconditions.java",
+        210,
+    ),
+    (
+        "java.base",
+        "jdk.internal.util.Preconditions",
+        "outOfBounds",
+        "Preconditions.java",
+        98,
+    ),
+];
+
+thread_local! {
+    /// The member or index operation the host ran last, and its receiver's
+    /// kind — what [`jdk_prefix`] reads to name the JDK method a runtime fault
+    /// came out of.
+    static LAST_OP: RefCell<(String, ReceiverKind, usize)> =
+        const { RefCell::new((String::new(), ReceiverKind::Other, 0)) };
+    /// Runtime-raised throwable → the JDK/stdlib frames in front of its user
+    /// frames.
+    static STACK_PREFIX: RefCell<std::collections::HashMap<u32, Vec<JdkFrame>>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReceiverKind {
+    List,
+    Str,
+    Map,
+    /// An iterator over an empty read-only list — Kotlin's `EmptyIterator`.
+    EmptyIter,
+    /// An iterator over a `MutableList` — `ArrayList$Itr`.
+    ArrayListIter,
+    Other,
+}
+
+/// Note `name` on `recv` with `arity` arguments as the operation running now —
+/// see [`LAST_OP`].
+fn note_op(name: &str, recv: &Value, arity: usize) {
+    let iter_src = with_obj(recv, |o| match o {
+        HeapObj::Iter { src, .. } => Some(src.clone()),
+        _ => None,
+    })
+    .flatten();
+    let kind = match (recv, iter_src) {
+        (Value::Str(_), _) => ReceiverKind::Str,
+        (_, Some(src)) if with_obj(&src, |o| matches!(o, HeapObj::List(_))).unwrap_or(false) => {
+            match (ro_list(&src).is_some(), iter_len(&src)) {
+                (true, Some(0)) => ReceiverKind::EmptyIter,
+                (false, _) => ReceiverKind::ArrayListIter,
+                _ => ReceiverKind::Other,
+            }
+        }
+        _ => with_obj(recv, |o| match o {
+            HeapObj::List(_) => ReceiverKind::List,
+            HeapObj::Map(_) => ReceiverKind::Map,
+            _ => ReceiverKind::Other,
+        })
+        .unwrap_or(ReceiverKind::Other),
+    };
+    LAST_OP.with(|o| {
+        let mut o = o.borrow_mut();
+        o.0.clear();
+        o.0.push_str(name);
+        o.1 = kind;
+        o.2 = arity;
+    });
+}
+
+/// The JDK/stdlib frames the JVM trace of the runtime-raised `class: msg`
+/// starts with, when the operation that raised it ([`LAST_OP`]) is one of the
+/// measured ones; empty otherwise, which is also the exact answer for the
+/// faults the JVM raises in the user's own frame (`/ by zero`, `!!`, `as`,
+/// `require`/`check`/`error`, an array index).
+fn jdk_prefix(class: &str, msg: &str) -> Vec<JdkFrame> {
+    let (op, kind, arity) = LAST_OP.with(|o| o.borrow().clone());
+    let with = |head: &[JdkFrame], tail: &[JdkFrame]| [head, tail].concat();
+    let list = kind == ReceiverKind::List;
+    let oob = msg.contains(" out of bounds for length ");
+    match (class, op.as_str()) {
+        ("java.lang.IndexOutOfBoundsException", "get") if list && oob => with(
+            &CHECK_INDEX,
+            &[(
+                "java.base",
+                "java.util.ArrayList",
+                "get",
+                "ArrayList.java",
+                427,
+            )],
+        ),
+        ("java.lang.IndexOutOfBoundsException", "removeAt") if list && oob => with(
+            &CHECK_INDEX,
+            &[(
+                "java.base",
+                "java.util.ArrayList",
+                "remove",
+                "ArrayList.java",
+                551,
+            )],
+        ),
+        ("java.lang.IndexOutOfBoundsException", "set") if list && oob => with(
+            &CHECK_INDEX,
+            &[(
+                "java.base",
+                "java.util.ArrayList",
+                "set",
+                "ArrayList.java",
+                470,
+            )],
+        ),
+        ("java.lang.IndexOutOfBoundsException", "get") if list && msg.starts_with("Index: ") => {
+            vec![(
+                "java.base",
+                "java.util.Collections$SingletonList",
+                "get",
+                "Collections.java",
+                5180,
+            )]
+        }
+        ("java.lang.IndexOutOfBoundsException", "get")
+            if list && msg.starts_with("Empty list doesn't contain") =>
+        {
+            vec![
+                (
+                    "",
+                    "kotlin.collections.EmptyList",
+                    "get",
+                    "Collections.kt",
+                    37,
+                ),
+                (
+                    "",
+                    "kotlin.collections.EmptyList",
+                    "get",
+                    "Collections.kt",
+                    25,
+                ),
+            ]
+        }
+        ("java.lang.ArrayIndexOutOfBoundsException", "get") if list => {
+            vec![(
+                "java.base",
+                "java.util.Arrays$ArrayList",
+                "get",
+                "Arrays.java",
+                4266,
+            )]
+        }
+        ("java.lang.StringIndexOutOfBoundsException", "get") if kind == ReceiverKind::Str => with(
+            &STRING_PRECONDITIONS,
+            &[
+                (
+                    "java.base",
+                    "jdk.internal.util.Preconditions",
+                    "outOfBoundsCheckIndex",
+                    "Preconditions.java",
+                    106,
+                ),
+                (
+                    "java.base",
+                    "jdk.internal.util.Preconditions",
+                    "checkIndex",
+                    "Preconditions.java",
+                    302,
+                ),
+                (
+                    "java.base",
+                    "java.lang.String",
+                    "checkIndex",
+                    "String.java",
+                    4822,
+                ),
+                (
+                    "java.base",
+                    "java.lang.StringLatin1",
+                    "charAt",
+                    "StringLatin1.java",
+                    46,
+                ),
+                (
+                    "java.base",
+                    "java.lang.String",
+                    "charAt",
+                    "String.java",
+                    1544,
+                ),
+            ],
+        ),
+        ("java.lang.NumberFormatException", "toInt") if msg.starts_with("For input string") => {
+            let mut v = vec![
+                (
+                    "java.base",
+                    "java.lang.NumberFormatException",
+                    "forInputString",
+                    "NumberFormatException.java",
+                    67,
+                ),
+                (
+                    "java.base",
+                    "java.lang.Integer",
+                    "parseInt",
+                    "Integer.java",
+                    662,
+                ),
+            ];
+            // `toInt()` reaches `parseInt(s, 10)` through `parseInt(s)`.
+            if arity == 0 {
+                v.push((
+                    "java.base",
+                    "java.lang.Integer",
+                    "parseInt",
+                    "Integer.java",
+                    778,
+                ));
+            }
+            v
+        }
+        ("java.lang.StringIndexOutOfBoundsException", "substring")
+            if kind == ReceiverKind::Str && msg.starts_with("Range [") =>
+        {
+            let mut v = with(
+                &STRING_PRECONDITIONS,
+                &[
+                    (
+                        "java.base",
+                        "jdk.internal.util.Preconditions",
+                        "outOfBoundsCheckFromToIndex",
+                        "Preconditions.java",
+                        112,
+                    ),
+                    (
+                        "java.base",
+                        "jdk.internal.util.Preconditions",
+                        "checkFromToIndex",
+                        "Preconditions.java",
+                        349,
+                    ),
+                    (
+                        "java.base",
+                        "java.lang.String",
+                        "checkBoundsBeginEnd",
+                        "String.java",
+                        4855,
+                    ),
+                    (
+                        "java.base",
+                        "java.lang.String",
+                        "substring",
+                        "String.java",
+                        2823,
+                    ),
+                ],
+            );
+            // `substring(begin)` is `substring(begin, length())`.
+            if arity == 1 {
+                v.push((
+                    "java.base",
+                    "java.lang.String",
+                    "substring",
+                    "String.java",
+                    2796,
+                ));
+            }
+            v
+        }
+        ("java.util.NoSuchElementException", "max") if list && msg.is_empty() => {
+            vec![(
+                "",
+                "kotlin.collections.CollectionsKt___CollectionsKt",
+                "maxOrThrow",
+                "_Collections.kt",
+                2272,
+            )]
+        }
+        ("java.util.NoSuchElementException", "min") if list && msg.is_empty() => {
+            vec![(
+                "",
+                "kotlin.collections.CollectionsKt___CollectionsKt",
+                "minOrThrow",
+                "_Collections.kt",
+                2696,
+            )]
+        }
+        ("java.util.NoSuchElementException", "removeFirst") if list && msg.is_empty() => {
+            vec![(
+                "java.base",
+                "java.util.ArrayList",
+                "removeFirst",
+                "ArrayList.java",
+                568,
+            )]
+        }
+        ("java.util.NoSuchElementException", "removeLast") if list && msg.is_empty() => {
+            vec![(
+                "java.base",
+                "java.util.ArrayList",
+                "removeLast",
+                "ArrayList.java",
+                586,
+            )]
+        }
+        ("java.util.NoSuchElementException", "first")
+            if kind == ReceiverKind::Str && msg == "Char sequence is empty." =>
+        {
+            vec![(
+                "",
+                "kotlin.text.StringsKt___StringsKt",
+                "first",
+                "_Strings.kt",
+                77,
+            )]
+        }
+        ("java.util.NoSuchElementException", "next")
+            if kind == ReceiverKind::EmptyIter && msg.is_empty() =>
+        {
+            vec![
+                (
+                    "",
+                    "kotlin.collections.EmptyIterator",
+                    "next",
+                    "Collections.kt",
+                    21,
+                ),
+                (
+                    "",
+                    "kotlin.collections.EmptyIterator",
+                    "next",
+                    "Collections.kt",
+                    16,
+                ),
+            ]
+        }
+        ("java.util.NoSuchElementException", "next")
+            if kind == ReceiverKind::ArrayListIter && msg.is_empty() =>
+        {
+            vec![(
+                "java.base",
+                "java.util.ArrayList$Itr",
+                "next",
+                "ArrayList.java",
+                1052,
+            )]
+        }
+        ("java.lang.UnsupportedOperationException", "add") if list && msg.is_empty() => vec![
+            (
+                "java.base",
+                "java.util.AbstractList",
+                "add",
+                "AbstractList.java",
+                155,
+            ),
+            (
+                "java.base",
+                "java.util.AbstractList",
+                "add",
+                "AbstractList.java",
+                113,
+            ),
+        ],
+        ("java.lang.NumberFormatException", "toLong") if msg.starts_with("For input string") => {
+            vec![
+                (
+                    "java.base",
+                    "java.lang.NumberFormatException",
+                    "forInputString",
+                    "NumberFormatException.java",
+                    67,
+                ),
+                ("java.base", "java.lang.Long", "parseLong", "Long.java", 709),
+                ("java.base", "java.lang.Long", "parseLong", "Long.java", 832),
+            ]
+        }
+        ("java.lang.NumberFormatException", "toDouble") if msg.starts_with("For input string") => {
+            vec![
+                (
+                    "java.base",
+                    "jdk.internal.math.FloatingDecimal",
+                    "readJavaFormatString",
+                    "FloatingDecimal.java",
+                    2054,
+                ),
+                (
+                    "java.base",
+                    "jdk.internal.math.FloatingDecimal",
+                    "parseDouble",
+                    "FloatingDecimal.java",
+                    110,
+                ),
+                (
+                    "java.base",
+                    "java.lang.Double",
+                    "parseDouble",
+                    "Double.java",
+                    792,
+                ),
+            ]
+        }
+        ("java.util.NoSuchElementException", "first") if list && msg == "List is empty." => {
+            vec![(
+                "",
+                "kotlin.collections.CollectionsKt___CollectionsKt",
+                "first",
+                "_Collections.kt",
+                222,
+            )]
+        }
+        ("java.util.NoSuchElementException", "last") if list && msg == "List is empty." => {
+            vec![(
+                "",
+                "kotlin.collections.CollectionsKt___CollectionsKt",
+                "last",
+                "_Collections.kt",
+                431,
+            )]
+        }
+        ("java.lang.IllegalArgumentException", "single")
+            if msg == "List has more than one element." =>
+        {
+            vec![(
+                "",
+                "kotlin.collections.CollectionsKt___CollectionsKt",
+                "single",
+                "_Collections.kt",
+                621,
+            )]
+        }
+        ("java.util.NoSuchElementException", "getValue")
+            if kind == ReceiverKind::Map && msg.ends_with("is missing in the map.") =>
+        {
+            vec![
+                (
+                    "",
+                    "kotlin.collections.MapsKt__MapWithDefaultKt",
+                    "getOrImplicitDefaultNullable",
+                    "MapWithDefault.kt",
+                    25,
+                ),
+                (
+                    "",
+                    "kotlin.collections.MapsKt__MapsKt",
+                    "getValue",
+                    "Maps.kt",
+                    437,
+                ),
+            ]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The body token a sub name stands for — `lam:<id>` for a lambda,
+/// `fn:<sub>` for a function — as a lambda's sub name records its parent.
+fn frame_token(sub: &str) -> String {
+    match sub.strip_prefix("$lambda$") {
+        Some(rest) => format!("lam:{}", rest.split('\x1f').next().unwrap_or("")),
+        None => format!("fn:{sub}"),
+    }
+}
+
+/// The body a lambda's literal was written in, as a [`frame_token`].
+fn lambda_parent(sub: &str) -> Option<&str> {
+    sub.strip_prefix("$lambda$")?.split('\x1f').nth(3)
 }
 
 /// Record the frames live now as `exc`'s stack trace. The throwable's own
@@ -3002,10 +3541,47 @@ fn capture_stack_trace(vm: &VM, exc: &Value) {
     // A lambda's frame is inlined into its caller's on the JVM, so its line
     // is the caller's line there.
     let mut inlined_line = None;
-    for frame in vm.frames.iter().rev() {
-        let line = vm.chunk.lines.get(at).copied();
-        if let Some(name) = frame.entry_ip.and_then(|e| entries.get(&e)) {
-            match jvm_frame(name) {
+    let sub_of = |k: usize| {
+        vm.frames
+            .get(k)
+            .and_then(|f| f.entry_ip)
+            .and_then(|e| entries.get(&e).copied())
+    };
+    // An op lowered with no line of its own (line 0) belongs to the nearest
+    // one before it, in the same body, that has one.
+    let line_at = |at: usize, entry: usize| {
+        let end = at.min(vm.chunk.lines.len().saturating_sub(1));
+        vm.chunk.lines[entry.min(end)..=end]
+            .iter()
+            .rev()
+            .copied()
+            .find(|l| *l != 0)
+    };
+    let name_idx: std::collections::HashMap<usize, u16> = vm
+        .chunk
+        .sub_entries
+        .iter()
+        .map(|(n, ip)| (*ip, *n))
+        .collect();
+    for (k, frame) in vm.frames.iter().enumerate().rev() {
+        // The JVM records at most `MaxJavaStackTraceDepth` (1024) frames.
+        if frames.len() >= 1024 {
+            break;
+        }
+        let line = line_at(at, frame.entry_ip.unwrap_or(0)).or_else(|| {
+            let n = frame.entry_ip.and_then(|e| name_idx.get(&e))?;
+            LAMBDA_LINES.with(|t| t.borrow().get(n).copied())
+        });
+        if let Some(name) = sub_of(k) {
+            // A lambda run by the body it was written in was run by an
+            // inlined stdlib call there (`map`, `run`, `forEach`), so the JVM
+            // has no frame for it.
+            let inlined = lambda_parent(name).is_some_and(|parent| {
+                k.checked_sub(1)
+                    .and_then(sub_of)
+                    .is_some_and(|outer| frame_token(outer) == parent)
+            });
+            match jvm_frame(name).filter(|_| !inlined) {
                 Some((class, method)) => {
                     frames.push((class, method, inlined_line.take().or(line)));
                 }
@@ -3014,7 +3590,20 @@ fn capture_stack_trace(vm: &VM, exc: &Value) {
                 }
             }
         }
-        at = frame.return_ip.saturating_sub(1);
+        let ret = if frame.return_ip >= vm.chunk.ops.len() {
+            RUN_SUB_IPS
+                .with(|s| {
+                    s.borrow()
+                        .iter()
+                        .rev()
+                        .find(|(f, _)| *f == k)
+                        .map(|(_, ip)| *ip)
+                })
+                .unwrap_or(frame.return_ip)
+        } else {
+            frame.return_ip
+        };
+        at = ret.saturating_sub(1);
     }
     while frames.len() > 1 && frames[0].1 == "<init>" {
         frames.remove(0);
@@ -3034,31 +3623,153 @@ fn capture_stack_trace(vm: &VM, exc: &Value) {
 fn stack_trace_array(exc: &Value) -> Option<Value> {
     let Value::Obj(id) = exc else { return None };
     let frames = STACK_TRACES.with(|t| t.borrow().get(id).cloned())?;
+    let head = STACK_PREFIX
+        .with(|t| t.borrow().get(id).cloned())
+        .unwrap_or_default();
     let file = source_file();
-    let items = frames
-        .into_iter()
-        .map(|(class, method, line)| {
-            alloc(HeapObj::Instance {
-                class: "java.lang.StackTraceElement".to_string(),
-                is_data: false,
-                fields: vec![
-                    ("className".to_string(), Value::str(class)),
-                    ("methodName".to_string(), Value::str(method)),
-                    ("fileName".to_string(), Value::str(file.clone())),
-                    (
-                        "lineNumber".to_string(),
-                        Value::Int(line.map_or(-1, i64::from)),
-                    ),
-                ],
-                data_from: 0,
-                data_len: 0,
-            })
+    let element = |module: &str, class: String, method: String, file: String, line: i64| {
+        alloc(HeapObj::Instance {
+            class: "java.lang.StackTraceElement".to_string(),
+            is_data: false,
+            fields: vec![
+                ("className".to_string(), Value::str(class)),
+                ("methodName".to_string(), Value::str(method)),
+                ("fileName".to_string(), Value::str(file)),
+                ("lineNumber".to_string(), Value::Int(line)),
+                (
+                    "moduleName".to_string(),
+                    if module.is_empty() {
+                        Value::Undef
+                    } else {
+                        Value::str(module.to_string())
+                    },
+                ),
+            ],
+            data_from: 0,
+            data_len: 0,
         })
+    };
+    let items = head
+        .into_iter()
+        .map(|(module, class, method, f, line)| {
+            element(
+                module,
+                class.to_string(),
+                method.to_string(),
+                f.to_string(),
+                i64::from(line),
+            )
+        })
+        .chain(frames.into_iter().map(|(class, method, line)| {
+            element("", class, method, file.clone(), line.map_or(-1, i64::from))
+        }))
         .collect();
     Some(alloc(HeapObj::Array {
         items,
         desc: "[Ljava.lang.StackTraceElement;".to_string(),
     }))
+}
+
+/// The `StackTraceElement` strings of `exc`'s trace, JDK frames first.
+fn trace_strings(exc: &Value) -> Vec<String> {
+    let Value::Obj(id) = exc else {
+        return Vec::new();
+    };
+    let head = STACK_PREFIX
+        .with(|t| t.borrow().get(id).cloned())
+        .unwrap_or_default();
+    let frames = STACK_TRACES
+        .with(|t| t.borrow().get(id).cloned())
+        .unwrap_or_default();
+    let file = source_file();
+    head.iter()
+        .map(|(module, class, method, f, line)| {
+            let module = if module.is_empty() {
+                String::new()
+            } else {
+                format!("{module}/")
+            };
+            format!("{module}{class}.{method}({f}:{line})")
+        })
+        .chain(frames.iter().map(|(class, method, line)| match line {
+            Some(l) => format!("{class}.{method}({file}:{l})"),
+            None => format!("{class}.{method}({file})"),
+        }))
+        .collect()
+}
+
+/// `Throwable.printStackTrace()`'s text, as `java.lang.Throwable` writes it:
+/// the throwable, its frames, each suppressed exception and the cause chain,
+/// an enclosed trace eliding the frames it shares with its encloser as
+/// `... n more`, and a cycle cut as `[CIRCULAR REFERENCE: …]`.
+fn stack_trace_text(exc: &Value) -> String {
+    let trace = trace_strings(exc);
+    let mut out = format!("{}\n", throwable_str(exc));
+    for f in &trace {
+        out.push_str(&format!("\tat {f}\n"));
+    }
+    let mut seen = vec![exc.clone()];
+    enclosed_parts(&mut out, exc, &trace, "", &mut seen);
+    out
+}
+
+/// The suppressed exceptions and the cause of `exc`, each as an enclosed trace.
+fn enclosed_parts(
+    out: &mut String,
+    exc: &Value,
+    trace: &[String],
+    prefix: &str,
+    seen: &mut Vec<Value>,
+) {
+    let suppressed = match exc {
+        Value::Obj(id) => SUPPRESSED
+            .with(|s| s.borrow().get(id).cloned())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    for s in &suppressed {
+        enclosed_trace(out, s, trace, "Suppressed: ", &format!("{prefix}\t"), seen);
+    }
+    let cause = match exc {
+        Value::Obj(id) => CAUSES.with(|c| c.borrow().get(id).cloned()),
+        _ => None,
+    };
+    if let Some(c) = cause {
+        enclosed_trace(out, &c, trace, "Caused by: ", prefix, seen);
+    }
+}
+
+fn enclosed_trace(
+    out: &mut String,
+    exc: &Value,
+    enclosing: &[String],
+    caption: &str,
+    prefix: &str,
+    seen: &mut Vec<Value>,
+) {
+    if seen.iter().any(|s| identical(s, exc)) {
+        out.push_str(&format!(
+            "{prefix}{caption}[CIRCULAR REFERENCE: {}]\n",
+            throwable_str(exc)
+        ));
+        return;
+    }
+    seen.push(exc.clone());
+    let trace = trace_strings(exc);
+    let shared = trace
+        .iter()
+        .rev()
+        .zip(enclosing.iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    out.push_str(&format!("{prefix}{caption}{}\n", throwable_str(exc)));
+    for f in &trace[..trace.len() - shared] {
+        out.push_str(&format!("{prefix}\tat {f}\n"));
+    }
+    if shared != 0 {
+        out.push_str(&format!("{prefix}\t... {shared} more\n"));
+    }
+    enclosed_parts(out, exc, &trace, prefix, seen);
 }
 
 /// `StackTraceElement.toString()`: `Cls.m(file.kt:12)`, or `Cls.m(file.kt)`
@@ -3072,7 +3783,11 @@ fn stack_element_string(fields: &[(String, Value)]) -> String {
     } else {
         s("fileName")
     };
-    format!("{}.{}({at})", s("className"), s("methodName"))
+    let module = match get("moduleName") {
+        Some(Value::Str(m)) => format!("{m}/"),
+        _ => String::new(),
+    };
+    format!("{module}{}.{}({at})", s("className"), s("methodName"))
 }
 
 thread_local! {
@@ -3144,17 +3859,56 @@ fn raise(vm: &mut VM, exc: Value) {
     if unwinding() {
         return;
     }
+    // A throwable the runtime raised has no trace yet: the frames live here are
+    // the user half of its JVM trace (one a JDK or stdlib method throws also
+    // has that method's frames in front, which this frontend does not have).
+    record_runtime_trace(vm, &exc);
     if EXC_ENABLED.with(|e| e.get()) {
         PENDING.with(|p| *p.borrow_mut() = Some(exc));
         return;
     }
-    KT_ERROR.with(|e| {
-        *e.borrow_mut() = Some(format!(
-            "Exception in thread \"main\" {}",
-            uncaught_line(throwable_str(&exc), throwable_matches(&exc, "Error"))
-        ))
-    });
+    KT_ERROR.with(|e| *e.borrow_mut() = Some(uncaught_report(&exc)));
     vm.request_halt();
+}
+
+/// Give `exc` the trace of the frames live now, when it has none yet — a
+/// throwable the runtime raised — with the JDK/stdlib frames its JVM trace
+/// starts with, where the raising operation is a measured one (see
+/// [`jdk_prefix`]).
+fn record_runtime_trace(vm: &VM, exc: &Value) {
+    let Value::Obj(id) = exc else { return };
+    if STACK_TRACES.with(|t| t.borrow().contains_key(id)) {
+        return;
+    }
+    capture_stack_trace(vm, exc);
+    let head = with_obj(exc, |o| match o {
+        HeapObj::Exc { class, msg } => Some(jdk_prefix(class, msg.as_deref().unwrap_or(""))),
+        _ => None,
+    })
+    .flatten()
+    .unwrap_or_default();
+    if !head.is_empty() {
+        STACK_PREFIX.with(|t| t.borrow_mut().insert(*id, head));
+    }
+}
+
+/// What the JVM prints for `exc` reaching the top of `main`: the
+/// `Exception in thread "main"` line, then its trace as `printStackTrace`
+/// writes it.
+fn uncaught_report(exc: &Value) -> String {
+    let is_error = throwable_matches(exc, "Error");
+    let line = uncaught_line(throwable_str(exc), is_error);
+    let in_init = INIT_DEPTH.with(|d| d.get()) > 0 && !is_error;
+    let text = stack_trace_text(exc);
+    let rest = text
+        .split_once('\n')
+        .map_or("", |(_, r)| r)
+        .trim_end_matches('\n');
+    if in_init || rest.is_empty() {
+        format!("Exception in thread \"main\" {line}")
+    } else {
+        format!("Exception in thread \"main\" {line}\n{rest}")
+    }
 }
 
 /// Parse a `java.lang.Xxx: message` fault string into a throwable, or `None`
@@ -5167,16 +5921,12 @@ fn fault(vm: &mut VM, msg: impl Into<String>) {
     // Uncatchable here (no `try` in the program, or a frontend-internal fault):
     // stop the run. A JVM throwable gets the report line `java` prints for one
     // that reached the top of `main`; a kotlinrs-internal message stays bare.
-    let msg = if throwable {
-        format!(
-            "Exception in thread \"main\" {}",
-            uncaught_line(
-                msg.clone(),
-                throwable_from_message(&msg).is_some_and(|e| throwable_matches(&e, "Error"))
-            )
-        )
-    } else {
-        msg
+    let msg = match throwable_from_message(&msg) {
+        Some(exc) => {
+            record_runtime_trace(vm, &exc);
+            uncaught_report(&exc)
+        }
+        None => msg,
     };
     KT_ERROR.with(|e| *e.borrow_mut() = Some(msg));
     vm.request_halt();
@@ -6604,6 +7354,20 @@ fn b_make_closure(vm: &mut VM, _argc: u8) -> Value {
     let ncap = vm.pop().to_int() as usize;
     let params = vm.pop().to_int() as u8;
     let name_idx = vm.pop().to_int() as u16;
+    // The literal's line, which a stack trace names for a frame of its body
+    // whose ops carry none: that of the call or statement the literal is
+    // part of, the first op after it that has a line.
+    if let Some(line) = vm
+        .chunk
+        .lines
+        .iter()
+        .skip(vm.ip)
+        .take(64)
+        .copied()
+        .find(|l| *l != 0)
+    {
+        LAMBDA_LINES.with(|t| t.borrow_mut().insert(name_idx, line));
+    }
     let mut captures = Vec::with_capacity(ncap);
     for _ in 0..ncap {
         captures.push(vm.pop());
@@ -6701,6 +7465,13 @@ fn run_sub(vm: &mut VM, entry: usize, stack_base: usize) -> Result<Value, String
 pub const NESTED_RUN_LIMIT: usize = 2000;
 
 thread_local! {
+    /// A lambda's sub name index → the line its literal was evaluated on.
+    static LAMBDA_LINES: RefCell<std::collections::HashMap<u16, u32>> =
+        RefCell::new(std::collections::HashMap::new());
+    /// `(frame index, caller ip)` for each frame [`run_sub`] pushed: that
+    /// frame's `return_ip` is past the chunk, so where its caller stands —
+    /// the line of the call a stack trace names — is only here.
+    static RUN_SUB_IPS: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
     /// Current re-entrant `vm.run()` nesting depth — see [`NESTED_RUN_LIMIT`].
     static NESTED_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -6717,8 +7488,11 @@ fn run_sub_inner(vm: &mut VM, entry: usize, stack_base: usize) -> Result<Value, 
         entry_ip: Some(entry),
     });
     let saved_ip = vm.ip;
+    let frame = vm.frames.len() - 1;
+    RUN_SUB_IPS.with(|s| s.borrow_mut().push((frame, saved_ip)));
     vm.ip = entry;
     let result = vm.run();
+    RUN_SUB_IPS.with(|s| s.borrow_mut().pop());
     vm.ip = saved_ip;
     match result {
         VMResult::Ok(v) => Ok(v),
@@ -12379,6 +13153,7 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
 }
 
 fn kt_method_inner(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    note_op(name, recv, args.len());
     if let Some(r) = unsigned_member(recv, name, args) {
         return r;
     }
@@ -14470,6 +15245,11 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                     SUPPRESSED.with(|s| s.borrow_mut().entry(*id).or_default().push(other.clone()));
                     return Ok(unit_value());
                 }
+                ("printStackTrace", []) => {
+                    eprint!("{}", stack_trace_text(recv));
+                    return Ok(unit_value());
+                }
+                ("stackTraceToString", []) => return Ok(Value::str(stack_trace_text(recv))),
                 ("stackTrace" | "getStackTrace", []) => {
                     return stack_trace_array(recv).ok_or_else(|| {
                         format!(
@@ -17087,6 +17867,7 @@ fn sum_values(items: &[Value], int32: bool) -> Value {
 
 /// `recv[index]` — list element (bounds-checked) or map value (null if absent).
 fn index_get(vm: &mut VM, recv: &Value, index: &Value) -> Result<Value, String> {
+    note_op("get", recv, 1);
     comod_check(recv)?;
     // An in-range read of a `subList`/`asList` view is a read of its backing
     // list, with no re-copy of the view: what keeps an indexed loop over a
@@ -17372,6 +18153,7 @@ fn store_at(items: &mut [Value], i: i64, value: Value, kind: &str) -> Result<(),
 
 /// `recv[index] = value` — list set (bounds-checked) or map put.
 fn index_set(vm: &mut VM, recv: &Value, index: &Value, value: Value) -> Result<(), String> {
+    note_op("set", recv, 2);
     comod_check(recv)?;
     // `range[k] = v` on a sorted map's range view is its `put`.
     refresh_sorted_view(vm, recv);

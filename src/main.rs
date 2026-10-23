@@ -110,8 +110,14 @@ fn main() -> ExitCode {
     }
 }
 
-/// Print `kotlin: <reason>` to stderr and return exit code 1.
+/// Print `kotlin: <reason>` to stderr and return exit code 1. An exception
+/// that reached the top of `main` is printed as the JVM prints it, with no
+/// prefix: its `Exception in thread "main"` line and its stack trace.
 fn fail(reason: &str) -> ExitCode {
-    eprintln!("kotlin: {reason}");
+    if reason.starts_with("Exception in thread \"main\"") {
+        eprintln!("{reason}");
+    } else {
+        eprintln!("kotlin: {reason}");
+    }
     ExitCode::FAILURE
 }

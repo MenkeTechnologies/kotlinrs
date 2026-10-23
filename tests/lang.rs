@@ -9950,3 +9950,136 @@ fn sorted_collection_ranges_are_live_views() {
         "[1, 2, 5, 9]\nkey out of range\n[1, 2, 5, 9]\nfalse\ntrue\n[1, 2, 9]\n[9]\n{1=a, 4=d, 5=e, 8=h}\nkey out of range\n{1=a, 4=d, 5=e}\n[4, 9]\n"
     );
 }
+
+/// A throwable the runtime raises carries the frames live at the fault as its\n`stackTrace`, after the JDK/stdlib frames its JVM trace starts with where the\nraising operation is a measured one (`ArrayList.get`, `Integer.parseInt`,\n`String.charAt`, `CollectionsKt.first`, …). A lambda passed to a non-inline\nfunction is its own frame, named as `kotlinc` names it (`main$lambda$3$0`), and\none run by an inlined stdlib call is not. `printStackTrace` and\n`stackTraceToString` write the trace with its suppressed and `Caused by` parts.\nRuntime-raised traces were refused and lambda frames were missing.
+#[test]
+fn runtime_raised_and_lambda_stack_traces() {
+    assert_eq!(
+        prog(
+            r##"fun t(name: String, f: () -> Unit) {
+    try { f() } catch (e: Throwable) {
+        println("$name: $e")
+        for (el in e.stackTrace) println("  $el")
+    }
+}
+fun div(a: Int, b: Int) = a / b
+fun main() {
+    t("div") { div(1, 0) }
+    t("idx") { listOf(1, 2)[5] }
+    t("npe") { val s: String? = null; s!!.length }
+    t("cast") { val a: Any = "x"; a as Int }
+    t("req") { require(false) { "bad" } }
+    t("chk") { check(false) }
+    t("err") { error("boom") }
+    t("nfe") { "x".toInt() }
+    t("first") { emptyList<Int>().first() }
+    t("arr") { IntArray(1)[3] }
+    t("map") { mapOf(1 to 2).getValue(3) }
+}"##
+        ),
+        "div: java.lang.ArithmeticException: / by zero\n  MainKt.div(main.kt:7)\n  MainKt.main$lambda$0(main.kt:9)\n  MainKt.t(main.kt:2)\n  MainKt.main(main.kt:9)\n  MainKt.main(main.kt)\nidx: java.lang.ArrayIndexOutOfBoundsException: Index 5 out of bounds for length 2\n  java.base/java.util.Arrays$ArrayList.get(Arrays.java:4266)\n  MainKt.main$lambda$1(main.kt:10)\n  MainKt.t(main.kt:2)\n  MainKt.main(main.kt:10)\n  MainKt.main(main.kt)\nnpe: java.lang.NullPointerException\n  MainKt.main$lambda$2(main.kt:11)\n  MainKt.t(main.kt:2)\n  MainKt.main(main.kt:11)\n  MainKt.main(main.kt)\ncast: java.lang.ClassCastException: class java.lang.String cannot be cast to class java.lang.Integer (java.lang.String and java.lang.Integer are in module java.base of loader 'bootstrap')\n  MainKt.main$lambda$3(main.kt:12)\n  MainKt.t(main.kt:2)\n  MainKt.main(main.kt:12)\n  MainKt.main(main.kt)\nreq: java.lang.IllegalArgumentException: bad\n  MainKt.main$lambda$4(main.kt:13)\n  MainKt.t(main.kt:2)\n  MainKt.main(main.kt:13)\n  MainKt.main(main.kt)\nchk: java.lang.IllegalStateException: Check failed.\n  MainKt.main$lambda$5(main.kt:14)\n  MainKt.t(main.kt:2)\n  MainKt.main(main.kt:14)\n  MainKt.main(main.kt)\nerr: java.lang.IllegalStateException: boom\n  MainKt.main$lambda$6(main.kt:15)\n  MainKt.t(main.kt:2)\n  MainKt.main(main.kt:15)\n  MainKt.main(main.kt)\nnfe: java.lang.NumberFormatException: For input string: \"x\"\n  java.base/java.lang.NumberFormatException.forInputString(NumberFormatException.java:67)\n  java.base/java.lang.Integer.parseInt(Integer.java:662)\n  java.base/java.lang.Integer.parseInt(Integer.java:778)\n  MainKt.main$lambda$7(main.kt:16)\n  MainKt.t(main.kt:2)\n  MainKt.main(main.kt:16)\n  MainKt.main(main.kt)\nfirst: java.util.NoSuchElementException: List is empty.\n  kotlin.collections.CollectionsKt___CollectionsKt.first(_Collections.kt:222)\n  MainKt.main$lambda$8(main.kt:17)\n  MainKt.t(main.kt:2)\n  MainKt.main(main.kt:17)\n  MainKt.main(main.kt)\narr: java.lang.ArrayIndexOutOfBoundsException: Index 3 out of bounds for length 1\n  MainKt.main$lambda$9(main.kt:18)\n  MainKt.t(main.kt:2)\n  MainKt.main(main.kt:18)\n  MainKt.main(main.kt)\nmap: java.util.NoSuchElementException: Key 3 is missing in the map.\n  kotlin.collections.MapsKt__MapWithDefaultKt.getOrImplicitDefaultNullable(MapWithDefault.kt:25)\n  kotlin.collections.MapsKt__MapsKt.getValue(Maps.kt:437)\n  MainKt.main$lambda$10(main.kt:19)\n  MainKt.t(main.kt:2)\n  MainKt.main(main.kt:19)\n  MainKt.main(main.kt)\n"
+    );
+    assert_eq!(
+        prog(
+            r##"fun t(f: () -> Unit) { try { f() } catch (e: Exception) { println(e.stackTrace.take(3).joinToString(" | ")) } }
+class K { fun m() { t { throw Exception() } } }
+fun main() {
+    println(listOf(1).map { it + 1 })
+    t { throw Exception() }
+    val g = { x: Int -> x + 1 }
+    t { t { throw Exception("in") }; throw Exception() }
+    K().m()
+    run { t { throw Exception() } }
+    listOf(1).forEach { t { throw Exception() } }
+}"##
+        ),
+        "[2]\nMainKt.main$lambda$1(main.kt:5) | MainKt.t(main.kt:1) | MainKt.main(main.kt:5)\nMainKt.main$lambda$3$0(main.kt:7) | MainKt.t(main.kt:1) | MainKt.main$lambda$3(main.kt:7)\nMainKt.main$lambda$3(main.kt:7) | MainKt.t(main.kt:1) | MainKt.main(main.kt:7)\nK.m$lambda$0(main.kt:2) | MainKt.t(main.kt:1) | K.m(main.kt:2)\nMainKt.main$lambda$4$0(main.kt:9) | MainKt.t(main.kt:1) | MainKt.main(main.kt:9)\nMainKt.main$lambda$5$0(main.kt:10) | MainKt.t(main.kt:1) | MainKt.main(main.kt:10)\n"
+    );
+    assert_eq!(
+        prog(
+            r##"fun t(name: String, f: () -> Unit) {
+    try { f() } catch (e: Throwable) {
+        println("$name: $e")
+        for (el in e.stackTrace) { if (el.className.startsWith("MainKt")) break; println("  $el") }
+    }
+}
+fun main() {
+    t("mut") { mutableListOf(1)[5] }
+    t("single") { listOf(1)[5] }
+    t("two") { listOf(1, 2)[5] }
+    t("empty") { emptyList<Int>()[0] }
+    t("toInt") { "x".toInt() }
+    t("toLong") { "x".toLong() }
+    t("toDouble") { "x".toDouble() }
+    t("first") { emptyList<Int>().first() }
+    t("last") { emptyList<Int>().last() }
+    t("getValue") { mapOf(1 to 2).getValue(3) }
+    t("str") { "abc"[5] }
+    t("arr") { arrayOf(1)[3] }
+    t("single2") { listOf(1, 2).single() }
+    t("next") { emptyList<Int>().iterator().next() }
+    t("removeAt") { mutableListOf(1).removeAt(3) }
+    t("mutset") { mutableListOf(1)[2] = 3 }
+    t("sub") { "abc".substring(5) }
+    t("max") { emptyList<Int>().max() }
+    t("reduce") { emptyList<Int>().reduce { a, b -> a + b } }
+    t("ro") { (listOf(1, 2) as MutableList<Int>).add(3) }
+}"##
+        ),
+        "mut: java.lang.IndexOutOfBoundsException: Index 5 out of bounds for length 1\n  java.base/jdk.internal.util.Preconditions.outOfBounds(Preconditions.java:100)\n  java.base/jdk.internal.util.Preconditions.outOfBoundsCheckIndex(Preconditions.java:106)\n  java.base/jdk.internal.util.Preconditions.checkIndex(Preconditions.java:302)\n  java.base/java.util.Objects.checkIndex(Objects.java:385)\n  java.base/java.util.ArrayList.get(ArrayList.java:427)\nsingle: java.lang.IndexOutOfBoundsException: Index: 5, Size: 1\n  java.base/java.util.Collections$SingletonList.get(Collections.java:5180)\ntwo: java.lang.ArrayIndexOutOfBoundsException: Index 5 out of bounds for length 2\n  java.base/java.util.Arrays$ArrayList.get(Arrays.java:4266)\nempty: java.lang.IndexOutOfBoundsException: Empty list doesn't contain element at index 0.\n  kotlin.collections.EmptyList.get(Collections.kt:37)\n  kotlin.collections.EmptyList.get(Collections.kt:25)\ntoInt: java.lang.NumberFormatException: For input string: \"x\"\n  java.base/java.lang.NumberFormatException.forInputString(NumberFormatException.java:67)\n  java.base/java.lang.Integer.parseInt(Integer.java:662)\n  java.base/java.lang.Integer.parseInt(Integer.java:778)\ntoLong: java.lang.NumberFormatException: For input string: \"x\"\n  java.base/java.lang.NumberFormatException.forInputString(NumberFormatException.java:67)\n  java.base/java.lang.Long.parseLong(Long.java:709)\n  java.base/java.lang.Long.parseLong(Long.java:832)\ntoDouble: java.lang.NumberFormatException: For input string: \"x\"\n  java.base/jdk.internal.math.FloatingDecimal.readJavaFormatString(FloatingDecimal.java:2054)\n  java.base/jdk.internal.math.FloatingDecimal.parseDouble(FloatingDecimal.java:110)\n  java.base/java.lang.Double.parseDouble(Double.java:792)\nfirst: java.util.NoSuchElementException: List is empty.\n  kotlin.collections.CollectionsKt___CollectionsKt.first(_Collections.kt:222)\nlast: java.util.NoSuchElementException: List is empty.\n  kotlin.collections.CollectionsKt___CollectionsKt.last(_Collections.kt:431)\ngetValue: java.util.NoSuchElementException: Key 3 is missing in the map.\n  kotlin.collections.MapsKt__MapWithDefaultKt.getOrImplicitDefaultNullable(MapWithDefault.kt:25)\n  kotlin.collections.MapsKt__MapsKt.getValue(Maps.kt:437)\nstr: java.lang.StringIndexOutOfBoundsException: Index 5 out of bounds for length 3\n  java.base/jdk.internal.util.Preconditions$1.apply(Preconditions.java:55)\n  java.base/jdk.internal.util.Preconditions$1.apply(Preconditions.java:52)\n  java.base/jdk.internal.util.Preconditions$4.apply(Preconditions.java:213)\n  java.base/jdk.internal.util.Preconditions$4.apply(Preconditions.java:210)\n  java.base/jdk.internal.util.Preconditions.outOfBounds(Preconditions.java:98)\n  java.base/jdk.internal.util.Preconditions.outOfBoundsCheckIndex(Preconditions.java:106)\n  java.base/jdk.internal.util.Preconditions.checkIndex(Preconditions.java:302)\n  java.base/java.lang.String.checkIndex(String.java:4822)\n  java.base/java.lang.StringLatin1.charAt(StringLatin1.java:46)\n  java.base/java.lang.String.charAt(String.java:1544)\narr: java.lang.ArrayIndexOutOfBoundsException: Index 3 out of bounds for length 1\nsingle2: java.lang.IllegalArgumentException: List has more than one element.\n  kotlin.collections.CollectionsKt___CollectionsKt.single(_Collections.kt:621)\nnext: java.util.NoSuchElementException\n  kotlin.collections.EmptyIterator.next(Collections.kt:21)\n  kotlin.collections.EmptyIterator.next(Collections.kt:16)\nremoveAt: java.lang.IndexOutOfBoundsException: Index 3 out of bounds for length 1\n  java.base/jdk.internal.util.Preconditions.outOfBounds(Preconditions.java:100)\n  java.base/jdk.internal.util.Preconditions.outOfBoundsCheckIndex(Preconditions.java:106)\n  java.base/jdk.internal.util.Preconditions.checkIndex(Preconditions.java:302)\n  java.base/java.util.Objects.checkIndex(Objects.java:385)\n  java.base/java.util.ArrayList.remove(ArrayList.java:551)\nmutset: java.lang.IndexOutOfBoundsException: Index 2 out of bounds for length 1\n  java.base/jdk.internal.util.Preconditions.outOfBounds(Preconditions.java:100)\n  java.base/jdk.internal.util.Preconditions.outOfBoundsCheckIndex(Preconditions.java:106)\n  java.base/jdk.internal.util.Preconditions.checkIndex(Preconditions.java:302)\n  java.base/java.util.Objects.checkIndex(Objects.java:385)\n  java.base/java.util.ArrayList.set(ArrayList.java:470)\nsub: java.lang.StringIndexOutOfBoundsException: Range [5, 3) out of bounds for length 3\n  java.base/jdk.internal.util.Preconditions$1.apply(Preconditions.java:55)\n  java.base/jdk.internal.util.Preconditions$1.apply(Preconditions.java:52)\n  java.base/jdk.internal.util.Preconditions$4.apply(Preconditions.java:213)\n  java.base/jdk.internal.util.Preconditions$4.apply(Preconditions.java:210)\n  java.base/jdk.internal.util.Preconditions.outOfBounds(Preconditions.java:98)\n  java.base/jdk.internal.util.Preconditions.outOfBoundsCheckFromToIndex(Preconditions.java:112)\n  java.base/jdk.internal.util.Preconditions.checkFromToIndex(Preconditions.java:349)\n  java.base/java.lang.String.checkBoundsBeginEnd(String.java:4855)\n  java.base/java.lang.String.substring(String.java:2823)\n  java.base/java.lang.String.substring(String.java:2796)\nmax: java.util.NoSuchElementException\n  kotlin.collections.CollectionsKt___CollectionsKt.maxOrThrow(_Collections.kt:2272)\nreduce: java.lang.UnsupportedOperationException: Empty collection can't be reduced.\nro: java.lang.UnsupportedOperationException\n  java.base/java.util.AbstractList.add(AbstractList.java:155)\n  java.base/java.util.AbstractList.add(AbstractList.java:113)\n"
+    );
+    assert_eq!(
+        prog(
+            r##"fun t(name: String, f: () -> Unit) {
+    try { f() } catch (e: Throwable) {
+        println("$name: $e")
+        for (el in e.stackTrace) { if (el.className.startsWith("MainKt")) break; println("  $el") }
+    }
+}
+fun main() {
+    t("sub2") { "abc".substring(5, 7) }
+    t("min") { emptyList<Int>().min() }
+    t("mutnext") { mutableListOf<Int>().iterator().next() }
+    t("removeFirst") { mutableListOf<Int>().removeFirst() }
+    t("removeLast") { mutableListOf<Int>().removeLast() }
+    t("ro2") { (listOf(1) as MutableList<Int>).add(3) }
+    t("roempty") { (emptyList<Int>() as MutableList<Int>).add(3) }
+    t("firstStr") { "".first() }
+    t("toIntRadix") { "z".toInt(10) }
+    t("lastIdx") { mutableListOf(1).last { it > 5 } }
+    t("firstPred") { listOf(1).first { it > 5 } }
+}"##
+        ),
+        "sub2: java.lang.StringIndexOutOfBoundsException: Range [5, 7) out of bounds for length 3\n  java.base/jdk.internal.util.Preconditions$1.apply(Preconditions.java:55)\n  java.base/jdk.internal.util.Preconditions$1.apply(Preconditions.java:52)\n  java.base/jdk.internal.util.Preconditions$4.apply(Preconditions.java:213)\n  java.base/jdk.internal.util.Preconditions$4.apply(Preconditions.java:210)\n  java.base/jdk.internal.util.Preconditions.outOfBounds(Preconditions.java:98)\n  java.base/jdk.internal.util.Preconditions.outOfBoundsCheckFromToIndex(Preconditions.java:112)\n  java.base/jdk.internal.util.Preconditions.checkFromToIndex(Preconditions.java:349)\n  java.base/java.lang.String.checkBoundsBeginEnd(String.java:4855)\n  java.base/java.lang.String.substring(String.java:2823)\nmin: java.util.NoSuchElementException\n  kotlin.collections.CollectionsKt___CollectionsKt.minOrThrow(_Collections.kt:2696)\nmutnext: java.util.NoSuchElementException\n  java.base/java.util.ArrayList$Itr.next(ArrayList.java:1052)\nremoveFirst: java.util.NoSuchElementException\n  java.base/java.util.ArrayList.removeFirst(ArrayList.java:568)\nremoveLast: java.util.NoSuchElementException\n  java.base/java.util.ArrayList.removeLast(ArrayList.java:586)\nro2: java.lang.UnsupportedOperationException\n  java.base/java.util.AbstractList.add(AbstractList.java:155)\n  java.base/java.util.AbstractList.add(AbstractList.java:113)\nroempty: java.lang.ClassCastException: kotlin.collections.EmptyList cannot be cast to kotlin.collections.MutableList\nfirstStr: java.util.NoSuchElementException: Char sequence is empty.\n  kotlin.text.StringsKt___StringsKt.first(_Strings.kt:77)\ntoIntRadix: java.lang.NumberFormatException: For input string: \"z\"\n  java.base/java.lang.NumberFormatException.forInputString(NumberFormatException.java:67)\n  java.base/java.lang.Integer.parseInt(Integer.java:662)\nlastIdx: java.util.NoSuchElementException: List contains no element matching the predicate.\nfirstPred: java.util.NoSuchElementException: Collection contains no element matching the predicate.\n"
+    );
+    assert_eq!(
+        prog(
+            r##"fun f() { throw IllegalStateException("x") }
+fun g() { try { f() } catch (e: Exception) { throw RuntimeException("wrapped", e) } }
+fun main() {
+    try { f() } catch (e: Exception) { println(e.stackTraceToString()) }
+    try { g() } catch (e: Exception) { println(e.stackTraceToString()) }
+    val a = Exception("a"); a.addSuppressed(IllegalArgumentException("s"))
+    println(a.stackTraceToString())
+    try { listOf(1, 2)[5] } catch (e: Exception) { println(e.stackTraceToString()) }
+}"##
+        ),
+        "java.lang.IllegalStateException: x\n	at MainKt.f(main.kt:1)\n	at MainKt.main(main.kt:4)\n	at MainKt.main(main.kt)\n\njava.lang.RuntimeException: wrapped\n	at MainKt.g(main.kt:2)\n	at MainKt.main(main.kt:5)\n	at MainKt.main(main.kt)\nCaused by: java.lang.IllegalStateException: x\n	at MainKt.f(main.kt:1)\n	... 3 more\n\njava.lang.Exception: a\n	at MainKt.main(main.kt:6)\n	at MainKt.main(main.kt)\n	Suppressed: java.lang.IllegalArgumentException: s\n		... 2 more\n\njava.lang.ArrayIndexOutOfBoundsException: Index 5 out of bounds for length 2\n	at java.base/java.util.Arrays$ArrayList.get(Arrays.java:4266)\n	at MainKt.main(main.kt:8)\n	at MainKt.main(main.kt)\n\n"
+    );
+}
+
+/// An exception that reaches the top of `main` is reported as the JVM reports
+/// it — the `Exception in thread "main"` line and the trace, with no `kotlin:`
+/// prefix — including the JDK frame of a measured operation. Measured on
+/// kotlinc 2.4.21 / JRE 21.0.12.1 with the program compiled as `main.kt`.
+#[test]
+fn an_uncaught_exception_prints_its_stack_trace() {
+    assert_eq!(
+        prog_err("fun f(n: Int): Int = 10 / n\nfun main() {\n    println(\"start\")\n    println(f(0))\n}"),
+        "Exception in thread \"main\" java.lang.ArithmeticException: / by zero\n\tat MainKt.f(main.kt:1)\n\tat MainKt.main(main.kt:4)\n\tat MainKt.main(main.kt)\n"
+    );
+    assert_eq!(
+        prog_err("fun main() { listOf(1, 2)[5] }"),
+        "Exception in thread \"main\" java.lang.ArrayIndexOutOfBoundsException: Index 5 out of bounds for length 2\n\tat java.base/java.util.Arrays$ArrayList.get(Arrays.java:4266)\n\tat MainKt.main(main.kt:1)\n\tat MainKt.main(main.kt)\n"
+    );
+}
