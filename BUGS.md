@@ -110,6 +110,7 @@ JRE 21.0.12.1:
 
 | program | kotlinrs | reference |
 | --- | --- | --- |
+| `fun g(x: Int) = when (x) { 1 -> 2 }` (no `else`, not a closed type) | compiles, `null` for other values | `'when' expression must be exhaustive. Add an 'else' branch.` — refused only in expression position, which this frontend does not tell apart from a value-discarding lambda body |
 | `(listOf(1, 2).asReversed() as MutableList<Int>)[0] = 5` | succeeds | `ClassCastException: kotlin.collections.ReversedListReadOnly cannot be cast to kotlin.collections.MutableList` |
 
 A live view is a heap copy re-taken whenever its backing object was written

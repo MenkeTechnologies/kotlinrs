@@ -10147,3 +10147,53 @@ fun main() {
         "[3.0, 6.0, 0.0]\n6\nCircle(r=2.0)\n[1, 2]\nString\n(4, 6)\nV(x=4, y=6)\nV(x=-1, y=-2)\nV(x=3, y=6)\n2\ntrue\ntrue\nV(x=2, y=3)\n[V(x=1, y=1), V(x=2, y=2)]\n2 5 10\n8\nx=9\n0p 1q \na->1 b->2 \n2\n"
     );
 }
+
+/// A `when` that covers a sealed hierarchy — through a sealed intermediate,\nobjects named or tested with `is`, every enum constant, both `Boolean`s — needs\nno `else`, in expression and statement position.
+#[test]
+fn an_exhaustive_when_over_a_sealed_hierarchy_runs() {
+    assert_eq!(
+        prog(
+            r##"sealed class T
+sealed class Mid : T()
+class L1 : Mid()
+class L2 : Mid()
+object O : T()
+data class D(val v: Int) : T()
+enum class Dir { N, S }
+fun a(t: T) = when (t) { is Mid -> "mid"; O -> "o"; is D -> "d${t.v}" }
+fun b(t: T) = when (t) { is L1 -> 1; is L2 -> 2; is O -> 3; is D -> 4 }
+fun c(d: Dir) = when (d) { Dir.N -> "n"; Dir.S -> "s" }
+fun e(x: Boolean) = when (x) { true -> 1; false -> 0 }
+fun f(d: Dir) = when (d) { Dir.N, Dir.S -> "any" }
+fun main() {
+    println(listOf(L1(), L2(), O, D(4)).map { a(it) + b(it) })
+    println(Dir.values().map { c(it) + f(it) })
+    println(e(false))
+    val t: T = L2()
+    when (t) { is Mid -> println("m"); O -> println("o"); is D -> println("d") }
+}"##
+        ),
+        "[mid1, mid2, o3, d44]\n[nany, sany]\n0\nm\n"
+    );
+}
+
+/// A `when` over a `sealed` type, an enum or a `Boolean` that misses a case and
+/// has no `else` is a compile error — in statement position too — naming what
+/// is missing as `kotlinc` 2.4.21 does. Each program used to run and answer
+/// `null` (or skip the arm silently).
+#[test]
+fn a_non_exhaustive_when_over_a_closed_type_is_refused() {
+    for (src, missing) in [
+        ("sealed class S\nclass A : S()\nclass B : S()\nfun f(s: S) = when (s) { is A -> 1 }\nfun main() { println(f(B())) }", "the 'is B' branch"),
+        ("enum class E { X, Y }\nfun f(e: E): Int = when (e) { E.X -> 1 }\nfun main() { println(f(E.Y)) }", "the 'Y' branch"),
+        ("fun f(b: Boolean): Int = when (b) { true -> 1 }\nfun main() { println(f(false)) }", "the 'false' branch"),
+        ("sealed interface S\nobject A : S\nobject B : S\nfun main() { val s: S = B\n when (s) { A -> println(\"a\") }\n println(\"done\") }", "the 'B' branch"),
+        ("sealed class S\nclass A : S()\nclass B : S()\nobject C : S()\nfun f(s: S) = when (s) { is A -> 1 }\nfun main() {}", "the 'is B', 'C' branches"),
+    ] {
+        let err = prog_err(src);
+        assert!(
+            err.contains(&format!("'when' expression must be exhaustive. Add {missing} or an 'else' branch.")),
+            "for {src:?}: stderr was {err}"
+        );
+    }
+}

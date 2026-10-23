@@ -11,6 +11,23 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## A non-exhaustive `when` over a closed type is a compile error
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | before | reference |
+| --- | --- | --- |
+| `sealed class S`; `A`, `B : S()`; `fun f(s: S) = when (s) { is A -> 1 }`; `f(B())` | `null` | `'when' expression must be exhaustive. Add the 'is B' branch or an 'else' branch.` |
+| `enum class E { X, Y }`; `when (e) { E.X -> 1 }` | `null` | `… Add the 'Y' branch …` |
+| `when (b) { true -> 1 }` on a `Boolean` | `null` | `… Add the 'false' branch …` |
+| a `when` STATEMENT over a sealed interface missing object `B` | ran, skipping the arm | `… Add the 'B' branch …` |
+| two missing (`is B` and object `C`) | `null` | `… Add the 'is B', 'C' branches …` |
+
+The subject's DECLARED type decides (`val s: S = B` is a `when` over `S`); an
+intermediate sealed class is covered by an `is` of it or by covering all its
+subclasses. A `when` over any other type without `else` is still accepted in
+expression position (BUGS.md).
+
 ## Operator extensions on a known type; user `componentN` in destructuring
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.

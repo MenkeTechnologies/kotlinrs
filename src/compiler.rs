@@ -2113,6 +2113,10 @@ pub struct Compiler {
     /// renamed by its parameter types (see [`mangle_member_overloads`]), and a
     /// call picking one by its arguments ([`Compiler::select_member_overload`]).
     member_overloads: HashSet<String>,
+    /// The `sealed` classes and interfaces — whose `when` must be exhaustive.
+    sealed: HashSet<String>,
+    /// Each `enum class`'s constants, in declaration order.
+    enum_constants: HashMap<String, Vec<String>>,
     /// The function names that can reach themselves through calls by name —
     /// the ones whose entry carries the `KT_DEPTH_GUARD` test (see
     /// [`recursive_names`]).
@@ -3217,6 +3221,27 @@ fn mangle_member_overloads(program: &mut Program) -> HashSet<String> {
     names
 }
 
+/// Each `enum class`'s constants: the properties of its companion that
+/// construct the enum (or a constant's own body subclass).
+fn enum_constants(program: &Program) -> HashMap<String, Vec<String>> {
+    let mut out = HashMap::new();
+    for e in program.classes.iter().filter(|c| c.is_enum) {
+        let companion = format!("{}$Companion", e.name);
+        let Some(cd) = program.classes.iter().find(|c| c.name == companion) else {
+            continue;
+        };
+        let own = format!("{}$", e.name);
+        let names = cd
+            .obj_props
+            .iter()
+            .filter(|p| matches!(&p.init, Expr::Call { name, .. } if *name == e.name || name.starts_with(&own)))
+            .map(|p| p.name.clone())
+            .collect();
+        out.insert(e.name.clone(), names);
+    }
+    out
+}
+
 /// The name a mangled overload was written with — what a diagnostic names.
 fn unmangled(name: &str) -> &str {
     name.split_once("$ov").map_or(name, |(base, _)| base)
@@ -3322,6 +3347,13 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         fun_sig,
         overloads,
         member_overloads,
+        sealed: program
+            .classes
+            .iter()
+            .filter(|c| c.is_sealed)
+            .map(|c| c.name.clone())
+            .collect(),
+        enum_constants: enum_constants(program),
         recursive: recursive_names(program),
         extensions,
         classes,
@@ -13650,6 +13682,133 @@ impl Compiler {
         Ok(if tt == et { tt } else { Type::Unknown })
     }
 
+    /// A `when` over a `sealed` type, an enum or a `Boolean` must cover every
+    /// case or say `else` — in statement position as well, since Kotlin 1.7.
+    /// The error names what is missing, as `kotlinc`'s does.
+    fn check_exhaustive(&self, sc: &Scope, w: &WhenExpr) -> Result<(), String> {
+        let Some(subject) = &w.subject else {
+            return Ok(());
+        };
+        if w.arms.iter().any(|a| matches!(a.guard, WhenGuard::Else)) {
+            return Ok(());
+        }
+        let conds: Vec<&WhenCond> = w
+            .arms
+            .iter()
+            .filter_map(|a| match &a.guard {
+                WhenGuard::Conds(c) => Some(c.iter()),
+                WhenGuard::Else => None,
+            })
+            .flatten()
+            .collect();
+        // The constant or object an `==` arm names, by its last segment.
+        let named = |c: &WhenCond| match c {
+            WhenCond::Expr(Expr::Var(n)) => Some(n.clone()),
+            WhenCond::Expr(Expr::Member { name, .. }) => Some(name.clone()),
+            _ => None,
+        };
+        let missing: Vec<String> = if self.infer(sc, subject) == Type::Boolean {
+            ["true", "false"]
+                .into_iter()
+                .filter(|b| {
+                    !conds
+                        .iter()
+                        .any(|c| matches!(c, WhenCond::Expr(Expr::Bool(v)) if v.to_string() == *b))
+                })
+                .map(str::to_string)
+                .collect()
+        } else {
+            // The DECLARED type decides: `val s: S = B` is a `when` over `S`.
+            let declared = match &**subject {
+                Expr::Var(n) => sc.declared_of(n),
+                _ => None,
+            };
+            let Some(class) = declared.or_else(|| self.infer_class(sc, subject)) else {
+                return Ok(());
+            };
+            if let Some(constants) = self.enum_constants.get(&class) {
+                constants
+                    .iter()
+                    .filter(|k| {
+                        !conds
+                            .iter()
+                            .any(|c| named(c).as_deref() == Some(k.as_str()))
+                    })
+                    .cloned()
+                    .collect()
+            } else if self.sealed.contains(&class) {
+                let tested: Vec<String> = conds
+                    .iter()
+                    .filter_map(|c| match c {
+                        WhenCond::Is {
+                            negated: false, ty, ..
+                        } => Some(self.canon_class(ty)),
+                        _ => None,
+                    })
+                    .collect();
+                let objects: Vec<String> = conds.iter().filter_map(|c| named(c)).collect();
+                let mut out = Vec::new();
+                self.uncovered_subclasses(&class, &tested, &objects, &mut out);
+                out
+            } else {
+                return Ok(());
+            }
+        };
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let what = missing
+            .iter()
+            .map(|m| format!("'{m}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let noun = if missing.len() == 1 {
+            "branch"
+        } else {
+            "branches"
+        };
+        Err(format!(
+            "'when' expression must be exhaustive. Add the {what} {noun} or an 'else' branch. (line {})",
+            w.line
+        ))
+    }
+
+    /// The direct subclasses of the sealed `class` no arm covers: one is
+    /// covered by an `is` of it or of a supertype, an object by naming it, and
+    /// a sealed one by covering all of its own. Pushed as `kotlinc` names them —
+    /// `is B` for a class, `C` for an object.
+    fn uncovered_subclasses(
+        &self,
+        class: &str,
+        tested: &[String],
+        objects: &[String],
+        out: &mut Vec<String>,
+    ) {
+        let mut subs: Vec<(&String, &ClassMeta)> = self
+            .classes
+            .iter()
+            .filter(|(_, m)| m.parents.iter().any(|p| self.canon_class(p) == class))
+            .collect();
+        subs.sort_by_key(|(n, _)| (*n).clone());
+        for (name, meta) in subs {
+            let short = name.rsplit(['.', '$']).next().unwrap_or(name).to_string();
+            let covered = meta.mro.iter().any(|a| tested.contains(a))
+                || (meta.is_object && (objects.contains(&short) || objects.contains(name)));
+            if covered {
+                continue;
+            }
+            if self.sealed.contains(name) {
+                let mut inner = Vec::new();
+                self.uncovered_subclasses(name, tested, objects, &mut inner);
+                out.extend(inner);
+            } else if meta.is_object {
+                out.push(short);
+            } else {
+                out.push(format!("is {short}"));
+            }
+        }
+    }
+
     /// Lower a `when` to a chain of guard tests. The subject (if any) is
     /// evaluated once into a temp slot; each arm's conditions are tested in
     /// order and the first match runs the arm body, whose value becomes the
@@ -13676,6 +13835,7 @@ impl Compiler {
         w: &WhenExpr,
         want_value: bool,
     ) -> Result<Type, String> {
+        self.check_exhaustive(sc, w)?;
         let mark = sc.enter();
         // Evaluate the subject once; remember its static type for `==` op choice.
         let subj = if let Some(subject) = &w.subject {
