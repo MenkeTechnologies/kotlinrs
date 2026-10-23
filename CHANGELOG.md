@@ -11,6 +11,22 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## `Char.category`
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1. Each was `unresolved reference`.
+
+| program | reference |
+| --- | --- |
+| `"aZ5 _-(é…".map { it.category }` | `[LOWERCASE_LETTER, UPPERCASE_LETTER, DECIMAL_DIGIT_NUMBER, SPACE_SEPARATOR, …]` |
+| `'a'.category.code`, `'A'.category.value`, `'1'.category.ordinal` | `Ll`, `1`, `9` |
+| `'a'.category == CharCategory.LOWERCASE_LETTER`, `when (c.category) { CharCategory.X -> … }` | compared as enum constants |
+| `(0..0xFFFF).count { it.toChar().category == CharCategory.OTHER_LETTER }` | the JDK's count |
+
+The categories come from `Character.getType` evaluated over the whole BMP on
+the reference JVM and run-length encoded (`unicode_jdk::CATEGORY_RUNS`, 2 892
+runs). `CharCategory` constants are enum instances with `name`, `ordinal`,
+`value` and `code`, one per category, ordered by ordinal.
+
 ## An `Iterable` user object with no static class
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.

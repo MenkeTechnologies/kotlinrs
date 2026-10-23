@@ -2604,6 +2604,7 @@ fn reset_heap() {
     ITER_END.with(|c| *c.borrow_mut() = None);
     UNIT.with(|u| *u.borrow_mut() = None);
     MOD_COUNTS.with(|t| t.borrow_mut().clear());
+    CHAR_CATEGORY_VALUES.with(|t| t.borrow_mut().clear());
     FAILED_INIT.with(|f| f.borrow_mut().clear());
     INIT_DEPTH.with(|d| d.set(0));
     TYPES.with(|t| t.borrow_mut().clear());
@@ -11438,6 +11439,18 @@ fn kt_method_inner(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Res
         }
         return Ok(alloc(HeapObj::List(Vec::new())));
     }
+    // `CharCategory.NAME`, the qualifier dropped by the compiler and the
+    // constant's name the receiver.
+    if name == "#charCategory" {
+        let want = recv.to_str();
+        return match CHAR_CATEGORIES
+            .iter()
+            .position(|(n, _, _)| *n == want.as_str())
+        {
+            Some(i) => Ok(char_category(i)),
+            None => Err(format!("unresolved reference: CharCategory.{want}")),
+        };
+    }
     // The `content…` members are declared on the NULLABLE array receiver:
     // `null.contentHashCode()` is `0`, its `toString` forms are `null`.
     if matches!(recv, Value::Undef) && args.is_empty() {
@@ -12974,6 +12987,91 @@ fn charseq_member(
 /// with the JVM's `Character` over ASCII; a supplementary-plane character has no
 /// single `Char` on either platform, so the surrogate halves classify as neither
 /// letter nor digit in both.
+/// Kotlin's `CharCategory`, in declaration order: `(name, Character.getType
+/// code, two-letter code)`. The ordinal is the position here — `getType` has
+/// no category 17, so the two numberings part after `FORMAT`.
+const CHAR_CATEGORIES: &[(&str, u8, &str)] = &[
+    ("UNASSIGNED", 0, "Cn"),
+    ("UPPERCASE_LETTER", 1, "Lu"),
+    ("LOWERCASE_LETTER", 2, "Ll"),
+    ("TITLECASE_LETTER", 3, "Lt"),
+    ("MODIFIER_LETTER", 4, "Lm"),
+    ("OTHER_LETTER", 5, "Lo"),
+    ("NON_SPACING_MARK", 6, "Mn"),
+    ("ENCLOSING_MARK", 7, "Me"),
+    ("COMBINING_SPACING_MARK", 8, "Mc"),
+    ("DECIMAL_DIGIT_NUMBER", 9, "Nd"),
+    ("LETTER_NUMBER", 10, "Nl"),
+    ("OTHER_NUMBER", 11, "No"),
+    ("SPACE_SEPARATOR", 12, "Zs"),
+    ("LINE_SEPARATOR", 13, "Zl"),
+    ("PARAGRAPH_SEPARATOR", 14, "Zp"),
+    ("CONTROL", 15, "Cc"),
+    ("FORMAT", 16, "Cf"),
+    ("PRIVATE_USE", 18, "Co"),
+    ("SURROGATE", 19, "Cs"),
+    ("DASH_PUNCTUATION", 20, "Pd"),
+    ("START_PUNCTUATION", 21, "Ps"),
+    ("END_PUNCTUATION", 22, "Pe"),
+    ("CONNECTOR_PUNCTUATION", 23, "Pc"),
+    ("OTHER_PUNCTUATION", 24, "Po"),
+    ("MATH_SYMBOL", 25, "Sm"),
+    ("CURRENCY_SYMBOL", 26, "Sc"),
+    ("MODIFIER_SYMBOL", 27, "Sk"),
+    ("OTHER_SYMBOL", 28, "So"),
+    ("INITIAL_QUOTE_PUNCTUATION", 29, "Pi"),
+    ("FINAL_QUOTE_PUNCTUATION", 30, "Pf"),
+];
+
+thread_local! {
+    /// The `CharCategory` constants, built once each so `==` between two
+    /// readings of one category is the identity an enum constant has.
+    static CHAR_CATEGORY_VALUES: RefCell<Vec<Option<Value>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The `CharCategory` constant at `ordinal` — an enum-class instance carrying
+/// `name`, `ordinal`, `value` and `code`, displayed by name and ordered by
+/// ordinal as every enum constant is.
+fn char_category(ordinal: usize) -> Value {
+    if let Some(v) = CHAR_CATEGORY_VALUES.with(|t| t.borrow().get(ordinal).cloned().flatten()) {
+        return v;
+    }
+    let (name, value, code) = CHAR_CATEGORIES[ordinal];
+    ENUM_CLASSES.with(|s| {
+        s.borrow_mut().insert("CharCategory".to_string());
+    });
+    let v = alloc(HeapObj::Instance {
+        class: "CharCategory".to_string(),
+        is_data: false,
+        fields: vec![
+            ("name".to_string(), Value::str(name)),
+            ("ordinal".to_string(), Value::Int(ordinal as i64)),
+            ("value".to_string(), Value::Int(i64::from(value))),
+            ("code".to_string(), Value::str(code)),
+        ],
+        data_from: 0,
+        data_len: 0,
+    });
+    CHAR_CATEGORY_VALUES.with(|t| {
+        let mut t = t.borrow_mut();
+        if t.len() <= ordinal {
+            t.resize(ordinal + 1, None);
+        }
+        t[ordinal] = Some(v.clone());
+    });
+    v
+}
+
+/// The `CharCategory` of a UTF-16 unit, from the JDK's `getType` data.
+fn char_category_of(unit: i64) -> Value {
+    let ty = unicode_jdk::category(unit as u16);
+    let ordinal = CHAR_CATEGORIES
+        .iter()
+        .position(|(_, v, _)| *v == ty)
+        .unwrap_or(0);
+    char_category(ordinal)
+}
+
 fn char_method(code: i64, name: &str, args: &[Value]) -> Result<Value, String> {
     let c = char::from_u32(code as u32).unwrap_or(char::REPLACEMENT_CHARACTER);
     let other = || args.first().map(num_of).unwrap_or(0);
@@ -12986,6 +13084,7 @@ fn char_method(code: i64, name: &str, args: &[Value]) -> Result<Value, String> {
     let surrogate = char::from_u32(code as u32).is_none();
     Ok(match name {
         "code" => Value::Int(code),
+        "category" => char_category_of(code),
         "toString" => Value::str(char_string(code)),
         "hashCode" => Value::Int(code),
         // `equals(other, ignoreCase)` folds both characters to the key they

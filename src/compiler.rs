@@ -7804,6 +7804,20 @@ impl Compiler {
         // `Double.NaN`). These are compile-time literals, so they fold here
         // rather than paying a host dispatch — and the receiver is a *type*
         // name, which has no runtime value to dispatch on at all.
+        // `CharCategory.UPPERCASE_LETTER` — a constant of the stdlib enum, built
+        // by the host from its name.
+        if args.is_empty() {
+            if let Expr::Var(q) = recv {
+                if q == "CharCategory" && self.is_type_ref(sc, q) {
+                    let n = self.b.add_constant(Value::str(name.to_string()));
+                    self.b.emit(Op::LoadConst(n), line);
+                    let m = self.b.add_constant(Value::str("#charCategory"));
+                    self.b.emit(Op::LoadConst(m), line);
+                    self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 0), line);
+                    return Ok(Type::Obj);
+                }
+            }
+        }
         // `IntRange.EMPTY` / `LongRange.EMPTY` / `CharRange.EMPTY` — the
         // companions' empty ranges, `1..0` (and `'\u0001'..'\u0000'`).
         if args.is_empty() && name == "EMPTY" {

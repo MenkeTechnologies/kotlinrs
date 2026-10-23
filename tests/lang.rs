@@ -8902,3 +8902,23 @@ fun main() {
         "3\n3\n[1, 2, 3]\n[30, 10, 20]\n[0, 1, 1, 2, 3, 5]\n[0, 2]\n3, 1, 2\n[6, 9]\n[3, 1, 2, 9]\n"
     );
 }
+
+#[test]
+fn char_category_answers_from_the_jdk_type_data() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. `Char.category` and the
+    // `CharCategory` constants were `unresolved reference`.
+    assert_eq!(
+        stdout(
+            r##"fun main() {
+    println("aZ5 _-(é €«ǅ̀".map { it.category })
+    println('a'.category.code); println('A'.category.value); println('1'.category.ordinal)
+    println('a'.category == CharCategory.LOWERCASE_LETTER); println('a'.category == CharCategory.UPPERCASE_LETTER)
+    println(CharCategory.MATH_SYMBOL); println('+'.category == CharCategory.MATH_SYMBOL)
+    println(listOf('b', 'B', '9').sortedBy { it.category }); println('͸'.category)
+    println((0..0xFFFF).count { it.toChar().category == CharCategory.OTHER_LETTER })
+    println(when ('x'.category) { CharCategory.LOWERCASE_LETTER -> "lower"; else -> "other" })
+}"##
+        ),
+        "[LOWERCASE_LETTER, UPPERCASE_LETTER, DECIMAL_DIGIT_NUMBER, SPACE_SEPARATOR, CONNECTOR_PUNCTUATION, DASH_PUNCTUATION, START_PUNCTUATION, LOWERCASE_LETTER, LINE_SEPARATOR, CURRENCY_SYMBOL, INITIAL_QUOTE_PUNCTUATION, TITLECASE_LETTER, NON_SPACING_MARK, PRIVATE_USE]\nLl\n1\n9\ntrue\nfalse\nMATH_SYMBOL\ntrue\n[B, b, 9]\nUNASSIGNED\n46126\nlower\n"
+    );
+}

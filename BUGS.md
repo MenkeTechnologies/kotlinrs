@@ -451,7 +451,6 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
 | `open class M(val c: Int)`; `class N(c: Int) : M(c)`; `operator fun M.plus(o: M)` and `operator fun N.plus(o: M)`; `listOf<M>(N(1), M(2)).reduce { a, b -> a + b }` | `unresolved reference: plus on N` | `M.plus`, chosen by the static type `M` |
 | `class C { fun f(a: String) = "s"; fun f(a: Int) = "i" }`; `C().f(1)` | `class C: method f is declared more than once — member overloads are not supported` | `i` |
 | `val a = arrayOf(1, 2); val l = a.asList(); a[0] = 7; println(l)` | `[1, 2]` | `[7, 2]` — a write to the ARRAY shows through the view; writes through the view reach the array since round 21 |
-| `'a'.category` | `unresolved reference: category on Char` | `LOWERCASE_LETTER` |
 
 The first is an untyped left operand against a PRIMITIVE right one: the native
 `Add` coerces a heap handle to a number. Routing every untyped arithmetic site
