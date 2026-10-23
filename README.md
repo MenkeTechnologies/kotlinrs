@@ -183,6 +183,9 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   and, like any `constrainOnce()` sequence, refuses a second traversal
   through any pipeline built on it; `emptySequence()` and `s.lineSequence()`
   are the empty and the line-split sequences.
+  A `for` loop over a lazy source and `seq.iterator()` pull ONE element per
+  pass, so the block's side effects interleave with the loop body's; a header
+  the compiler cannot prove indexable takes that pull-based walk.
 - **`java.util.stream` pipelines** — `coll.stream()`, `Stream.of(…)` and
   `IntStream.range`/`rangeClosed` lower onto the lazy sequence, which evaluates
   the same way: `filter`, `map`, the `mapTo…`/`boxed` conversions, `flatMap`,

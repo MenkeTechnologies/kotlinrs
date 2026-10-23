@@ -29,13 +29,13 @@ use crate::host::{
     KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND,
     KT_EXTREMUM_VM, KT_F32, KT_F32_ARITH, KT_F32_STR, KT_FFI_CALL, KT_FFI_COMPILE, KT_GENSEQ,
     KT_GETFIELD, KT_HASH_REG, KT_IDENTITY, KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM,
-    KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_GET, KT_ITER_SIZE, KT_ITER_SRC, KT_JOIN, KT_LATEINIT,
-    KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO, KT_LIST_TAG, KT_MAKE_CLOSURE, KT_MAP_VM,
-    KT_MATH, KT_METHOD_VM, KT_NEW, KT_NLR_MATCH, KT_NLR_RAISE, KT_NLR_TAKE, KT_NOTNULL,
-    KT_OBJEQ_VM, KT_OBSERVE, KT_OPER_REG, KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN,
-    KT_RANDOM, KT_RANGE, KT_RANGE_STEP, KT_REIFIED, KT_REIFY, KT_RESULT_HOF, KT_RUN_CATCHING,
-    KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_STR_ORDER, KT_SYSTEM, KT_TOSTRING_REG,
-    KT_TO_STRING, KT_TYPE_REG, KT_YIELD,
+    KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_END, KT_ITER_GET, KT_ITER_PULL, KT_ITER_SIZE, KT_ITER_SRC,
+    KT_ITER_SRC_LAZY, KT_JOIN, KT_LATEINIT, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO,
+    KT_LIST_TAG, KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW, KT_NLR_MATCH,
+    KT_NLR_RAISE, KT_NLR_TAKE, KT_NOTNULL, KT_OBJEQ_VM, KT_OBSERVE, KT_OPER_REG, KT_OPER_VM,
+    KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANDOM, KT_RANGE, KT_RANGE_STEP, KT_REIFIED,
+    KT_REIFY, KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM,
+    KT_STR_ORDER, KT_SYSTEM, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG, KT_YIELD,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
@@ -5461,10 +5461,18 @@ impl Compiler {
         // The iterable and the loop's index/length temporaries.
         let cslot = sc.temp();
         self.compile_expr(sc, iter)?;
-        // A lazy `Sequence` has no length and no index, so it is pulled into a
-        // list here — at the head, where Kotlin evaluates the header expression
-        // exactly once. Every other iterable passes straight through.
-        self.b.emit(Op::CallBuiltin(KT_ITER_SRC, 1), 0);
+        // A header the frontend cannot prove indexable may be a LAZY source —
+        // a pipeline or an `iterator { … }` cursor — which the loop then pulls
+        // one element per pass (`KT_ITER_SRC_LAZY` / `KT_ITER_PULL`), so the
+        // source's side effects interleave with the body's as Kotlin's
+        // iterator protocol does. A header that is known indexable keeps the
+        // cheaper extension-op walk.
+        let lazy = !self.indexable_header(sc, iter);
+        if lazy {
+            self.b.emit(Op::CallBuiltin(KT_ITER_SRC_LAZY, 1), 0);
+        } else {
+            self.b.emit(Op::CallBuiltin(KT_ITER_SRC, 1), 0);
+        }
         self.b.emit(Op::SetSlot(cslot), 0);
         let nslot = sc.temp();
         self.b.emit(Op::GetSlot(cslot), 0);
@@ -5505,7 +5513,15 @@ impl Compiler {
         let top = self.b.current_pos();
         self.b.emit(Op::GetSlot(cslot), 0);
         self.b.emit(Op::GetSlot(islot), 0);
-        self.b.emit(Op::Extended(KT_ITER_GET, 0), 0);
+        let mut dry = None;
+        if lazy {
+            self.b.emit(Op::CallBuiltin(KT_ITER_PULL, 2), 0);
+            self.b.emit(Op::Dup, 0);
+            self.b.emit(Op::Extended(KT_ITER_END, 0), 0);
+            dry = Some(self.b.emit(Op::JumpIfTrue(0), 0));
+        } else {
+            self.b.emit(Op::Extended(KT_ITER_GET, 0), 0);
+        }
         self.b.emit(Op::SetSlot(vslot), 0);
         // `for ((k, v) in map)` — split the element into its components. This
         // runs per iteration, so the names are declared once (outside the loop
@@ -5548,6 +5564,15 @@ impl Compiler {
         self.b.emit(Op::SetSlot(islot), 0);
         self.emit_index_test(islot, nslot);
         self.b.emit(Op::JumpIfTrue(top), 0);
+        // A lazy source that ran dry left the end marker on the stack.
+        if let Some(dry) = dry {
+            let over = self.b.emit(Op::Jump(0), 0);
+            let at = self.b.current_pos();
+            self.b.patch_jump(dry, at);
+            self.b.emit(Op::Pop, 0);
+            let after = self.b.current_pos();
+            self.b.patch_jump(over, after);
+        }
         let done = self.b.current_pos();
         self.b.patch_jump(jf, done);
         self.pop_unwind_to(done);
@@ -5556,6 +5581,52 @@ impl Compiler {
         }
         sc.exit(mark);
         Ok(())
+    }
+
+    /// Whether a `for` header is statically a value the indexed walk handles
+    /// without pulling — a `String`, an array, a range, a `List`/`Set`/`Map`
+    /// or another eager container. Anything else may be a lazy source.
+    fn indexable_header(&self, sc: &Scope, iter: &Expr) -> bool {
+        // A lazy intermediate keeps its receiver's kind, so a chain is only as
+        // indexable as its source: `gen().map { … }` over a function answering
+        // a `Sequence` is lazy whatever a bare `map` is assumed to answer.
+        if let Expr::MethodCall { recv, name, .. } = iter {
+            if sequence_keeps_kind(name) && !self.indexable_header(sc, recv) {
+                return false;
+            }
+        }
+        if self.infer(sc, iter).is_str() || matches!(iter, Expr::Range { .. } | Expr::Step { .. }) {
+            return true;
+        }
+        self.infer_class(sc, iter).is_some_and(|c| {
+            is_array_class(&c)
+                || matches!(
+                    c.as_str(),
+                    "List"
+                        | "MutableList"
+                        | "ArrayList"
+                        | "Set"
+                        | "MutableSet"
+                        | "HashSet"
+                        | "LinkedHashSet"
+                        | "TreeSet"
+                        | "Map"
+                        | "MutableMap"
+                        | "HashMap"
+                        | "LinkedHashMap"
+                        | "TreeMap"
+                        | "Collection"
+                        | "ArrayDeque"
+                        | "IntRange"
+                        | "LongRange"
+                        | "CharRange"
+                        | "IntProgression"
+                        | "LongProgression"
+                        | "CharProgression"
+                        | "String"
+                        | "StringBuilder"
+                )
+        })
     }
 
     /// `for (v in iterable)`'s bounds test — `index < length`, both read from
@@ -9980,7 +10051,13 @@ impl Compiler {
             }
             "generateSequence" if args.len() == 2 && is_lambda(&args[1]) => {
                 self.compile_erased(sc, &args[0])?;
-                self.lambda_hint = Some(vec![(Type::Unknown, Type::Unknown)]);
+                // The step's parameter is the seed's type, so `{ it + 1 }` over an
+                // `Int` seed wraps at 32 bits as Kotlin's does.
+                let seed_ty = match self.infer(sc, &args[0]) {
+                    t @ (Type::Int | Type::Long | Type::Double | Type::Char) => t,
+                    _ => Type::Unknown,
+                };
+                self.lambda_hint = Some(vec![(seed_ty, Type::Unknown)]);
                 self.compile_expr(sc, &args[1])?;
                 self.lambda_hint = None;
                 self.b.emit(Op::CallBuiltin(KT_GENSEQ, 0), line);
@@ -13262,6 +13339,12 @@ impl Compiler {
                 | "listOfNotNull" | "sequenceOf" => {
                     elem_of_args(&args.iter().map(|a| self.infer(sc, a)).collect::<Vec<_>>())
                 }
+                // `generateSequence(seed) { … }` yields the seed's type: the
+                // step takes and answers a `T`.
+                "generateSequence" if args.len() == 2 => match self.infer(sc, &args[0]) {
+                    t @ (Type::Int | Type::Long | Type::Double | Type::Float | Type::Char) => t,
+                    _ => Type::Unknown,
+                },
                 "intArrayOf" | "shortArrayOf" | "byteArrayOf" => Type::Int,
                 "longArrayOf" => Type::Long,
                 "doubleArrayOf" => Type::Double,
@@ -13937,6 +14020,9 @@ impl Compiler {
                     // their elements are unconstrained.
                     "runCatching" => return Some("Result".to_string()),
                     "Pair" => return Some("Pair".to_string()),
+                    "sequence" | "generateSequence" | "sequenceOf" | "emptySequence" => {
+                        return Some("Sequence".to_string())
+                    }
                     "Triple" => return Some("Triple".to_string()),
                     "intArrayOf" | "IntArray" => return Some("IntArray".to_string()),
                     "longArrayOf" | "LongArray" => return Some("LongArray".to_string()),
@@ -14006,6 +14092,15 @@ impl Compiler {
                 });
                 match name.as_str() {
                     _ if declares => {}
+                    // A `Sequence` receiver keeps a `Sequence`: its intermediate
+                    // members are lazy, and calling the result a `List` made a
+                    // `for` over it pull the whole pipeline at the head.
+                    _ if recv_cls.as_deref() == Some("Sequence") && sequence_keeps_kind(name) => {
+                        return Some("Sequence".to_string())
+                    }
+                    "asSequence" | "constrainOnce" if args.is_empty() => {
+                        return Some("Sequence".to_string())
+                    }
                     "map" | "mapIndexed" | "flatMap" | "filter" | "filterNot" | "sortedBy"
                     | "sortedByDescending" | "toList" | "distinct" | "sorted"
                     | "sortedDescending" | "take" | "drop" => return Some("List".to_string()),
@@ -16105,4 +16200,50 @@ fn builtin_fit(arg: &str, param: &str) -> Option<u32> {
         (Some(_), Some(_)) => None,
         _ => Some(1),
     }
+}
+
+/// The `Sequence` members that answer another `Sequence` — the lazy
+/// intermediates. Everything else on a sequence is a terminal (`toList`,
+/// `first`, `sum`, …) and answers what its own signature says.
+fn sequence_keeps_kind(name: &str) -> bool {
+    matches!(
+        name,
+        "map"
+            | "mapIndexed"
+            | "mapNotNull"
+            | "filter"
+            | "filterNot"
+            | "filterIndexed"
+            | "filterNotNull"
+            | "filterIsInstance"
+            | "take"
+            | "drop"
+            | "takeWhile"
+            | "dropWhile"
+            | "onEach"
+            | "onEachIndexed"
+            | "flatMap"
+            | "flatten"
+            | "distinct"
+            | "distinctBy"
+            | "sorted"
+            | "sortedBy"
+            | "sortedByDescending"
+            | "sortedDescending"
+            | "sortedWith"
+            | "withIndex"
+            | "zip"
+            | "zipWithNext"
+            | "chunked"
+            | "windowed"
+            | "plus"
+            | "minus"
+            | "shuffled"
+            | "constrainOnce"
+            | "runningFold"
+            | "runningReduce"
+            | "scan"
+            | "requireNoNulls"
+            | "ifEmpty"
+    )
 }

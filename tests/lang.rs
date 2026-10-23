@@ -7989,3 +7989,56 @@ fun main() {
         "nullsFirst: [a, d, b, c]\nnullsLast: [d, b, c, a]\nbyCmpDesc: [a, b, c, d]\nbyLen: [ccc, bb, a]\ncmpValues: [-1, 1, 0, 0, 1]\ncmpBy: [-1, 1, -1]\nminOfWith: b!\nmaxOfWith: 10\nminOfWithEmpty: EX java.util.NoSuchElementException\nminOfWithOrNull: null\nmaxOfWithOrNull: -4\n"
     );
 }
+
+#[test]
+fn a_for_loop_and_an_iterator_pull_a_lazy_source_one_element_at_a_time() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. The loop used to pull the
+    // whole sequence at its head, so the block's side effects ran before the
+    // body's (`y1 y2 b1 b2` for `y1 b1 y2 b2`); `seq.iterator()` did the same.
+    assert_eq!(
+        stdout(
+            r#"fun main() {
+    val it1 = sequence { print("y1 "); yield(1); print("y2 "); yield(2) }.iterator()
+    while (it1.hasNext()) print("b${it1.next()} "); println()
+    val s = generateSequence(1) { print("g$it "); if (it < 3) it + 1 else null }.map { print("m$it "); it * 10 }
+    val it2 = s.iterator(); while (it2.hasNext()) print("b${it2.next()} "); println()
+    val it3 = iterator { print("i1 "); yield(5); print("i2 ") }
+    while (it3.hasNext()) print("b${it3.next()} "); println()
+    for (x in sequence { print("y1 "); yield(1); print("y2 "); yield(2) }) print("b$x "); println()
+    for (x in s) print("b$x "); println()
+    for (x in iterator { print("i1 "); yield(5); print("i2 ") }) print("b$x "); println()
+    val ss = sequence { print("A "); yield(1); print("B "); yield(2); print("C ") }
+    for (x in ss) { if (x == 1) continue; print("b$x ") }; println()
+    for (x in ss) { print("b$x "); break }; println()
+    for ((i, v) in ss.withIndex()) print("$i:$v "); println()
+    for (x in listOf(1, 2).asSequence().filter { print("f$it "); true }) print("b$x "); println()
+    val lst = listOf(1, 2); for (x in lst.asSequence()) print("L$x "); println()
+}"#
+        ),
+        "y1 b1 y2 b2 \nm1 b10 g1 m2 b20 g2 m3 b30 g3 \ni1 b5 i2 \ny1 b1 y2 b2 \nm1 b10 g1 m2 b20 g2 m3 b30 g3 \ni1 b5 i2 \nA B b2 C \nA b1 \nA 0:1 B 1:2 C \nf1 b1 f2 b2 \nL1 L2 \n"
+    );
+    assert_eq!(
+        stdout(
+            r#"fun t(name: String, f: () -> Any?) { try { println("$name: ${f()}") } catch (e: Throwable) { println("$name: EX $e") } }
+fun gen() = sequence { print("<a>"); yield(1); print("<b>"); yield(2); print("<c>") }
+fun main() {
+    for (x in gen()) print("[$x]"); println()
+    for (x in gen().map { it * 10 }.filter { it > 10 }) print("[$x]"); println()
+    for (x in gen().take(1)) print("[$x]"); println()
+    var n = 0; for (x in generateSequence(1) { it + 1 }) { n += x; if (x == 70_000) break }; println(n)
+    for ((i, v) in gen().withIndex()) print("[$i=$v]"); println()
+    println(gen().withIndex().toList())
+    val it = gen().iterator(); println("made"); println(it.hasNext()); println(it.hasNext()); println(it.next()); println(it.next()); println(it.hasNext())
+    t("nextPastEnd") { val i2 = sequenceOf(1).iterator(); i2.next(); i2.next() }
+    val once = sequenceOf(1, 2).constrainOnce(); for (x in once) print(x); println(); t("twice") { for (x in once) print(x) }
+    fun numbers(): Sequence<Int> = generateSequence(1) { it + 1 }
+    for (x in numbers()) { if (x > 3) break; print(x) }; println()
+    val xs: Iterable<Int> = listOf(4, 5); for (x in xs) print(x); println()
+    for (x in mapOf(1 to 2).entries) print(x); println()
+    for (c in "ab".asSequence()) print(c); println()
+    for (x in (1..3).asSequence().map { print("m"); it }) print(x); println()
+}"#
+        ),
+        "<a>[1]<b>[2]<c>\n<a><b>[20]<c>\n<a>[1]\n-1844932296\n<a>[0=1]<b>[1=2]<c>\n<a><b><c>[IndexedValue(index=0, value=1), IndexedValue(index=1, value=2)]\nmade\n<a>true\ntrue\n1\n<b>2\n<c>false\nnextPastEnd: EX java.util.NoSuchElementException\n12\ntwice: EX java.lang.IllegalStateException: This sequence can be consumed only once.\n123\n45\n1=2\nab\nm1m2m3\n"
+    );
+}

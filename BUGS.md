@@ -416,22 +416,20 @@ superclass initializer lands on the superclass's method.
 **Unsigned types** are not modelled at all (`5u`, `UInt`, `toUInt()`); see Round
 20 for the representation question.
 
-## Round 9: `for` over a lazy source runs the source first
+## A lazy pipeline materializes at its first non-lazy intermediate
 
-Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1. A `for` loop lowers to a length
-and an index, so a `sequence { … }` or `iterator { … }` header is pulled into a
-list at the loop's head (`KT_ITER_SRC`) before the body runs once. The elements
-and their order agree; what differs is the INTERLEAVING of the block's side
-effects with the body's:
+A `for` loop and `seq.iterator()` pull a pipeline one element at a time since
+round 21, through the lazy stages `map`, `filter`/`filterNot`, `onEach`,
+`take`/`drop`, `takeWhile`/`dropWhile` and `withIndex`. Every other
+intermediate (`mapNotNull`, `mapIndexed`, `flatMap`, `distinct`, `zip`,
+`chunked`, `windowed`, …) pulls the pipeline into a list where it is applied,
+so a block's side effects run ahead of the consumer's from that point on —
+the elements and their order still agree. Measured on `kotlinc` 2.4.21 /
+JRE 21.0.12.1:
 
 | program | kotlinrs | reference |
 | --- | --- | --- |
-| `for (x in iterator { print("y1 "); yield(1); print("y2 "); yield(2) }) print("b$x ")` | `y1 y2 b1 b2` | `y1 b1 y2 b2` |
-| the same with `sequence { … }` | `y1 y2 b1 b2` | `y1 b1 y2 b2` |
-
-`hasNext()`/`next()` driven by hand interleave correctly; only the `for`
-lowering pulls ahead. Closing it means a pull-based loop (`hasNext`/`next` per
-iteration) for a header whose static type is not known to be indexable.
+| `for (x in sequence { print("a "); yield(1); print("b "); yield(2) }.mapNotNull { it }) print("[$x] ")` | `a b [1] [2]` | `a [1] b [2]` |
 
 ## Round 10: measured and not closed
 

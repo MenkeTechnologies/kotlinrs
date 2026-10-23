@@ -11,6 +11,29 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## `for` over a lazy sequence pulls one element per pass
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, compiled and run on the same JVM.
+
+| program | before | reference |
+| --- | --- | --- |
+| `for (x in sequence { print("y1 "); yield(1); print("y2 "); yield(2) }) print("b$x ")` | `y1 y2 b1 b2` | `y1 b1 y2 b2` |
+| `for (x in iterator { print("i1 "); yield(5); print("i2 ") }) print("b$x ")` | `i1 i2 b5` | `i1 b5 i2` |
+| `val it = s.iterator(); while (it.hasNext()) print("b${it.next()} ")` over `generateSequence(1) { … }.map { … }` | the whole pipeline first | one element per `next` |
+| `for (x in ss) { print("b$x "); break }` over `sequence { print("A "); yield(1); print("B "); … }` | `A B C b1` | `A b1` |
+| `var n = 0; for (x in generateSequence(1) { it + 1 }) { n += x; if (x == 70_000) break }` | `IllegalStateException: sequence produced more than 1000000 elements …` — the head pulled the endless source | `-1844932296` — `x` is an `Int` |
+| `for ((i, v) in seq.withIndex())` | the pipeline pulled first | interleaved |
+
+A `for` header the compiler cannot prove indexable — anything but a `String`,
+an array, a range or an eager container — lowers to `KT_ITER_SRC_LAZY` /
+`KT_ITER_PULL`: a lazy source becomes an iterator pulled once per pass, and the
+loop ends at the end marker `KT_ITER_END` tests for. The pipeline traversal is
+one `GenCursor` either way, which the terminal operations drive in a loop and
+an iterator holds between pulls; `withIndex` is a lazy stage of its own. The
+element type of `generateSequence(seed) { … }` is the seed's, so the step's
+`it` and the loop variable have its width. A pipeline still materializes at
+any other intermediate; see BUGS.md.
+
 ## Comparator builders over a comparator, `compareValues`, `minOfWith`
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1. Each was `unresolved reference`.

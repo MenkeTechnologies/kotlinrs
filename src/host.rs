@@ -297,6 +297,22 @@ pub const KT_DELEG_SET: u16 = 139;
 /// extension op. Pulling a `sequence { … }` from an extension op answered an
 /// empty list, silently.
 pub const KT_ITER_SRC: u16 = 137;
+/// `KT_ITER_SRC_LAZY`: [`KT_ITER_SRC`] for a loop whose header the compiler
+/// could not prove indexable. A lazy source — a pipeline, an `iterator { … }`
+/// cursor — is NOT pulled at the head: it becomes an iterator the loop pulls
+/// once per pass with [`KT_ITER_PULL`], so the source's side effects
+/// interleave with the body's. Every other value is [`KT_ITER_SRC`]'s.
+pub const KT_ITER_SRC_LAZY: u16 = 151;
+/// `KT_ITER_PULL`: [`KT_ITER_GET`] for the loop [`KT_ITER_SRC_LAZY`] set up.
+/// Stack `[iterable, i]`; pushes element `i`, or for a lazy iterator its next
+/// element — and the end marker [`KT_ITER_END`] tests for once it is dry. A
+/// builtin because the pull runs the pipeline's lambdas and the block's
+/// coroutine.
+pub const KT_ITER_PULL: u16 = 152;
+/// `KT_ITER_END`: whether the value on top is the end marker
+/// [`KT_ITER_PULL`] answers for an exhausted lazy source. Stack `[value]`;
+/// pushes a `Bool`.
+pub const KT_ITER_END: u16 = 153;
 
 /// `KT_SEQ_NEW`: build the lazy `Sequence` a `sequence { … }` block denotes.
 /// Stack `[blockClosure]`; pushes a `Gen` whose source is a fresh coroutine.
@@ -1824,6 +1840,14 @@ enum HeapObj {
         coro: Value,
         ahead: Option<Value>,
     },
+    /// The `Iterator` of a lazy pipeline — `seq.iterator()`, and what a `for`
+    /// loop over a [`HeapObj::Gen`] walks: one traversal, pulled an element at
+    /// a time, with `ahead` parking what `hasNext` pulled exactly as
+    /// [`HeapObj::CoroIter`] does.
+    GenIter {
+        cursor: Box<GenCursor>,
+        ahead: Option<Value>,
+    },
     /// A class object — `x::class` (a `kotlin.reflect.KClass`) or `x.javaClass`
     /// (a `java.lang.Class`). See [`KT_CLASS_REF`].
     Klass {
@@ -2016,6 +2040,24 @@ enum Stage {
     DropWhile(Value, bool),
     Take(i64),
     Drop(i64),
+    /// `withIndex` — pairs each element with the count of elements that
+    /// reached this stage before it, as an `IndexedValue`.
+    WithIndex(i64),
+}
+
+/// Kotlin's `IndexedValue(index, value)` — a `data class`, so it displays,
+/// compares and destructures as one.
+fn indexed_value(index: i64, value: Value) -> Value {
+    alloc(HeapObj::Instance {
+        class: "IndexedValue".to_string(),
+        is_data: true,
+        fields: vec![
+            ("index".to_string(), Value::Int(index)),
+            ("value".to_string(), value),
+        ],
+        data_from: 0,
+        data_len: 2,
+    })
 }
 
 /// The most elements a terminal operation will pull from a generator before
@@ -2179,6 +2221,7 @@ fn reset_heap() {
     SEQ_VIEW.with(|t| t.borrow_mut().clear());
     ONCE_TOKEN.with(|t| t.borrow_mut().clear());
     ONCE_CONSUMED.with(|t| t.borrow_mut().clear());
+    ITER_END.with(|c| *c.borrow_mut() = None);
     TYPES.with(|t| t.borrow_mut().clear());
     TOSTRING_SUBS.with(|t| t.borrow_mut().clear());
     EQUALS_SUBS.with(|t| t.borrow_mut().clear());
@@ -4565,6 +4608,12 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
         }
         KT_ITER_SIZE => {
             let recv = vm.pop();
+            // A lazy loop source has no length: the loop runs until
+            // `KT_ITER_PULL` answers the end marker.
+            if is_lazy_iter(&recv) {
+                vm.push(Value::Int(i64::MAX));
+                return;
+            }
             // `for (k in aHashMap)` walks the stored sequence, so it is the
             // bucket order it has to walk. Taken once at the loop's head.
             ensure_ordered(vm, &recv);
@@ -4578,6 +4627,10 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
                     vm.push(Value::Int(0));
                 }
             }
+        }
+        KT_ITER_END => {
+            let v = vm.pop();
+            vm.push(Value::Bool(is_iter_end(&v)));
         }
         KT_ITER_GET => {
             let i = vm.pop().to_int();
@@ -4881,6 +4934,8 @@ fn register_builtins(vm: &mut VM) {
     vm.register_builtin(KT_COMPARATOR, b_comparator);
     vm.register_builtin(KT_GENSEQ, b_genseq);
     vm.register_builtin(KT_ITER_SRC, b_iter_src);
+    vm.register_builtin(KT_ITER_SRC_LAZY, b_iter_src_lazy);
+    vm.register_builtin(KT_ITER_PULL, b_iter_pull);
     vm.register_builtin(KT_DELEG_GET, b_deleg_get);
     vm.register_builtin(KT_DELEG_SET, b_deleg_set);
     vm.register_builtin(KT_EXC_NEW, b_exc_new);
@@ -6631,169 +6686,221 @@ fn gen_drive(
     want: Option<usize>,
     on: &mut dyn FnMut(&mut VM, &Value) -> Result<bool, String>,
 ) -> Result<Vec<Value>, String> {
-    // A `constrainOnce()` source — and the seedless `generateSequence`, which
-    // is one — refuses a second traversal, through any pipeline built on it.
-    if let Some(token) = once_token(gen) {
-        if !ONCE_CONSUMED.with(|c| c.borrow_mut().insert(token)) {
-            return Err(
-                "java.lang.IllegalStateException: This sequence can be consumed only once."
-                    .to_string(),
-            );
-        }
-    }
-    let (block, items, seed, step, mut stages) =
-        gen_parts(gen).ok_or_else(|| format!("unresolved reference on {}", obj_label(gen)))?;
-    // THIS traversal's coroutine, entered from the block afresh — see the
-    // `block` field on [`HeapObj::Gen`] for why it is not shared. A coroutine
-    // source has no seed to prime the loop with either, so the first pull
-    // happens here; every later one happens at the bottom of the loop, in the
-    // same place the seed/step form advances.
-    let coro = block.map(|body| {
-        alloc(HeapObj::Coro {
-            body,
-            frames: Vec::new(),
-            stack: Vec::new(),
-            ip: 0,
-            state: CoroState::Fresh,
-        })
-    });
-    // Where a LIST source has got to. Local to the traversal, so two pipelines
-    // built from one `asSequence()` are independent — the same reason the
-    // `sequence { … }` block instantiates its own coroutine above.
-    let mut at = 0usize;
-    // The FIRST element, already in hand: the `generateSequence` seed, or the
-    // block's first yield. Every later one is pulled at the top of the loop,
-    // on demand.
-    let mut primed = match (&coro, &items) {
-        (Some(c), _) => coro_next(vm, c)?,
-        (None, Some(_)) => None,
-        // The seedless `generateSequence { … }`: its first element is the
-        // function's first answer, asked for here, lazily, like every later one.
-        (None, None) if seed.as_ref().is_some_and(is_lateinit_unset) => {
-            match invoke_closure(vm, &step, &[])? {
-                Value::Undef => None,
-                v => Some(v),
-            }
-        }
-        (None, None) => seed,
-    };
-    // The element the source yielded last — the step's argument.
-    let mut prev: Option<Value> = None;
+    let mut cursor = GenCursor::open(gen, true)?;
     let mut out: Vec<Value> = Vec::new();
-    let mut pulled = 0usize;
-    'source: loop {
-        if want.is_some_and(|n| out.len() >= n) {
-            break;
-        }
-        // The source is advanced HERE, when the next element is actually
-        // wanted, rather than after the previous one was taken. That ordering
-        // is observable: Kotlin's `generateSequence(1) { … }.take(1)` never
-        // runs the step at all, because the seed alone satisfies the `take`,
-        // and advancing eagerly ran it twice.
-        let cur = match primed.take() {
-            Some(v) => v,
-            None => match (&coro, &items) {
-                (Some(c), _) => match coro_next(vm, c)? {
-                    Some(v) => v,
-                    None => break,
-                },
-                (None, Some(list)) => match list.get(at) {
-                    Some(v) => {
-                        at += 1;
-                        v.clone()
-                    }
-                    None => break,
-                },
-                (None, None) => {
-                    let Some(p) = prev.clone() else { break };
-                    // A range's `asSequence()` keeps the RANGE as its step: the
-                    // next element is one step on, up to the range's last.
-                    let range = with_obj(&step, |o| match o {
-                        HeapObj::Range(r) => Some(*r),
-                        _ => None,
-                    })
-                    .flatten();
-                    let next = match range {
-                        Some(r) => {
-                            let cur = char_code(&p).unwrap_or_else(|| p.to_int());
-                            if cur == r.last() {
-                                break;
-                            }
-                            if r.is_char {
-                                char_of(cur + r.step)
-                            } else {
-                                Value::Int(cur + r.step)
-                            }
-                        }
-                        None => invoke_closure(vm, &step, std::slice::from_ref(&p))?,
-                    };
-                    if matches!(next, Value::Undef) {
-                        break;
-                    }
-                    next
-                }
-            },
-        };
-        prev = Some(cur.clone());
-        pulled += 1;
-        if pulled > GEN_PULL_CAP {
-            return Err(format!(
-                "java.lang.IllegalStateException: sequence produced more than {GEN_PULL_CAP} \
-                 elements without a `take`, `takeWhile` or a step returning null"
-            ));
-        }
-
-        // Whether a `take` budget ran out on THIS element. Nothing further can
-        // pass that stage, so the traversal ends without asking the source for
-        // another — which is the second half of why `take(1)` runs no step.
-        let mut spent = false;
-        let mut v = cur;
-        for stage in stages.iter_mut() {
-            match stage.clone() {
-                Stage::Map(f) => v = invoke_closure(vm, &f, std::slice::from_ref(&v))?,
-                Stage::OnEach(f) => {
-                    invoke_closure(vm, &f, std::slice::from_ref(&v))?;
-                }
-                Stage::Filter(f, keep) => {
-                    if truthy(&invoke_closure(vm, &f, std::slice::from_ref(&v))?) != keep {
-                        continue 'source;
-                    }
-                }
-                Stage::TakeWhile(f) => {
-                    if !truthy(&invoke_closure(vm, &f, std::slice::from_ref(&v))?) {
-                        break 'source;
-                    }
-                }
-                Stage::DropWhile(f, done) => {
-                    if !done {
-                        if truthy(&invoke_closure(vm, &f, std::slice::from_ref(&v))?) {
-                            continue 'source;
-                        }
-                        *stage = Stage::DropWhile(f, true);
-                    }
-                }
-                Stage::Take(n) => {
-                    if n <= 0 {
-                        break 'source;
-                    }
-                    *stage = Stage::Take(n - 1);
-                    spent = spent || n == 1;
-                }
-                Stage::Drop(n) => {
-                    if n > 0 {
-                        *stage = Stage::Drop(n - 1);
-                        continue 'source;
-                    }
-                }
-            }
-        }
+    while !want.is_some_and(|n| out.len() >= n) {
+        let Some(v) = cursor.next(vm)? else { break };
         let more = on(vm, &v)?;
         out.push(v);
-        if spent || !more {
+        if !more {
             break;
         }
     }
     Ok(out)
+}
+
+/// One traversal of a lazy pipeline ([`HeapObj::Gen`]), pulled one element at
+/// a time: what [`gen_drive`] loops over, and what a `for` loop or a
+/// hand-driven `iterator()` holds between pulls ([`HeapObj::GenIter`]), so a
+/// `sequence { … }` block's side effects interleave with the consumer's.
+///
+/// The source is asked for an element only when the consumer wants one —
+/// Kotlin's `generateSequence(1) { … }.take(1)` never runs the step, because
+/// the seed alone satisfies the `take` and a spent `take` ends the traversal
+/// without another pull.
+#[derive(Clone)]
+struct GenCursor {
+    /// THIS traversal's coroutine, entered from the block afresh — see the
+    /// `block` field on [`HeapObj::Gen`] for why it is not shared.
+    coro: Option<Value>,
+    items: Option<Vec<Value>>,
+    seed: Option<Value>,
+    step: Value,
+    /// The stages, cloned per traversal: `take`/`drop` budgets and the
+    /// `dropWhile` flag are per-pull state.
+    stages: Vec<Stage>,
+    /// Where a LIST source has got to.
+    at: usize,
+    /// Whether the source has produced its first element yet.
+    started: bool,
+    /// The element the source yielded last — the step's argument.
+    prev: Option<Value>,
+    /// Set once the source or a stage has ended the traversal.
+    finished: bool,
+    pulled: usize,
+    /// Whether [`GEN_PULL_CAP`] applies. A terminal operation with no bound is
+    /// an infinite loop and gets the diagnostic; a `for` loop or an iterator
+    /// decides for itself when to stop, as on the JVM.
+    capped: bool,
+}
+
+impl GenCursor {
+    fn open(gen: &Value, capped: bool) -> Result<GenCursor, String> {
+        // A `constrainOnce()` source — and the seedless `generateSequence`,
+        // which is one — refuses a second traversal, through any pipeline
+        // built on it.
+        if let Some(token) = once_token(gen) {
+            if !ONCE_CONSUMED.with(|c| c.borrow_mut().insert(token)) {
+                return Err(
+                    "java.lang.IllegalStateException: This sequence can be consumed only once."
+                        .to_string(),
+                );
+            }
+        }
+        let (block, items, seed, step, stages) =
+            gen_parts(gen).ok_or_else(|| format!("unresolved reference on {}", obj_label(gen)))?;
+        let coro = block.map(|body| {
+            alloc(HeapObj::Coro {
+                body,
+                frames: Vec::new(),
+                stack: Vec::new(),
+                ip: 0,
+                state: CoroState::Fresh,
+            })
+        });
+        Ok(GenCursor {
+            coro,
+            items,
+            seed,
+            step,
+            stages,
+            at: 0,
+            started: false,
+            prev: None,
+            finished: false,
+            pulled: 0,
+            capped,
+        })
+    }
+
+    /// The source's next element, before any stage: the seed (or the block's
+    /// first yield, or the seedless function's first answer) first, then one
+    /// step on from the previous element each time.
+    fn pull_source(&mut self, vm: &mut VM) -> Result<Option<Value>, String> {
+        if let Some(c) = &self.coro {
+            return coro_next(vm, c);
+        }
+        if let Some(list) = &self.items {
+            let v = list.get(self.at).cloned();
+            self.at += 1;
+            return Ok(v);
+        }
+        if !self.started {
+            self.started = true;
+            // The seedless `generateSequence { … }`: its first element is the
+            // function's first answer, asked for here, lazily, like every later
+            // one.
+            if self.seed.as_ref().is_some_and(is_lateinit_unset) {
+                return Ok(match invoke_closure(vm, &self.step, &[])? {
+                    Value::Undef => None,
+                    v => Some(v),
+                });
+            }
+            return Ok(self.seed.clone());
+        }
+        let Some(p) = self.prev.clone() else {
+            return Ok(None);
+        };
+        // A range's `asSequence()` keeps the RANGE as its step: the next
+        // element is one step on, up to the range's last.
+        let range = with_obj(&self.step, |o| match o {
+            HeapObj::Range(r) => Some(*r),
+            _ => None,
+        })
+        .flatten();
+        let next = match range {
+            Some(r) => {
+                let cur = char_code(&p).unwrap_or_else(|| p.to_int());
+                if cur == r.last() {
+                    return Ok(None);
+                }
+                if r.is_char {
+                    char_of(cur + r.step)
+                } else {
+                    Value::Int(cur + r.step)
+                }
+            }
+            None => invoke_closure(vm, &self.step, std::slice::from_ref(&p))?,
+        };
+        Ok((!matches!(next, Value::Undef)).then_some(next))
+    }
+
+    /// The next element that survives every stage, or `None` once the
+    /// traversal has ended.
+    fn next(&mut self, vm: &mut VM) -> Result<Option<Value>, String> {
+        'source: loop {
+            if self.finished {
+                return Ok(None);
+            }
+            let Some(cur) = self.pull_source(vm)? else {
+                self.finished = true;
+                return Ok(None);
+            };
+            self.prev = Some(cur.clone());
+            self.pulled += 1;
+            if self.capped && self.pulled > GEN_PULL_CAP {
+                return Err(format!(
+                    "java.lang.IllegalStateException: sequence produced more than {GEN_PULL_CAP} \
+                     elements without a `take`, `takeWhile` or a step returning null"
+                ));
+            }
+            // Whether a `take` budget ran out on THIS element. Nothing further
+            // can pass that stage, so the traversal ends without asking the
+            // source for another — the second half of why `take(1)` runs no
+            // step.
+            let mut spent = false;
+            let mut v = cur;
+            for i in 0..self.stages.len() {
+                match self.stages[i].clone() {
+                    Stage::Map(f) => v = invoke_closure(vm, &f, std::slice::from_ref(&v))?,
+                    Stage::OnEach(f) => {
+                        invoke_closure(vm, &f, std::slice::from_ref(&v))?;
+                    }
+                    Stage::Filter(f, keep) => {
+                        if truthy(&invoke_closure(vm, &f, std::slice::from_ref(&v))?) != keep {
+                            continue 'source;
+                        }
+                    }
+                    Stage::TakeWhile(f) => {
+                        if !truthy(&invoke_closure(vm, &f, std::slice::from_ref(&v))?) {
+                            self.finished = true;
+                            return Ok(None);
+                        }
+                    }
+                    Stage::DropWhile(f, done) => {
+                        if !done {
+                            if truthy(&invoke_closure(vm, &f, std::slice::from_ref(&v))?) {
+                                continue 'source;
+                            }
+                            self.stages[i] = Stage::DropWhile(f, true);
+                        }
+                    }
+                    Stage::Take(n) => {
+                        if n <= 0 {
+                            self.finished = true;
+                            return Ok(None);
+                        }
+                        self.stages[i] = Stage::Take(n - 1);
+                        spent = spent || n == 1;
+                    }
+                    Stage::Drop(n) => {
+                        if n > 0 {
+                            self.stages[i] = Stage::Drop(n - 1);
+                            continue 'source;
+                        }
+                    }
+                    Stage::WithIndex(k) => {
+                        v = indexed_value(k, v);
+                        self.stages[i] = Stage::WithIndex(k + 1);
+                    }
+                }
+            }
+            if spent {
+                self.finished = true;
+            }
+            return Ok(Some(v));
+        }
+    }
 }
 
 thread_local! {
@@ -7071,6 +7178,9 @@ fn b_deleg_set(vm: &mut VM, _argc: u8) -> Value {
 /// element (`next`); without it the element is parked in `ahead` (`hasNext`),
 /// so asking twice runs the block once. `None` for a value that is not one.
 fn coro_iter_step(vm: &mut VM, it: &Value, take: bool) -> Option<Result<Option<Value>, String>> {
+    if let Some(step) = gen_iter_step(vm, it, take) {
+        return Some(step);
+    }
     let (coro, ahead) = with_obj(it, |o| match o {
         HeapObj::CoroIter { coro, ahead } => Some((coro.clone(), ahead.clone())),
         _ => None,
@@ -7090,6 +7200,118 @@ fn coro_iter_step(vm: &mut VM, it: &Value, take: bool) -> Option<Result<Option<V
         }
     });
     Some(Ok(cur))
+}
+
+/// [`coro_iter_step`] for a [`HeapObj::GenIter`]: the cursor is lifted out of
+/// the heap for the pull, because the pull runs the pipeline's lambdas.
+fn gen_iter_step(vm: &mut VM, it: &Value, take: bool) -> Option<Result<Option<Value>, String>> {
+    let (mut cursor, ahead) = with_obj_mut(it, |o| match o {
+        HeapObj::GenIter { cursor, ahead } => Some((cursor.clone(), ahead.take())),
+        _ => None,
+    })
+    .flatten()?;
+    let cur = match ahead {
+        Some(v) => Ok(Some(v)),
+        None => cursor.next(vm),
+    };
+    let park = match (&cur, take) {
+        (Ok(Some(v)), false) => Some(v.clone()),
+        _ => None,
+    };
+    with_obj_mut(it, |o| {
+        if let HeapObj::GenIter { cursor: c, ahead } = o {
+            *c = cursor;
+            *ahead = park;
+        }
+    });
+    Some(cur)
+}
+
+/// A `for` loop's iterator over `v` when it is a lazy source: an `iterator {
+/// … }` cursor as itself, a pipeline as a fresh [`HeapObj::GenIter`] over it.
+/// `None` for every other value.
+fn lazy_loop_iter(v: &Value) -> Option<Result<Value, String>> {
+    if with_obj(v, |o| {
+        matches!(o, HeapObj::CoroIter { .. } | HeapObj::GenIter { .. })
+    })
+    .unwrap_or(false)
+    {
+        return Some(Ok(v.clone()));
+    }
+    gen_parts(v)?;
+    Some(GenCursor::open(v, false).map(|c| {
+        alloc(HeapObj::GenIter {
+            cursor: Box::new(c),
+            ahead: None,
+        })
+    }))
+}
+
+fn is_lazy_iter(v: &Value) -> bool {
+    with_obj(v, |o| {
+        matches!(o, HeapObj::CoroIter { .. } | HeapObj::GenIter { .. })
+    })
+    .unwrap_or(false)
+}
+
+thread_local! {
+    /// The value [`KT_ITER_PULL`] answers once a lazy loop source has run dry
+    /// — see [`iter_end`].
+    static ITER_END: RefCell<Option<Value>> = const { RefCell::new(None) };
+}
+
+/// The end-of-source marker a lazy `for` loop tests with [`KT_ITER_END`]: a
+/// heap object of its own, so no element a program can produce is it.
+fn iter_end() -> Value {
+    ITER_END.with(|c| {
+        let mut c = c.borrow_mut();
+        let alive = c.as_ref().is_some_and(|v| with_obj(v, |_| ()).is_some());
+        if !alive {
+            *c = Some(alloc(HeapObj::List(Vec::new())));
+        }
+        c.clone().unwrap_or(Value::Undef)
+    })
+}
+
+fn is_iter_end(v: &Value) -> bool {
+    matches!(v, Value::Obj(_))
+        && ITER_END.with(
+            |c| matches!((c.borrow().as_ref(), v), (Some(Value::Obj(a)), Value::Obj(b)) if a == b),
+        )
+}
+
+/// `KT_ITER_SRC_LAZY` — see [`KT_ITER_SRC_LAZY`].
+fn b_iter_src_lazy(vm: &mut VM, argc: u8) -> Value {
+    let v = vm.pop();
+    match lazy_loop_iter(&v) {
+        Some(Ok(it)) => it,
+        Some(Err(e)) => {
+            fault(vm, e);
+            alloc_ro_list(Vec::new())
+        }
+        None => {
+            vm.push(v);
+            b_iter_src(vm, argc)
+        }
+    }
+}
+
+/// `KT_ITER_PULL` — see [`KT_ITER_PULL`].
+fn b_iter_pull(vm: &mut VM, _argc: u8) -> Value {
+    let i = vm.pop().to_int();
+    let recv = vm.pop();
+    if is_lazy_iter(&recv) {
+        return match coro_iter_step(vm, &recv, true) {
+            Some(Ok(Some(v))) => v,
+            Some(Ok(None)) | None => iter_end(),
+            Some(Err(e)) => {
+                fault(vm, e);
+                iter_end()
+            }
+        };
+    }
+    ensure_ordered(vm, &recv);
+    iter_at(&recv, i)
 }
 
 /// `KT_ITER_SRC` — see [`KT_ITER_SRC`].
@@ -12155,6 +12377,14 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             }));
         }
     }
+    // `seq.iterator()` over a lazy pipeline pulls one element per `next`, so
+    // the source's side effects interleave with the caller's.
+    if name == "iterator" && args.is_empty() && gen_parts(recv).is_some() {
+        return Ok(alloc(HeapObj::GenIter {
+            cursor: Box::new(GenCursor::open(recv, false)?),
+            ahead: None,
+        }));
+    }
     // `xs.iterator()` — the cursor over any iterable, including the `String`
     // and `Map` forms, which is why the argument is the RECEIVER and not a
     // materialized element list.
@@ -12194,6 +12424,9 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             }
             // `asSequence` on a sequence is the identity.
             "asSequence" => return Ok(recv.clone()),
+            // `withIndex()` is lazy too: an `IndexedValue` per element as it
+            // passes, numbered by the stage itself.
+            "withIndex" if args.is_empty() => return gen_with(vm, recv, Stage::WithIndex(0)),
             // The no-lambda prefix reads. Each needs a BOUNDED prefix, so each
             // asks for exactly that many elements rather than materializing the
             // pipeline — which on an endless one is the difference between an
@@ -14056,18 +14289,7 @@ fn sequence_member(
             let out = items
                 .iter()
                 .enumerate()
-                .map(|(i, v)| {
-                    alloc(HeapObj::Instance {
-                        class: "IndexedValue".to_string(),
-                        is_data: true,
-                        fields: vec![
-                            ("index".to_string(), Value::Int(i as i64)),
-                            ("value".to_string(), v.clone()),
-                        ],
-                        data_from: 0,
-                        data_len: 2,
-                    })
-                })
+                .map(|(i, v)| indexed_value(i as i64, v.clone()))
                 .collect();
             return Some(Ok(alloc(HeapObj::List(out))));
         }
@@ -14460,6 +14682,7 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
         | HeapObj::MatchGroup { .. }
         | HeapObj::Coro { .. }
         | HeapObj::CoroIter { .. }
+        | HeapObj::GenIter { .. }
         | HeapObj::Observed { .. }
         | HeapObj::F32(_)
         | HeapObj::I64(_)
@@ -15195,6 +15418,7 @@ fn obj_hash(recv: &Value) -> Option<i32> {
         | HeapObj::Iter { .. }
         | HeapObj::Coro { .. }
         | HeapObj::CoroIter { .. }
+        | HeapObj::GenIter { .. }
         | HeapObj::Observed { .. }
         | HeapObj::Klass { .. } => None,
         // `java.lang.Float.hashCode()` is `floatToIntBits`, which is NOT the
@@ -15285,7 +15509,7 @@ fn obj_label(recv: &Value) -> String {
         HeapObj::Iter { .. } => "Iterator".to_string(),
         HeapObj::Gen { .. } => "Sequence".to_string(),
         HeapObj::Coro { .. } => "SequenceScope".to_string(),
-        HeapObj::CoroIter { .. } => "Iterator".to_string(),
+        HeapObj::CoroIter { .. } | HeapObj::GenIter { .. } => "Iterator".to_string(),
         HeapObj::Observed { .. } => "ObservableProperty".to_string(),
         HeapObj::Grouping { .. } => "Grouping".to_string(),
         HeapObj::Range(r) => match (r.is_char, r.progression) {
@@ -15505,6 +15729,7 @@ fn display_obj(id: u32) -> String {
             }
             HeapObj::Iter { at, .. } => format!("(iterator at={at})"),
             HeapObj::CoroIter { .. } => "(iterator block)".to_string(),
+            HeapObj::GenIter { .. } => "(sequence iterator)".to_string(),
             // `IntRange.toString` is `first..last`; `IntProgression.toString` is
             // `first..last step n` ascending and `first downTo last step n`
             // descending, where `last` is the last element actually reached
