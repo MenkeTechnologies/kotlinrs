@@ -4514,17 +4514,6 @@ fn fault(vm: &mut VM, msg: impl Into<String>) {
     vm.request_halt();
 }
 
-/// The handler fusevm calls for every `Op::Extended`. The depth guard runs on
-/// every entry to a recursive function, so it is answered here, ahead of the
-/// one-arm-per-op match in [`handle_coercion`].
-fn handle_extension(vm: &mut VM, id: u16, arg: u8) {
-    if id == KT_DEPTH_GUARD {
-        depth_guard(vm);
-    } else {
-        handle_coercion(vm, id, arg);
-    }
-}
-
 /// `KT_DEPTH_GUARD` — see the constant.
 fn depth_guard(vm: &mut VM) {
     if vm.frames.len() > MAX_CALL_DEPTH {
@@ -5172,6 +5161,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             vm.push(Value::Bool(false));
         }
         KT_UNIT => vm.push(unit_value()),
+        KT_DEPTH_GUARD => depth_guard(vm),
         KT_MODCOUNT => {
             let v = vm.pop();
             vm.push(Value::Int(mod_count(&v) as i64));
@@ -5450,7 +5440,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
 pub fn install(vm: &mut VM) {
     reset_heap();
     register_builtins(vm);
-    vm.set_extension_handler(Box::new(handle_extension));
+    vm.set_extension_handler(Box::new(handle_coercion));
 }
 
 /// Switch `vm` to fusevm's *strict* numeric policy, routing every arithmetic or
@@ -5537,7 +5527,7 @@ pub fn install_debug(vm: &mut VM) {
         if id == KT_DBG_LINE {
             crate::dap::on_debug_line(vm);
         } else {
-            handle_extension(vm, id, arg);
+            handle_coercion(vm, id, arg);
         }
     }));
 }

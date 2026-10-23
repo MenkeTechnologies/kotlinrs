@@ -71,8 +71,8 @@ itself by name tests its depth on entry (`KT_DEPTH_GUARD`) and raises
 `StackOverflowError` past a million frames, twenty times the ~45 000 at which
 the reference overflows a one-parameter recursion, so no depth the reference
 completes is cut short. The test is one dispatched op per call and costs
-about 3.6% of a call-bound benchmark's retired instructions (`fib(27)`, debug
-build: 10.80 G unguarded, 11.19 G guarded; it was 11.93 G, 10.4%, when the
+about 4.4% of a call-bound benchmark's retired instructions (`fib(27)`, debug
+build: 10.80 G unguarded, 11.28 G guarded; it was 11.93 G, 10.4%, when the
 guard was two ops).
 
 ### `"ab".repeat(2000000000)` and `"a".padStart(2000000000)`
