@@ -11977,10 +11977,13 @@ fn sorted_range_member(name: &str) -> bool {
     )
 }
 
+/// A range view's recipe: `(source, member, arguments)`.
+type SortedRange = (Value, String, Vec<Value>);
+
 thread_local! {
     /// A sorted-collection range view → `(source, member, arguments)`: what
     /// [`refresh_sorted_view`] recomputes it from.
-    static SORTED_VIEWS: RefCell<std::collections::HashMap<u32, (Value, String, Vec<Value>)>> =
+    static SORTED_VIEWS: RefCell<std::collections::HashMap<u32, SortedRange>> =
         RefCell::new(std::collections::HashMap::new());
 }
 
