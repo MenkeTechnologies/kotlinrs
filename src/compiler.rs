@@ -6425,14 +6425,14 @@ impl Compiler {
                         0,
                     );
                 }
-                // A `Float` endpoint is boxed so the range keeps its width:
-                // `1.0f..3.0f` is a `ClosedFloatRange` and renders and hashes
-                // its endpoints as `Float`s. An integral endpoint stays bare —
-                // an `IntRange` reads it as a plain number.
+                // A `Float` or `Long` endpoint is boxed so the range keeps its
+                // width: `1.0f..3.0f` is a `ClosedFloatRange` that renders and
+                // hashes its endpoints as `Float`s, and `1L..3L` (or `1..3L`,
+                // `Int.rangeTo(Long)`) a `LongRange` whose elements are `Long`s.
+                // An `Int` endpoint stays bare — an `IntRange` reads it as a
+                // plain number.
                 for bound in [start, end] {
-                    if self.compile_expr(sc, bound)? == Type::Float {
-                        self.b.emit(Op::Extended(KT_BOX_F32, 0), 0);
-                    }
+                    self.compile_erased(sc, bound)?;
                 }
                 self.b.emit(Op::Extended(KT_RANGE, range_form(*kind)), 0);
                 Ok(Type::Obj)
@@ -6504,11 +6504,21 @@ impl Compiler {
                     };
                     let value = &self.as_long_if(sc, value, want);
                     self.compile_erased(sc, value)?;
+                    self.compile_expr(sc, container)?;
+                    self.b.emit(Op::CallBuiltin(KT_IN_VM, 2), 0);
                 } else {
+                    // A value statically `Int` or `Long` selects a range's
+                    // numeric `contains` overloads, which take either width; an
+                    // erased one compares by `equals` against the elements (see
+                    // `RangeObj::holds`). The flag is what tells `5 in 1L..10L`
+                    // from `(5 as Any) in 1L..10L`.
+                    let typed = matches!(self.infer(sc, value), Type::Int | Type::Long);
                     self.compile_expr(sc, value)?;
+                    self.compile_expr(sc, container)?;
+                    let flag = self.b.add_constant(Value::Bool(typed));
+                    self.b.emit(Op::LoadConst(flag), 0);
+                    self.b.emit(Op::CallBuiltin(KT_IN_VM, 3), 0);
                 }
-                self.compile_expr(sc, container)?;
-                self.b.emit(Op::CallBuiltin(KT_IN_VM, 2), 0);
                 if *negated {
                     self.b.emit(Op::LogNot, 0);
                 }
@@ -7502,7 +7512,12 @@ impl Compiler {
             && self.infer_class(sc, recv).is_some_and(|c| {
                 matches!(
                     c.as_str(),
-                    "IntRange" | "CharRange" | "IntProgression" | "CharProgression"
+                    "IntRange"
+                        | "LongRange"
+                        | "CharRange"
+                        | "IntProgression"
+                        | "LongProgression"
+                        | "CharProgression"
                 )
             })
         {
@@ -11485,14 +11500,22 @@ impl Compiler {
             // object: Kotlin's `1..5` compiles to `new IntRange(1, 5)`. An
             // empty one (`IntRange(5, 1)`) is a range whose end precedes its
             // start, exactly as `5..1` is.
-            "IntRange" | "LongRange" if args.len() == 2 => self.compile_expr(
-                sc,
-                &Expr::Range {
-                    start: Box::new(args[0].clone()),
-                    end: Box::new(args[1].clone()),
-                    kind: RangeKind::Inclusive,
-                },
-            ),
+            // `LongRange(1, 3)` takes `Long`s, so its `Int` literals are widened
+            // the way any `Long` parameter widens one.
+            "IntRange" | "LongRange" if args.len() == 2 => {
+                let ends = match name {
+                    "LongRange" => self.widen_to_long(sc, args),
+                    _ => args.to_vec(),
+                };
+                self.compile_expr(
+                    sc,
+                    &Expr::Range {
+                        start: Box::new(ends[0].clone()),
+                        end: Box::new(ends[1].clone()),
+                        kind: RangeKind::Inclusive,
+                    },
+                )
+            }
             // `listOfNotNull(a, b, c)` is `listOf(a, b, c).filterNotNull()` —
             // the nulls are dropped at run time because the frontend cannot see
             // which arguments are null (`listOfNotNull(maybe, "b")` depends on
@@ -14936,9 +14959,9 @@ impl Compiler {
             },
             // A range's elements are its endpoints' type: `Int`, or `Char` for
             // `'a'..'e'`.
-            Expr::Range { start, .. } => match self.infer(sc, start) {
-                Type::Char => Type::Char,
-                Type::Long => Type::Long,
+            Expr::Range { start, end, .. } => match (self.infer(sc, start), self.infer(sc, end)) {
+                (Type::Char, _) => Type::Char,
+                (Type::Long, _) | (_, Type::Long) => Type::Long,
                 _ => Type::Int,
             },
             Expr::Step { recv, .. } => self.infer_elem(sc, recv),
@@ -15892,7 +15915,13 @@ impl Compiler {
             }
             // Container names for dispatch. None of these is a user class, so
             // member access on them falls through to the host method table.
-            Expr::Range { .. } | Expr::Step { .. } => Some("IntRange".to_string()),
+            Expr::Range { .. } | Expr::Step { .. } => Some(
+                match self.infer_elem(sc, e) {
+                    Type::Long => "LongRange",
+                    _ => "IntRange",
+                }
+                .to_string(),
+            ),
             _ => None,
         }
     }

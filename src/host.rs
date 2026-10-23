@@ -2712,6 +2712,11 @@ struct RangeObj {
     /// the flip is an addition of 2^63). The elements are boxed back into the
     /// unsigned type.
     unsigned: u8,
+    /// `1L..3L` — a `LongRange`/`LongProgression`. Its endpoints ride as the
+    /// same `i64`s an `IntRange`'s do; this decides that its elements are boxed
+    /// `Long`s (see [`KT_BOX_I64`]), that it answers its own class, `equals`
+    /// and `hashCode`, and which erased values its `contains` lets in.
+    long: bool,
 }
 
 impl RangeObj {
@@ -2724,6 +2729,7 @@ impl RangeObj {
                 progression: false,
                 is_char,
                 unsigned: 0,
+                long: false,
             },
             // `until` is exclusive: it builds the `IntRange` `first..(end-1)`.
             // Kotlin guards the underflow by yielding an empty range instead of
@@ -2735,6 +2741,7 @@ impl RangeObj {
                 progression: false,
                 is_char,
                 unsigned: 0,
+                long: false,
             },
             RangeForm::DownTo => RangeObj {
                 first,
@@ -2743,6 +2750,7 @@ impl RangeObj {
                 progression: true,
                 is_char,
                 unsigned: 0,
+                long: false,
             },
         }
     }
@@ -2804,6 +2812,19 @@ impl RangeObj {
         }
     }
 
+    /// The simple class name of a signed range — `IntRange`, `LongProgression`,
+    /// `CharRange`, … (an unsigned one is named by its own arm).
+    fn class_name(&self) -> &'static str {
+        match (self.is_char, self.long, self.progression) {
+            (true, _, true) => "CharProgression",
+            (true, _, false) => "CharRange",
+            (false, true, true) => "LongProgression",
+            (false, true, false) => "LongRange",
+            (false, false, true) => "IntProgression",
+            (false, false, false) => "IntRange",
+        }
+    }
+
     /// Wrap a code point drawn from this range in its element type.
     fn wrap(&self, n: i64) -> Value {
         if self.is_char {
@@ -2812,6 +2833,8 @@ impl RangeObj {
             make_unsigned(64, (n ^ i64::MIN) as u64)
         } else if self.unsigned > 0 {
             make_unsigned(self.unsigned, n as u64)
+        } else if self.long {
+            box_i64(n)
         } else {
             Value::Int(n)
         }
@@ -2828,6 +2851,38 @@ impl RangeObj {
             (last, self.first)
         };
         v >= lo && v <= hi && (v - self.first) % self.step == 0
+    }
+
+    /// `value in self` — the element kind first, then [`RangeObj::contains`].
+    ///
+    /// `typed` says the value's STATIC type is `Int` or `Long`, which is where
+    /// Kotlin resolves the numeric overloads: `IntRange.contains(Int)`,
+    /// `LongRange.contains(Long)` and the `ClosedRange<Int>.contains(Long)` /
+    /// `ClosedRange<Long>.contains(Int)` extensions, so either width is a
+    /// member of either range. An ERASED value — `when (x: Any?) { in r -> }`
+    /// — resolves to `Iterable<Any?>.contains` instead, i.e. `equals` against
+    /// each element: a boxed `Long` equals no `IntRange` element and an `Int`
+    /// no `LongRange` one, while a `Double`, a `String` or `null` equals
+    /// neither.
+    fn holds(&self, value: &Value, typed: bool) -> bool {
+        let boxed_long = i64_box(value);
+        let kind_fits = if self.is_char {
+            is_char(value)
+        } else if self.unsigned > 0 {
+            unsigned_box(value).is_some()
+        } else if typed {
+            matches!(value, Value::Int(_)) || boxed_long.is_some()
+        } else if self.long {
+            boxed_long.is_some()
+        } else {
+            matches!(value, Value::Int(_))
+        };
+        let n = if self.unsigned == 64 {
+            num_of(value) ^ i64::MIN
+        } else {
+            boxed_long.unwrap_or_else(|| num_of(value))
+        };
+        kind_fits && self.contains(n)
     }
 
     fn to_vec(self) -> Vec<Value> {
@@ -5683,6 +5738,7 @@ fn is_char(v: &Value) -> bool {
 fn num_of(v: &Value) -> i64 {
     char_code(v)
         .or_else(|| unsigned_box(v).map(|u| u.1 as i64))
+        .or_else(|| i64_box(v))
         .unwrap_or_else(|| v.to_int())
 }
 
@@ -6477,6 +6533,9 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let unsigned = unsigned_box(&start)
                 .or(unsigned_box(&end))
                 .map_or(0, |u| u.0.max(32));
+            // A `Long` endpoint makes a `LongRange`: `Int.rangeTo(Long)` and
+            // `Long.rangeTo(Int)` both answer one.
+            let long = i64_box(&start).is_some() || i64_box(&end).is_some();
             let (first, end) = (num_of(&start), num_of(&end));
             let mut range = if unsigned > 0 && form == RangeForm::Until && end == 0 {
                 // `x until 0u` is the type's `EMPTY`, which is `MAX..0`.
@@ -6492,10 +6551,12 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
                 RangeObj::new(first, end, form, is_char)
             };
             range.unsigned = unsigned;
+            range.long = long;
             vm.push(alloc(HeapObj::Range(range)));
         }
         KT_RANGE_STEP => {
-            let n = vm.pop().to_int();
+            let n = vm.pop();
+            let n = num_of(&n);
             let recv = vm.pop();
             let base = with_obj(&recv, |o| match o {
                 HeapObj::Range(r) => Some(*r),
@@ -6531,7 +6592,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
         KT_IN => {
             let container = vm.pop();
             let value = vm.pop();
-            let has = contains_value(vm, &container, &value);
+            let has = contains_value(vm, &container, &value, false);
             vm.push(Value::Bool(has));
         }
         KT_ITER_SIZE => {
@@ -6996,7 +7057,7 @@ fn is_numeric_arg(v: &Value) -> bool {
 /// `value in container` for every container kind `in` accepts: numeric
 /// membership in a range, element membership in a `List` or array, key
 /// membership in a `Map`, and substring containment in a `String`.
-fn contains_value(vm: &mut VM, container: &Value, value: &Value) -> bool {
+fn contains_value(vm: &mut VM, container: &Value, value: &Value, typed: bool) -> bool {
     if let Value::Str(s) = container {
         return s.contains(&kotlin_string(value));
     }
@@ -7015,29 +7076,9 @@ fn contains_value(vm: &mut VM, container: &Value, value: &Value) -> bool {
     }
     let search = with_obj(container, |o| match o {
         // `'x' in 'a'..'z'` compares code units, like every other range test.
-        //
-        // An `IntRange` takes an `Int`, a `Long` (`ClosedRange<Int>.contains(
-        // Long)`) or a `Char` for a `CharRange`. Anything else can only have
-        // arrived through an erased position — `when (x: Any?) { in 1..3 -> }`
-        // — where the resolution is `Iterable<Any?>.contains`, i.e. `equals`
-        // against each element, and a `Double`, a boxed `Long`, a `String` or
-        // `null` equals no `Int`. Coercing those to a number made `2.0` and
-        // `"2"` members of `1..3`.
-        HeapObj::Range(r) => {
-            let kind_fits = if r.is_char {
-                is_char(value)
-            } else if r.unsigned > 0 {
-                unsigned_box(value).is_some()
-            } else {
-                matches!(value, Value::Int(_))
-            };
-            let n = if r.unsigned == 64 {
-                num_of(value) ^ i64::MIN
-            } else {
-                num_of(value)
-            };
-            Search::Range(kind_fits && r.contains(n))
-        }
+        // Coercing an erased value to a number made `2.0` and `"2"` members of
+        // `1..3`; see [`RangeObj::holds`] for which values each range lets in.
+        HeapObj::Range(r) => Search::Range(r.holds(value, typed)),
         HeapObj::FloatRange { start, end } => {
             Search::Range(float_range_contains(num_f64(start), num_f64(end), value))
         }
@@ -8135,12 +8176,16 @@ fn b_set_new(vm: &mut VM, argc: u8) -> Value {
     s
 }
 
-/// `KT_IN_VM` — see [`KT_IN_VM`]. Stack: `[value, container]`.
-fn b_in(vm: &mut VM, _argc: u8) -> Value {
+/// `KT_IN_VM` — see [`KT_IN_VM`]. Stack: `[value, container]`, or `[value,
+/// container, typed]` with three arguments: `typed` is a `Bool` saying the
+/// value's static type is `Int` or `Long`, which selects a range's numeric
+/// `contains` overloads (see [`RangeObj::holds`]).
+fn b_in(vm: &mut VM, argc: u8) -> Value {
+    let typed = argc == 3 && truthy(&vm.pop());
     let container = vm.pop();
     let value = vm.pop();
     refresh_sorted_view(vm, &container);
-    Value::Bool(contains_value(vm, &container, &value))
+    Value::Bool(contains_value(vm, &container, &value, typed))
 }
 
 /// `KT_INDEX_GET_VM` — see [`KT_INDEX_GET_VM`]. Stack: `[recv, index]`.
@@ -9107,12 +9152,16 @@ impl GenCursor {
         .flatten();
         let next = match range {
             Some(r) => {
-                let cur = char_code(&p).unwrap_or_else(|| p.to_int());
+                let cur = char_code(&p)
+                    .or_else(|| i64_box(&p))
+                    .unwrap_or_else(|| p.to_int());
                 if cur == r.last() {
                     return Ok(None);
                 }
                 if r.is_char {
                     char_of(cur + r.step)
+                } else if r.long {
+                    box_i64(cur + r.step)
                 } else {
                     Value::Int(cur + r.step)
                 }
@@ -12779,13 +12828,13 @@ fn sorted_view_write(
     }
     let out = match (name, args) {
         ("add" | "put", [key, ..]) => {
-            let had = contains_value(vm, &source, key);
+            let had = contains_value(vm, &source, key, false);
             let r = match kt_method(vm, &source, name, args) {
                 Ok(r) => r,
                 Err(e) => return Some(Err(e)),
             };
             refresh_sorted_view(vm, view);
-            if !contains_value(vm, view, key) {
+            if !contains_value(vm, view, key, false) {
                 if !had {
                     let _ = kt_method(vm, &source, "remove", std::slice::from_ref(key));
                     refresh_sorted_view(vm, view);
@@ -12797,7 +12846,7 @@ fn sorted_view_write(
             Ok(r)
         }
         ("remove", [key]) => {
-            if contains_value(vm, view, key) {
+            if contains_value(vm, view, key, false) {
                 kt_method(vm, &source, "remove", args)
             } else if with_obj(view, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false) {
                 Ok(Value::Undef)
@@ -16289,7 +16338,27 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // sign is how the progression knows its direction.
         if name == "step" {
             if let Some(r) = range {
-                return Ok(Value::Int(r.step));
+                return Ok(if r.long {
+                    box_i64(r.step)
+                } else {
+                    Value::Int(r.step)
+                });
+            }
+        }
+        // `ClosedRange.start`/`endInclusive` — a range's `first` and `last`,
+        // at its element type.
+        if matches!(name, "start" | "endInclusive") && args.is_empty() {
+            if let Some(r) = range {
+                let n = if name == "start" { r.first } else { r.last() };
+                return Ok(r.wrap(n));
+            }
+        }
+        // `r.contains(x)` is the range's own bounds test, which takes either
+        // integral width (see [`RangeObj::holds`]) and needs no elements —
+        // the snapshot below would build every one of them first.
+        if name == "contains" && args.len() == 1 {
+            if let Some(r) = range {
+                return Ok(Value::Bool(r.holds(&args[0], true)));
             }
         }
         // `(1..Int.MAX_VALUE).asSequence()` — a lazy pipeline whose SOURCE is
@@ -17727,6 +17796,7 @@ fn sequence_member(
                         progression: true,
                         is_char: is_char(&first),
                         unsigned,
+                        long: i64_box(&first).is_some(),
                     }))
                 }
                 None => alloc_ro_list(items.iter().rev().cloned().collect()),
@@ -18229,7 +18299,8 @@ fn index_set_inner(vm: &mut VM, recv: &Value, index: &Value, value: Value) -> Re
 }
 
 /// Structural equality — `==` over heap objects (recursively) and value
-/// equality over primitives. Ints and Doubles compare by numeric value.
+/// equality over primitives, class first the way a boxed number's `equals`
+/// is: an integral value never equals a floating-point one.
 pub fn value_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         // An unsigned value equals one of its own type and value only: a
@@ -18244,11 +18315,12 @@ pub fn value_eq(a: &Value, b: &Value) -> bool {
         _ if f32_box(a).is_some() || f32_box(b).is_some() => {
             match (f32_box(a), f32_box(b)) {
                 (Some(x), Some(y)) => (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits(),
-                // A box against a bare number compares numerically, the way an
-                // `Int` and a `Double` do above.
-                _ if matches!(a, Value::Int(_) | Value::Float(_))
-                    || matches!(b, Value::Int(_) | Value::Float(_)) =>
-                {
+                // A box against a bare `Value::Float` compares by value: a
+                // `Float`-typed operand travels UNBOXED (see [`KT_F32_ARITH`]),
+                // so the bare value may be a `Float` of the same width. A bare
+                // `Value::Int` is an integral width, never a `Float`, and
+                // `Float.equals` checks the class first.
+                _ if matches!(a, Value::Float(_)) || matches!(b, Value::Float(_)) => {
                     num_f64(a) == num_f64(b)
                 }
                 _ => false,
@@ -18261,12 +18333,10 @@ pub fn value_eq(a: &Value, b: &Value) -> bool {
         _ if i64_box(a).is_some() || i64_box(b).is_some() => {
             match (i64_box(a), i64_box(b)) {
                 (Some(x), Some(y)) => x == y,
-                // A `Long` against a `Double` still compares numerically: those
-                // are two different boxes on the JVM too, but `Value::Float` is
-                // where a Kotlin `Double` lives and `1L == 1.0` in a numeric
-                // position is the arithmetic comparison the native ops make.
-                (Some(x), None) => matches!(b, Value::Float(_)) && (x as f64) == b.to_float(),
-                (None, Some(y)) => matches!(a, Value::Float(_)) && a.to_float() == (y as f64),
+                // A `Long` never equals a `Double` or a `Float` either: `Long
+                // .equals` is false for any other class, and Kotlin refuses a
+                // typed `1L == 1.0` at compile time, so no numeric position
+                // reaches here with one.
                 _ => false,
             }
         }
@@ -18300,9 +18370,14 @@ pub fn value_eq(a: &Value, b: &Value) -> bool {
         (Value::Float(x), Value::Float(y)) => {
             (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits()
         }
-        (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_)) => {
-            a.to_float() == b.to_float()
-        }
+        // An integral value never equals a floating-point one. A bare
+        // `Value::Int` is an `Int`, `Short`, `Byte` or unboxed `Long`, a bare
+        // `Value::Float` a `Double` or unboxed `Float`, and every one of their
+        // boxes checks the class before the value: `(2.0 as Any) == 2`,
+        // `2.0 in listOf(1, 2, 3)` and `2 in listOf(2.0)` are all `false`.
+        // Kotlin rejects a TYPED `2.0 == 2` at compile time, so the only `==`
+        // that reaches here across the two kinds is the erased one.
+        (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_)) => false,
         (Value::Undef, Value::Undef) => true,
         _ => a == b,
     }
@@ -18407,8 +18482,10 @@ fn heap_eq(a: &HeapObj, b: &HeapObj) -> bool {
                     .all(|(k, v)| eb.iter().any(|(k2, v2)| value_eq(k, k2) && value_eq(v, v2)))
         }
         // `IntRange`/`IntProgression` define structural `equals`; two empty
-        // ranges are equal regardless of their endpoints, as in Kotlin.
-        (HeapObj::Range(a), HeapObj::Range(b)) => {
+        // ranges are equal regardless of their endpoints, as in Kotlin. Each
+        // class's `equals` checks the class first, so an `IntRange` never
+        // equals a `LongRange` with the same elements.
+        (HeapObj::Range(a), HeapObj::Range(b)) if a.long == b.long => {
             let (ea, eb) = (a.count() == 0, b.count() == 0);
             (ea && eb)
                 || (!ea && !eb && a.first == b.first && a.last() == b.last() && a.step == b.step)
@@ -18616,6 +18693,20 @@ fn obj_hash(recv: &Value) -> Option<i32> {
         // An empty progression hashes to -1. `IntRange` folds `31 * first +
         // last`; `IntProgression` adds the step, `31 * (31 * first + last) +
         // step`. `last` is the last ELEMENT, not the written endpoint.
+        // `LongRange` folds each `Long` through its own hash, `x xor (x ushr
+        // 32)`, combines in `Long` arithmetic and narrows the result.
+        HeapObj::Range(r) if r.long => Some(if r.count() == 0 {
+            -1
+        } else {
+            let fold = |x: i64| x ^ ((x as u64) >> 32) as i64;
+            let base = fold(r.first).wrapping_mul(31).wrapping_add(fold(r.last()));
+            let full = if r.progression {
+                base.wrapping_mul(31).wrapping_add(fold(r.step))
+            } else {
+                base
+            };
+            full as i32
+        }),
         HeapObj::Range(r) => Some(if r.count() == 0 {
             -1
         } else {
@@ -18692,13 +18783,7 @@ fn obj_label(recv: &Value) -> String {
         HeapObj::CoroIter { .. } | HeapObj::GenIter { .. } => "Iterator".to_string(),
         HeapObj::Observed { .. } => "ObservableProperty".to_string(),
         HeapObj::Grouping { .. } => "Grouping".to_string(),
-        HeapObj::Range(r) => match (r.is_char, r.progression) {
-            (true, true) => "CharProgression",
-            (true, false) => "CharRange",
-            (false, true) => "IntProgression",
-            (false, false) => "IntRange",
-        }
-        .to_string(),
+        HeapObj::Range(r) => r.class_name().to_string(),
         HeapObj::FloatRange { start, .. } => float_range_class(start).to_string(),
         HeapObj::Array { .. } => "Array".to_string(),
         HeapObj::Builder { .. } => "StringBuilder".to_string(),
@@ -19226,16 +19311,7 @@ fn runtime_jvm_class(v: &Value) -> Option<(String, bool)> {
             ),
             false,
         )),
-        HeapObj::Range(r) => Some((
-            match (r.is_char, r.progression) {
-                (true, true) => "kotlin.ranges.CharProgression",
-                (true, false) => "kotlin.ranges.CharRange",
-                (false, true) => "kotlin.ranges.IntProgression",
-                (false, false) => "kotlin.ranges.IntRange",
-            }
-            .to_string(),
-            false,
-        )),
+        HeapObj::Range(r) => Some((format!("kotlin.ranges.{}", r.class_name()), false)),
         HeapObj::FloatRange { start, .. } => {
             Some((format!("kotlin.ranges.{}", float_range_class(start)), false))
         }
@@ -19510,6 +19586,18 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         }
         "Pair" => with_obj(v, |o| matches!(o, HeapObj::Pair(_, _))).unwrap_or(false),
         "Triple" => with_obj(v, |o| matches!(o, HeapObj::Triple(_, _, _))).unwrap_or(false),
+        // A signed range is its own class, and every `…Range` extends the
+        // `…Progression` of its element type: `(1..3) is IntProgression` holds,
+        // `(1L..3L) is IntRange` does not.
+        "IntRange" | "LongRange" | "CharRange" | "IntProgression" | "LongProgression"
+        | "CharProgression" => with_obj(v, |o| match o {
+            HeapObj::Range(r) if r.unsigned == 0 => {
+                let class = r.class_name();
+                class == ty || class.replace("Range", "Progression") == ty
+            }
+            _ => false,
+        })
+        .unwrap_or(false),
         // Each array type is its own JVM class, told apart by the descriptor:
         // `Array<T>` is a reference array (`[L…;`), and a primitive array is
         // NOT one — `intArrayOf(1) is Array<*>` is `false`.

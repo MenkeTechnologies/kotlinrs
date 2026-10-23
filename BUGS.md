@@ -474,25 +474,17 @@ Measured on `kotlinc` 2.4.21 / JDK 25.0.5, compiled and run on the same JVM.
 
 | program | kotlinrs | reference |
 | --- | --- | --- |
-| `val x: Any? = 2.0`; `println(x == 2)`, `x in listOf(1, 2, 3)`; `val y: Any = 2`; `y in listOf(2.0)` | `true`, `true`, `true` | `false`, `false`, `false` — `Double.equals(Integer)` checks the class first |
-| `val b: Any = 5`; `b in 1L..10L` | `true` | `false` |
-| `val a: Any = 5L`; `a in 1L..10L` | `false` | `true` |
+| `val f: Any = 2.0f; val d: Any = 2.0`; `f == d`, `listOf(2.0).contains(f)` | `true`, `true` | `false`, `false` — `Float.equals(Double)` checks the class first |
 | `class P(val xs: List<Int>) { constructor(vararg v: Int) : this(v.toList()) }` | `expected Colon, found Ident("v")` | `P(1, 2, 3).xs` is `[1, 2, 3]` |
 
-The first row is `value_eq`, whose `Int`/`Double` arm compares numerically. An
-erased `==` on the JVM is `Intrinsics.areEqual`, i.e. the boxed class's
-`equals`, so a `Double` never equals an `Int`. The arm is not simply wrong,
-though: a `Double`-typed result can still be a `Value::Int` at run time (see
-`KT_DDIV`), and making the arm class-strict would turn those into false
-negatives. Closing it needs the `Double` width carried on the value, the way
-`Long` and `Float` already are.
-
-The two `LongRange` rows are one cause: a `RangeObj` keeps no width, so
-`1L..10L` and `1..10` are the same value. An erased `Int` is let in where the
-JVM's `LongRange.contains` (an `Iterable<Long>` test here) refuses it, and a
-boxed `Long` is turned away, because an `IntRange` must refuse it and the range
-cannot say which one it is. The boxed-`Long` row answered `false` before this
-round's `in` fix as well.
+The erased `Int`/`Double`, `Long`/`Double` and `LongRange` rows this section
+recorded are closed (CHANGELOG, "Erased numbers compare by class; `LongRange`
+keeps its width"). The first row left is what remains of them: a boxed `Float`
+against a bare `Value::Float` still compares by value, because a `Float`-typed
+operand travels UNBOXED (`KT_F32_ARITH` pushes a bare `Value::Float`), so the
+bare value may be a `Float` of the same width or a `Double`, and nothing on it
+says which. Making that arm class-strict is only sound once every `Float` that
+can reach `value_eq` is boxed first, and those paths have not been audited.
 
 The `vararg` row is the secondary-constructor parser, which still refuses the
 modifier rather than mis-binding it.

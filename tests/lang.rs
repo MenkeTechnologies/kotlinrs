@@ -10477,3 +10477,62 @@ fun main() {
         "pa 4\n{k=[7, 8]}\n"
     );
 }
+
+/// An erased `==` is the boxed class's `equals`, which checks the class before
+/// the value: no integral box equals a floating-point one, and a `Long` box
+/// equals neither an `Int` nor a `Double`. Measured against kotlinc 2.4.21 /
+/// JDK 25.
+#[test]
+fn erased_numbers_of_different_classes_are_never_equal() {
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    val x: Any? = 2.0
+    val y: Any = 2
+    val l: Any = 2L
+    val f: Any = 2.0f
+    println(listOf(x == 2, x in listOf(1, 2, 3), y in listOf(2.0), x == 2.0))
+    println(listOf(l == x, x == l, f == y, y == f, l == f, y == 2))
+    println(listOf(1, 2.0, 3L).indexOf(2))
+    println(listOf<Any>(2, 2.0, 2L).distinct())
+    println(mapOf<Any, String>(1 to "i", 1.0 to "d", 1L to "l").size)
+    println(listOf<Any>(3.0 / 1.5).contains(2))
+}"##
+        ),
+        "[false, false, false, true]\n[false, false, false, false, false, true]\n-1\n[2, 2.0, 2]\n3\nfalse\n"
+    );
+}
+
+/// `1L..10L` is a `LongRange`: its elements are `Long`s, it is its own class
+/// with its own `equals`/`hashCode`, and `contains` takes either width from a
+/// typed value but only a `Long` from an erased one. Measured against kotlinc
+/// 2.4.21 / JDK 25.
+#[test]
+fn long_ranges_keep_their_width() {
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    val i = 5
+    val l = 5L
+    val b: Any = 5
+    val a: Any = 5L
+    println(listOf(i in 1L..10L, l in 1..10, b in 1L..10L, a in 1L..10L, b in 1..10, a in 1..10))
+    println(listOf((1L..10L).contains(i), (1..10).contains(l)))
+    val r: Any = 1L..3L
+    println(listOf(r is LongRange, r is IntRange, r is LongProgression, (1..3) is IntProgression))
+    println((1L..3L).toList() == listOf(1L, 2L, 3L))
+    println((1L..3L).toList().contains(2L))
+    val xs: List<Any> = (1L..2L).toList()
+    println(listOf(xs.contains(1), xs.contains(1L), xs[0] is Long))
+    println((1..4L).toList().contains(4L))
+    println(listOf((1..3) == (1L..3L) as Any, LongRange(1, 3) == 1L..3L))
+    println(listOf((1L..3L).hashCode(), (1L..10L step 3).hashCode(), (-5L..5_000_000_000L).hashCode()))
+    println((1L until 4L).reversed().javaClass.name)
+    val z: Any = 3
+    println(when (z) { in 1L..5L -> "in"; else -> "out" })
+    println(listOf((1L..9L).start, (1L..9L).endInclusive, (1..9).endInclusive))
+}"##
+        ),
+        "[true, true, false, true, true, false]\n[true, true]\n[true, false, true, true]\ntrue\ntrue\n[false, true, true]\ntrue\n[false, true]\n[34, 1274, 705032829]\nkotlin.ranges.LongProgression\nout\n[1, 9, 9]\n"
+    );
+}

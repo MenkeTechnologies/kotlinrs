@@ -457,7 +457,8 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   class metadata), `Double` folds `doubleToLongBits`, `Boolean` is `1231`/`1237`,
   `String` is the `31`-polynomial over UTF-16 units, a `List` folds `31`, a `Set`
   and a `Map` SUM (so insertion order cannot matter), a `Map.Entry` is
-  `key xor value`, an `IntRange` is `31 * first + last` and an `IntProgression`
+  `key xor value`, an `IntRange` is `31 * first + last` (a `LongRange` folds each
+  end through `Long.hashCode` first) and an `IntProgression`
   folds that once more before adding its step, `31 * (31 * first + last) + step`
   (so `(1..5).hashCode()` is `36` and `(1..9 step 2).hashCode()` is `1242`, not
   `42`). The identity-hashed kinds — a non-`data` class instance, an
@@ -566,9 +567,13 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   (`IntRange` shows `1..5`, `IntProgression` shows `1..9 step 2` — its last
   *reachable* element), aggregated (`(1..3).sum()`), mapped/filtered, and
   iterated. `x in r` / `x !in r` is step-aligned membership; `in` also works over
-  a `List`, a `Map`'s keys, and a `String`'s substrings. An `IntRange` admits only
-  an `Int` through an untyped subject (`when (x: Any?) { in 1..3 -> }` does not
-  match `2.0`). `1.0..3.0` and `1.0f..3.0f` are `ClosedDoubleRange` /
+  a `List`, a `Map`'s keys, and a `String`'s substrings. A `Long` endpoint
+  (`1L..10L`, `1..10L`, `LongRange(1, 3)`) makes a `LongRange`/`LongProgression`:
+  its elements are `Long`s, and it is its own class with its own `equals` and
+  `hashCode`. A typed `Int` or `Long` is a member of either width's range, while
+  an untyped subject is compared by `equals`, so `when (x: Any?) { in 1..3 -> }`
+  matches only an `Int` (not `2.0`, not `2L`) and `in 1L..3L` only a `Long`.
+  `start`/`endInclusive` read a range's ends. `1.0..3.0` and `1.0f..3.0f` are `ClosedDoubleRange` /
   `ClosedFloatRange`, with `start`, `endInclusive`, `isEmpty()` and an IEEE
   `contains`.
   `List(n) { … }` and `MutableList(n) { … }` build the same way an array

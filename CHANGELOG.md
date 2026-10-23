@@ -11,6 +11,41 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Erased numbers compare by class; `LongRange` keeps its width
+
+Measured on `kotlinc` 2.4.21 / JDK 25.0.5.
+
+| program | before | reference |
+| --- | --- | --- |
+| `val x: Any? = 2.0`; `x == 2`, `x in listOf(1, 2, 3)`; `val y: Any = 2`; `y in listOf(2.0)` | `true`, `true`, `true` | `false`, `false`, `false` |
+| `(2L as Any) == (2.0 as Any)`, `(2.0f as Any) == (2 as Any)` | `true`, `true` | `false`, `false` |
+| `(1L..3L).toList().contains(2L)`, `(1L..3L).toList() == listOf(1L, 2L, 3L)` | `false`, `false` | `true`, `true` |
+| `val l = 5L`; `(1L..10L).contains(l)`, `(1..10).contains(l)` | `false`, `false` | `true`, `true` |
+| `val b: Any = 5; b in 1L..10L`; `val a: Any = 5L; a in 1L..10L` | `true`, `false` | `false`, `true` |
+| `val r: Any = 1L..3L; r is LongRange`, `(1L..3L).javaClass.name` | `false`, `kotlin.ranges.IntRange` | `true`, `kotlin.ranges.LongRange` |
+| `(1..3) == (1L..3L) as Any`, `LongRange(1, 3) == 1L..3L` | `true`, `true` | `false`, `true` |
+| `(-5L..5_000_000_000L).hashCode()` | `705032549` | `705032829` |
+| `(1..9).start`, `(1..9).endInclusive` | `unresolved reference: start on IntRange` | `1`, `9` |
+
+`value_eq`'s `Int`/`Double` arm compared numerically, on the stated worry that
+a `Double`-typed result could still be a `Value::Int` at run time. Probing 55
+`Double`-producing expressions (literals, conversions, `kotlin.math`, `op=`,
+folds, array reads, loops) found none, and every `==` that reaches `value_eq`
+across the two kinds is an erased one, since `kotlinc` refuses a typed `2.0 ==
+2` and `1L == 1.0`. So the arm now answers `false`, as `Double.equals(Integer)`
+does, and so do a boxed `Long` against any floating-point value and a boxed
+`Float` against an integral one. A boxed `Float` against a bare floating-point
+value still compares by value (see BUGS.md, round 22).
+
+A `RangeObj` now records a `Long` width: a `Long` endpoint is boxed on its way
+into `KT_RANGE` (the way a `Float` one already was), which makes the range a
+`LongRange`/`LongProgression` whose elements are boxed `Long`s, with its own
+class name, `equals` and `hashCode`. Membership follows the overload Kotlin
+picks: a value statically `Int` or `Long` takes the numeric `contains` of
+either width (`KT_IN_VM` carries that as a third argument), while an erased one
+is `equals` against the elements. `r.contains(x)` answers by bounds rather than
+by building every element first.
+
 ## `+x`, `a..<b`, and `op=` on a value
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
