@@ -359,8 +359,11 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   call reaches the subclass's override, which reads the subclass's own fields at
   their zero values, as on the JVM. A class whose chain holds a throwable, an
   enum or an object expression keeps the older build-then-extend lowering.
-  An `object` that has an `init` block or an initializer with an effect is built
-  on FIRST USE, and a companion with the first construction of its owner.
+  An `object` is built on FIRST USE (only one of literal constants is built up
+  front, which no program can tell apart), and a companion with the first
+  construction of its owner. An initializer that throws an `Exception` surfaces
+  as `ExceptionInInitializerError` at that access, and every later access as
+  `NoClassDefFoundError: Could not initialize class …`, as on the JVM.
   A **`companion object`** (one per class, named or not) is hoisted to a
   singleton reached through the class name — `C.K`, `C.of(…)` — and, from inside
   the class, with no qualifier at all.

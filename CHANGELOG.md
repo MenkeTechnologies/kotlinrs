@@ -11,6 +11,24 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## A throwing `object` initializer
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, compiled and run on the same JVM.
+
+| program | before | reference |
+| --- | --- | --- |
+| `object O { init { throw IllegalStateException("in init") }; val x = 1 }`; `O.x` | `IllegalStateException: in init` | `ExceptionInInitializerError`, its `cause` the `IllegalStateException` |
+| the same `O.x` a second time | `0` — the half-built object | `NoClassDefFoundError: Could not initialize class O` (cause `ExceptionInInitializerError: Exception java.lang.IllegalStateException: in init [in thread "main"]`) |
+| `object E { val y: Int = error("boom") }` beside `O`; `O.x` | `IllegalStateException: boom` — `E` was built at program start | only `O`'s own initializer runs |
+| a companion's `init` throwing; `C.k` twice | the exception, then `0` | `ExceptionInInitializerError`, then `Could not initialize class C` |
+| `object S { init { throw StackOverflowError() } }` | `StackOverflowError` | `StackOverflowError` — an `Error` is not wrapped |
+| uncaught | `Exception in thread "main" java.lang.IllegalStateException: boom` | `Exception in thread "main" java.lang.ExceptionInInitializerError` |
+
+Every `object` but one of literal constants is now built on first use, since
+any other initializer may throw. The first-use call is bracketed by
+`KT_OBJ_INIT_ENTER`/`KT_OBJ_INIT_EXIT`, which wrap an in-flight `Exception`,
+record the object as failed, and clear its half-built global.
+
 ## User classes implementing `Iterable`
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.

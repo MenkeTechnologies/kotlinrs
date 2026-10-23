@@ -8583,3 +8583,49 @@ fun main() {
         "true\ntrue\n0\ntrue\n"
     );
 }
+
+#[test]
+fn an_object_initializer_that_throws_is_an_exception_in_initializer_error() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. The first access raises
+    // `ExceptionInInitializerError` (its cause the exception; an `Error`
+    // passes through), every later one `NoClassDefFoundError`. An object whose
+    // property initializer called a stdlib function was built eagerly at
+    // program start, so its fault surfaced at an unrelated access.
+    assert_eq!(
+        stdout(
+            r##"object O { init { println("init O"); if (true) throw IllegalStateException("in init") }; val x = 1 }
+object E { val y: Int = error("boom") }
+object S { init { throw StackOverflowError() } ; val z = 2 }
+class C { companion object { init { println("comp init"); throw IllegalArgumentException("comp") }; val k = 3 } }
+fun main() {
+    try { println(O.x) } catch (e: Throwable) { println("1 $e / ${e.cause} / ${e.message}") }
+    try { println(O.x) } catch (e: Throwable) { println("2 $e / ${e.cause}") }
+    try { println(E.y) } catch (e: Throwable) { println("3 $e / ${e.cause}") }
+    try { println(S.z) } catch (e: Throwable) { println("4 $e / ${e.cause}") }
+    try { println(C.k) } catch (e: Throwable) { println("5 $e / ${e.cause}") }
+    try { println(C.k) } catch (e: Throwable) { println("6 $e / ${e.cause}") }
+    try { println(O.x) } catch (e: ExceptionInInitializerError) { println("7 eiie") } catch (e: Throwable) { println("7 other $e") }
+}"##
+        ),
+        "init O\n1 java.lang.ExceptionInInitializerError / java.lang.IllegalStateException: in init / null\n2 java.lang.NoClassDefFoundError: Could not initialize class O / java.lang.ExceptionInInitializerError: Exception java.lang.IllegalStateException: in init [in thread \"main\"]\n3 java.lang.ExceptionInInitializerError / java.lang.IllegalStateException: boom\n4 java.lang.StackOverflowError / null\ncomp init\n5 java.lang.ExceptionInInitializerError / java.lang.IllegalArgumentException: comp\n6 java.lang.NoClassDefFoundError: Could not initialize class C / java.lang.ExceptionInInitializerError: Exception java.lang.IllegalArgumentException: comp [in thread \"main\"]\n7 other java.lang.NoClassDefFoundError: Could not initialize class O\n"
+    );
+    assert_eq!(
+        stdout(
+            r##"object A { init { println("A init") }; val v = B.w + 1 }
+object B { init { println("B init") }; val w = 10 * 2 }
+object Cfg { val list = listOf(1, 2).map { it * 2 }; val n = list.size }
+object Plain { val k = 5; val s = "x" }
+fun main() {
+    println("main")
+    println(Cfg.n)
+    println(A.v)
+    println(B.w)
+    println(Plain.k)
+}"##
+        ),
+        "main\n2\nA init\nB init\n21\n20\n5\n"
+    );
+    let out = eval("object O { val x: Int = error(\"boom\") }\nfun main() { println(\"start\"); println(O.x) }");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "start\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("java.lang.ExceptionInInitializerError"));
+}

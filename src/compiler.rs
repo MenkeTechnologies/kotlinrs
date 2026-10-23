@@ -32,10 +32,11 @@ use crate::host::{
     KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_END, KT_ITER_GET, KT_ITER_PULL, KT_ITER_SIZE, KT_ITER_SRC,
     KT_ITER_SRC_LAZY, KT_JOIN, KT_LATEINIT, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO,
     KT_LIST_TAG, KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW, KT_NLR_MATCH,
-    KT_NLR_RAISE, KT_NLR_TAKE, KT_NOTNULL, KT_OBJEQ_VM, KT_OBSERVE, KT_OPER_REG, KT_OPER_VM,
-    KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANDOM, KT_RANGE, KT_RANGE_STEP, KT_REIFIED,
-    KT_REIFY, KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM,
-    KT_STR_ORDER, KT_SYSTEM, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG, KT_YIELD,
+    KT_NLR_RAISE, KT_NLR_TAKE, KT_NOTNULL, KT_OBJEQ_VM, KT_OBJ_INIT_ENTER, KT_OBJ_INIT_EXIT,
+    KT_OBSERVE, KT_OPER_REG, KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANDOM,
+    KT_RANGE, KT_RANGE_STEP, KT_REIFIED, KT_REIFY, KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN,
+    KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_STR_ORDER, KT_SYSTEM, KT_TOSTRING_REG, KT_TO_STRING,
+    KT_TYPE_REG, KT_YIELD,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
@@ -3252,11 +3253,14 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         .chain(["println".to_string(), "print".to_string()])
         .collect();
     for cd in &program.classes {
+        // Anything but a literal can throw (`error("boom")`, `1 / 0`), and a
+        // throw from an initializer is observable — it is the access that
+        // raises `ExceptionInInitializerError` — so only an object of literal
+        // constants keeps the eager form.
         let effectful = !cd.inits.is_empty()
-            || cd
-                .obj_props
-                .iter()
-                .any(|p| expr_names(&p.init).iter().any(|n| user_calls.contains(n)));
+            || cd.obj_props.iter().any(|p| {
+                expr_names(&p.init).iter().any(|n| user_calls.contains(n)) || !is_literal(&p.init)
+            });
         if cd.is_object && effectful && c.object_chained(cd) {
             c.lazy_objects.insert(cd.name.clone());
         }
@@ -3528,10 +3532,34 @@ impl Compiler {
         self.b.emit(Op::Extended(KT_ISNULL, 0), 0);
         let built = self.b.emit(Op::JumpIfFalse(0), 0);
         self.b.emit(Op::Pop, 0);
+        // The initializer runs bracketed by `KT_OBJ_INIT_ENTER`/`EXIT`, which
+        // turn an exception it throws into the JVM's
+        // `ExceptionInInitializerError` and a later access to the failed
+        // object into `NoClassDefFoundError`.
+        let name = self.b.add_constant(Value::str(obj.to_string()));
+        self.b.emit(Op::LoadConst(name), 0);
+        self.b.emit(Op::Extended(KT_OBJ_INIT_ENTER, 0), 0);
+        let failed = self.b.emit(Op::JumpIfFalse(0), 0);
         let init = self.b.add_name(&object_init_sub_name(obj));
         self.b.emit(Op::Call(init, 0), 0);
+        self.b.emit(Op::LoadConst(name), 0);
+        self.b.emit(Op::Extended(KT_OBJ_INIT_EXIT, 0), 0);
+        // A failed initializer leaves its half-built instance in the global;
+        // clearing it routes the next access back through `ENTER`, which
+        // answers `NoClassDefFoundError`.
+        let ok = self.b.emit(Op::JumpIfFalse(0), 0);
+        self.b.emit(Op::LoadUndef, 0);
+        let g = self.b.add_name(obj);
+        self.b.emit(Op::SetVar(g), 0);
+        let here = self.b.current_pos();
+        self.b.patch_jump(ok, here);
+        let done = self.b.emit(Op::Jump(0), 0);
+        let at = self.b.current_pos();
+        self.b.patch_jump(failed, at);
+        self.b.emit(Op::LoadUndef, 0);
         let end = self.b.current_pos();
         self.b.patch_jump(built, end);
+        self.b.patch_jump(done, end);
     }
 
     /// Initialize the companion of `class` — Kotlin runs it with the class's

@@ -313,6 +313,18 @@ pub const KT_ITER_PULL: u16 = 152;
 /// [`KT_ITER_PULL`] answers for an exhausted lazy source. Stack `[value]`;
 /// pushes a `Bool`.
 pub const KT_ITER_END: u16 = 153;
+/// `KT_OBJ_INIT_ENTER`: an `object`'s first-use initializer is about to run.
+/// Stack `[nameStr]`; pushes whether to run it. An object whose initializer
+/// already failed is not run again: the access raises
+/// `NoClassDefFoundError: Could not initialize class …` instead, as the JVM's
+/// erroneous-class state does.
+pub const KT_OBJ_INIT_ENTER: u16 = 154;
+/// `KT_OBJ_INIT_EXIT`: the initializer returned. Stack `[instance, nameStr]`;
+/// leaves the instance and pushes whether it FAILED. An `Exception` in flight
+/// is wrapped in an
+/// `ExceptionInInitializerError` whose cause it is, and the object recorded
+/// as failed; an `Error` propagates as it is.
+pub const KT_OBJ_INIT_EXIT: u16 = 155;
 
 /// `KT_SEQ_NEW`: build the lazy `Sequence` a `sequence { … }` block denotes.
 /// Stack `[blockClosure]`; pushes a `Gen` whose source is a fresh coroutine.
@@ -2291,6 +2303,8 @@ fn reset_heap() {
     ONCE_TOKEN.with(|t| t.borrow_mut().clear());
     ONCE_CONSUMED.with(|t| t.borrow_mut().clear());
     ITER_END.with(|c| *c.borrow_mut() = None);
+    FAILED_INIT.with(|f| f.borrow_mut().clear());
+    INIT_DEPTH.with(|d| d.set(0));
     TYPES.with(|t| t.borrow_mut().clear());
     TOSTRING_SUBS.with(|t| t.borrow_mut().clear());
     EQUALS_SUBS.with(|t| t.borrow_mut().clear());
@@ -2327,6 +2341,33 @@ fn reset_heap() {
 // handler; the handler's [`KT_EXC_CUT`] then discards those stranded operands.
 // A program with no `try` pays nothing — no check is emitted and a fault halts
 // exactly as it did before.
+
+thread_local! {
+    /// The `object`s whose initializer threw, with what it threw — see
+    /// [`KT_OBJ_INIT_ENTER`].
+    static FAILED_INIT: RefCell<std::collections::HashMap<String, Value>> =
+        RefCell::new(std::collections::HashMap::new());
+    /// How many `object` initializers are running, so an UNCATCHABLE fault
+    /// inside one is reported as the `ExceptionInInitializerError` the JVM
+    /// raises for it.
+    static INIT_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The JVM class a failed initializer names: an object's own binary name, and
+/// for a companion its OWNER, whose static initializer runs the companion's.
+fn init_class_name(obj: &str) -> &str {
+    obj.strip_suffix("$Companion").unwrap_or(obj)
+}
+
+/// The report line of an uncatchable fault: an `Exception` raised inside an
+/// `object` initializer surfaces as `ExceptionInInitializerError`.
+fn uncaught_line(line: String, is_error: bool) -> String {
+    if INIT_DEPTH.with(|d| d.get()) > 0 && !is_error {
+        "java.lang.ExceptionInInitializerError".to_string()
+    } else {
+        line
+    }
+}
 
 thread_local! {
     /// The exception currently unwinding, if any.
@@ -2371,7 +2412,7 @@ fn raise(vm: &mut VM, exc: Value) {
     KT_ERROR.with(|e| {
         *e.borrow_mut() = Some(format!(
             "Exception in thread \"main\" {}",
-            throwable_str(&exc)
+            uncaught_line(throwable_str(&exc), throwable_matches(&exc, "Error"))
         ))
     });
     vm.request_halt();
@@ -2500,6 +2541,12 @@ pub const BUILTIN_THROWABLES: &[(&str, &str)] = &[
     // — see [`NESTED_RUN_LIMIT`].
     ("VirtualMachineError", "java.lang.VirtualMachineError"),
     ("StackOverflowError", "java.lang.StackOverflowError"),
+    ("LinkageError", "java.lang.LinkageError"),
+    (
+        "ExceptionInInitializerError",
+        "java.lang.ExceptionInInitializerError",
+    ),
+    ("NoClassDefFoundError", "java.lang.NoClassDefFoundError"),
     (
         "PatternSyntaxException",
         "java.util.regex.PatternSyntaxException",
@@ -2558,6 +2605,9 @@ const THROWABLE_PARENTS: &[(&str, &str)] = &[
     ("IllegalFormatFlagsException", "IllegalFormatException"),
     ("VirtualMachineError", "Error"),
     ("StackOverflowError", "VirtualMachineError"),
+    ("LinkageError", "Error"),
+    ("ExceptionInInitializerError", "LinkageError"),
+    ("NoClassDefFoundError", "LinkageError"),
     ("PatternSyntaxException", "IllegalArgumentException"),
 ];
 
@@ -4127,7 +4177,13 @@ fn fault(vm: &mut VM, msg: impl Into<String>) {
     // stop the run. A JVM throwable gets the report line `java` prints for one
     // that reached the top of `main`; a kotlinrs-internal message stays bare.
     let msg = if throwable {
-        format!("Exception in thread \"main\" {msg}")
+        format!(
+            "Exception in thread \"main\" {}",
+            uncaught_line(
+                msg.clone(),
+                throwable_from_message(&msg).is_some_and(|e| throwable_matches(&e, "Error"))
+            )
+        )
     } else {
         msg
     };
@@ -4723,6 +4779,51 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
                     vm.push(Value::Int(0));
                 }
             }
+        }
+        KT_OBJ_INIT_ENTER => {
+            let name = vm.pop().to_str();
+            let failed = FAILED_INIT.with(|f| f.borrow().get(&name).cloned());
+            match failed {
+                Some(cause) => {
+                    let eiie = new_throwable(
+                        "java.lang.ExceptionInInitializerError",
+                        Some(&format!(
+                            "Exception {} [in thread \"main\"]",
+                            throwable_str(&cause)
+                        )),
+                    );
+                    let ncdfe = new_throwable(
+                        "java.lang.NoClassDefFoundError",
+                        Some(&format!(
+                            "Could not initialize class {}",
+                            init_class_name(&name)
+                        )),
+                    );
+                    set_cause(&ncdfe, eiie);
+                    raise(vm, ncdfe);
+                    vm.push(Value::Bool(false));
+                }
+                None => {
+                    INIT_DEPTH.with(|d| d.set(d.get() + 1));
+                    vm.push(Value::Bool(true));
+                }
+            }
+        }
+        KT_OBJ_INIT_EXIT => {
+            let name = vm.pop().to_str();
+            INIT_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            let pending = PENDING.with(|p| p.borrow().clone());
+            if let Some(exc) =
+                pending.filter(|e| !is_nlr_marker(e) && !throwable_matches(e, "Error"))
+            {
+                let eiie = new_throwable("java.lang.ExceptionInInitializerError", None);
+                set_cause(&eiie, exc.clone());
+                PENDING.with(|p| *p.borrow_mut() = Some(eiie));
+                FAILED_INIT.with(|f| f.borrow_mut().insert(name, exc));
+                vm.push(Value::Bool(true));
+                return;
+            }
+            vm.push(Value::Bool(false));
         }
         KT_ITER_END => {
             let v = vm.pop();
