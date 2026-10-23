@@ -110,7 +110,6 @@ JRE 21.0.12.1:
 
 | program | kotlinrs | reference |
 | --- | --- | --- |
-| `fun g(x: Int) = when (x) { 1 -> 2 }` (no `else`, not a closed type) | compiles, `null` for other values | `'when' expression must be exhaustive. Add an 'else' branch.` — refused only in expression position, which this frontend does not tell apart from a value-discarding lambda body |
 | `(listOf(1, 2).asReversed() as MutableList<Int>)[0] = 5` | succeeds | `ClassCastException: kotlin.collections.ReversedListReadOnly cannot be cast to kotlin.collections.MutableList` |
 
 A live view is a heap copy re-taken whenever its backing object was written
@@ -442,6 +441,7 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
 | program | kotlinrs | reference |
 | --- | --- | --- |
 | `fun <T> id(x: T) = x`; `println(id(listOf(1)) + 5)` | `5.0` | `[1, 5]` |
+| `fun g(x: Int) = when (x) { 1 -> 2 }` (no `else`, not a closed type) | compiles, `null` for other values | `'when' expression must be exhaustive. Add an 'else' branch.` — refused only in expression position, which this frontend does not tell apart from a value-discarding lambda body |
 | `open class M(val c: Int)`; `class N(c: Int) : M(c)`; `operator fun M.plus(o: M)` and `operator fun N.plus(o: M)`; `listOf<M>(N(1), M(2)).reduce { a, b -> a + b }` | `unresolved reference: plus on N` | `M.plus`, chosen by the static type `M` |
 | `val a = arrayOf(1, 2); val l = a.asList(); a[0] = 7; println(l)` | `[1, 2]` | `[7, 2]` — a write to the ARRAY shows through the view; writes through the view reach the array since round 21 |
 
