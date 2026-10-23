@@ -7948,11 +7948,20 @@ fun main() {
 }
 
 #[test]
-fn a_class_declaring_one_method_twice_is_refused_rather_than_resolved_wrongly() {
-    // Member overloads are not modelled: the second declaration used to
-    // answer for the first (`C().f(1)` ran `f(a: String)`).
+fn a_class_declaring_one_method_twice_resolves_the_call_by_its_argument() {
+    // The second declaration used to answer for the first (`C().f(1)` ran
+    // `f(a: String)`), and the set was then refused; member overloads now
+    // resolve, and `C().f(1)` is the reference's `2` (kotlinc 2.4.21 / JRE
+    // 21.0.12.1). An overload set of a member the host calls by name stays
+    // refused rather than resolved wrongly.
+    assert_eq!(
+        stdout(
+            "class C { fun f(a: String) = 1; fun f(a: Int) = 2 }\nfun main() { println(C().f(1)) }"
+        ),
+        "2\n"
+    );
     let out = eval(
-        "class C { fun f(a: String) = 1; fun f(a: Int) = 2 }\nfun main() { println(C().f(1)) }",
+        "class C { fun next(a: String) = 1; fun next(a: Int) = 2 }\nfun main() { println(C().next(1)) }",
     );
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
