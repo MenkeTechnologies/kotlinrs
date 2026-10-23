@@ -10246,3 +10246,56 @@ fun main() { println(A(1).x + B(2).y + B().y) }"##
         "10\n"
     );
 }
+
+/// `fun <T> pick(a: T, b: T) where T : Comparable<T> = …` and `class Holder<T>(…)\nwhere T : Comparable<T> { … }` declare bounds the coarse typing does not keep;\nthey were refused (`top-level fun pick needs a body`, `found Ident("where")`).\nThe rest of the program pins typealiases, infix and extension properties,\nlabels, local functions and smart casts beside them.
+#[test]
+fn where_clauses_on_functions_and_classes() {
+    assert_eq!(
+        prog(
+            r##"typealias Pred<T> = (T) -> Boolean
+typealias Matrix = List<List<Int>>
+infix fun Int.pow(e: Int): Long { var r = 1L; repeat(e) { r *= this }; return r }
+val String.vowels get() = count { it in "aeiou" }
+fun <T> List<T>.firstMatch(p: Pred<T>): T? = firstOrNull(p)
+fun <T> pick(a: T, b: T, cond: Boolean) where T : Comparable<T> = if (cond) maxOf(a, b) else minOf(a, b)
+fun len(s: String?): Int = s?.length ?: return -1
+fun need(s: String?): String = s ?: throw IllegalArgumentException("null!")
+fun main() {
+    println(2 pow 10)
+    println("education".vowels)
+    println(listOf(3, 8, 11).firstMatch { it > 5 })
+    println(pick("b", "a", true))
+    val m: Matrix = listOf(listOf(1, 2), listOf(3, 4))
+    println(m.map { r -> r.sum() })
+    println(len(null)); println(len("abc"))
+    try { need(null) } catch (e: IllegalArgumentException) { println(e.message) }
+    outer@ for (i in 1..3) { for (j in 1..3) { if (j == 2) continue@outer; if (i == 3) break@outer; print("$i$j ") } }
+    println()
+    fun local(n: Int): Int = if (n <= 1) 1 else n * local(n - 1)
+    println(local(5))
+    val x: Any = "str"
+    if (x is String && x.length > 2) println(x.uppercase())
+    val y: Any = 42
+    val desc = when (y) { is Int -> "int ${y + 1}"; is String -> "s"; else -> "?" }
+    println(desc)
+    println((10 downTo 1 step 3).toList()); println((0 until 10 step 4).toList())
+    println(('a'..'e').joinToString("")); println('a' + 2); println('z' - 'a'); println('A'.code)
+    for (ch in "hi") print(ch.uppercaseChar())
+    println()
+    val nested: String? = listOf<String?>(null, "v").last()
+    println(nested?.let { "got $it" } ?: "none")
+    listOf(1, 2, 3).forEach lit@{ if (it == 2) return@lit; print(it) }
+    println()
+    println(run { listOf(1, 2).map { v -> v * 3 } })
+}"##
+        ),
+        "1024\n5\n8\nb\n[3, 7]\n-1\n3\nnull!\n11 21 \n120\nSTR\nint 43\n[10, 7, 4, 1]\n[0, 4, 8]\nabcde\nc\n25\n65\nHI\ngot v\n13\n[3, 6]\n"
+    );
+    assert_eq!(
+        prog(
+            r##"class Holder<T>(val v: T) where T : Comparable<T> { fun bigger(o: T) = if (v > o) v else o }
+fun main() { println(Holder(3).bigger(5)) }"##
+        ),
+        "5\n"
+    );
+}

@@ -1073,6 +1073,23 @@ impl Parser {
             || matches!(self.peek(), Tok::Ident(w) if w == "interface")
     }
 
+    /// Consume a `where` clause — `where T : Bound, U : Other` — if one follows.
+    fn skip_where_clause(&mut self) -> Result<(), String> {
+        if !matches!(self.peek(), Tok::Ident(w) if w == "where") {
+            return Ok(());
+        }
+        self.advance();
+        loop {
+            self.ident()?;
+            self.eat(&Tok::Colon)?;
+            self.type_ref()?;
+            if !self.at(&Tok::Comma) {
+                return Ok(());
+            }
+            self.advance();
+        }
+    }
+
     /// Consume `Companion.` after a receiver type's `.`, answering whether it
     /// was there — the receiver is then that type's companion object.
     fn companion_qualifier(&mut self) -> bool {
@@ -1258,6 +1275,9 @@ impl Parser {
         } else {
             (None, None, Vec::new(), None)
         };
+        // `where T : Comparable<T>, U : Any` — bounds on the type variables,
+        // which the coarse typing does not keep.
+        self.skip_where_clause()?;
         // Pair the result's type variable with the parameter that carries it.
         let ret_type_param_of = ret_tp.as_ref().and_then(|r| {
             param_tps
@@ -1593,6 +1613,8 @@ impl Parser {
             }
         }
 
+        // `class C<T> where T : Bound { … }` — bounds the typing does not keep.
+        self.skip_where_clause()?;
         // Body: methods, plus (for `object`) property initializers.
         let mut methods = Vec::new();
         let mut obj_props = Vec::new();

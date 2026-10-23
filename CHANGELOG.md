@@ -11,6 +11,17 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## `where` clauses
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | before | reference |
+| --- | --- | --- |
+| `fun <T> pick(a: T, b: T, cond: Boolean) where T : Comparable<T> = …` | `top-level fun pick needs a body` | runs |
+| `class Holder<T>(val v: T) where T : Comparable<T> { … }` | `found Ident("where")` | runs |
+
+The bounds are consumed; the coarse typing keeps no type-variable bounds.
+
 ## A primary constructor spelled with its keyword
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
