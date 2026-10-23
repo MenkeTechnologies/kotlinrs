@@ -9363,3 +9363,205 @@ fun main() {
         "MainKt.main(main.kt:8)\nMainKt.main(main.kt)\nMainKt.main(main.kt:10), MainKt.main(main.kt)\nBox.make(main.kt:3), MainKt.main(main.kt:11), MainKt.main(main.kt)\nMainKt.boom(main.kt:5), MainKt.main(main.kt:12), MainKt.main(main.kt)\nMainKt.deep(main.kt:6), MainKt.deep(main.kt:6), MainKt.deep(main.kt:6), MainKt.main(main.kt:13), MainKt.main(main.kt)\nMainKt.main(main.kt:14), MainKt.main(main.kt)\nMainKt main main.kt 8\n"
     );
 }
+
+/// `UByte`/`UShort`/`UInt`/`ULong`: `u`/`uL` literals, wrapping arithmetic at\nthe type's width, unsigned division, remainder and comparison, conversions to\nand from the signed types and `String`, companions' constants, bitwise members,\nranges, arrays, `sum`, and `is`/`equals`/`hashCode` by type. Every program here\nwas a parse error (`expected RParen, found Ident("u")`) before.
+#[test]
+fn unsigned_integer_types() {
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    val a: UInt = 5u
+    val b = 3u
+    println(a + b)
+    println(b - a)
+    println(a * 1000000000u)
+    println(UInt.MAX_VALUE)
+    println(UInt.MAX_VALUE + 1u)
+    println(ULong.MAX_VALUE)
+    println(ULong.MAX_VALUE / 3uL)
+    println((-1).toUInt())
+    println((-1).toULong())
+    println(4000000000u.toInt())
+    println(7u / 2u)
+    println(7u % 3u)
+    println(0u - 1u > 5u)
+    println(a is UInt)
+    println(listOf(1u, 2u).map { it * 2u })
+    val x: UByte = 255u
+    println(x)
+    println((x + 1u).toUByte())
+    val s: UShort = 65535u
+    println(s.toInt())
+    println(200.toUByte())
+    println(300.toUByte())
+    println(0xFFFFFFFFu)
+    println(5u.toLong() + 1)
+    println(18446744073709551615uL.toString())
+    println("x=${2u * 3u}")
+    println(1u.compareTo(2u))
+    println(UInt.MIN_VALUE)
+    println(5u shl 30)
+    println(5u.toString(2))
+    println("42".toUInt() + 1u)
+    println("4294967296".toUIntOrNull())
+}"##
+        ),
+        "8\n4294967294\n705032704\n4294967295\n0\n18446744073709551615\n6148914691236517205\n4294967295\n18446744073709551615\n-294967296\n3\n1\ntrue\ntrue\n[2, 4]\n255\n0\n65535\n200\n44\n4294967295\n6\n18446744073709551615\nx=6\n-1\n0\n1073741824\n101\n43\nnull\n"
+    );
+    assert_eq!(
+        prog(
+            r##"fun half(x: UInt): UInt = x / 2u
+fun big(x: ULong) = x * 2uL
+fun main() {
+    val x: UByte = 255u
+    println(x is UByte)
+    val y: ULong = 5u
+    println(y is ULong)
+    var i = 0u
+    i++
+    i += 2u
+    println(i)
+    var j = 10u
+    j--
+    println(j)
+    println(half(9u))
+    println(big(ULong.MAX_VALUE / 2uL + 1uL))
+    val xs = listOf(3u, 1u, 2u)
+    println(xs.sorted())
+    println(xs.maxOrNull())
+    println(xs.sum())
+    println(xs.contains(2u))
+    println(setOf(1u, 1u, 2u).size)
+    println(mapOf(1u to "a")[1u])
+    println(1u == 1u)
+    println(when (j) { 9u -> "nine"; else -> "?" })
+    val n: UInt? = null
+    println(n ?: 7u)
+    println(5u.hashCode())
+    println(UByte.MAX_VALUE.hashCode())
+    println((1u as Any) == (1 as Any))
+    println(UInt.SIZE_BITS)
+    println(255u.toUByte().toInt())
+    println(3000000000u.toLong())
+    println(1.5.toUInt())
+    println((-1.5).toUInt())
+    println(xs.map { it + 1u })
+    println(xs.filter { it > 1u })
+    println(5u.toString().length)
+    println(0u.inv())
+    println(maxOf(3u, 7u))
+    println(0xFFu and 0x0Fu)
+    println(1uL shl 63)
+}"##
+        ),
+        "true\ntrue\n3\n9\n4\n0\n[1, 2, 3]\n3\n6\ntrue\n2\na\ntrue\nnine\n7\n5\n-1\nfalse\n32\n255\n3000000000\n1\n0\n[4, 2, 3]\n[3, 2]\n1\n4294967295\n7\n15\n9223372036854775808\n"
+    );
+    assert_eq!(
+        prog(
+            r##"fun takeByte(b: UByte) = b is UByte
+fun main() {
+    for (i in 1u..3u) print("$i ")
+    println()
+    for (i in 0u until 3u) print("$i ")
+    println()
+    println((1u..5u).toList())
+    println(5u in 1u..10u)
+    val arr = uintArrayOf(1u, 2u)
+    println(arr.size)
+    println(arr[1])
+    println(takeByte(5u))
+    println(ubyteArrayOf(1u).toList())
+    println(UIntArray(2).toList())
+    println((10u downTo 8u).toList())
+    println(listOf(2u, 1u).minOrNull())
+    println(1u.coerceIn(2u, 5u))
+    val m = mutableMapOf<UInt, Int>()
+    m[3u] = 1
+    println(m)
+}"##
+        ),
+        "1 2 3 \n0 1 2 \n[1, 2, 3, 4, 5]\ntrue\n2\n2\ntrue\n[1]\n[0, 0]\n[10, 9, 8]\n1\n2\n{3=1}\n"
+    );
+    assert_eq!(
+        prog(
+            r##"data class P(val a: UInt, val b: ULong)
+fun main() {
+    val p = P(1u, 2uL)
+    println(p)
+    println(p == P(1u, 2uL))
+    var h = 2166136261u
+    for (c in "ab") { h = h xor c.code.toUInt(); h *= 16777619u }
+    println(h)
+    println(255u.toString(16))
+    println(ULong.MAX_VALUE.toString(36))
+    try { println(1u / 0u) } catch (e: ArithmeticException) { println(e.message) }
+    try { "-1".toUInt() } catch (e: NumberFormatException) { println(e.message) }
+    println("ff".toUInt(16))
+    println("256".toUByteOrNull())
+    println((1u as Any) is UInt)
+    println((1u as Any) is Int)
+    println(listOf(3u, 10u, 2u).sortedDescending())
+    println(10000000000uL * 10000000000uL)
+    println((-1L).toULong())
+    println(Long.MAX_VALUE.toULong() + 1uL)
+    println(5u.toByte())
+    println(200u.toByte())
+    var x = 7u
+    x *= 3u
+    x -= 1u
+    x /= 2u
+    println(x)
+    println(x shr 1)
+    println(when (x) { in 0u..9u -> "low"; else -> "high" })
+    println(x.toInt() + 1)
+    println(UShort.MAX_VALUE.toInt())
+    println(UByte.MIN_VALUE)
+    println(0u.countLeadingZeroBits())
+    println("v=$x ${x + 1u}")
+    println(x.compareTo(10u))
+    println(listOf(1u, 2u).joinToString("-"))
+    println(mutableListOf(1u).apply { add(5u) })
+}"##
+        ),
+        "P(a=1, b=2)\ntrue\n1294271946\nff\n3w5e11264sgsf\n/ by zero\nInvalid number format: '-1'\n255\nnull\ntrue\nfalse\n[10, 3, 2]\n7766279631452241920\n18446744073709551615\n9223372036854775808\n5\n-56\n10\n5\nhigh\n11\n65535\n0\n32\nv=10 11\n0\n1-2\n[1, 5]\n"
+    );
+}
+
+/// An unsigned value's `::class` and `javaClass` name `kotlin.UInt`/`kotlin.ULong`, `%d`\nrefuses one as `java.util.Formatter` does, and unsigned ranges are\n`UIntRange`/`ULongRange`/`UIntProgression` — a `UByte` range a `UIntRange` of\n`UInt`s.
+#[test]
+fn unsigned_classes_formats_and_range_kinds() {
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    println(5u::class.simpleName)
+    println(5u::class.qualifiedName)
+    println(5u.javaClass)
+    println(5uL.javaClass.name)
+    try { println("%d".format(5u)) } catch (e: Exception) { println(e) }
+}"##
+        ),
+        "UInt\nkotlin.UInt\nclass kotlin.UInt\nkotlin.ULong\njava.util.IllegalFormatConversionException: d != kotlin.UInt\n"
+    );
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    println((1u..3u).javaClass.name)
+    println((1uL..3uL).javaClass.name)
+    println((3u downTo 1u).javaClass.name)
+    println((1u..3u))
+    println(1u..9u step 2)
+}"##
+        ),
+        "kotlin.ranges.UIntRange\nkotlin.ranges.ULongRange\nkotlin.ranges.UIntProgression\n1..3\n1..9 step 2\n"
+    );
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    val r = 1.toUByte()..3.toUByte()
+    println(r.first() is UInt)
+    println(r.javaClass.name)
+}"##
+        ),
+        "true\nkotlin.ranges.UIntRange\n"
+    );
+}

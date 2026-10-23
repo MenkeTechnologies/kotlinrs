@@ -23,6 +23,9 @@ pub enum Tok {
     /// expression, and the compiler needs that width to decide whether the
     /// surrounding arithmetic narrows back to 32 bits.
     Long(i64),
+    /// A `u`/`U`-suffixed integer literal (`5u`, `0xFFu`, `7uL`): its value,
+    /// and whether it is a `ULong` — written `uL`, or too wide for a `UInt`.
+    Unsigned(u64, bool),
     Float(f64),
     /// An `f`/`F`-suffixed literal, already narrowed to 32-bit precision.
     Float32(f64),

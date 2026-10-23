@@ -11,6 +11,30 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Unsigned integer types
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1. Every program was a parse error
+(`expected RParen, found Ident("u")`) or `unresolved reference`.
+
+| program | reference |
+| --- | --- |
+| `3u - 5u`, `5u * 1000000000u`, `UInt.MAX_VALUE + 1u` | `4294967294`, `705032704`, `0` |
+| `ULong.MAX_VALUE / 3uL`, `10000000000uL * 10000000000uL` | `6148914691236517205`, `7766279631452241920` |
+| `(-1).toUInt()`, `4000000000u.toInt()`, `(-1.5).toUInt()`, `200u.toByte()` | `4294967295`, `-294967296`, `0`, `-56` |
+| `0u - 1u > 5u`, `listOf(3u, 10u, 2u).sortedDescending()` | `true`, `[10, 3, 2]` |
+| `val x: UByte = 255u; (x + 1u).toUByte()`, `x is UByte` | `0`, `true` |
+| `var i = 0u; i++; i += 2u`, FNV-1a over `"ab"` with `xor`/`*=` | `3`, `1294271946` |
+| `for (i in 0u until 3u)`, `(10u downTo 8u).toList()`, `5u in 1u..10u` | `0 1 2`, `[10, 9, 8]`, `true` |
+| `"ff".toUInt(16)`, `"256".toUByteOrNull()`, `"-1".toUInt()` | `255`, `null`, `NumberFormatException: Invalid number format: '-1'` |
+| `1u / 0u` | `ArithmeticException: / by zero` |
+| `(1u as Any) == (1 as Any)`, `UByte.MAX_VALUE.hashCode()`, `5u.javaClass` | `false`, `-1`, `class kotlin.UInt` |
+
+A value is a heap box (`HeapObj::Unsigned`) of its width and bits; the
+compiler types unsigned expressions (`unsigned_class`) so arithmetic reaches the
+host's operator dispatch, and a literal takes a declared unsigned type from a
+binding or parameter. Open: a `ULongRange` above `Long.MAX_VALUE`, and an
+unsigned array's printed form (BUGS.md).
+
 ## `Any()`, `synchronized`, `Throwable.stackTrace`
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1. Each was `unresolved reference`.

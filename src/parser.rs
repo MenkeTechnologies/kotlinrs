@@ -4753,6 +4753,20 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Long(n))
             }
+            // `5u` / `7uL` — an unsigned literal, carried as the call the
+            // compiler lowers to a boxed `UInt`/`ULong` (its bits in a `Long`).
+            Tok::Unsigned(n, long) => {
+                self.advance();
+                let kind = if long { "ULong" } else { "UInt" };
+                Ok(Expr::Call {
+                    name: "__unsigned".to_string(),
+                    args: vec![
+                        Expr::Long(n as i64),
+                        Expr::Str(vec![StrExpr::Text(kind.to_string())]),
+                    ],
+                    line,
+                })
+            }
             Tok::Float(f) => {
                 self.advance();
                 Ok(Expr::Float(f))

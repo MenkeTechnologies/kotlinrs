@@ -210,6 +210,31 @@ impl<'a> Lexer<'a> {
         Ok(Tok::Char(ch as i64))
     }
 
+    /// The unsigned literal a `u`/`U` suffix (optionally followed by `L`)
+    /// makes of the digits just read: a `UInt` when it fits 32 bits and no `L`
+    /// was written, else a `ULong`. `None` when no such suffix follows.
+    fn unsigned_suffix(&mut self, value: Option<u64>) -> Option<Tok> {
+        if !matches!(self.peek(), b'u' | b'U') {
+            return None;
+        }
+        let long_at = self.peek2() == b'L';
+        // `5until` is no literal; a `u` that starts an identifier is not ours.
+        let after = if long_at {
+            self.src.get(self.pos + 2)
+        } else {
+            self.src.get(self.pos + 1)
+        };
+        if after.is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_') {
+            return None;
+        }
+        self.bump();
+        if long_at {
+            self.bump();
+        }
+        let v = value.unwrap_or(u64::MAX);
+        Some(Tok::Unsigned(v, long_at || v > u64::from(u32::MAX)))
+    }
+
     fn number(&mut self) -> Tok {
         let start = self.pos;
         // `0x…` / `0b…` — a radix literal, which has no fraction, no exponent
@@ -234,6 +259,9 @@ impl<'a> Lexer<'a> {
                 .chars()
                 .filter(|&ch| ch != '_')
                 .collect();
+            if let Some(t) = self.unsigned_suffix(u64::from_str_radix(&raw, radix).ok()) {
+                return t;
+            }
             let long = self.peek() == b'L';
             if long {
                 self.bump();
@@ -276,6 +304,11 @@ impl<'a> Lexer<'a> {
             .chars()
             .filter(|&ch| ch != '_')
             .collect();
+        if !is_float {
+            if let Some(t) = self.unsigned_suffix(raw.parse::<u64>().ok()) {
+                return t;
+            }
+        }
         // A trailing `L` (Long) or `f`/`F` (Float) suffix.
         let suffix = self.peek();
         if suffix == b'L' {

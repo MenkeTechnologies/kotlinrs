@@ -112,6 +112,19 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `Float.toString`), `Boolean`,
   `Char` (a distinct runtime type — see below), `String`, `Unit`; annotations
   optional (including nullable `T?`), coarsely inferred otherwise.
+- **Unsigned integers** — `UByte`/`UShort`/`UInt`/`ULong`, each a runtime type
+  of its own (a heap box holding the value's bits), so `x is UInt` and `x is
+  Int` differ and `1u != 1`. `u`/`U` literals with an optional `L` (`7uL`;
+  decimal, hex or binary; a literal too wide for `UInt` is a `ULong`), typed by
+  a declared `UByte`/`UShort`/`ULong` binding or parameter; arithmetic that
+  wraps at the type's width, unsigned `/`, `%` and ordering, `UByte`/`UShort`
+  arithmetic answering `UInt`; `and`/`or`/`xor`/`inv`/`shl`/`shr`, `inc`/`dec`
+  (`i++`), `coerceIn`/`AtLeast`/`AtMost`, the bit counts, `toString(radix)`;
+  `toInt`/`toLong`/… and `toUInt`/`toULong`/… both ways (a `Double` saturates),
+  `String.toUInt()`/`toUIntOrNull()` with a radix; `MIN_VALUE`/`MAX_VALUE`/
+  `SIZE_BITS`/`SIZE_BYTES`; `UIntRange`/`ULongRange` (`1u..5u`, `until`,
+  `downTo`, `step`, `in`, `for`); `uintArrayOf`/`UIntArray(n)` and siblings;
+  `sum()`; and `equals`/`hashCode` as the JVM's value classes define them.
 - **Declarations** — top-level `fun` with typed parameters and return type,
   block bodies **and** single-expression bodies (`fun f(...) = expr`);
   `val`/`var` locals (`val` reassignment is a compile error, matching Kotlin);

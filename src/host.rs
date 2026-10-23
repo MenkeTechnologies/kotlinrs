@@ -343,6 +343,10 @@ pub const KT_DEPTH_GUARD: u16 = 157;
 /// `KT_MODCOUNT`: a collection's modification count — see [`mod_count`].
 /// Stack `[collection]`; pushes an `Int`.
 pub const KT_MODCOUNT: u16 = 159;
+/// `KT_UNSIGNED`: box an unsigned value. Stack `[value, typeName]`; the value
+/// (an integer literal's bits, or any number) is converted to the named
+/// `UByte`/`UShort`/`UInt`/`ULong` as `toUInt()` and its siblings convert.
+pub const KT_UNSIGNED: u16 = 160;
 
 /// How many VM frames a call chain may hold before `StackOverflowError`.
 ///
@@ -2458,6 +2462,12 @@ enum HeapObj {
     /// A boxed `Long` — see [`KT_BOX_I64`]. The value is the same `i64` a bare
     /// `Value::Int` would hold; what the box carries is that it is a `Long`.
     I64(i64),
+    /// An unsigned integer: `UByte`/`UShort`/`UInt`/`ULong` by `bits`, its
+    /// value masked to that width. See [`KT_UNSIGNED`].
+    Unsigned {
+        bits: u8,
+        v: u64,
+    },
     /// The cursor `xs.iterator()` hands back: the collection it walks and how
     /// far along it is.
     ///
@@ -2695,6 +2705,10 @@ struct RangeObj {
     /// code units (so the arithmetic below is shared verbatim); this only
     /// decides that its elements and its printed form are characters.
     is_char: bool,
+    /// `1u..3u` — a `UIntRange`/`ULongRange` of this width (0 for a signed
+    /// one). The endpoints ride as the values' bits; the elements are boxed
+    /// back into the unsigned type.
+    unsigned: u8,
 }
 
 impl RangeObj {
@@ -2706,6 +2720,7 @@ impl RangeObj {
                 step: 1,
                 progression: false,
                 is_char,
+                unsigned: 0,
             },
             // `until` is exclusive: it builds the `IntRange` `first..(end-1)`.
             // Kotlin guards the underflow by yielding an empty range instead of
@@ -2716,6 +2731,7 @@ impl RangeObj {
                 step: 1,
                 progression: false,
                 is_char,
+                unsigned: 0,
             },
             RangeForm::DownTo => RangeObj {
                 first,
@@ -2723,6 +2739,7 @@ impl RangeObj {
                 step: -1,
                 progression: true,
                 is_char,
+                unsigned: 0,
             },
         }
     }
@@ -2770,10 +2787,24 @@ impl RangeObj {
         self.wrap(self.at(i))
     }
 
+    /// How an endpoint prints — a character, an unsigned number, or a number —
+    /// without allocating, since a render walk holds the heap.
+    fn elem_string(&self, n: i64) -> String {
+        if self.is_char {
+            char_string(n)
+        } else if self.unsigned > 0 {
+            (n as u64).to_string()
+        } else {
+            n.to_string()
+        }
+    }
+
     /// Wrap a code point drawn from this range in its element type.
     fn wrap(&self, n: i64) -> Value {
         if self.is_char {
             char_of(n)
+        } else if self.unsigned > 0 {
+            make_unsigned(self.unsigned, n as u64)
         } else {
             Value::Int(n)
         }
@@ -4503,6 +4534,16 @@ fn b_array_init(vm: &mut VM, _argc: u8) -> Value {
     alloc(HeapObj::Array { items, desc })
 }
 
+/// A copy of `v`'s range, when it is one — read out so its elements can be
+/// built (an unsigned range's are heap boxes) outside the heap borrow.
+fn range_obj(v: &Value) -> Option<RangeObj> {
+    with_obj(v, |o| match o {
+        HeapObj::Range(r) => Some(*r),
+        _ => None,
+    })
+    .flatten()
+}
+
 /// Allocate `obj` on the heap and return its handle.
 ///
 /// Handles are dealt out from `0` upward and the top 64 K of the space is
@@ -4616,6 +4657,218 @@ fn box_i64(n: i64) -> Value {
     alloc(HeapObj::I64(n))
 }
 
+// ── Unsigned integers ───────────────────────────────────────────────────────
+//
+// `UByte`/`UShort`/`UInt`/`ULong` are Kotlin value classes over the signed
+// types. Here each is a heap box (`HeapObj::Unsigned`) holding its bits masked
+// to the type's width, so it keeps its class through every position and every
+// operator on one reaches these functions rather than a native signed op.
+
+/// The width of an unsigned type name, in bits.
+fn unsigned_bits(name: &str) -> Option<u8> {
+    match name {
+        "UByte" => Some(8),
+        "UShort" => Some(16),
+        "UInt" => Some(32),
+        "ULong" => Some(64),
+        _ => None,
+    }
+}
+
+fn unsigned_name(bits: u8) -> &'static str {
+    match bits {
+        8 => "UByte",
+        16 => "UShort",
+        32 => "UInt",
+        _ => "ULong",
+    }
+}
+
+fn unsigned_mask(bits: u8, v: u64) -> u64 {
+    if bits >= 64 {
+        v
+    } else {
+        v & ((1u64 << bits) - 1)
+    }
+}
+
+/// A boxed unsigned value of `bits` width.
+fn make_unsigned(bits: u8, v: u64) -> Value {
+    alloc(HeapObj::Unsigned {
+        bits,
+        v: unsigned_mask(bits, v),
+    })
+}
+
+/// `(bits, value)` when `v` is an unsigned box.
+fn unsigned_box(v: &Value) -> Option<(u8, u64)> {
+    if !matches!(v, Value::Obj(_)) {
+        return None;
+    }
+    with_obj(v, |o| match o {
+        HeapObj::Unsigned { bits, v } => Some((*bits, *v)),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// `n.toUInt()` and its siblings on a signed or unsigned integer: the low
+/// `bits` of its two's-complement form. A floating-point value saturates into
+/// the type's range (NaN is 0), as `Double.toUInt()` does.
+fn to_unsigned(bits: u8, v: &Value) -> Option<Value> {
+    if let Some((_, u)) = unsigned_box(v) {
+        return Some(make_unsigned(bits, u));
+    }
+    if let Some(n) = i64_box(v) {
+        return Some(make_unsigned(bits, n as u64));
+    }
+    match v {
+        Value::Int(n) => Some(make_unsigned(bits, *n as u64)),
+        Value::Float(f) => {
+            let max = unsigned_mask(bits, u64::MAX);
+            let u = if f.is_nan() || *f <= 0.0 {
+                0
+            } else if *f >= max as f64 {
+                max
+            } else {
+                *f as u64
+            };
+            Some(make_unsigned(bits, u))
+        }
+        _ => None,
+    }
+}
+
+/// `UInt.hashCode()` and its siblings: the hash of the signed value with the
+/// same bits — `UByte` hashes as its `Byte`, `ULong` folds like a `Long`.
+fn unsigned_hash(bits: u8, v: u64) -> i32 {
+    match bits {
+        8 => i32::from(v as u8 as i8),
+        16 => i32::from(v as u16 as i16),
+        32 => v as u32 as i32,
+        _ => (v ^ (v >> 32)) as i32,
+    }
+}
+
+/// A binary operator or infix member between two unsigned values. `UByte`
+/// and `UShort` arithmetic answers a `UInt`, and a `UInt` against a `ULong`
+/// answers a `ULong`; the bitwise members keep the operands' own width.
+fn unsigned_binary(name: &str, a: (u8, u64), b: (u8, u64)) -> Option<Result<Value, String>> {
+    let wide = a.0.max(b.0).max(32);
+    let (x, y) = (a.1, b.1);
+    let div_zero = || Err("java.lang.ArithmeticException: / by zero".to_string());
+    Some(Ok(match name {
+        "plus" => make_unsigned(wide, x.wrapping_add(y)),
+        "minus" => make_unsigned(wide, x.wrapping_sub(y)),
+        "times" => make_unsigned(wide, x.wrapping_mul(y)),
+        "div" | "floorDiv" => match y {
+            0 => return Some(div_zero()),
+            _ => make_unsigned(wide, x / y),
+        },
+        "rem" | "mod" => match y {
+            0 => return Some(div_zero()),
+            _ => make_unsigned(wide, x % y),
+        },
+        "and" => make_unsigned(a.0, x & y),
+        "or" => make_unsigned(a.0, x | y),
+        "xor" => make_unsigned(a.0, x ^ y),
+        "compareTo" => Value::Int(x.cmp(&y) as i64),
+        "coerceAtLeast" => make_unsigned(a.0, x.max(y)),
+        "coerceAtMost" => make_unsigned(a.0, x.min(y)),
+        _ => return None,
+    }))
+}
+
+/// A member of an unsigned value. `None` for a name it does not declare, which
+/// the caller reports as unresolved.
+fn unsigned_method(bits: u8, v: u64, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    let shift = |a: &Value| (a.to_int() as u32) & (u32::from(bits) - 1);
+    Some(Ok(match (name, args) {
+        ("toInt", []) => Value::Int(i64::from(v as u32 as i32)),
+        ("toLong", []) => Value::Int(v as i64),
+        ("toShort", []) => Value::Int(i64::from(v as u16 as i16)),
+        ("toByte", []) => Value::Int(i64::from(v as u8 as i8)),
+        ("toDouble", []) => Value::Float(v as f64),
+        ("toFloat", []) => Value::Float(f64::from(v as f32)),
+        ("toString", []) => Value::str(v.to_string()),
+        ("toString", [radix]) => Value::str(unsigned_radix(v, radix.to_int())),
+        ("hashCode", []) => Value::Int(i64::from(unsigned_hash(bits, v))),
+        ("inc", []) => make_unsigned(bits, v.wrapping_add(1)),
+        ("dec", []) => make_unsigned(bits, v.wrapping_sub(1)),
+        ("inv", []) => make_unsigned(bits, !v),
+        ("shl", [n]) if bits >= 32 => make_unsigned(bits, v << shift(n)),
+        ("shr", [n]) if bits >= 32 => make_unsigned(bits, v >> shift(n)),
+        ("countOneBits", []) => Value::Int(i64::from(v.count_ones())),
+        ("countLeadingZeroBits", []) => {
+            Value::Int(i64::from(v.leading_zeros()) - (64 - i64::from(bits)))
+        }
+        ("countTrailingZeroBits", []) => {
+            Value::Int(i64::from(v.trailing_zeros().min(u32::from(bits))))
+        }
+        (conv, []) if conv.strip_prefix("to").and_then(unsigned_bits).is_some() => {
+            let to = conv
+                .strip_prefix("to")
+                .and_then(unsigned_bits)
+                .unwrap_or(64);
+            make_unsigned(to, v)
+        }
+        ("coerceIn", [lo, hi]) => {
+            let (lo, hi) = (unsigned_box(lo)?.1, unsigned_box(hi)?.1);
+            if lo > hi {
+                return Some(Err(format!(
+                    "java.lang.IllegalArgumentException: Cannot coerce value to an empty range: maximum {hi} is less than minimum {lo}."
+                )));
+            }
+            make_unsigned(bits, v.clamp(lo, hi))
+        }
+        (_, [other]) => {
+            let b = unsigned_box(other)?;
+            return unsigned_binary(name, (bits, v), b);
+        }
+        _ => return None,
+    }))
+}
+
+/// `"42".toUInt()` and its siblings: the string read as an unsigned number of
+/// the named width (an optional radix as the argument). The `…OrNull` forms
+/// answer null where the plain ones raise `NumberFormatException`.
+fn parse_unsigned(s: &str, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    let (ty, or_null) = match name.strip_suffix("OrNull") {
+        Some(base) => (base.strip_prefix("to")?, true),
+        None => (name.strip_prefix("to")?, false),
+    };
+    let bits = unsigned_bits(ty)?;
+    let radix = args.first().map_or(10, |r| r.to_int()) as u32;
+    let parsed = (!s.starts_with('+') || s.len() > 1)
+        .then(|| u64::from_str_radix(s.strip_prefix('+').unwrap_or(s), radix).ok())
+        .flatten()
+        .filter(|u| unsigned_mask(bits, *u) == *u);
+    Some(match (parsed, or_null) {
+        (Some(u), _) => Ok(make_unsigned(bits, u)),
+        (None, true) => Ok(Value::Undef),
+        (None, false) => Err(format!(
+            "java.lang.NumberFormatException: Invalid number format: '{s}'"
+        )),
+    })
+}
+
+/// The unsigned members [`kt_method`] answers first: every member of an
+/// unsigned value, the `toUInt()` family on a signed number, and the
+/// `toUInt()` family on a `String`.
+fn unsigned_member(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    if let Some((bits, v)) = unsigned_box(recv) {
+        return unsigned_method(bits, v, name, args);
+    }
+    if let Value::Str(s) = recv {
+        return parse_unsigned(s, name, args);
+    }
+    let bits = name.strip_prefix("to").and_then(unsigned_bits)?;
+    if !args.is_empty() || char_code(recv).is_some() {
+        return None;
+    }
+    to_unsigned(bits, recv).map(Ok)
+}
+
 /// `Some(f32)` when `v` is a boxed `Float`.
 fn f32_box(v: &Value) -> Option<f32> {
     with_obj(v, |o| match o {
@@ -4654,7 +4907,9 @@ fn is_char(v: &Value) -> bool {
 /// The integral value of a number-like operand: a `Char`'s code unit, or the
 /// value's own integer form.
 fn num_of(v: &Value) -> i64 {
-    char_code(v).unwrap_or_else(|| v.to_int())
+    char_code(v)
+        .or_else(|| unsigned_box(v).map(|u| u.1 as i64))
+        .unwrap_or_else(|| v.to_int())
 }
 
 /// The one-character string a `Char` displays as. An unpaired surrogate has no
@@ -5447,12 +5702,12 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             // `'a'..'z'` is a `CharRange`, whose elements and printed form are
             // characters; the endpoints ride as code units either way.
             let is_char = is_char(&start) || is_char(&end);
-            vm.push(alloc(HeapObj::Range(RangeObj::new(
-                num_of(&start),
-                num_of(&end),
-                form,
-                is_char,
-            ))));
+            let mut range = RangeObj::new(num_of(&start), num_of(&end), form, is_char);
+            // A `UByte`/`UShort` range is a `UIntRange`, as their `rangeTo` answers.
+            range.unsigned = unsigned_box(&start)
+                .or(unsigned_box(&end))
+                .map_or(0, |u| u.0.max(32));
+            vm.push(alloc(HeapObj::Range(range)));
         }
         KT_RANGE_STEP => {
             let n = vm.pop().to_int();
@@ -5562,6 +5817,12 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             vm.push(Value::Bool(false));
         }
         KT_UNIT => vm.push(unit_value()),
+        KT_UNSIGNED => {
+            let ty = vm.pop().to_str();
+            let v = vm.pop();
+            let bits = unsigned_bits(&ty).unwrap_or(32);
+            vm.push(to_unsigned(bits, &v).unwrap_or(Value::Undef));
+        }
         KT_DEPTH_GUARD => depth_guard(vm),
         KT_MODCOUNT => {
             let v = vm.pop();
@@ -5980,6 +6241,8 @@ fn contains_value(vm: &mut VM, container: &Value, value: &Value) -> bool {
         HeapObj::Range(r) => {
             let kind_fits = if r.is_char {
                 is_char(value)
+            } else if r.unsigned > 0 {
+                unsigned_box(value).is_some()
             } else {
                 matches!(value, Value::Int(_))
             };
@@ -6118,11 +6381,13 @@ fn iter_at(recv: &Value, i: i64) -> Value {
     if let Some((k, v)) = entry {
         return alloc(HeapObj::Entry(k, v));
     }
+    if let Some(r) = range_obj(recv) {
+        return r.value_at(i);
+    }
     with_obj(recv, |o| match o {
         HeapObj::List(items) | HeapObj::Set(items) | HeapObj::Array { items, .. } => {
             usize::try_from(i).ok().and_then(|i| items.get(i).cloned())
         }
-        HeapObj::Range(r) => Some(r.value_at(i)),
         HeapObj::Builder { units, .. } => usize::try_from(i)
             .ok()
             .and_then(|i| units.get(i))
@@ -7147,6 +7412,9 @@ fn grouping_parts(v: &Value) -> Option<(Vec<Value>, Value)> {
 /// the `plus(element)` overload and appends the string whole — `[x, y]`, where
 /// treating it as a sequence would have appended its characters.
 fn as_iterable(v: &Value) -> Option<Vec<Value>> {
+    if let Some(r) = range_obj(v) {
+        return Some(r.to_vec());
+    }
     with_obj(v, |o| match o {
         HeapObj::List(items) | HeapObj::Set(items) => Some(items.clone()),
         HeapObj::Array { items, .. } => Some(items.clone()),
@@ -7223,6 +7491,18 @@ fn operator_apply_inner(
     name: &str,
     rhs: &Value,
 ) -> Result<Value, String> {
+    if let Some(a) = unsigned_box(lhs) {
+        // `i++` / `i--` on an unsigned `var` arrive as `plus`/`minus` of the
+        // `Int` 1 — the only `Int` operand an unsigned operator can be given,
+        // since Kotlin rejects mixing them in source.
+        let b = match rhs {
+            Value::Int(n) if matches!(name, "plus" | "minus") => Some((a.0, *n as u64)),
+            _ => unsigned_box(rhs),
+        };
+        if let Some(r) = b.and_then(|b| unsigned_binary(name, a, b)) {
+            return r;
+        }
+    }
     // A lazy `Sequence`'s `plus`/`minus` are its members, which the method
     // spelling already reaches.
     if matches!(name, "plus" | "minus")
@@ -7581,6 +7861,9 @@ fn sequence_items(v: &Value) -> Vec<Value> {
     // members that take one (`"abc".zip("xy")`, `list.zip("xy")`).
     if let Value::Str(s) = v {
         return chars_of(s);
+    }
+    if let Some(r) = range_obj(v) {
+        return r.to_vec();
     }
     with_obj(v, |o| match o {
         HeapObj::List(items) | HeapObj::Set(items) => items.clone(),
@@ -8920,11 +9203,13 @@ fn list_snapshot(recv: &Value) -> Option<Vec<Value>> {
                 .collect(),
         );
     }
+    if let Some(r) = range_obj(recv) {
+        return Some(r.to_vec());
+    }
     with_obj(recv, |o| match o {
         HeapObj::List(items) | HeapObj::Set(items) | HeapObj::Array { items, .. } => {
             Some(items.clone())
         }
-        HeapObj::Range(r) => Some(r.to_vec()),
         _ => None,
     })
     .flatten()
@@ -9005,6 +9290,9 @@ pub fn utf16_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
+    if let (Some(x), Some(y)) = (unsigned_box(a), unsigned_box(b)) {
+        return x.1.cmp(&y.1);
+    }
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => utf16_cmp(x, y),
         // Every enum is `Comparable` by DECLARATION order, which is exactly what
@@ -11907,6 +12195,9 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
 }
 
 fn kt_method_inner(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    if let Some(r) = unsigned_member(recv, name, args) {
+        return r;
+    }
     // An `Iterable` user object with no static type: the member runs over the
     // elements its iterator yields, unless the class declares the member.
     if !matches!(
@@ -16456,6 +16747,7 @@ fn sequence_member(
                     step: -1,
                     progression: true,
                     is_char: is_char(&first),
+                    unsigned: unsigned_box(&first).map_or(0, |u| u.0),
                 })),
                 None => alloc_ro_list(items.iter().rev().cloned().collect()),
             }));
@@ -16512,6 +16804,7 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
         | HeapObj::Observed { .. }
         | HeapObj::F32(_)
         | HeapObj::I64(_)
+        | HeapObj::Unsigned { .. }
         | HeapObj::Gen { .. }
         | HeapObj::Grouping { .. }
         | HeapObj::Iter { .. }
@@ -16555,6 +16848,13 @@ fn is_int_array(v: &Value) -> bool {
 /// its integers are `Int`s or unboxed `Long`s, so its width is applied by the
 /// compiler, from the static element type.
 fn sum_values(items: &[Value], int32: bool) -> Value {
+    // `Iterable<UInt>.sum()` is a `UInt` (`ULong` over `ULong`s), wrapping at
+    // its width; `UByte`/`UShort` sums are `UInt`s too.
+    let unsigned: Option<Vec<(u8, u64)>> = items.iter().map(unsigned_box).collect();
+    if let Some(us) = unsigned.filter(|us| !us.is_empty()) {
+        let bits = us.iter().map(|u| u.0).max().unwrap_or(32).max(32);
+        return make_unsigned(bits, us.iter().fold(0u64, |t, u| t.wrapping_add(u.1)));
+    }
     // Integral totals WRAP, as the JVM's `long` (and, narrowed by the
     // caller, `int`) addition does — `longArrayOf(Long.MAX_VALUE, 1).sum()` is
     // `Long.MIN_VALUE`, not an overflow.
@@ -16945,6 +17245,11 @@ fn index_set_inner(vm: &mut VM, recv: &Value, index: &Value, value: Value) -> Re
 /// equality over primitives. Ints and Doubles compare by numeric value.
 pub fn value_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
+        // An unsigned value equals one of its own type and value only: a
+        // `UInt` is never equal to an `Int` or a `ULong`.
+        _ if unsigned_box(a).is_some() || unsigned_box(b).is_some() => {
+            unsigned_box(a) == unsigned_box(b)
+        }
         // A boxed `Float` compares by its VALUE and not by its handle, which is
         // what Kotlin's `==` (`equals`) does for a boxed primitive. `Float
         // .equals` compares `floatToIntBits`, so — like `Double.equals` below —
@@ -17304,6 +17609,7 @@ fn obj_hash(recv: &Value) -> Option<i32> {
         // boxed `Long` and an `Int` of the same small magnitude land in the same
         // bucket and are separated by `equals`, exactly as on the JVM.
         HeapObj::I64(n) => Some(int_hash(*n, true)),
+        HeapObj::Unsigned { bits, v } => Some(unsigned_hash(*bits, *v)),
         // `Map.Entry.hashCode()` is `key ^ value`; a `Pair` is a `data class`,
         // so it folds like one.
         HeapObj::Entry(k, v) => Some(value_hash(k, false) ^ value_hash(v, false)),
@@ -17391,6 +17697,7 @@ fn obj_label(recv: &Value) -> String {
         HeapObj::MatchGroup { .. } => "MatchGroup".to_string(),
         HeapObj::F32(_) => "Float".to_string(),
         HeapObj::I64(_) => "Long".to_string(),
+        HeapObj::Unsigned { bits, .. } => unsigned_name(*bits).to_string(),
         HeapObj::Klass { java, .. } => if *java { "Class" } else { "KClass" }.to_string(),
         HeapObj::Iter { .. } => "Iterator".to_string(),
         HeapObj::Gen { .. } => "Sequence".to_string(),
@@ -17604,6 +17911,7 @@ fn display_obj(id: u32) -> String {
             // A `Long` renders exactly as an `Int` of the same value does; the
             // box exists for identity and equality, not for display.
             HeapObj::I64(n) => n.to_string(),
+            HeapObj::Unsigned { v, .. } => v.to_string(),
             // `Class.toString` is `class <name>` — except for a PRIMITIVE
             // class, which prints its bare name. `KClass.toString` is
             // `class <qualifiedName>` for every class.
@@ -17629,9 +17937,9 @@ fn display_obj(id: u32) -> String {
                 // A `CharRange` prints its endpoints as characters (`a..e`);
                 // the `step` count stays a number in both.
                 let (first, last, end) = (
-                    kotlin_string(&r.wrap(r.first)),
-                    kotlin_string(&r.wrap(r.last())),
-                    kotlin_string(&r.wrap(r.end)),
+                    r.elem_string(r.first),
+                    r.elem_string(r.last()),
+                    r.elem_string(r.end),
                 );
                 if !r.progression {
                     format!("{first}..{end}")
@@ -17687,6 +17995,10 @@ fn jvm_class(ty: &str) -> Option<(&'static str, bool)> {
         "Char" => ("java.lang.Character", true),
         "String" => ("java.lang.String", true),
         "StringBuilder" => ("java.lang.StringBuilder", true),
+        "UByte" => ("kotlin.UByte", false),
+        "UShort" => ("kotlin.UShort", false),
+        "UInt" => ("kotlin.UInt", false),
+        "ULong" => ("kotlin.ULong", false),
         _ => return None,
     })
 }
@@ -17705,6 +18017,10 @@ fn kotlin_class(ty: &str) -> Option<(&'static str, &'static str)> {
         "String" => ("String", "kotlin.String"),
         "Unit" => ("Unit", "kotlin.Unit"),
         "Any" => ("Any", "kotlin.Any"),
+        "UByte" => ("UByte", "kotlin.UByte"),
+        "UShort" => ("UShort", "kotlin.UShort"),
+        "UInt" => ("UInt", "kotlin.UInt"),
+        "ULong" => ("ULong", "kotlin.ULong"),
         _ => return None,
     })
 }
@@ -17897,8 +18213,21 @@ fn runtime_jvm_class(v: &Value) -> Option<(String, bool)> {
         // everything else is the `LinkedHashSet` the mutable builders answer.
         HeapObj::Set(items) => Some(coll_jvm_class(v, items.len(), true)),
         HeapObj::Map(entries) => Some(coll_jvm_class(v, entries.len(), false)),
+        HeapObj::Unsigned { bits, .. } => Some((format!("kotlin.{}", unsigned_name(*bits)), false)),
         HeapObj::Pair(_, _) => Some(("kotlin.Pair".to_string(), false)),
         HeapObj::Triple(_, _, _) => Some(("kotlin.Triple".to_string(), false)),
+        HeapObj::Range(r) if r.unsigned > 0 => Some((
+            format!(
+                "kotlin.ranges.{}{}",
+                if r.unsigned == 64 { "ULong" } else { "UInt" },
+                if r.progression {
+                    "Progression"
+                } else {
+                    "Range"
+                }
+            ),
+            false,
+        )),
         HeapObj::Range(r) => Some((
             match (r.is_char, r.progression) {
                 (true, true) => "kotlin.ranges.CharProgression",
@@ -18117,8 +18446,13 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         // `Comparable`: the numbers, `String`, `Char`, `Boolean`, every enum
         // constant, `StringBuilder` (`Comparable<StringBuilder>` since JDK 11),
         // and a user class that declares it.
+        // The unsigned types are `Comparable` and not `Number`s.
+        "UByte" | "UShort" | "UInt" | "ULong" => {
+            unsigned_box(v).is_some_and(|(bits, _)| unsigned_bits(ty) == Some(bits))
+        }
         "Comparable" => {
-            is_number(v)
+            unsigned_box(v).is_some()
+                || is_number(v)
                 || matches!(v, Value::Str(_) | Value::Bool(_))
                 || is_char(v)
                 || enum_ordinal(v).is_some()

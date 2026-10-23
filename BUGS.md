@@ -421,7 +421,8 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
 | program | kotlinrs | reference |
 | --- | --- | --- |
 | `(listOf(1) as List<Any>)[0] is Byte` | `true` | `false` |
-| `5L.toULong()` | `unresolved reference` | the value |
+| `ULong.MAX_VALUE - 1uL..ULong.MAX_VALUE` (a `ULongRange` above `Long.MAX_VALUE`) | elements and printed form wrong: the endpoints ride as signed bits | the two values |
+| `println(uintArrayOf(1u))` | `[Ljava.lang.Object;@…` | `UIntArray(storage=[I@…)` |
 | `listOf(1)[5]` caught, then `e.stackTrace` | `unresolved reference: stackTrace of a …` | frames inside the JDK |
 | `stackTrace` of a throwable built inside a lambda passed to a user (non-inline) function | the lambda frame and `invoke` missing | `MainKt.main$lambda$0(…)` and its caller |
 | `import java.util.*` then `kotlin.collections.ArrayDeque` `.push(0)` | `unresolved reference: push` | `java.util.ArrayDeque` wins the star import |

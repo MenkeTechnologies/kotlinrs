@@ -36,7 +36,7 @@ use crate::host::{
     KT_OBJ_INIT_EXIT, KT_OBSERVE, KT_OPER_REG, KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT,
     KT_PRINTLN, KT_RANDOM, KT_RANGE, KT_RANGE_STEP, KT_REIFIED, KT_REIFY, KT_RESULT_HOF,
     KT_RUN_CATCHING, KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_STR_ORDER, KT_SYSTEM,
-    KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG, KT_UNIT, KT_YIELD,
+    KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG, KT_UNIT, KT_UNSIGNED, KT_YIELD,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
@@ -289,6 +289,10 @@ fn element_param_member(name: &str) -> bool {
             | "fill"
     )
 }
+
+/// The call an unsigned literal (`5u`, `7uL`) parses to: its bits as a `Long`
+/// and the type name, lowered to a [`crate::host::KT_UNSIGNED`] box.
+const UNSIGNED_LIT: &str = "__unsigned";
 
 /// The desugar target a `rust { ... }` block lowers to (see [`crate::rust_ffi`]).
 const RUST_COMPILE: &str = "__rust_compile";
@@ -4959,6 +4963,26 @@ impl Compiler {
                 let written_elem = annotated_elem(annotated_class.as_deref(), annotated);
                 let typed_init;
                 let init = match init {
+                    // `val b: UByte = 255u` — the literal takes the declared
+                    // unsigned type.
+                    Expr::Call {
+                        name: lit,
+                        args: lit_args,
+                        line: l,
+                    } if lit == UNSIGNED_LIT
+                        && matches!(
+                            annotated_class.as_deref(),
+                            Some("UByte" | "UShort" | "UInt" | "ULong")
+                        ) =>
+                    {
+                        let kind = annotated_class.clone().unwrap_or_default();
+                        typed_init = Expr::Call {
+                            name: lit.clone(),
+                            args: vec![lit_args[0].clone(), Expr::Str(vec![StrExpr::Text(kind)])],
+                            line: *l,
+                        };
+                        &typed_init
+                    }
                     Expr::Call { name: b, .. }
                         if written_elem == Type::Long && element_builder(b) =>
                     {
@@ -5419,7 +5443,27 @@ impl Compiler {
                 body,
                 label,
             } => {
-                self.compile_for(sc, var, start, end, *kind, step, body, label)?;
+                // `for (i in 0u until n)` walks a `UIntRange`, whose elements
+                // are unsigned boxes the native counted loop cannot step.
+                if self.unsigned_class(sc, start).is_some()
+                    || self.unsigned_class(sc, end).is_some()
+                {
+                    let range = Expr::Range {
+                        start: Box::new(start.clone()),
+                        end: Box::new(end.clone()),
+                        kind: *kind,
+                    };
+                    let iter = match step {
+                        Some(by) => Expr::Step {
+                            recv: Box::new(range),
+                            by: Box::new(by.clone()),
+                        },
+                        None => range,
+                    };
+                    self.compile_for_in(sc, var, &[], &iter, body, label)?;
+                } else {
+                    self.compile_for(sc, var, start, end, *kind, step, body, label)?;
+                }
             }
             StmtKind::ForIn {
                 var,
@@ -7943,6 +7987,35 @@ impl Compiler {
         // by the host from its name.
         if args.is_empty() {
             if let Expr::Var(q) = recv {
+                // `UInt.MAX_VALUE`, `ULong.SIZE_BITS`, … — the unsigned
+                // companions' constants.
+                let bits = match q.as_str() {
+                    "UByte" => 8,
+                    "UShort" => 16,
+                    "UInt" => 32,
+                    "ULong" => 64,
+                    _ => 0,
+                };
+                if bits > 0 && sc.slot(q).is_none() {
+                    let lit = |v: u64| Expr::Call {
+                        name: UNSIGNED_LIT.to_string(),
+                        args: vec![
+                            Expr::Long(v as i64),
+                            Expr::Str(vec![StrExpr::Text(q.clone())]),
+                        ],
+                        line,
+                    };
+                    match name {
+                        "MIN_VALUE" => return self.compile_expr(sc, &lit(0)),
+                        "MAX_VALUE" => return self.compile_expr(sc, &lit(u64::MAX)),
+                        "SIZE_BITS" | "SIZE_BYTES" => {
+                            let n = if name == "SIZE_BITS" { bits } else { bits / 8 };
+                            self.b.emit(Op::LoadInt(n), line);
+                            return Ok(Type::Int);
+                        }
+                        _ => {}
+                    }
+                }
                 if q == "CharCategory" && self.is_type_ref(sc, q) {
                     let n = self.b.add_constant(Value::str(name.to_string()));
                     self.b.emit(Op::LoadConst(n), line);
@@ -10833,6 +10906,56 @@ impl Compiler {
                 self.b.emit(Op::Pop, line);
                 self.compile_call(sc, "run", &args[1..], line)
             }
+            // `uintArrayOf(1u, 2u)` / `UIntArray(n)` / `UIntArray(n) { … }` —
+            // an array of unsigned boxes, its literals taking the element type.
+            "uintArrayOf" | "ulongArrayOf" | "ubyteArrayOf" | "ushortArrayOf" | "UIntArray"
+            | "ULongArray" | "UByteArray" | "UShortArray"
+                if !self.classes.contains_key(name) =>
+            {
+                let kind = match name {
+                    "uintArrayOf" | "UIntArray" => "UInt",
+                    "ulongArrayOf" | "ULongArray" => "ULong",
+                    "ubyteArrayOf" | "UByteArray" => "UByte",
+                    _ => "UShort",
+                };
+                let lit = |bits: Expr| Expr::Call {
+                    name: UNSIGNED_LIT.to_string(),
+                    args: vec![bits, Expr::Str(vec![StrExpr::Text(kind.to_string())])],
+                    line,
+                };
+                if name.ends_with("Of") {
+                    let elems: Vec<Expr> = args
+                        .iter()
+                        .map(|a| match a {
+                            Expr::Call {
+                                name: l, args: la, ..
+                            } if l == UNSIGNED_LIT => lit(la[0].clone()),
+                            other => other.clone(),
+                        })
+                        .collect();
+                    return self.compile_call(sc, "arrayOf", &elems, line);
+                }
+                let init = match args.get(1) {
+                    Some(f) => f.clone(),
+                    None => Expr::Lambda {
+                        params: Vec::new(),
+                        body: vec![Stmt {
+                            line,
+                            kind: StmtKind::Expr(lit(Expr::Long(0))),
+                        }],
+                        catch_tag: None,
+                    },
+                };
+                let first = args.first().cloned().unwrap_or(Expr::Int(0));
+                self.compile_call(sc, "Array", &[first, init], line)
+            }
+            // `5u` — the bits, then the type the box is of.
+            UNSIGNED_LIT if args.len() == 2 => {
+                self.compile_expr(sc, &args[0])?;
+                self.compile_expr(sc, &args[1])?;
+                self.b.emit(Op::Extended(KT_UNSIGNED, 0), line);
+                Ok(Type::Obj)
+            }
             "Triple" if args.len() == 3 => {
                 for a in args {
                     self.compile_erased(sc, a)?;
@@ -12297,6 +12420,25 @@ impl Compiler {
         full: &[Expr],
     ) -> Result<(), String> {
         for (i, a) in full.iter().enumerate() {
+            // `f(5u)` into a `UByte` parameter: the literal takes its type.
+            let typed;
+            let a = match (a, params.get(i).and_then(|p| p.class.as_deref())) {
+                (
+                    Expr::Call { name, args, line },
+                    Some(k @ ("UByte" | "UShort" | "UInt" | "ULong")),
+                ) if name == UNSIGNED_LIT => {
+                    typed = Expr::Call {
+                        name: name.clone(),
+                        args: vec![
+                            args[0].clone(),
+                            Expr::Str(vec![StrExpr::Text(k.to_string())]),
+                        ],
+                        line: *line,
+                    };
+                    &typed
+                }
+                _ => a,
+            };
             match params.get(i).map(|p| p.ty) {
                 Some(Type::Float) => {
                     self.compile_expr(sc, a)?;
@@ -13450,6 +13592,13 @@ impl Compiler {
     // ── Coarse type inference (no code emitted) ────────────────────
 
     fn infer(&self, sc: &Scope, e: &Expr) -> Type {
+        if matches!(
+            e,
+            Expr::Call { .. } | Expr::MethodCall { .. } | Expr::Binary { .. } | Expr::Member { .. }
+        ) && self.unsigned_class(sc, e).is_some()
+        {
+            return Type::Obj;
+        }
         match e {
             // `emptyList<Int>()`: the parser wraps a generic call in the reification
             // intrinsic, which changes nothing about what the call evaluates to.
@@ -14729,7 +14878,67 @@ impl Compiler {
             })
     }
 
+    /// The unsigned type (`UByte`/`UShort`/`UInt`/`ULong`) of `e`, when its
+    /// static type is one: an unsigned literal, a conversion to one, a binding
+    /// of one, a companion constant, or arithmetic and bitwise members over
+    /// one. `UByte`/`UShort` arithmetic is `UInt`, and either side `ULong`
+    /// makes it `ULong`, as in Kotlin.
+    fn unsigned_class(&self, sc: &Scope, e: &Expr) -> Option<&'static str> {
+        let named = |n: &str| {
+            ["UByte", "UShort", "UInt", "ULong"]
+                .into_iter()
+                .find(|u| *u == n)
+        };
+        let promote = |a: Option<&'static str>, b: Option<&'static str>| {
+            if a == Some("ULong") || b == Some("ULong") {
+                Some("ULong")
+            } else {
+                a.or(b).map(|_| "UInt")
+            }
+        };
+        match e {
+            Expr::Call { name, args, .. } if name == UNSIGNED_LIT => match args.get(1) {
+                Some(Expr::Str(parts)) => match parts.as_slice() {
+                    [StrExpr::Text(k)] => named(k),
+                    _ => None,
+                },
+                _ => None,
+            },
+            Expr::Var(n) => sc.class_of(n).as_deref().and_then(named),
+            Expr::Member { recv, name, .. } => match &**recv {
+                Expr::Var(t) if matches!(name.as_str(), "MIN_VALUE" | "MAX_VALUE") => named(t),
+                _ => None,
+            },
+            Expr::MethodCall {
+                recv, name, args, ..
+            } => {
+                if let Some(k) = name.strip_prefix("to").and_then(named) {
+                    return Some(k);
+                }
+                let own = self.unsigned_class(sc, recv)?;
+                match name.as_str() {
+                    "plus" | "minus" | "times" | "div" | "rem" | "floorDiv" | "mod" => promote(
+                        Some(own),
+                        args.first().and_then(|a| self.unsigned_class(sc, a)),
+                    ),
+                    "and" | "or" | "xor" | "inv" | "inc" | "dec" | "shl" | "shr"
+                    | "coerceAtLeast" | "coerceAtMost" | "coerceIn" => Some(own),
+                    _ => None,
+                }
+            }
+            Expr::Binary {
+                op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod,
+                l,
+                r,
+            } => promote(self.unsigned_class(sc, l), self.unsigned_class(sc, r)),
+            _ => None,
+        }
+    }
+
     fn infer_class(&self, sc: &Scope, e: &Expr) -> Option<String> {
+        if let Some(k) = self.unsigned_class(sc, e) {
+            return Some(k.to_string());
+        }
         match e {
             // The class half of the nested-class rewrite `infer` mirrors above.
             Expr::MethodCall { recv, name, .. } if self.nests() => {
