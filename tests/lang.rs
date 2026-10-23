@@ -9306,3 +9306,60 @@ fn a_mutable_lists_reversed_view_writes_through() {
         "[1, 2, 9]\n[0, 1, 2, 9]\n[0, 1, 9] [9, 1, 0]\n[7, 9, 1, 0]\n"
     );
 }
+
+/// `Any()` is a bare `java.lang.Object` (equal only to itself), `synchronized(lock)`\nruns its block, and a throwable user code constructs carries the frames live\nat construction as its `stackTrace`: `Cls.method(file.kt:line)`, the facade\nclass `MainKt` for top-level functions, the throwable's own `<init>` frames\nleft out, inlined lambdas folded into their caller, and the bridge frame of a\nparameterless `main`. Each was `unresolved reference`. Expected output is the\nreference compiling the program as `main.kt`, the name a `-e` program takes.
+#[test]
+fn any_synchronized_and_user_stack_traces() {
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    val a = Any()
+    val b = Any()
+    println(a == a)
+    println(a == b)
+    println(a.equals(b))
+    println(a.hashCode() == a.hashCode())
+    println(a.toString().startsWith("java.lang.Object@"))
+    println(a is Any)
+    val lock = Any()
+    synchronized(lock) { println("in") }
+    val s = setOf(a, b, a)
+    println(s.size)
+    println(generateSequence { 5L }.take(3).toList())
+    var n = 0
+    println(generateSequence { if (n < 3) n++ else null }.toList())
+    println(generateSequence { 5L }.take(2).map { it is Long }.toList())
+    val t = Throwable("x")
+    println(t.stackTrace is Array<StackTraceElement>)
+    println(t.stackTrace.isNotEmpty())
+    val e = RuntimeException("boom")
+    println(e.stackTrace.size > 0)
+    println(e.stackTrace[0].methodName)
+}"##
+        ),
+        "true\nfalse\nfalse\ntrue\ntrue\ntrue\nin\n2\n[5, 5, 5]\n[0, 1, 2]\n[true, true]\ntrue\ntrue\ntrue\nmain\n"
+    );
+    assert_eq!(
+        prog(
+            r##"class MyEx(m: String) : Exception(m)
+class Box {
+    fun make(): Throwable = IllegalStateException("in box")
+}
+fun Int.boom(): RuntimeException = RuntimeException("ext $this")
+fun deep(n: Int): Throwable = if (n == 0) Exception("deep") else deep(n - 1)
+fun main() {
+    val t = Throwable("x")
+    for (e in t.stackTrace) println(e)
+    println(MyEx("m").stackTrace.joinToString())
+    println(Box().make().stackTrace.joinToString())
+    println(3.boom().stackTrace.joinToString())
+    println(deep(2).stackTrace.joinToString())
+    val l = run { Exception("in run") }
+    println(l.stackTrace.joinToString())
+    val f = t.stackTrace[0]
+    println("${f.className} ${f.methodName} ${f.fileName} ${f.lineNumber}")
+}"##
+        ),
+        "MainKt.main(main.kt:8)\nMainKt.main(main.kt)\nMainKt.main(main.kt:10), MainKt.main(main.kt)\nBox.make(main.kt:3), MainKt.main(main.kt:11), MainKt.main(main.kt)\nMainKt.boom(main.kt:5), MainKt.main(main.kt:12), MainKt.main(main.kt)\nMainKt.deep(main.kt:6), MainKt.deep(main.kt:6), MainKt.deep(main.kt:6), MainKt.main(main.kt:13), MainKt.main(main.kt)\nMainKt.main(main.kt:14), MainKt.main(main.kt)\nMainKt main main.kt 8\n"
+    );
+}

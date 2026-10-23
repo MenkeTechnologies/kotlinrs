@@ -11,6 +11,26 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## `Any()`, `synchronized`, `Throwable.stackTrace`
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1. Each was `unresolved reference`.
+
+| program | reference |
+| --- | --- |
+| `val a = Any(); a == Any(); a.toString()` | `false`, `java.lang.Object@…` |
+| `synchronized(lock) { println("in") }` | `in` |
+| `for (e in Throwable("x").stackTrace) println(e)` in `main` of `st.kt` | `StKt.main(st.kt:8)`, `StKt.main(st.kt)` |
+| `Box().make().stackTrace`, an extension, a recursion, a `run { }` body, a user `Exception` subclass | the user frames, innermost first |
+
+`stackTrace` is recorded when user code constructs the throwable: one element
+per kotlinrs frame that has a JVM frame (`Cls.method(file.kt:line)`; top-level
+and extension functions under the file's `…Kt` class), without the throwable's
+own `<init>` frames, with lambda frames folded into their caller as an inline
+`run`/`let` is on the JVM, and with the line-less bridge frame of a
+parameterless `main`. The file name comes from the script path (`main.kt` for
+`-e`). A throwable the runtime raised has JDK frames this frontend does not
+have, so its `stackTrace` is refused loudly (BUGS.md).
+
 ## Collection views read live
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.

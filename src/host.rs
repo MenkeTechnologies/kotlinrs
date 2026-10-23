@@ -2832,6 +2832,7 @@ fn reset_heap() {
     CHAR_CATEGORY_VALUES.with(|t| t.borrow_mut().clear());
     FAILED_INIT.with(|f| f.borrow_mut().clear());
     SUPPRESSED.with(|s| s.borrow_mut().clear());
+    STACK_TRACES.with(|t| t.borrow_mut().clear());
     INIT_DEPTH.with(|d| d.set(0));
     TYPES.with(|t| t.borrow_mut().clear());
     TOSTRING_SUBS.with(|t| t.borrow_mut().clear());
@@ -2869,6 +2870,171 @@ fn reset_heap() {
 // handler; the handler's [`KT_EXC_CUT`] then discards those stranded operands.
 // A program with no `try` pays nothing — no check is emitted and a fault halts
 // exactly as it did before.
+
+/// One `StackTraceElement` as recorded: `(class, method, line)`.
+type TraceFrame = (String, String, Option<u32>);
+
+thread_local! {
+    /// Throwable handle → the frames live when user code constructed it, as
+    /// `(class, method, line)`, innermost first — what `stackTrace` reads. A
+    /// throwable the runtime raised itself has none (see `stackTrace` below).
+    static STACK_TRACES: RefCell<std::collections::HashMap<u32, Vec<TraceFrame>>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// The source file name a `StackTraceElement` names, and the facade class
+/// (`main.kt` → `MainKt`) its top-level functions belong to. Process-wide:
+/// the program runs on an interpreter thread of its own.
+static SOURCE_FILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn source_file() -> String {
+    SOURCE_FILE
+        .get()
+        .cloned()
+        .unwrap_or_else(|| "main.kt".to_string())
+}
+
+/// Name the program's source file, for `StackTraceElement.fileName` and the
+/// `…Kt` facade class of its top-level functions. Defaults to `main.kt`.
+pub fn set_source_file(path: &str) {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .map_or("main.kt".to_string(), |n| n.to_string_lossy().into_owned());
+    let _ = SOURCE_FILE.set(name);
+}
+
+/// The facade class Kotlin compiles a file's top-level functions into:
+/// `lv.kt` → `LvKt`, with each character no Java identifier takes as `_`.
+fn facade_class() -> String {
+    let file = source_file();
+    let stem = file.strip_suffix(".kt").unwrap_or(&file);
+    let mut out: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if let Some(first) = out.get(0..1) {
+        out.replace_range(0..1, &first.to_uppercase());
+    }
+    out + "Kt"
+}
+
+/// The JVM `(class, method)` a kotlinrs subroutine runs as, or `None` for one
+/// that has no frame of its own there: a lambda (inlined into its caller by
+/// `run`/`let`/…), or an internal entry.
+fn jvm_frame(sub: &str) -> Option<(String, String)> {
+    if sub.starts_with("$lambda$") {
+        return None;
+    }
+    let base = sub.split_once("$ov").map_or(sub, |(b, _)| b);
+    if let Some((class, member)) = base.split_once('#') {
+        let class = class.replace('.', "$");
+        return match member {
+            "$init" | "$into" => Some((class, "<init>".to_string())),
+            m if m.starts_with('$') => None,
+            m => Some((class, m.to_string())),
+        };
+    }
+    if let Some((_, name)) = base.split_once("$ext$") {
+        return Some((facade_class(), name.to_string()));
+    }
+    Some((facade_class(), base.to_string()))
+}
+
+/// Record the frames live now as `exc`'s stack trace. The throwable's own
+/// constructor frames are left out, as `Throwable.fillInStackTrace` leaves
+/// them out, and a parameterless `main` ends with the bridge the compiler
+/// generates for it, which has no line.
+fn capture_stack_trace(vm: &VM, exc: &Value) {
+    let Value::Obj(id) = exc else { return };
+    let entries: std::collections::HashMap<usize, &str> = vm
+        .chunk
+        .sub_entries
+        .iter()
+        .filter_map(|(n, ip)| Some((*ip, vm.chunk.names.get(*n as usize)?.as_str())))
+        .collect();
+    let mut frames = Vec::new();
+    let mut at = vm.ip.saturating_sub(1);
+    // A lambda's frame is inlined into its caller's on the JVM, so its line
+    // is the caller's line there.
+    let mut inlined_line = None;
+    for frame in vm.frames.iter().rev() {
+        let line = vm.chunk.lines.get(at).copied();
+        if let Some(name) = frame.entry_ip.and_then(|e| entries.get(&e)) {
+            match jvm_frame(name) {
+                Some((class, method)) => {
+                    frames.push((class, method, inlined_line.take().or(line)));
+                }
+                None => {
+                    inlined_line = inlined_line.or(line);
+                }
+            }
+        }
+        at = frame.return_ip.saturating_sub(1);
+    }
+    while frames.len() > 1 && frames[0].1 == "<init>" {
+        frames.remove(0);
+    }
+    if frames
+        .last()
+        .is_some_and(|f| f.1 == "main" && f.0 == facade_class())
+    {
+        frames.push((facade_class(), "main".to_string(), None));
+    }
+    STACK_TRACES.with(|t| t.borrow_mut().insert(*id, frames));
+}
+
+/// `Throwable.stackTrace` — an `Array<StackTraceElement>`. `None` for a
+/// throwable the runtime raised: its JVM trace starts inside the JDK or the
+/// Kotlin stdlib, which this frontend has no frames for.
+fn stack_trace_array(exc: &Value) -> Option<Value> {
+    let Value::Obj(id) = exc else { return None };
+    let frames = STACK_TRACES.with(|t| t.borrow().get(id).cloned())?;
+    let file = source_file();
+    let items = frames
+        .into_iter()
+        .map(|(class, method, line)| {
+            alloc(HeapObj::Instance {
+                class: "java.lang.StackTraceElement".to_string(),
+                is_data: false,
+                fields: vec![
+                    ("className".to_string(), Value::str(class)),
+                    ("methodName".to_string(), Value::str(method)),
+                    ("fileName".to_string(), Value::str(file.clone())),
+                    (
+                        "lineNumber".to_string(),
+                        Value::Int(line.map_or(-1, i64::from)),
+                    ),
+                ],
+                data_from: 0,
+                data_len: 0,
+            })
+        })
+        .collect();
+    Some(alloc(HeapObj::Array {
+        items,
+        desc: "[Ljava.lang.StackTraceElement;".to_string(),
+    }))
+}
+
+/// `StackTraceElement.toString()`: `Cls.m(file.kt:12)`, or `Cls.m(file.kt)`
+/// for a frame with no line.
+fn stack_element_string(fields: &[(String, Value)]) -> String {
+    let get = |k: &str| fields.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    let s = |k: &str| get(k).map(|v| v.to_str()).unwrap_or_default();
+    let line = get("lineNumber").map_or(-1, |v| v.to_int());
+    let at = if line >= 0 {
+        format!("{}:{line}", s("fileName"))
+    } else {
+        s("fileName")
+    };
+    format!("{}.{}({at})", s("className"), s("methodName"))
+}
 
 thread_local! {
     /// Throwable handle → the exceptions `addSuppressed` attached to it.
@@ -3375,6 +3541,7 @@ fn b_exc_new(vm: &mut VM, argc: u8) -> Value {
     };
     let exc = new_throwable(&class, msg.as_deref());
     set_cause(&exc, cause);
+    capture_stack_trace(vm, &exc);
     exc
 }
 
@@ -4819,14 +4986,19 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let data_len = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
             register_widths(&class, it.next().unwrap_or(""));
             let fields: Vec<(String, Value)> = it.map(|s| s.to_string()).zip(vals).collect();
-            vm.push(alloc(HeapObj::Instance {
+            let throwable = type_is_throwable(&class);
+            let obj = alloc(HeapObj::Instance {
                 class,
                 is_data,
                 fields,
                 // No superclass, so every field is this class's own.
                 data_from: 0,
                 data_len,
-            }));
+            });
+            if throwable {
+                capture_stack_trace(vm, &obj);
+            }
+            vm.push(obj);
         }
         KT_TYPE_REG => {
             // Stack: [nameStr, supersCsvStr].
@@ -13812,6 +13984,14 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                     SUPPRESSED.with(|s| s.borrow_mut().entry(*id).or_default().push(other.clone()));
                     return Ok(unit_value());
                 }
+                ("stackTrace" | "getStackTrace", []) => {
+                    return stack_trace_array(recv).ok_or_else(|| {
+                        format!(
+                            "unresolved reference: stackTrace of a {} the runtime raised",
+                            obj_label(recv)
+                        )
+                    });
+                }
                 ("suppressed" | "getSuppressed" | "suppressedExceptions", []) => {
                     let items =
                         SUPPRESSED.with(|s| s.borrow().get(id).cloned().unwrap_or_default());
@@ -17250,6 +17430,9 @@ fn display_obj(id: u32) -> String {
                 data_from,
                 data_len,
             } => {
+                if class == "java.lang.StackTraceElement" {
+                    return stack_element_string(fields);
+                }
                 if *is_data {
                     // Only the primary-constructor properties, which is what
                     // Kotlin's generated `toString` renders. Guarded like a

@@ -10814,6 +10814,25 @@ impl Compiler {
                 self.b.emit(Op::Extended(KT_LIST_TAG, 0), line);
                 Ok(Type::Obj)
             }
+            // `Any()` — a bare `java.lang.Object`: an instance with no fields,
+            // equal only to itself, rendered `java.lang.Object@<hash>`.
+            "Any" if args.is_empty() && !self.classes.contains_key("Any") => {
+                let meta = self.b.add_constant(Value::str("java.lang.Object\x1fc"));
+                self.b.emit(Op::LoadConst(meta), line);
+                self.b.emit(Op::Extended(KT_NEW, 0), line);
+                Ok(Type::Obj)
+            }
+            // `synchronized(lock) { … }` on one thread is the block itself: the
+            // monitor is never contended, so it is `lock` evaluated, then `run`.
+            "synchronized"
+                if args.len() == 2
+                    && matches!(args[1], Expr::Lambda { .. })
+                    && !self.fun_sig.contains_key("synchronized") =>
+            {
+                self.compile_expr(sc, &args[0])?;
+                self.b.emit(Op::Pop, line);
+                self.compile_call(sc, "run", &args[1..], line)
+            }
             "Triple" if args.len() == 3 => {
                 for a in args {
                     self.compile_erased(sc, a)?;

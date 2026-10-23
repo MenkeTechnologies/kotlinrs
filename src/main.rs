@@ -62,6 +62,7 @@ fn main() -> ExitCode {
     let (src, is_snippet) = if !cli.eval.is_empty() {
         (cli.eval.join("\n"), true)
     } else if let Some(file) = &cli.file {
+        kotlinrs::host::set_source_file(file);
         match std::fs::read_to_string(file) {
             Ok(s) => (s, false),
             Err(e) => return fail(&format!("{file}: {e}")),
