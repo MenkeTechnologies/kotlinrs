@@ -326,8 +326,8 @@ pub const KT_OBJ_INIT_ENTER: u16 = 154;
 /// as failed; an `Error` propagates as it is.
 pub const KT_OBJ_INIT_EXIT: u16 = 155;
 /// `KT_ITER_MORE`: the loop test of a `for` over a collection. Stack
-/// `[iterable, i, n0]`, `n0` the size at the loop's head; pushes whether to
-/// run another pass. It is the JDK iterator's protocol over a size check: a
+/// `[iterable, i, n0, m0]`, `n0` the size and `m0` the modification count
+/// ([`mod_count`]) at the loop's head; pushes whether to run another pass. It is the JDK iterator's protocol over a size check: a
 /// collection whose size the body changed ends the loop if the cursor now
 /// sits at its end (`hasNext` is `cursor != size`) and otherwise raises
 /// `ConcurrentModificationException`, which is what `next()`'s modification
@@ -339,6 +339,9 @@ pub const KT_ITER_MORE: u16 = 156;
 /// recursion — and every frame entered while that error unwinds returns
 /// immediately instead of recursing again. Stack-neutral otherwise.
 pub const KT_DEPTH_GUARD: u16 = 157;
+/// `KT_MODCOUNT`: a collection's modification count — see [`mod_count`].
+/// Stack `[collection]`; pushes an `Int`.
+pub const KT_MODCOUNT: u16 = 159;
 
 /// How many VM frames a call chain may hold before `StackOverflowError`.
 ///
@@ -2600,6 +2603,7 @@ fn reset_heap() {
     ONCE_CONSUMED.with(|t| t.borrow_mut().clear());
     ITER_END.with(|c| *c.borrow_mut() = None);
     UNIT.with(|u| *u.borrow_mut() = None);
+    MOD_COUNTS.with(|t| t.borrow_mut().clear());
     FAILED_INIT.with(|f| f.borrow_mut().clear());
     INIT_DEPTH.with(|d| d.set(0));
     TYPES.with(|t| t.borrow_mut().clear());
@@ -5130,7 +5134,12 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             }
             vm.push(Value::Bool(over && unwinding()));
         }
+        KT_MODCOUNT => {
+            let v = vm.pop();
+            vm.push(Value::Int(mod_count(&v) as i64));
+        }
         KT_ITER_MORE => {
+            let m0 = vm.pop().to_int() as u64;
             let n0 = vm.pop().to_int();
             let i = vm.pop().to_int();
             let recv = vm.pop();
@@ -5143,7 +5152,8 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             } else {
                 n0
             };
-            if cur == n0 {
+            let changed = cur != n0 || (resizable && mod_count(&recv) != m0);
+            if !changed {
                 vm.push(Value::Bool(i < n0));
             } else if i == cur {
                 vm.push(Value::Bool(false));
@@ -6663,6 +6673,18 @@ fn map_upsert(vm: &mut VM, entries: &mut Vec<(Value, Value)>, k: Value, v: Value
 /// drops only the FIRST match (`listOf(1, 2, 2, 3) - 2` is `[1, 2, 3]`), while
 /// `minus(elements)` drops every occurrence of every listed element.
 fn operator_apply(vm: &mut VM, lhs: &Value, name: &str, rhs: &Value) -> Result<Value, String> {
+    let before = mod_len(lhs);
+    let out = operator_apply_inner(vm, lhs, name, rhs);
+    note_mod(lhs, name, before);
+    out
+}
+
+fn operator_apply_inner(
+    vm: &mut VM,
+    lhs: &Value,
+    name: &str,
+    rhs: &Value,
+) -> Result<Value, String> {
     // A lazy `Sequence`'s `plus`/`minus` are its members, which the method
     // spelling already reaches.
     if matches!(name, "plus" | "minus")
@@ -7064,6 +7086,21 @@ fn b_coll_hof(vm: &mut VM, argc: u8) -> Value {
     }
     extras.reverse();
     let recv = vm.pop();
+    let before = mod_len(&recv);
+    let out = b_coll_hof_inner(vm, &name, clo, extras, &recv);
+    note_mod(&recv, &name, before);
+    out
+}
+
+fn b_coll_hof_inner(
+    vm: &mut VM,
+    name: &str,
+    clo: Value,
+    mut extras: Vec<Value>,
+    recv: &Value,
+) -> Value {
+    let name = name.to_string();
+    let recv = recv.clone();
     // `Regex.find(input)` shares its name with the collection predicate, so a
     // call on a `Regex` (or a `String` member taking one) arrives here with its
     // last argument in the lambda's place. Put it back and dispatch as a member.
@@ -11304,7 +11341,9 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         ) | ("fill", _)
             | ("add", 2)
     );
+    let before = mod_len(recv);
     let out = kt_method_inner(vm, recv, name, args);
+    note_mod(recv, name, before);
     match out {
         Ok(Value::Undef) if unit => Ok(unit_value()),
         other => other,
@@ -16091,6 +16130,13 @@ fn store_at(items: &mut [Value], i: i64, value: Value, kind: &str) -> Result<(),
 
 /// `recv[index] = value` — list set (bounds-checked) or map put.
 fn index_set(vm: &mut VM, recv: &Value, index: &Value, value: Value) -> Result<(), String> {
+    let before = mod_len(recv);
+    let out = index_set_inner(vm, recv, index, value);
+    note_mod(recv, "set", before);
+    out
+}
+
+fn index_set_inner(vm: &mut VM, recv: &Value, index: &Value, value: Value) -> Result<(), String> {
     let pair = [index.clone(), value.clone()];
     if let Some(r) = sublist_write(vm, recv, "set", &pair, &mut |vm| {
         index_set(vm, recv, &pair[0], pair[1].clone()).map(|()| Value::Undef)
@@ -18421,6 +18467,50 @@ fn is_unit(v: &Value) -> bool {
         && UNIT.with(
             |u| matches!((u.borrow().as_ref(), v), (Some(Value::Obj(a)), Value::Obj(b)) if a == b),
         )
+}
+
+thread_local! {
+    /// Collection handle → its structural modification count — the JDK's
+    /// `modCount`, which an iterator compares to raise
+    /// `ConcurrentModificationException`. See [`note_mod`].
+    static MOD_COUNTS: RefCell<std::collections::HashMap<u32, u64>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+fn mod_count(v: &Value) -> u64 {
+    let Value::Obj(id) = v else { return 0 };
+    MOD_COUNTS.with(|t| t.borrow().get(id).copied().unwrap_or(0))
+}
+
+/// A collection's size before a member call, when it is one.
+fn mod_len(v: &Value) -> Option<i64> {
+    with_obj(v, |o| {
+        matches!(o, HeapObj::List(_) | HeapObj::Set(_) | HeapObj::Map(_))
+    })
+    .unwrap_or(false)
+    .then(|| iter_len(v))
+    .flatten()
+}
+
+/// Count a structural modification of `v` by the member `name`: any change of
+/// size, and the in-place sorts and `replaceAll` of a list of two or more,
+/// which `ArrayList` counts too. A `set` and a `put` over an existing key are
+/// not structural, as on the JDK.
+fn note_mod(v: &Value, name: &str, before: Option<i64>) {
+    let Some(before) = before else { return };
+    let after = iter_len(v).unwrap_or(before);
+    let is_list = with_obj(v, |o| matches!(o, HeapObj::List(_))).unwrap_or(false);
+    let reorder = is_list
+        && after > 1
+        && matches!(
+            name,
+            "sort" | "sortDescending" | "sortWith" | "sortBy" | "sortByDescending" | "replaceAll"
+        );
+    if after != before || reorder {
+        if let Value::Obj(id) = v {
+            MOD_COUNTS.with(|t| *t.borrow_mut().entry(*id).or_insert(0) += 1);
+        }
+    }
 }
 
 /// Whether `v` is an EMPTY read-only `Set`/`Map` literal — Kotlin's

@@ -31,8 +31,8 @@ use crate::host::{
     KT_GETFIELD, KT_HASH_REG, KT_IDENTITY, KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM,
     KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_END, KT_ITER_GET, KT_ITER_MORE, KT_ITER_PULL, KT_ITER_SIZE,
     KT_ITER_SRC, KT_ITER_SRC_LAZY, KT_JOIN, KT_LATEINIT, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST,
-    KT_LIST_RO, KT_LIST_TAG, KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW,
-    KT_NLR_MATCH, KT_NLR_RAISE, KT_NLR_TAKE, KT_NOTNULL, KT_OBJEQ_VM, KT_OBJ_INIT_ENTER,
+    KT_LIST_RO, KT_LIST_TAG, KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_MODCOUNT,
+    KT_NEW, KT_NLR_MATCH, KT_NLR_RAISE, KT_NLR_TAKE, KT_NOTNULL, KT_OBJEQ_VM, KT_OBJ_INIT_ENTER,
     KT_OBJ_INIT_EXIT, KT_OBSERVE, KT_OPER_REG, KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT,
     KT_PRINTLN, KT_RANDOM, KT_RANGE, KT_RANGE_STEP, KT_REIFIED, KT_REIFY, KT_RESULT_HOF,
     KT_RUN_CATCHING, KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_STR_ORDER, KT_SYSTEM,
@@ -5558,10 +5558,18 @@ impl Compiler {
         // iterator does; a string, an array or a range cannot change size and
         // keeps the native compare.
         let checked = !self.fixed_size_header(sc, iter);
+        // The collection's modification count at the head, which the test
+        // compares as the JDK iterator compares `modCount`.
+        let mslot = sc.temp();
+        if checked {
+            self.b.emit(Op::GetSlot(cslot), 0);
+            self.b.emit(Op::Extended(KT_MODCOUNT, 0), 0);
+            self.b.emit(Op::SetSlot(mslot), 0);
+        }
         // Rotated, like every other loop here: the index test guards the entry
         // and closes the loop as a conditional backward branch. See
         // the note on `while` in [`Compiler::compile_stmt_inner`].
-        self.emit_loop_test(checked, cslot, islot, nslot);
+        self.emit_loop_test(checked, cslot, islot, nslot, mslot);
         let jf = self.b.emit(Op::JumpIfFalse(0), 0);
         let top = self.b.current_pos();
         self.b.emit(Op::GetSlot(cslot), 0);
@@ -5615,7 +5623,7 @@ impl Compiler {
         self.b.emit(Op::LoadInt(1), 0);
         self.b.emit(Op::Add, 0);
         self.b.emit(Op::SetSlot(islot), 0);
-        self.emit_loop_test(checked, cslot, islot, nslot);
+        self.emit_loop_test(checked, cslot, islot, nslot, mslot);
         self.b.emit(Op::JumpIfTrue(top), 0);
         // A lazy source that ran dry left the end marker on the stack.
         if let Some(dry) = dry {
@@ -5687,13 +5695,14 @@ impl Compiler {
     /// [`Compiler::emit_range_test`] gives.
     /// The `for`-in loop test: [`Compiler::emit_index_test`], or
     /// `KT_ITER_MORE` over the iterable for a header that may be resized.
-    fn emit_loop_test(&mut self, checked: bool, cslot: u16, islot: u16, nslot: u16) {
+    fn emit_loop_test(&mut self, checked: bool, cslot: u16, islot: u16, nslot: u16, mslot: u16) {
         if !checked {
             return self.emit_index_test(islot, nslot);
         }
         self.b.emit(Op::GetSlot(cslot), 0);
         self.b.emit(Op::GetSlot(islot), 0);
         self.b.emit(Op::GetSlot(nslot), 0);
+        self.b.emit(Op::GetSlot(mslot), 0);
         self.b.emit(Op::Extended(KT_ITER_MORE, 0), 0);
     }
 

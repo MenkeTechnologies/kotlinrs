@@ -468,9 +468,9 @@ fails loudly, because the runtime class does not say which the source meant.
 A write through a `subList` or an `asList` view reaches its backing store
 since round 21; reads through either stay snapshots (see "Collection VIEWS
 are snapshots"). A `for` loop over a collection raises `ConcurrentModificationException`
-from a SIZE change since round 21; a body that changes the collection
-without changing its size (an `add` and a `remove` in one pass, a `sort`)
-is not detected, which the JDK's modification count would.
+from a size change or a modification-count change since round 21; a
+structural write through a `subList` view does not bump the BACKING list's
+count.
 
 Member overloads were silently resolved to the FIRST declaration of the name;
 they are refused now, which is the measurement above. Resolving them needs a

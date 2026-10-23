@@ -11,6 +11,23 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Same-size modifications during a `for` loop
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | before | reference |
+| --- | --- | --- |
+| `for (x in l) if (x == 1) { l.add(9); l.removeAt(3) }` | ran to the end | `ConcurrentModificationException` |
+| `for (x in l) if (x == 3) l.sort()` over three elements, `l.replaceAll { … }`, `l.sortBy { … }` | ran to the end | `ConcurrentModificationException` |
+| a `put` of a new key then its `remove`, over a `MutableMap` | ran to the end | `ConcurrentModificationException` |
+| `l[1] = 5`, `m[k] = v + 1` over an existing key, `l.shuffle(…)`, `l.sort()` of one element | ran | ran — not structural |
+
+Each collection carries a modification count (`MOD_COUNTS`), bumped by any
+member call, operator or index write that changes its size, and by the
+in-place sorts and `replaceAll` of a list of two or more — what `ArrayList`
+counts. A `for` loop records it at its head (`KT_MODCOUNT`) and `KT_ITER_MORE`
+compares it on every pass.
+
 ## `array.asList()` is an `Arrays$ArrayList` over the array
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.

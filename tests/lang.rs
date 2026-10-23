@@ -8820,3 +8820,30 @@ fun main() {
         "add: EX java.lang.UnsupportedOperationException\nadd1: EX java.lang.UnsupportedOperationException\nset: [9, 2]\nset1: [9]\nsortThrough: [1, 2, 3]\nremove: EX java.lang.UnsupportedOperationException: remove\nclear: EX java.lang.UnsupportedOperationException\nidx: EX java.lang.ArrayIndexOutOfBoundsException: Index 5 out of bounds for length 1\n"
     );
 }
+
+#[test]
+fn a_same_size_structural_change_during_a_for_loop_is_detected() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1: an `add` and a `remove` in
+    // one pass, or a `sort`/`replaceAll` of two or more elements, bump the
+    // JDK's `modCount` without changing the size; a `set`, a `put` over an
+    // existing key and a `shuffle` do not.
+    assert_eq!(
+        stdout(
+            r##"fun t(name: String, f: () -> Any?) { try { println("$name: ${f()}") } catch (e: Throwable) { println("$name: EX $e") } }
+fun main() {
+    t("addRemove") { val l = mutableListOf(1, 2, 3); for (x in l) if (x == 1) { l.add(9); l.removeAt(3) }; l }
+    t("sortDuring") { val l = mutableListOf(3, 1, 2); for (x in l) if (x == 3) l.sort(); l }
+    t("sortOne") { val l = mutableListOf(1); for (x in l) l.sort(); l }
+    t("replaceAllDuring") { val l = mutableListOf(1, 2); for (x in l) l.replaceAll { it * 2 }; l }
+    t("setDuring") { val l = mutableListOf(1, 2); for (x in l) l[1] = 5; l }
+    t("putExisting") { val m = mutableMapOf(1 to 1, 2 to 2); for ((k, v) in m) m[k] = v + 1; m }
+    t("putNewRemove") { val m = mutableMapOf(1 to 1, 2 to 2, 3 to 3); for ((k, _) in m) if (k == 1) { m[9] = 9; m.remove(9) }; m }
+    t("shuffleDuring") { val l = mutableListOf(1, 2, 3); var n = 0; for (x in l) { l.shuffle(java.util.Random(1)); n++ }; n }
+    t("removeIfNone") { val l = mutableListOf(1, 2); for (x in l) l.removeIf { it > 9 }; l }
+    t("addRemoveSet") { val s = mutableSetOf(1, 2, 3); for (x in s) if (x == 1) { s.add(9); s.remove(9) }; s }
+    t("sortByDuring") { val l = mutableListOf("b", "a"); for (x in l) l.sortBy { it }; l }
+}"##
+        ),
+        "addRemove: EX java.util.ConcurrentModificationException\nsortDuring: EX java.util.ConcurrentModificationException\nsortOne: [1]\nreplaceAllDuring: EX java.util.ConcurrentModificationException\nsetDuring: [1, 5]\nputExisting: {1=2, 2=3}\nputNewRemove: EX java.util.ConcurrentModificationException\nshuffleDuring: 3\nremoveIfNone: [1, 2]\naddRemoveSet: EX java.util.ConcurrentModificationException\nsortByDuring: EX java.util.ConcurrentModificationException\n"
+    );
+}
