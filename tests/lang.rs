@@ -8847,3 +8847,29 @@ fun main() {
         "addRemove: EX java.util.ConcurrentModificationException\nsortDuring: EX java.util.ConcurrentModificationException\nsortOne: [1]\nreplaceAllDuring: EX java.util.ConcurrentModificationException\nsetDuring: [1, 5]\nputExisting: {1=2, 2=3}\nputNewRemove: EX java.util.ConcurrentModificationException\nshuffleDuring: 3\nremoveIfNone: [1, 2]\naddRemoveSet: EX java.util.ConcurrentModificationException\nsortByDuring: EX java.util.ConcurrentModificationException\n"
     );
 }
+
+#[test]
+fn a_class_implements_a_collection_interface_by_a_delegate() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. `: MutableList<String> by
+    // inner` was rejected; every member the class does not declare now
+    // reaches the delegate, `+=` is the virtual `add`, and an override wins.
+    assert_eq!(
+        stdout(
+            r##"class Logger(private val inner: MutableList<String> = mutableListOf()) : MutableList<String> by inner {
+    override fun add(element: String): Boolean { println("adding $element"); return inner.add(element.uppercase()) }
+}
+class Registry(private val m: MutableMap<String, Int> = mutableMapOf()) : MutableMap<String, Int> by m
+class Names(names: List<String>) : List<String> by names { fun shout() = map { it.uppercase() } }
+fun main() {
+    val lg = Logger(); lg.add("a"); lg += "b"; lg.addAll(listOf("c"))
+    println(lg.size); println(lg[0]); println(lg.joinToString()); println("A" in lg); println(lg.map { it.lowercase() })
+    for (x in lg) print(x); println()
+    lg.removeAt(0); println(lg.size); println(lg.isEmpty())
+    val r = Registry(); r["x"] = 1; r.put("y", 2); println(r.size); println(r["x"]); println(r.keys); println(r.getOrDefault("z", 0))
+    val n = Names(listOf("ann", "bo")); println(n.shout()); println(n.first()); println(n.size); println(n.indexOf("bo"))
+    println(lg.toString().startsWith("Logger@"))
+}"##
+        ),
+        "adding a\nadding b\n3\nA\nA, B, c\ntrue\n[a, b, c]\nABc\n2\nfalse\n2\n1\n[x, y]\n0\n[ANN, BO]\nann\n2\n1\ntrue\n"
+    );
+}

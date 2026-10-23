@@ -1251,7 +1251,9 @@ declaration order and a secondary's body runs only after the constructor it
 delegates to has finished; **interface delegation** (`class C(x: I) : I by x`),
 which forwards `I`'s defaulted members too, so a default method calls the
 DELEGATE's implementation rather than the delegating class's override, as
-Kotlin specifies; **property delegation** through a custom `operator fun
+Kotlin specifies; a stdlib collection interface (`List`, `MutableList`, `Set`,
+`Map`, …) implemented `by` a delegate forwards every member the class does not
+declare, `[]` and `in` included, with `+=` the virtual `add`; **property delegation** through a custom `operator fun
 getValue` / `setValue`, which receive the `thisRef` and a `KProperty` carrying
 the property's name; **invoking the result of a call** (`f()()`, `lst[0](7)`,
 `{ x: Int -> x }(9)`, `f.invoke(x)`, and a class declaring `operator fun

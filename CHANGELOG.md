@@ -11,6 +11,23 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## A collection interface implemented `by` a delegate
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | before | reference |
+| --- | --- | --- |
+| `class Logger(private val inner: MutableList<String> = mutableListOf()) : MutableList<String> by inner { override fun add(element: String): Boolean { … } }` | `` `by` delegation requires an interface supertype; MutableList is not one `` | compiles |
+| `lg += "b"`, `lg.addAll(listOf("c"))` | — | `+=` reaches the OVERRIDDEN `add`; `addAll` is the delegate's |
+| `lg.size`, `lg[0]`, `"A" in lg`, `lg.map { … }`, `for (x in lg)` | — | the delegate's elements |
+| `class Registry(m: MutableMap<String, Int>) : MutableMap<String, Int> by m`; `r["x"] = 1`, `r.keys` | — | the delegate map |
+| `class Names(names: List<String>) : List<String> by names { fun shout() = map { … } }` | — | an unqualified extension over the delegate |
+
+The parser keeps the delegate field for a stdlib collection interface (it has
+no declaration to forward from), and the compiler forwards every member,
+index and `in` the class does not declare to that field; an `override` of one
+of the interface's members is accepted on trust.
+
 ## Same-size modifications during a `for` loop
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.

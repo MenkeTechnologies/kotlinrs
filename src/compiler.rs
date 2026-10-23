@@ -2535,7 +2535,11 @@ fn check_modifiers(
                     && !cd
                         .parents
                         .iter()
-                        .any(|p| marker_member(p, &m.name, m.params.len())) =>
+                        .any(|p| marker_member(p, &m.name, m.params.len()))
+                    // A stdlib collection interface implemented `by` a delegate
+                    // declares members this frontend does not list; an override of
+                    // one is taken on trust, as the forwarding is.
+                    && !cd.parents.iter().any(|p| crate::parser::is_collection_iface(p)) =>
             {
                 return Err(format!(
                     "class {}: `{}` overrides nothing (line {})",
@@ -2630,6 +2634,11 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
             if !by_name.contains_key(p.as_str())
                 && crate::host::throwable_fqn(p).is_none()
                 && !is_marker_supertype(p)
+                && !(crate::parser::is_collection_iface(p)
+                    && cd
+                        .obj_props
+                        .iter()
+                        .any(|bp| bp.name == crate::parser::delegate_field(p)))
             {
                 return Err(format!("unresolved supertype {p} of class {}", cd.name));
             }
@@ -5126,7 +5135,10 @@ impl Compiler {
                 index,
                 op,
                 value,
-            } => self.compile_set_index(sc, recv, index, op, value)?,
+            } => match self.collection_delegate(sc, recv, "set") {
+                Some(field) => self.compile_set_index(sc, &field, index, op, value)?,
+                None => self.compile_set_index(sc, recv, index, op, value)?,
+            },
             StmtKind::Destructure { names, init } => self.compile_destructure(sc, names, init)?,
             StmtKind::Return(e) => {
                 match e {
@@ -5493,6 +5505,11 @@ impl Compiler {
         body: &[Stmt],
         label: &Option<String>,
     ) -> Result<(), String> {
+        // A class implementing a collection interface `by` a delegate iterates
+        // as its delegate.
+        if let Some(field) = self.collection_delegate(sc, iter, "iterator") {
+            return self.compile_for_in(sc, var, parts, &field, body, label);
+        }
         let mark = sc.enter();
         // Iterating a `String` yields `Char`s. The runtime element is an integer
         // code unit like every other kotlinrs `Char`, so the element type has to
@@ -6035,6 +6052,14 @@ impl Compiler {
             }
             Expr::Index { recv, index, line } => {
                 // `a[i]` is the `get` convention.
+                if let Some(field) = self.collection_delegate(sc, recv, "get") {
+                    let inner = Expr::Index {
+                        recv: Box::new(field),
+                        index: index.clone(),
+                        line: *line,
+                    };
+                    return self.compile_expr(sc, &inner);
+                }
                 if self.declares_operator(sc, recv, "get") {
                     return self.compile_member(
                         sc,
@@ -6113,6 +6138,15 @@ impl Compiler {
                         self.b.emit(Op::LogNot, 0);
                     }
                     return Ok(Type::Boolean);
+                }
+                // A class implementing a collection interface `by` a delegate.
+                if let Some(field) = self.collection_delegate(sc, container, "contains") {
+                    let inner = Expr::In {
+                        value: value.clone(),
+                        container: Box::new(field),
+                        negated: *negated,
+                    };
+                    return self.compile_expr(sc, &inner);
                 }
                 // A user `Iterable` with no `contains` of its own: the
                 // `Iterable.contains` extension over its elements.
@@ -6681,6 +6715,15 @@ impl Compiler {
                 return Ok(Type::Int);
             }
             return Ok(Type::Double);
+        }
+        // A class implementing a stdlib collection interface `by` a delegate
+        // forwards every member it does not declare to that delegate —
+        // `size`, `add`, `map`, `joinToString` — as Kotlin's delegation does.
+        // `Any`'s members stay the class's own.
+        if !matches!(name, "toString" | "equals" | "hashCode" | "javaClass") && !is_scope_fn(name) {
+            if let Some(field) = self.collection_delegate(sc, recv, name) {
+                return self.compile_member(sc, &field, name, args, safe, line);
+            }
         }
         // An `Iterable` EXTENSION on a user class that implements `Iterable`
         // and does not declare the member itself: the elements its iterator
@@ -9120,6 +9163,21 @@ impl Compiler {
         };
         if self.declares_operator(sc, target, fname) {
             self.compile_member(sc, target, fname, std::slice::from_ref(value), false, 0)?;
+        } else if self.collection_delegate(sc, target, fname).is_some() {
+            // `MutableCollection.plusAssign` is `this.add(element)` (`addAll`
+            // for a collection) — a VIRTUAL call, so a class implementing the
+            // interface `by` a delegate and overriding `add` gets its own.
+            let many = matches!(
+                self.infer_class(sc, value).as_deref(),
+                Some("List" | "Set" | "Collection" | "Iterable" | "Sequence")
+            );
+            let member = match (fname, many) {
+                ("plusAssign", false) => "add",
+                ("plusAssign", true) => "addAll",
+                (_, false) => "remove",
+                (_, true) => "removeAll",
+            };
+            self.compile_member(sc, target, member, std::slice::from_ref(value), false, 0)?;
         } else if !is_primitive_recv(self.infer(sc, target)) {
             self.emit_operator_call(sc, target, value, fname)?;
         } else {
@@ -11072,6 +11130,9 @@ impl Compiler {
                             .iter()
                             .chain(&m.parents)
                             .any(|p| matches!(p.as_str(), "Iterable" | "MutableIterable"))
+                            || m.parents
+                                .iter()
+                                .any(|p| crate::parser::is_collection_iface(p))
                     });
                     if iterable
                         && sc.slot("this").is_some()
@@ -11370,6 +11431,32 @@ impl Compiler {
             .map(|((r, n), s)| (ext_sub_name(r, n), s.clone()));
         let first = hits.next()?;
         hits.next().is_none().then_some(first)
+    }
+
+    /// `recv.$delegate$I` when `recv` is statically an instance of a class
+    /// implementing the stdlib collection interface `I` `by` a delegate, and
+    /// the class does not itself declare `name`.
+    fn collection_delegate(&self, sc: &Scope, recv: &Expr, name: &str) -> Option<Expr> {
+        let cls = self.infer_class(sc, recv)?;
+        let meta = self.classes.get(&cls)?;
+        if name.starts_with("$delegate$")
+            || meta.methods.contains_key(name)
+            || meta.prop(name).is_some()
+        {
+            return None;
+        }
+        let iface = meta
+            .parents
+            .iter()
+            .find(|p| crate::parser::is_collection_iface(p))?;
+        let field = crate::parser::delegate_field(iface);
+        meta.prop(&field)?;
+        Some(Expr::Member {
+            recv: Box::new(recv.clone()),
+            name: field,
+            safe: false,
+            line: 0,
+        })
     }
 
     /// The members that act on an `Iterable` user object ITSELF rather than on

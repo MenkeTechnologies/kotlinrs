@@ -599,8 +599,25 @@ fn str_lit(s: &str) -> Expr {
 
 /// The synthetic field a `class C(b: B) : I by b` stores its delegate in.
 /// `$` cannot appear in a Kotlin identifier, so it can never collide.
-fn delegate_field(iface: &str) -> String {
+pub fn delegate_field(iface: &str) -> String {
     format!("$delegate${iface}")
+}
+
+/// The stdlib collection interfaces a class may implement `by` a delegate.
+pub fn is_collection_iface(name: &str) -> bool {
+    matches!(
+        name,
+        "List"
+            | "MutableList"
+            | "Collection"
+            | "MutableCollection"
+            | "Set"
+            | "MutableSet"
+            | "Map"
+            | "MutableMap"
+            | "Iterable"
+            | "MutableIterable"
+    )
 }
 
 /// Rewrite every `class C : I by expr` into ordinary code: a stored property
@@ -648,7 +665,12 @@ fn expand_interface_delegation(prog: &mut Program) -> Result<(), String> {
             continue;
         }
         for (iface, expr) in std::mem::take(&mut cd.delegates) {
-            if !ifaces.contains_key(&iface) {
+            // A stdlib collection interface has no declaration to forward
+            // from: its members reach the delegate through the compiler's
+            // forwarding of every member the class does not declare (see
+            // `Compiler::collection_delegate`), so only the field is made here.
+            let builtin = is_collection_iface(&iface);
+            if !ifaces.contains_key(&iface) && !builtin {
                 return Err(format!(
                     "class {}: `by` delegation requires an interface supertype; \
                      {iface} is not one",
@@ -676,6 +698,9 @@ fn expand_interface_delegation(prog: &mut Program) -> Result<(), String> {
                     deferred: false,
                 },
             );
+            if builtin {
+                continue;
+            }
             let mut inherited = Vec::new();
             members(&iface, &ifaces, &mut inherited, 0);
             for m in inherited {
