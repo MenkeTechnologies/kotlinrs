@@ -11,6 +11,27 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Collection views read live
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | before | reference |
+| --- | --- | --- |
+| `val s = a.subList(1, 3); a[1] = 20; println(s)` | `[2, 3]` | `[20, 3]` |
+| `arr.asList()` / `intArrayOf(3, 1, 2).asList()` after `arr[0] = 10` / `ia.sort()` | the old elements | the array's |
+| `m.keys`, `m.values`, `m.entries` after `m["b"] = 2` | the old entries | the map's |
+| `a.asReversed()` after `a[0] = 100` | the old elements | reversed live |
+| `b.asReversed()[0] = 9` on a `MutableList` | dropped silently | writes `b`'s last element |
+| `t[0] = 300` with `t = a.subList(1, 5).subList(1, 3)` | reached the middle view only | reaches `a` |
+| any use of a `subList` after its backing list changed size | answered | `ConcurrentModificationException` |
+
+A view keeps its own heap copy and is re-copied by the next read after its
+backing object is written; `for` loops and indexing over a view read the
+backing directly, so a loop over a view that writes the backing stays linear. A
+`HashMap` write over an existing key no longer marks the map for re-ordering,
+which kept such a loop quadratic. Sorted-collection ranges (`headSet`, …) are
+still snapshots (BUGS.md).
+
 ## Explicit and annotated collection type arguments
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1. Kotlin gives an integer literal

@@ -9180,3 +9180,129 @@ fun main() {
         "-294967296\nnull\n7\n-294967296\ntrue\n-294967296\nv=2000000000 null\n0.75\n3\nv!\nnull!\n3000000001\nb\nnull\n"
     );
 }
+
+/// `subList`, `asList` (object and primitive arrays), `asReversed` and a map's\n`keys`/`values`/`entries` read their backing object live, as the JDK's views\ndo, and a `subList` whose backing list changed structurally raises\n`ConcurrentModificationException` on every later use. Each was a snapshot\nbefore. The two loops pin linear cost: a write to the backing inside a loop\nover the view must not re-copy the view per step.
+#[test]
+fn collection_views_read_their_backing_live() {
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    val a = mutableListOf(1, 2, 3, 4)
+    val s = a.subList(1, 3)
+    a[1] = 20
+    println(s)
+    val arr = arrayOf(1, 2, 3)
+    val v = arr.asList()
+    arr[0] = 10
+    println(v)
+    val ia = intArrayOf(3, 1, 2)
+    val il = ia.asList()
+    ia.sort()
+    println(il)
+    val m = mutableMapOf("a" to 1)
+    val ks = m.keys
+    val vs = m.values
+    val es = m.entries
+    m["b"] = 2
+    m["a"] = 10
+    println("$ks $vs $es ${ks.size}")
+    val rev = a.asReversed()
+    a[0] = 100
+    println(rev)
+    a.add(5)
+    try { println(s) } catch (e: ConcurrentModificationException) { println("CME print") }
+    try { s.add(7) } catch (e: ConcurrentModificationException) { println("CME add") }
+    try { println(listOf(s)) } catch (e: ConcurrentModificationException) { println("CME nested") }
+    val h = HashMap<Int, Int>()
+    for (i in 0 until 3000) h[i] = i
+    for (k in h.keys) h[k] = k + 1
+    for (k in h.keys) h.put(k, h.getValue(k) + 1)
+    println(h.values.sum())
+    val big = (1..3000).toMutableList()
+    val bs = big.subList(0, 3000)
+    var acc = 0L
+    for (i in 0 until bs.size) { acc += bs[i]; big[0] = i }
+    println(acc)
+}"##
+        ),
+        "[20, 3]\n[10, 2, 3]\n[1, 2, 3]\n[a, b] [10, 2] [a=10, b=2] 2\n[4, 3, 20, 100]\nCME print\nCME add\nCME nested\n4504500\n4501500\n"
+    );
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    val a = mutableListOf(1, 2, 3, 4, 5, 6)
+    val s = a.subList(1, 5)
+    val t = s.subList(1, 3)
+    a[2] = 30
+    println(t)
+    t[0] = 300
+    println(a)
+    println(s)
+    s.removeAt(0)
+    println(a)
+    println(s)
+    println(s.size)
+    for (x in s) print("$x ")
+    println()
+    println(s.sum())
+    val m = mutableMapOf("a" to 1, "b" to 2)
+    val vs = m.values
+    m["a"] = 10
+    println(vs)
+    println(vs.sum())
+    m.remove("b")
+    println(vs.size)
+    for (k in m.keys) print(k)
+    println()
+    val ks = m.keys
+    m["z"] = 26
+    println(ks.contains("z"))
+    println("z" in ks)
+    val es = m.entries
+    m["y"] = 25
+    println(es.map { it.key })
+    val arr = intArrayOf(3, 1, 2)
+    val al = arr.asList()
+    arr.sort()
+    println(al)
+    val r = a.asReversed()
+    a[0] = -1
+    println(r)
+    println(r.size)
+    println(listOf(s, r))
+    println(s == listOf(300, 4, 5))
+    val big = (1..2000).toMutableList()
+    val bs = big.subList(0, 2000)
+    var acc = 0L
+    for (i in 0 until bs.size) acc += bs[i]
+    println(acc)
+    val out = mutableListOf<Int>()
+    for (i in 0 until bs.size) out.add(bs[i])
+    println(out.size)
+}"##
+        ),
+        "[30, 4]\n[1, 2, 300, 4, 5, 6]\n[2, 300, 4, 5]\n[1, 300, 4, 5, 6]\n[300, 4, 5]\n3\n300 4 5 \n309\n[10, 2]\n12\n1\na\ntrue\ntrue\n[a, z, y]\n[1, 2, 3]\n[6, 5, 4, 300, -1]\n5\n[[300, 4, 5], [6, 5, 4, 300, -1]]\ntrue\n2001000\n2000\n"
+    );
+}
+
+/// `MutableList.asReversed()` is a `MutableList` view: `set`, `add` and `removeAt`\nthrough it reach the backing list at the mirrored position. It was a\nread-only copy whose writes were dropped silently (`[1, 2, 3]` stayed).
+#[test]
+fn a_mutable_lists_reversed_view_writes_through() {
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    val b = mutableListOf(1, 2, 3)
+    val r = b.asReversed()
+    r[0] = 9
+    println(b)
+    r.add(0)
+    println(b)
+    r.removeAt(1)
+    println("$b $r")
+    b.add(7)
+    println(r)
+}"##
+        ),
+        "[1, 2, 9]\n[0, 1, 2, 9]\n[0, 1, 9] [9, 1, 0]\n[7, 9, 1, 0]\n"
+    );
+}

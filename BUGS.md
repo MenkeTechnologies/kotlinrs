@@ -99,32 +99,22 @@ overflow) and succeeds for the second. Same category as the `%2147483647d` entry
   added to the stdlib surface without being added there loses the sequence
   wording for everything downstream of it.
 
-## Collection VIEWS are snapshots
+## Sorted-collection range VIEWS are snapshots
 
-`asReversed()`, `Map.keys`/`Map.values` and `subList()`, and a sorted
-collection's `headMap`/`tailMap`/`subMap`/`headSet`/`tailSet`/`subSet`/`descending…`
-ranges, are declared to be LIVE
-VIEWS of their receiver: Kotlin's documentation for each says a change to the
-backing collection shows through. Every one of them is a copy here, taken when
-the member is called, so the view stops tracking at that moment. Measured on
-`kotlinc` 2.4.10 / JRE 21.0.12:
+`subList()`, `asList()`, `asReversed()` and a map's `keys`/`values`/`entries`
+read their backing object live (see CHANGELOG, "Collection views read live").
+A sorted collection's `headMap`/`tailMap`/`subMap`/`headSet`/`tailSet`/`subSet`/
+`descending…` ranges are still copies taken when the member is called, so they
+stop tracking at that moment. Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1:
 
 | program | kotlinrs | reference |
 | --- | --- | --- |
-| `val b = mutableListOf(1, 2, 3); val v = b.asReversed(); b.add(4); println(v)` | `[3, 2, 1]` | `[4, 3, 2, 1]` |
-| `val m = mutableMapOf("a" to 1); val k = m.keys; m["b"] = 2; println(k)` | `[a]` | `[a, b]` |
-| `val l = mutableListOf(1, 2); val s = l.subList(0, 2); l[0] = 9; println(s)` | `[1, 2]` | `[9, 2]` |
+| `val t = sortedSetOf(1, 5, 9); val h = t.headSet(6); t.add(2); println(h)` | `[1, 5]` | `[1, 2, 5]` |
+| `(listOf(1, 2).asReversed() as MutableList<Int>)[0] = 5` | succeeds | `ClassCastException: kotlin.collections.ReversedListReadOnly cannot be cast to kotlin.collections.MutableList` |
 
-A WRITE through a map's `keys`/`values`/`entries` view reaches the map since
-round 21 (see CHANGELOG); the view itself is re-read from the map at that write.
-
-Every read that does not outlive a mutation of the backing collection agrees, so
-this is invisible until a program holds a view across a write. Closing it needs a
-heap representation for a view — a `HeapObj` that carries a handle and a mapping
-rather than its own elements — which every member that snapshots elements
-(`list_snapshot`, the display path, indexing, `size`) would then have to
-understand. That is the whole change; the measurements above are its
-specification.
+A live view is a heap copy re-taken whenever its backing object was written
+since the last copy; reads that walk a view (`for`, indexing) read the backing
+directly, so a loop over a view stays linear while the backing is written.
 
 ## Still missing, with the measurement
 
@@ -334,7 +324,7 @@ Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 | `mutableMapOf("a" to 1).withDefault { 0 }.getValue("zz")` | `unresolved reference: withDefault on Map` | `0` |
 
 `withDefault` is a VIEW over the receiver, and maps here have no view
-representation (see "Collection VIEWS are snapshots").
+representation (see "Sorted-collection range VIEWS are snapshots").
 
 ## Round 19: `sum()` over an `Int` collection the frontend cannot type
 
@@ -463,8 +453,7 @@ extension on a class and on its subclass), the chain declines and the call
 fails loudly, because the runtime class does not say which the source meant.
 
 A write through a `subList` or an `asList` view reaches its backing store
-since round 21; reads through either stay snapshots (see "Collection VIEWS
-are snapshots"). A `for` loop over a collection raises `ConcurrentModificationException`
+since round 21; reads through either are live since the views round. A `for` loop over a collection raises `ConcurrentModificationException`
 from a size change or a modification-count change since round 21; a
 structural write through a `subList` view does not bump the BACKING list's
 count.

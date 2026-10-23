@@ -1279,6 +1279,7 @@ thread_local! {
 
 fn register_map_view(view: &Value, map: &Value, kind: MapView) {
     if let Value::Obj(id) = view {
+        track_view(view, map);
         MAP_VIEWS.with(|t| t.borrow_mut().insert(*id, (map.clone(), kind)));
     }
 }
@@ -1409,10 +1410,10 @@ fn map_view_filter(vm: &mut VM, view: &Value, keep: &[bool]) -> Option<Result<Va
 }
 
 thread_local! {
-    /// `subList` view handle → `(backing list, fromIndex, toIndex)`. As with
-    /// [`MAP_VIEWS`], reads stay snapshots; a WRITE through the view is
-    /// applied to the backing list's range, so `xs.subList(1, 3).clear()` —
-    /// the idiomatic range removal — removes from `xs`.
+    /// `subList` view handle → `(backing list, fromIndex, toIndex)`. A WRITE
+    /// through the view is applied to the backing list's range, so
+    /// `xs.subList(1, 3).clear()` — the idiomatic range removal — removes from
+    /// `xs`; a read re-copies the range first (see [`refresh_view`]).
     static SUBLISTS: RefCell<std::collections::HashMap<u32, (Value, usize, usize)>> =
         RefCell::new(std::collections::HashMap::new());
 }
@@ -1426,6 +1427,8 @@ fn set_sublist(v: &Value, entry: Option<(Value, usize, usize)>) {
     if let Value::Obj(id) = v {
         SUBLISTS.with(|t| match entry {
             Some(e) => {
+                track_view(v, &e.0);
+                SUB_MOD.with(|m| m.borrow_mut().insert(*id, mod_count(&e.0)));
                 t.borrow_mut().insert(*id, e);
             }
             None => {
@@ -1433,6 +1436,155 @@ fn set_sublist(v: &Value, entry: Option<(Value, usize, usize)>) {
             }
         });
     }
+}
+
+// ── Live views ──────────────────────────────────────────────────────────────
+//
+// A view (`subList`, `asList`, `asReversed`, a map's `keys`/`values`/
+// `entries`) is a heap collection of its own holding a copy of its backing
+// object. Every read of it goes through `with_obj`, which first re-copies it
+// when the backing object has been written since the last copy, so the view
+// reads live, as the JDK's do; an unchanged backing costs one table probe.
+
+thread_local! {
+    /// Whether any view exists; until one does, [`refresh_view`] returns at once.
+    static VIEWS_LIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Backing object → its write count, bumped by [`with_obj_mut`].
+    static BACKING_WRITES: RefCell<std::collections::HashMap<u32, u64>> =
+        RefCell::new(std::collections::HashMap::new());
+    /// View → the backing write count its elements were copied at.
+    static VIEW_SEEN: RefCell<std::collections::HashMap<u32, u64>> =
+        RefCell::new(std::collections::HashMap::new());
+    /// `asReversed()` view → the list it reverses.
+    static REVERSED_VIEWS: RefCell<std::collections::HashMap<u32, Value>> =
+        RefCell::new(std::collections::HashMap::new());
+    /// `subList` view → its backing list's `modCount` when the view was made
+    /// or last wrote through: a structural change of the backing since then
+    /// makes every later use of the view raise `ConcurrentModificationException`,
+    /// as `ArrayList.SubList` does.
+    static SUB_MOD: RefCell<std::collections::HashMap<u32, u64>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+fn backing_writes(id: u32) -> u64 {
+    BACKING_WRITES.with(|t| t.borrow().get(&id).copied().unwrap_or(0))
+}
+
+/// Register `view` as a copy of `backing`, current as of now.
+fn track_view(view: &Value, backing: &Value) {
+    let (Value::Obj(v), Value::Obj(b)) = (view, backing) else {
+        return;
+    };
+    VIEWS_LIVE.with(|l| l.set(true));
+    BACKING_WRITES.with(|t| {
+        t.borrow_mut().entry(*b).or_insert(0);
+    });
+    let seen = backing_writes(*b);
+    VIEW_SEEN.with(|t| t.borrow_mut().insert(*v, seen));
+}
+
+/// Count a write of heap object `id`, when it backs a view.
+fn note_backing_write(id: u32) {
+    if VIEWS_LIVE.with(|l| l.get()) {
+        BACKING_WRITES.with(|t| {
+            if let Some(n) = t.borrow_mut().get_mut(&id) {
+                *n += 1;
+            }
+        });
+    }
+}
+
+/// Re-copy view `id` from its backing object when that has been written since
+/// the last copy; a view of a view refreshes its own backing first. Skipped
+/// while the heap is borrowed — a read nested inside another object's borrow
+/// sees the last copy.
+fn refresh_view(id: u32) {
+    if !VIEWS_LIVE.with(|l| l.get()) {
+        return;
+    }
+    let Some(seen) = VIEW_SEEN.with(|t| t.borrow().get(&id).copied()) else {
+        return;
+    };
+    if HEAP.with(|h| h.try_borrow_mut().is_err()) {
+        return;
+    }
+    let me = Value::Obj(id);
+    let map_view = map_view_of(&me);
+    let sub = sublist_of(&me);
+    let reversed = REVERSED_VIEWS.with(|t| t.borrow().get(&id).cloned());
+    let backing = match (&map_view, &sub, &reversed) {
+        (Some((map, _)), _, _) => map.clone(),
+        (_, Some((list, _, _)), _) => list.clone(),
+        (_, _, Some(list)) => list.clone(),
+        _ => return,
+    };
+    let Value::Obj(b) = backing else { return };
+    refresh_view(b);
+    let now = backing_writes(b);
+    if now == seen {
+        return;
+    }
+    if let Some((map, kind)) = map_view {
+        refresh_map_view(&me, &map, kind);
+    } else {
+        let all = list_snapshot(&backing).unwrap_or_default();
+        let items = match sub {
+            Some((_, from, to)) => {
+                let to = to.min(all.len());
+                all[from.min(to)..to].to_vec()
+            }
+            None => all.into_iter().rev().collect(),
+        };
+        with_obj_mut(&me, |o| {
+            if let HeapObj::List(xs) = o {
+                *xs = items;
+            }
+        });
+    }
+    VIEW_SEEN.with(|t| t.borrow_mut().insert(id, now));
+}
+
+/// `ConcurrentModificationException` for a use of a `subList` whose backing
+/// list changed structurally since the view was made.
+fn comod_check(v: &Value) -> Result<(), String> {
+    match sublist_comodified(v) {
+        true => Err("java.util.ConcurrentModificationException".to_string()),
+        false => Ok(()),
+    }
+}
+
+/// [`comod_check`] for `v` and every collection nested in it — what a render
+/// walk of `v` would iterate.
+fn comod_check_deep(v: &Value, depth: usize) -> Result<(), String> {
+    if SUB_MOD.with(|m| m.borrow().is_empty()) || depth > RENDER_DEPTH_LIMIT {
+        return Ok(());
+    }
+    comod_check(v)?;
+    let children = with_obj(v, |o| match o {
+        HeapObj::List(xs) | HeapObj::Set(xs) | HeapObj::Array { items: xs, .. } => xs.clone(),
+        HeapObj::Map(entries) => entries
+            .iter()
+            .flat_map(|(k, v)| [k.clone(), v.clone()])
+            .collect(),
+        _ => Vec::new(),
+    })
+    .unwrap_or_default();
+    children
+        .iter()
+        .try_for_each(|c| comod_check_deep(c, depth + 1))
+}
+
+/// Whether `v` is a `subList` whose backing list changed structurally since
+/// the view was made — see [`SUB_MOD`].
+fn sublist_comodified(v: &Value) -> bool {
+    let Value::Obj(id) = v else { return false };
+    let Some((parent, _, _)) = sublist_of(v) else {
+        return false;
+    };
+    let Some(made) = SUB_MOD.with(|m| m.borrow().get(id).copied()) else {
+        return false;
+    };
+    array_items(&parent).is_none() && mod_count(&parent) != made
 }
 
 /// The `MutableList` members that write, for [`sublist_write`].
@@ -1466,6 +1618,45 @@ fn is_list_write(name: &str) -> bool {
     )
 }
 
+/// The list an `asReversed()` view reverses — see [`REVERSED_VIEWS`].
+fn reversed_of(view: &Value) -> Option<Value> {
+    let Value::Obj(id) = view else { return None };
+    REVERSED_VIEWS.with(|t| t.borrow().get(id).cloned())
+}
+
+/// [`sublist_write`] for an `asReversed()` view of a `MutableList`: the write
+/// runs on the view and the backing list becomes the view's elements
+/// reversed. A read-only view (of a read-only list) refuses it as its class
+/// does.
+fn reversed_write(
+    vm: &mut VM,
+    view: &Value,
+    backing: &Value,
+    name: &str,
+    write: &mut dyn FnMut(&mut VM) -> Result<Value, String>,
+) -> Option<Result<Value, String>> {
+    if !is_list_write(name) || ro_list(view).is_some() {
+        return None;
+    }
+    let Value::Obj(id) = view else { return None };
+    let _ = list_snapshot(view);
+    REVERSED_VIEWS.with(|t| t.borrow_mut().remove(id));
+    let out = write(vm);
+    let now: Vec<Value> = list_snapshot(view)
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .collect();
+    with_obj_mut(backing, |o| {
+        if let HeapObj::List(xs) = o {
+            *xs = now;
+        }
+    });
+    REVERSED_VIEWS.with(|t| t.borrow_mut().insert(*id, backing.clone()));
+    track_view(view, backing);
+    Some(out)
+}
+
 /// Run `write` — a mutating member on a `subList` view — and carry its
 /// effect into the backing list: the view is first re-read from the backing
 /// range, the write runs on the view, and the backing range is replaced by
@@ -1478,6 +1669,9 @@ fn sublist_write(
     args: &[Value],
     write: &mut dyn FnMut(&mut VM) -> Result<Value, String>,
 ) -> Option<Result<Value, String>> {
+    if let Some(backing) = reversed_of(view) {
+        return reversed_write(vm, view, &backing, name, write);
+    }
     let (parent, from, to) = sublist_of(view)?;
     if !is_list_write(name) {
         return None;
@@ -1506,13 +1700,34 @@ fn sublist_write(
     let out = write(vm);
     let now = list_snapshot(view).unwrap_or_default();
     let len = now.len();
-    with_obj_mut(&parent, |o| {
-        if let HeapObj::List(xs) | HeapObj::Array { items: xs, .. } = o {
-            xs.splice(from..to, now);
-        }
-    });
+    splice_into(&parent, from, to, now);
     set_sublist(view, Some((parent, from, from + len)));
     Some(out)
+}
+
+/// Replace `backing[from..to]` by `items`. A backing list that is itself a
+/// `subList` passes the change on to its own backing, so a write through a
+/// view of a view reaches the list at the bottom.
+fn splice_into(backing: &Value, from: usize, to: usize, items: Vec<Value>) {
+    if let Some((outer, of, ot)) = sublist_of(backing) {
+        let mut whole = list_snapshot(backing).unwrap_or_default();
+        let to = to.min(whole.len());
+        whole.splice(from.min(to)..to, items);
+        let len = whole.len();
+        with_obj_mut(backing, |o| {
+            if let HeapObj::List(xs) = o {
+                xs.clone_from(&whole);
+            }
+        });
+        splice_into(&outer, of, ot, whole);
+        set_sublist(backing, Some((outer, of, of + len)));
+        return;
+    }
+    with_obj_mut(backing, |o| {
+        if let HeapObj::List(xs) | HeapObj::Array { items: xs, .. } = o {
+            xs.splice(from..to, items);
+        }
+    });
 }
 
 /// Record `list`'s implementation class. A no-op for a non-handle.
@@ -1860,6 +2075,10 @@ fn mark_unordered(v: &Value) {
 /// frozen corpus catches; calling one that did not need it costs a sort.
 fn ensure_ordered(vm: &mut VM, v: &Value) {
     let Value::Obj(id) = v else { return };
+    // A map view reads its map's sequence (see [`view_at`]).
+    if let Some((map, _)) = map_view_of(v) {
+        ensure_ordered(vm, &map);
+    }
     if !COLL_UNORDERED.with(|d| d.borrow_mut().remove(id)) {
         return;
     }
@@ -2600,6 +2819,11 @@ fn reset_heap() {
     SEQ_VIEW.with(|t| t.borrow_mut().clear());
     MAP_VIEWS.with(|t| t.borrow_mut().clear());
     SUBLISTS.with(|t| t.borrow_mut().clear());
+    VIEWS_LIVE.with(|l| l.set(false));
+    BACKING_WRITES.with(|t| t.borrow_mut().clear());
+    VIEW_SEEN.with(|t| t.borrow_mut().clear());
+    REVERSED_VIEWS.with(|t| t.borrow_mut().clear());
+    SUB_MOD.with(|t| t.borrow_mut().clear());
     ONCE_TOKEN.with(|t| t.borrow_mut().clear());
     ONCE_CONSUMED.with(|t| t.borrow_mut().clear());
     ITER_END.with(|c| *c.borrow_mut() = None);
@@ -4135,12 +4359,14 @@ fn alloc(obj: HeapObj) -> Value {
 /// each caller's non-object branch unless that caller handles them first.
 fn with_obj<T>(v: &Value, f: impl FnOnce(&HeapObj) -> T) -> Option<T> {
     let Value::Obj(id) = v else { return None };
+    refresh_view(*id);
     HEAP.with(|h| h.borrow().get(*id as usize).map(f))
 }
 
 /// Run `f` with a mutable borrow of heap object `id` (if the handle is live).
 fn with_obj_mut<T>(v: &Value, f: impl FnOnce(&mut HeapObj) -> T) -> Option<T> {
     let Value::Obj(id) = v else { return None };
+    note_backing_write(*id);
     HEAP.with(|h| h.borrow_mut().get_mut(*id as usize).map(f))
 }
 
@@ -4881,6 +5107,9 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             // Checked, not bare: this is the coercion string interpolation and
             // `+` go through, so a cyclic structure reaches the render walk
             // here as readily as through `println`.
+            if let Err(e) = comod_check_deep(&v, 0) {
+                fault(vm, e);
+            }
             RENDER_OVERFLOW.with(|f| f.set(false));
             let s = kotlin_string(&v);
             if RENDER_OVERFLOW.with(|f| f.replace(false)) {
@@ -5171,10 +5400,12 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let n0 = vm.pop().to_int();
             let i = vm.pop().to_int();
             let recv = vm.pop();
-            let resizable = with_obj(&recv, |o| {
-                matches!(o, HeapObj::List(_) | HeapObj::Set(_) | HeapObj::Map(_))
-            })
-            .unwrap_or(false);
+            // A view is a resizable collection, answered without reading it.
+            let resizable = view_len(&recv).is_some()
+                || with_obj(&recv, |o| {
+                    matches!(o, HeapObj::List(_) | HeapObj::Set(_) | HeapObj::Map(_))
+                })
+                .unwrap_or(false);
             let cur = if resizable {
                 iter_len(&recv).unwrap_or(n0)
             } else {
@@ -5620,6 +5851,9 @@ fn member_eq(vm: &mut VM, a: &Value, b: &Value, hashed: bool) -> bool {
 /// which the general `for (v in …)` lowering reports as a fault rather than
 /// silently looping zero times.
 fn iter_len(recv: &Value) -> Option<i64> {
+    if let Some(n) = view_len(recv) {
+        return Some(n);
+    }
     // `for (c in "abc")` walks a String's UTF-16 code units — the same basis
     // `String.length` and `indexOf` use.
     if let Value::Str(s) = recv {
@@ -5638,10 +5872,59 @@ fn iter_len(recv: &Value) -> Option<i64> {
     .flatten()
 }
 
+/// The length of a view, read off its backing object rather than the view's
+/// copy — so a loop over a view does not re-copy it at every step while the
+/// backing is written (see [`refresh_view`]). `None` for a value that is not a
+/// view.
+fn view_len(v: &Value) -> Option<i64> {
+    let Value::Obj(id) = v else { return None };
+    if !VIEWS_LIVE.with(|l| l.get()) {
+        return None;
+    }
+    if let Some((backing, from, to)) = sublist_of(v) {
+        let n = iter_len(&backing)? as usize;
+        return Some((to.min(n) - from.min(to.min(n))) as i64);
+    }
+    if let Some((map, _)) = map_view_of(v) {
+        return iter_len(&map);
+    }
+    let backing = REVERSED_VIEWS.with(|t| t.borrow().get(id).cloned())?;
+    iter_len(&backing)
+}
+
+/// Element `i` of a view, read off its backing object — see [`view_len`].
+fn view_at(v: &Value, i: i64) -> Option<Value> {
+    let n = view_len(v)?;
+    if !(0..n).contains(&i) {
+        return Some(Value::Undef);
+    }
+    if let Some((backing, from, _)) = sublist_of(v) {
+        return Some(iter_at(&backing, from as i64 + i));
+    }
+    if let Some((map, kind)) = map_view_of(v) {
+        let entry = with_obj(&map, |o| match o {
+            HeapObj::Map(entries) => entries.get(i as usize).cloned(),
+            _ => None,
+        })
+        .flatten()?;
+        return Some(match kind {
+            MapView::Keys => entry.0,
+            MapView::Values => entry.1,
+            MapView::Entries => alloc(HeapObj::Entry(entry.0, entry.1)),
+        });
+    }
+    let Value::Obj(id) = v else { return None };
+    let backing = REVERSED_VIEWS.with(|t| t.borrow().get(id).cloned())?;
+    Some(iter_at(&backing, n - 1 - i))
+}
+
 /// Element `i` of an iterable. Only called with an `i` the loop already bounded
 /// by [`iter_len`], so an out-of-range index can only mean the collection was
 /// mutated mid-loop; that yields `null` rather than faulting.
 fn iter_at(recv: &Value, i: i64) -> Value {
+    if let Some(v) = view_at(recv, i) {
+        return v;
+    }
     // A String yields `Char`s.
     if let Value::Str(s) = recv {
         return usize::try_from(i)
@@ -6397,6 +6680,10 @@ fn rendering<T>(v: &Value, body: impl FnOnce() -> T) -> Option<T> {
 /// so they park the fact in `RENDER_OVERFLOW` and this — the one render entry
 /// point holding a `vm` — turns it into the exception.
 fn display_checked(vm: &mut VM, v: &Value) -> String {
+    if let Err(e) = comod_check_deep(v, 0) {
+        fault(vm, e);
+        return String::new();
+    }
     RENDER_OVERFLOW.with(|f| f.set(false));
     let s = display_vm(vm, v);
     if RENDER_OVERFLOW.with(|f| f.replace(false)) {
@@ -6751,6 +7038,7 @@ fn map_upsert(vm: &mut VM, entries: &mut Vec<(Value, Value)>, k: Value, v: Value
 /// drops only the FIRST match (`listOf(1, 2, 2, 3) - 2` is `[1, 2, 3]`), while
 /// `minus(elements)` drops every occurrence of every listed element.
 fn operator_apply(vm: &mut VM, lhs: &Value, name: &str, rhs: &Value) -> Result<Value, String> {
+    comod_check(lhs)?;
     let before = mod_len(lhs);
     let out = operator_apply_inner(vm, lhs, name, rhs);
     note_mod(lhs, name, before);
@@ -7164,6 +7452,10 @@ fn b_coll_hof(vm: &mut VM, argc: u8) -> Value {
     }
     extras.reverse();
     let recv = vm.pop();
+    if let Err(e) = comod_check(&recv) {
+        fault(vm, e);
+        return Value::Undef;
+    }
     let before = mod_len(&recv);
     let out = b_coll_hof_inner(vm, &name, clo, extras, &recv);
     note_mod(&recv, &name, before);
@@ -7981,6 +8273,10 @@ fn lazy_loop_iter(v: &Value) -> Option<Result<Value, String>> {
 }
 
 fn is_lazy_iter(v: &Value) -> bool {
+    // Answered without reading a view, which would re-copy it.
+    if view_len(v).is_some() {
+        return false;
+    }
     with_obj(v, |o| {
         matches!(o, HeapObj::CoroIter { .. } | HeapObj::GenIter { .. })
     })
@@ -11428,6 +11724,7 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
         ) | ("fill", _)
             | ("add", 2)
     );
+    comod_check(recv)?;
     let before = mod_len(recv);
     let out = kt_method_inner(vm, recv, name, args);
     note_mod(recv, name, before);
@@ -11726,6 +12023,7 @@ fn kt_method_inner(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Res
             ensure_ordered(vm, recv);
         }
         let from_sequence = is_sequence_view(recv);
+        let size_before = mod_len(recv);
         let out = obj_method(vm, recv, name, args);
         // A DERIVED sequence is still a sequence. `Sequence.map`/`filter`/
         // `take`/`drop`/… are declared to answer a `Sequence`, so
@@ -11743,8 +12041,11 @@ fn kt_method_inner(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Res
         // collection that does not iterate in insertion order. Noting it here
         // rather than at each mutation keeps the ~10 mutating members from
         // having to remember to, and it is one set insert; the order itself is
-        // restored by whichever reader next needs it.
-        mark_unordered(recv);
+        // restored by whichever reader next needs it. Only a change of size
+        // can have moved anything: a `put` over an existing key does not.
+        if size_before.is_none() || mod_len(recv) != size_before {
+            mark_unordered(recv);
+        }
         return out;
     }
     match (recv, name) {
@@ -15941,10 +16242,26 @@ fn sequence_member(
             }))));
         }
         // `asReversed()` is a REVERSED VIEW on the receiver, where `reversed()`
-        // copies. The two agree for every read; they part only when the backing
-        // list is mutated afterwards, which is recorded in BUGS.md — this
-        // answers the copy.
-        "asReversed" => return Some(Ok(alloc_ro_list(items.iter().rev().cloned().collect()))),
+        // copies: a later write to the backing list shows through it.
+        "asReversed" => {
+            let rev = items.iter().rev().cloned().collect();
+            // A `MutableList`'s reversed view is a `MutableList` that writes
+            // through (see [`reversed_write`]); any other receiver's is read-only.
+            let mutable = recv.is_some_and(|r| {
+                ro_list(r).is_none()
+                    && with_obj(r, |o| matches!(o, HeapObj::List(_))).unwrap_or(false)
+            });
+            let view = if mutable {
+                alloc(HeapObj::List(rev))
+            } else {
+                alloc_ro_list(rev)
+            };
+            if let (Some(backing), Value::Obj(v)) = (recv, &view) {
+                track_view(&view, backing);
+                REVERSED_VIEWS.with(|t| t.borrow_mut().insert(*v, backing.clone()));
+            }
+            return Some(Ok(view));
+        }
         // `orEmpty()` is declared on the NULLABLE receiver and answers an empty
         // collection for null. A receiver that reached here is not null, so the
         // member is the identity — the empty half never applies.
@@ -16090,6 +16407,15 @@ fn sum_values(items: &[Value], int32: bool) -> Value {
 
 /// `recv[index]` — list element (bounds-checked) or map value (null if absent).
 fn index_get(vm: &mut VM, recv: &Value, index: &Value) -> Result<Value, String> {
+    comod_check(recv)?;
+    // An in-range read of a `subList`/`asList` view is a read of its backing
+    // list, with no re-copy of the view: what keeps an indexed loop over a
+    // view linear while the backing is being written.
+    if let (Some((backing, from, to)), Value::Int(i)) = (sublist_of(recv), index) {
+        if (0..(to - from) as i64).contains(i) {
+            return index_get(vm, &backing, &Value::Int(from as i64 + i));
+        }
+    }
     // `s[i]` is a `Char`, indexed by UTF-16 code unit — the same basis
     // `String.length` uses.
     if let Value::Str(s) = recv {
@@ -16366,8 +16692,15 @@ fn store_at(items: &mut [Value], i: i64, value: Value, kind: &str) -> Result<(),
 
 /// `recv[index] = value` — list set (bounds-checked) or map put.
 fn index_set(vm: &mut VM, recv: &Value, index: &Value, value: Value) -> Result<(), String> {
+    comod_check(recv)?;
     let before = mod_len(recv);
     let out = index_set_inner(vm, recv, index, value);
+    // A new key appended to a `HashMap` belongs in its bucket, not at the end —
+    // which the next reader of its order will put it in. A write over an
+    // existing key moves nothing.
+    if before.is_none() || mod_len(recv) != before {
+        mark_unordered(recv);
+    }
     note_mod(recv, "set", before);
     out
 }
@@ -16424,10 +16757,7 @@ fn index_set_inner(vm: &mut VM, recv: &Value, index: &Value, value: Value) -> Re
             obj_label(recv)
         )),
     });
-    // A new key appended to a `HashMap` belongs in its bucket, not at the end —
-    // which the next reader of its order will put it in.
     let _ = vm;
-    mark_unordered(recv);
     out.unwrap_or_else(|| Err("indexing a non-object value".to_string()))
 }
 
@@ -16475,6 +16805,8 @@ pub fn value_eq(a: &Value, b: &Value) -> bool {
         // heap is touched so neither answer takes a borrow it does not need.
         (Value::Obj(ia), Value::Obj(ib)) if ia == ib => true,
         (Value::Obj(ia), Value::Obj(ib)) => HEAP.with(|h| {
+            refresh_view(*ia);
+            refresh_view(*ib);
             let h = h.borrow();
             match (h.get(*ia as usize), h.get(*ib as usize)) {
                 (Some(oa), Some(ob)) => heap_eq(oa, ob),
@@ -16904,6 +17236,7 @@ fn obj_label(recv: &Value) -> String {
 /// Kotlin display form for a heap object — `data` class `C(x=1, y=2)`, a plain
 /// class `C@<hash>`, a `List` `[a, b]`, a `Map` `{k=v, …}`, a `Pair` `(a, b)`.
 fn display_obj(id: u32) -> String {
+    refresh_view(id);
     HEAP.with(|h| {
         let h = h.borrow();
         let Some(o) = h.get(id as usize) else {
