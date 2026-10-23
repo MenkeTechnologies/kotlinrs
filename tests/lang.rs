@@ -10083,3 +10083,67 @@ fn an_uncaught_exception_prints_its_stack_trace() {
         "Exception in thread \"main\" java.lang.ArrayIndexOutOfBoundsException: Index 5 out of bounds for length 2\n\tat java.base/java.util.Arrays$ArrayList.get(Arrays.java:4266)\n\tat MainKt.main(main.kt:1)\n\tat MainKt.main(main.kt)\n"
     );
 }
+
+/// An operator EXTENSION on the left operand's known type (`operator fun\nPair<Int, Int>.plus`) is the operator's convention, and `val (a, b, c) = v` calls\na user class's own `operator fun component3` beside its data components. They\nwere `unresolved reference: plus on Pair` and `no component3 on V`.
+#[test]
+fn operator_extensions_and_user_component_functions() {
+    assert_eq!(
+        prog(
+            r##"sealed class Shape {
+    data class Circle(val r: Double) : Shape()
+    data class Rect(val w: Double, val h: Double) : Shape()
+    object Empty : Shape()
+}
+sealed interface Expr
+data class Num(val v: Int) : Expr
+data class Add(val l: Expr, val r: Expr) : Expr
+fun eval(e: Expr): Int = when (e) { is Num -> e.v; is Add -> eval(e.l) + eval(e.r) }
+fun area(s: Shape) = when (s) {
+    is Shape.Circle -> 3.0 * s.r * s.r
+    is Shape.Rect -> s.w * s.h
+    Shape.Empty -> 0.0
+}
+inline fun <reified T> List<Any>.only(): List<T> = filter { it is T }.map { it as T }
+inline fun <reified T> typeName() = T::class.simpleName
+operator fun Pair<Int, Int>.plus(o: Pair<Int, Int>) = Pair(first + o.first, second + o.second)
+data class V(val x: Int, val y: Int) {
+    operator fun plus(o: V) = V(x + o.x, y + o.y)
+    operator fun unaryMinus() = V(-x, -y)
+    operator fun times(k: Int) = V(x * k, y * k)
+    operator fun get(i: Int) = if (i == 0) x else y
+    operator fun contains(k: Int) = k == x || k == y
+    operator fun compareTo(o: V) = (x + y) - (o.x + o.y)
+    operator fun inc() = V(x + 1, y + 1)
+    operator fun rangeTo(o: V) = listOf(this, o)
+    operator fun component3() = x * y
+}
+class Grid { val m = mutableMapOf<Pair<Int, Int>, Int>(); operator fun get(a: Int, b: Int) = m[a to b] ?: 0; operator fun set(a: Int, b: Int, v: Int) { m[a to b] = v } }
+fun main() {
+    println(listOf(Shape.Circle(1.0), Shape.Rect(2.0, 3.0), Shape.Empty).map { area(it) })
+    println(eval(Add(Num(1), Add(Num(2), Num(3)))))
+    println(Shape.Circle(2.0))
+    println(listOf<Any>(1, "a", 2, 'c').only<Int>())
+    println(typeName<String>())
+    println((1 to 2) + (3 to 4))
+    var v = V(1, 2)
+    println(v + V(3, 4)); println(-v); println(v * 3); println(v[1]); println(2 in v); println(v > V(0, 0))
+    v++
+    println(v)
+    println(V(1, 1)..V(2, 2))
+    val (a, b, c) = V(2, 5)
+    println("$a $b $c")
+    val g = Grid(); g[1, 2] = 7; g[1, 2] += 1; println(g[1, 2])
+    val (k, w) = "x" to 9
+    println("$k=$w")
+    for ((i, s) in listOf("p", "q").withIndex()) print("$i$s ")
+    println()
+    val m = mapOf("a" to 1, "b" to 2)
+    for ((key, value) in m) print("$key->$value ")
+    println()
+    val (_, second) = listOf(1, 2)
+    println(second)
+}"##
+        ),
+        "[3.0, 6.0, 0.0]\n6\nCircle(r=2.0)\n[1, 2]\nString\n(4, 6)\nV(x=4, y=6)\nV(x=-1, y=-2)\nV(x=3, y=6)\n2\ntrue\ntrue\nV(x=2, y=3)\n[V(x=1, y=1), V(x=2, y=2)]\n2 5 10\n8\nx=9\n0p 1q \na->1 b->2 \n2\n"
+    );
+}

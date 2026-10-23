@@ -9789,19 +9789,26 @@ impl Compiler {
         names: &[String],
         init: &Expr,
     ) -> Result<(), String> {
-        self.compile_expr(sc, init)?; // [val]
-        let tslot = sc.temp();
+        let ty = self.compile_expr(sc, init)?; // [val]
+                                               // A named stand-in, so each `componentN()` is an ordinary member call
+                                               // on it: a user class's own `operator fun componentN` is found by its
+                                               // static class, and the host's for anything else.
+        let tmp = format!("$destructure{}", self.b.current_pos());
+        let class = self.infer_class(sc, init);
+        let tslot = sc.declare_obj(&tmp, ty, false, class);
         self.b.emit(Op::SetSlot(tslot), 0);
         for (i, nm) in names.iter().enumerate() {
             if nm == "_" {
                 continue; // `_` discards the component
             }
-            self.b.emit(Op::GetSlot(tslot), 0);
-            let cidx = self
-                .b
-                .add_constant(Value::str(format!("component{}", i + 1)));
-            self.b.emit(Op::LoadConst(cidx), 0);
-            self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 0), 0);
+            let call = Expr::MethodCall {
+                recv: Box::new(Expr::Var(tmp.clone())),
+                name: format!("component{}", i + 1),
+                args: Vec::new(),
+                safe: false,
+                line: 0,
+            };
+            self.compile_expr(sc, &call)?;
             let slot = sc.declare(nm, Type::Unknown, false);
             self.b.emit(Op::SetSlot(slot), 0);
         }
@@ -9995,6 +10002,14 @@ impl Compiler {
             // A user class that declares the convention. Resolved statically,
             // like every other member call on a known class.
             if self.declares_operator(sc, l, fname) {
+                return self.compile_member(sc, l, fname, std::slice::from_ref(r), false, 0);
+            }
+            // An operator EXTENSION on the left operand's known type —
+            // `operator fun Pair<Int, Int>.plus(o: Pair<Int, Int>)`.
+            if self
+                .recv_type_name(sc, l)
+                .is_some_and(|t| self.extensions.contains_key(&(t, fname.to_string())))
+            {
                 return self.compile_member(sc, l, fname, std::slice::from_ref(r), false, 0);
             }
             // An operand of no known class where user-class EXTENSIONS supply

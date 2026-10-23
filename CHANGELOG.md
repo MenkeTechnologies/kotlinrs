@@ -11,6 +11,18 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Operator extensions on a known type; user `componentN` in destructuring
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | before | reference |
+| --- | --- | --- |
+| `operator fun Pair<Int, Int>.plus(o: Pair<Int, Int>)`; `(1 to 2) + (3 to 4)` | `unresolved reference: plus on Pair` | `(4, 6)` |
+| `data class V(val x: Int, val y: Int) { operator fun component3() = x * y }`; `val (a, b, c) = V(2, 5)` | `no component3 on V` | `2 5 10` |
+
+A destructuring declaration now calls each `componentN()` as a member call on
+a named stand-in, so a user class's own component functions are found.
+
 ## Stack traces: runtime-raised throwables, lambda frames, `printStackTrace`, uncaught reports
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, the program compiled as `main.kt`.
