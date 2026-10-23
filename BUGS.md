@@ -280,7 +280,6 @@ Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 | --- | --- | --- |
 | `class S : Iterable<Int> { override fun iterator() = … }; S().map { … }` | `unresolved supertype Iterable of class S` | the `Iterable` extensions over `S` |
 | `java.util.LinkedList<Int>()` | `unresolved reference: java` | the JDK list |
-| `generateSequence { x }` (the seedless form) | `unresolved reference: generateSequence` | a sequence calling the block until `null` |
 | `(-1).toUInt()` / `5u + 3u` | `unresolved reference: toUInt on Int` / parse error | `4294967295` / `8` |
 
 ## A closure's `Unit` result prints `null`
@@ -339,7 +338,6 @@ Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 | program | kotlinrs | reference |
 | --- | --- | --- |
 | `mutableMapOf("a" to 1).withDefault { 0 }.getValue("zz")` | `unresolved reference: withDefault on Map` | `0` |
-| `println(IntRange.EMPTY)` | `unresolved reference: IntRange` | `1..0` |
 
 `withDefault` is a VIEW over the receiver, and maps here have no view
 representation (see "Collection VIEWS are snapshots").
@@ -400,7 +398,6 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
 | --- | --- | --- |
 | `open class A { init { println("A " + name()) }; abstract fun name(): String }` with `class B : A() { val nm = "b"; override fun name() = nm }` | `A ` | `A null` |
 | `println(mutableListOf(1).clear())`, `val f = { }; println(f())` | `null` | `kotlin.Unit` |
-| `IntRange.EMPTY`, `sequence.constrainOnce()`, `Integer.reverse(1)`, `java.lang.String.valueOf(5)` | `unresolved reference` | `1..0`, the sequence, `-2147483648`, `5` |
 
 **A `String`-typed field read before its initializer.** A field the JVM has not
 yet written is `null`, and a value statically typed `String` concatenates as
@@ -436,17 +433,6 @@ effects with the body's:
 lowering pulls ahead. Closing it means a pull-based loop (`hasNext`/`next` per
 iteration) for a header whose static type is not known to be indexable.
 
-## Round 9: measured and not closed
-
-Each fails loudly. Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
-
-| program | kotlinrs | reference |
-| --- | --- | --- |
-| `listOf(5, 3).sumBy { it }` (deprecated, still compiles with a warning) | `unresolved reference: sumBy on List` | `8` |
-| `emptySequence<Int>()` | `unresolved reference: emptySequence` | an empty sequence |
-| `"a\nb\n".lineSequence().toList()` | `unresolved reference: lineSequence on String` | `[a, b, ]` |
-| `12.345.toBits()` | `unresolved reference: toBits on Double` | the IEEE-754 bits as a `Long` |
-
 ## Round 10: measured and not closed
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
@@ -458,7 +444,7 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
 | `5L.absoluteValue is Long`, `5.mod(3L) is Long`, `5L.mod(3) is Int` | `Int`, `Int`, `Long` | `Long`, `Long`, `Int` |
 | `Any()`, `generateSequence { 5L }`, `Throwable().stackTrace`, `5L.toULong()` | `unresolved reference` | the value |
 | `import java.util.*` then `kotlin.collections.ArrayDeque` `.push(0)` | `unresolved reference: push` | `java.util.ArrayDeque` wins the star import |
-| `java.lang.Double.toString(1.5)`, `java.util.LinkedList`, `java.util.BitSet`, `java.util.Optional`, `System.getProperty` | `unresolved reference` | the JDK member |
+| `java.util.LinkedList`, `java.util.BitSet`, `java.util.Optional`, `System.getProperty` | `unresolved reference` | the JDK member |
 
 The first three rows are one cause: a `Long` is an unboxed `Value::Int` until it
 enters an erased position, and these producers (a range's elements, a typed

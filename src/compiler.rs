@@ -6376,6 +6376,56 @@ impl Compiler {
         safe: bool,
         line: u32,
     ) -> Result<Type, String> {
+        // The deprecated `sumBy { }` / `sumByDouble { }` — still accepted with a
+        // warning — are `sumOf` at a fixed width: `sumBy`'s selector and total
+        // are `Int`, so the total wraps at 32 bits whatever inference saw.
+        if matches!(name, "sumBy" | "sumByDouble")
+            && args.len() == 1
+            && !safe
+            && !self
+                .infer_class(sc, recv)
+                .and_then(|c| self.classes.get(&c))
+                .is_some_and(|m| m.methods.contains_key(name))
+        {
+            self.compile_coll_hof(sc, recv, "sumOf", args, line)?;
+            if name == "sumBy" {
+                self.emit_wrap32();
+                return Ok(Type::Int);
+            }
+            return Ok(Type::Double);
+        }
+        // `s.lineSequence()` is `s.lines().asSequence()`: the same split, lazily.
+        if name == "lineSequence" && args.is_empty() && !safe && self.infer(sc, recv).is_str() {
+            let lines = Expr::MethodCall {
+                recv: Box::new(recv.clone()),
+                name: "lines".to_string(),
+                args: Vec::new(),
+                safe: false,
+                line,
+            };
+            return self.compile_member(sc, &lines, "asSequence", &[], false, line);
+        }
+        // `x.toBits()` / `x.toRawBits()` read the IEEE pattern at the
+        // receiver's STATIC width — a `Float` is 32 bits, a `Double` 64 — and
+        // `toBits` folds every NaN to the canonical one.
+        if matches!(name, "toBits" | "toRawBits") && args.is_empty() && !safe {
+            let width = match self.infer(sc, recv) {
+                Type::Float => Some("float"),
+                Type::Double => Some("double"),
+                _ => None,
+            };
+            if let Some(width) = width {
+                self.compile_expr(sc, recv)?;
+                let nidx = self.b.add_constant(Value::str(format!("#{width}{name}")));
+                self.b.emit(Op::LoadConst(nidx), line);
+                self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 0), line);
+                return Ok(if width == "float" {
+                    Type::Int
+                } else {
+                    Type::Long
+                });
+            }
+        }
         // `pattern.toRegex(option)` / `toRegex(setOf(options))`.
         if name == "toRegex" && args.len() == 1 && !safe {
             if let Some(src) = regex_with_options(recv, &args[0], line) {
@@ -6996,7 +7046,19 @@ impl Compiler {
                 // `String.format(fmt, args…)` — the static spelling of the
                 // `fmt.format(args…)` member, with the receiver moved into the
                 // first argument position.
-                "String" if name == "format" && !args.is_empty() => {
+                // `java.lang.String.valueOf(x)` is `String.valueOf(Object)`:
+                // `x.toString()`, `null` for null — a string template of it.
+                // The `char[]` overload builds the string FROM the array,
+                // which a template would not, so that one is left unresolved.
+                "java.lang.String"
+                    if name == "valueOf"
+                        && args.len() == 1
+                        && self.infer_class(sc, &args[0]).as_deref() != Some("CharArray") =>
+                {
+                    let shown = Expr::Str(vec![StrExpr::Expr(Box::new(args[0].clone()))]);
+                    return self.compile_expr(sc, &shown);
+                }
+                "String" | "java.lang.String" if name == "format" && !args.is_empty() => {
                     self.static_format = true;
                     return self.compile_member(sc, &args[0], "format", &args[1..], false, line);
                 }
@@ -7085,6 +7147,74 @@ impl Compiler {
                 }
                 "java.util" if name == "Random" && args.len() <= 1 => {
                     return self.compile_jrandom(sc, args, line);
+                }
+                // `Double.fromBits(bits)` / `Float.fromBits(bits)` — the
+                // companions' inverses of `toRawBits`.
+                "Double" | "Float" if name == "fromBits" && args.len() == 1 => {
+                    let width = if path == "Float" { "float" } else { "double" };
+                    self.compile_expr(sc, &args[0])?;
+                    let nidx = self.b.add_constant(Value::str(format!("#{width}fromBits")));
+                    self.b.emit(Op::LoadConst(nidx), line);
+                    self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 0), line);
+                    return Ok(if width == "float" {
+                        Type::Float
+                    } else {
+                        Type::Double
+                    });
+                }
+                // The `Integer`/`Long` statics with no Kotlin member to move
+                // onto — bit reversal, the sign, the unsigned family — as host
+                // members on the first argument, at the class's own width.
+                "Integer" | "java.lang.Integer" | "java.lang.Long"
+                    if matches!(args.len(), 1 | 2)
+                        && matches!(
+                            name,
+                            "reverse"
+                                | "reverseBytes"
+                                | "signum"
+                                | "toUnsignedString"
+                                | "toUnsignedLong"
+                                | "divideUnsigned"
+                                | "remainderUnsigned"
+                                | "compareUnsigned"
+                                | "hashCode"
+                        ) =>
+                {
+                    let width = if path.ends_with("Long") {
+                        "long"
+                    } else {
+                        "int"
+                    };
+                    let member = format!("#{width}{name}");
+                    return self.compile_member(sc, &args[0], &member, &args[1..], false, line);
+                }
+                // `java.lang.Double`/`Float`/`Boolean` statics are the members
+                // of the argument — `Double.compare` IS `compareTo`'s total
+                // order — or the plain operations they name.
+                "java.lang.Double" | "java.lang.Float" | "java.lang.Boolean"
+                    if match name {
+                        "compare" | "max" | "min" | "sum" => args.len() == 2,
+                        "isNaN" | "isInfinite" | "isFinite" | "toString" | "hashCode" => {
+                            args.len() == 1
+                        }
+                        _ => false,
+                    } =>
+                {
+                    return match name {
+                        "compare" => {
+                            self.compile_member(sc, &args[0], "compareTo", &args[1..], false, line)
+                        }
+                        "max" | "min" => self.compile_math(sc, name, args, line),
+                        "sum" => self.compile_expr(
+                            sc,
+                            &Expr::Binary {
+                                op: BinOp::Add,
+                                l: Box::new(args[0].clone()),
+                                r: Box::new(args[1].clone()),
+                            },
+                        ),
+                        _ => self.compile_member(sc, &args[0], name, &args[1..], false, line),
+                    };
                 }
                 // The JDK's bit statics on `Integer`/`Long` are the `kotlin`
                 // members on the argument, which carry its width.
@@ -7276,6 +7406,26 @@ impl Compiler {
         // `Double.NaN`). These are compile-time literals, so they fold here
         // rather than paying a host dispatch — and the receiver is a *type*
         // name, which has no runtime value to dispatch on at all.
+        // `IntRange.EMPTY` / `LongRange.EMPTY` / `CharRange.EMPTY` — the
+        // companions' empty ranges, `1..0` (and `'\u0001'..'\u0000'`).
+        if args.is_empty() && name == "EMPTY" {
+            if let Expr::Var(ty) = recv {
+                let ends = match ty.as_str() {
+                    "IntRange" => Some((Expr::Int(1), Expr::Int(0))),
+                    "LongRange" => Some((Expr::Long(1), Expr::Long(0))),
+                    "CharRange" => Some((Expr::Char(1), Expr::Char(0))),
+                    _ => None,
+                };
+                if let Some((start, end)) = ends.filter(|_| self.is_type_ref(sc, ty)) {
+                    let range = Expr::Range {
+                        start: Box::new(start),
+                        end: Box::new(end),
+                        kind: RangeKind::Inclusive,
+                    };
+                    return self.compile_expr(sc, &range);
+                }
+            }
+        }
         if args.is_empty() {
             if let Expr::Var(ty) = recv {
                 if self.is_type_ref(sc, ty) {
@@ -9680,7 +9830,8 @@ impl Compiler {
             // `Sequence is empty.`, not `List is empty.` — and applying it
             // through the same `asSequence` the member spelling uses keeps the
             // two builders from drifting.
-            "sequenceOf" => {
+            // `emptySequence()` is the empty `sequenceOf()`.
+            "sequenceOf" | "emptySequence" if name == "sequenceOf" || args.is_empty() => {
                 for a in args {
                     self.compile_erased(sc, a)?;
                 }
@@ -9694,6 +9845,18 @@ impl Compiler {
             // `generateSequence(seed) { next }` — the one sequence that is
             // genuinely lazy here, because it is the one that can be endless.
             // The step answers Kotlin `null` to end it.
+            // `generateSequence { … }` — no seed: every element, the first
+            // included, is the function's answer, until it answers `null`. The
+            // lateinit marker in the seed position tells the host so.
+            "generateSequence" if args.len() == 1 && is_lambda(&args[0]) => {
+                self.b.emit(Op::Extended(KT_LATEINIT, 0), line);
+                if let Expr::Lambda { body, .. } = &args[0] {
+                    self.zero_arity_body = Some(body.as_ptr());
+                }
+                self.compile_expr(sc, &args[0])?;
+                self.b.emit(Op::CallBuiltin(KT_GENSEQ, 0), line);
+                Ok(Type::Obj)
+            }
             "generateSequence" if args.len() == 2 && is_lambda(&args[1]) => {
                 self.compile_erased(sc, &args[0])?;
                 self.lambda_hint = Some(vec![(Type::Unknown, Type::Unknown)]);

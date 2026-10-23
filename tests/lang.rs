@@ -7796,3 +7796,72 @@ fn to_map_with_a_destination_fills_and_answers_that_map() {
         "[k1, k2, k3, k20, k4, k5, k11, k6]\n{1=a, 3=c}\n{2=2, 5=1, 9=9}\ntrue\n{0=0, 1=1}\n"
     );
 }
+
+#[test]
+fn jdk_integer_long_and_double_statics_without_a_kotlin_member() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. Each was `unresolved
+    // reference: Integer` (or `java`).
+    assert_eq!(
+        stdout(
+            r#"fun main() {
+    println(listOf(Integer.reverse(1), Integer.reverse(-2), Integer.reverseBytes(0x01020304), Integer.signum(-5), Integer.signum(0), Integer.signum(9)))
+    println(listOf(Integer.toUnsignedString(-1), Integer.toUnsignedLong(-1), Integer.divideUnsigned(-1, 2), Integer.remainderUnsigned(-1, 7), Integer.compareUnsigned(-1, 1), Integer.toUnsignedString(-16, 16)))
+    println(listOf(java.lang.Long.reverse(1L), java.lang.Long.reverseBytes(1L), java.lang.Long.signum(-9L), java.lang.Long.toUnsignedString(-1L), java.lang.Long.divideUnsigned(-1L, 3L), java.lang.Long.remainderUnsigned(-1L, 10L), java.lang.Long.compareUnsigned(-1L, 1L)))
+    println(listOf(java.lang.Double.compare(1.0, 2.0), java.lang.Double.compare(0.0, -0.0), java.lang.Double.isNaN(0.0 / 0), java.lang.Double.isInfinite(1 / 0.0), java.lang.Double.isFinite(1.0), java.lang.Double.toString(1.5), java.lang.Double.max(1.0, 3.0), java.lang.Double.min(-0.0, 0.0), java.lang.Double.sum(0.1, 0.2), java.lang.Double.hashCode(1.5)))
+    println(listOf(java.lang.Float.compare(1f, 2f), java.lang.Float.isNaN(Float.NaN), java.lang.Float.toString(0.1f), java.lang.Integer.toString(5), java.lang.Integer.hashCode(7), java.lang.Long.hashCode(-1L), java.lang.Boolean.compare(true, false), java.lang.Character.isLetter('x')))
+}"#
+        ),
+        "[-2147483648, 2147483647, 67305985, -1, 0, 1]\n\
+         [4294967295, 4294967295, 2147483647, 3, 1, fffffff0]\n\
+         [-9223372036854775808, 72057594037927936, -1, 18446744073709551615, 6148914691236517205, 5, 1]\n\
+         [-1, 1, true, true, true, 1.5, 3.0, -0.0, 0.30000000000000004, 1073217536]\n\
+         [-1, true, 0.1, 5, 7, 0, 1, true]\n"
+    );
+}
+
+#[test]
+fn stdlib_members_that_answered_unresolved_reference() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. Every one of these was
+    // `unresolved reference` (`IntRange`, `emptySequence`, `lineSequence on
+    // String`, `toBits on Double`, `Double`, `java`, `sumBy on List`).
+    assert_eq!(
+        stdout(
+            r#"data class P(val a: Int)
+@Suppress("DEPRECATION")
+fun main() {
+    println(listOf(IntRange.EMPTY, LongRange.EMPTY, IntRange.EMPTY.isEmpty(), CharRange.EMPTY.count()))
+    println(listOf(emptySequence<Int>().toList(), emptySequence<String>().count(), "a\nb\r\nc\n".lineSequence().toList()))
+    println(listOf(12.345.toBits(), Double.NaN.toRawBits(), (0.0 / 0.0).toBits(), (-0.0).toBits(), 1.5f.toBits(), 0.1f.toRawBits(), Float.NaN.toBits()))
+    println(listOf(Double.fromBits(4613937818241073152L), Float.fromBits(1069547520), Float.fromBits(1036831949)))
+    val n: String? = null
+    println(listOf(java.lang.String.valueOf(5), java.lang.String.valueOf(n), java.lang.String.valueOf(P(1)), java.lang.String.valueOf('c')))
+    println(listOf(listOf(5, 3).sumBy { it }, listOf(Int.MAX_VALUE, 1).sumBy { it }, listOf(1.5, 2.0).sumByDouble { it * 2 }))
+}"#
+        ),
+        "[1..0, 1..0, true, 0]\n[[], 0, [a, b, c, ]]\n[4623139235229744497, 9221120237041090560, 9221120237041090560, -9223372036854775808, 1069547520, 1036831949, 2143289344]\n[3.0, 1.5, 0.1]\n[5, null, P(a=1), c]\n[8, -2147483648, 7.0]\n"
+    );
+}
+
+#[test]
+fn the_seedless_generate_sequence_and_constrain_once_allow_one_traversal() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. `generateSequence { }` asks
+    // its function for every element, lazily, and is `constrainOnce()`d: a
+    // second traversal — through any pipeline built on it — throws.
+    assert_eq!(
+        stdout(
+            r#"fun t(name: String, f: () -> Any?) { try { println("$name: ${f()}") } catch (e: Throwable) { println("$name: EX $e") } }
+fun main() {
+    t("genSeedless") { var i = 0; generateSequence { if (i < 3) i++ else null }.toList() }
+    t("seedlessLazy") { var n = 0; val s = generateSequence { n++; if (n <= 2) n * 10 else null }; println("built $n"); s.toList() }
+    t("seedlessTwice") { var i = 0; val s = generateSequence { if (i < 3) i++ else null }; s.toList(); s.toList() }
+    t("seedlessMapTwice") { var i = 0; val s = generateSequence { if (i < 9) i++ else null }; val m = s.map { it * 2 }; println(m.take(2).toList()); m.toList() }
+    t("constrain") { val s = sequenceOf(1, 2).constrainOnce(); s.toList(); s.toList() }
+    t("constrainOrig") { val s = sequenceOf(1, 2); val c = s.constrainOnce(); c.toList(); s.toList() }
+    t("constrainGen") { val s = generateSequence(1) { if (it < 3) it + 1 else null }.constrainOnce(); println(s.toList()); s.count() }
+    t("constrainBlock") { val s = sequence { yield(1) }.constrainOnce(); println(s.first()); s.first() }
+    t("seedTake") { var i = 0; generateSequence { i++ }.take(4).toList() }
+}"#
+        ),
+        "genSeedless: [0, 1, 2]\nbuilt 0\nseedlessLazy: [10, 20]\nseedlessTwice: EX java.lang.IllegalStateException: This sequence can be consumed only once.\n[0, 2]\nseedlessMapTwice: EX java.lang.IllegalStateException: This sequence can be consumed only once.\nconstrain: EX java.lang.IllegalStateException: This sequence can be consumed only once.\nconstrainOrig: [1, 2]\n[1, 2, 3]\nconstrainGen: EX java.lang.IllegalStateException: This sequence can be consumed only once.\n1\nconstrainBlock: EX java.lang.IllegalStateException: This sequence can be consumed only once.\nseedTake: [0, 1, 2, 3]\n"
+    );
+}

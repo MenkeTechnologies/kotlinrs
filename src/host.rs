@@ -2177,6 +2177,8 @@ fn reset_heap() {
     MAP_INDEX.with(|t| t.borrow_mut().clear());
     LIST_IMPL.with(|t| t.borrow_mut().clear());
     SEQ_VIEW.with(|t| t.borrow_mut().clear());
+    ONCE_TOKEN.with(|t| t.borrow_mut().clear());
+    ONCE_CONSUMED.with(|t| t.borrow_mut().clear());
     TYPES.with(|t| t.borrow_mut().clear());
     TOSTRING_SUBS.with(|t| t.borrow_mut().clear());
     EQUALS_SUBS.with(|t| t.borrow_mut().clear());
@@ -6587,13 +6589,19 @@ fn gen_with(vm: &mut VM, gen: &Value, stage: Stage) -> Result<Value, String> {
         gen_parts(gen).ok_or_else(|| format!("unresolved reference on {}", obj_label(gen)))?;
     let _ = vm;
     stages.push(stage);
-    Ok(alloc(HeapObj::Gen {
+    let derived = alloc(HeapObj::Gen {
         block,
         items,
         seed,
         step,
         stages,
-    }))
+    });
+    // A pipeline over a once-only source shares its token: traversing it
+    // traverses the source.
+    if let Some(token) = once_token(gen) {
+        set_once_token(&derived, token);
+    }
+    Ok(derived)
 }
 
 /// Pull from a lazy sequence until `want` elements have come out, the generator
@@ -6623,6 +6631,16 @@ fn gen_drive(
     want: Option<usize>,
     on: &mut dyn FnMut(&mut VM, &Value) -> Result<bool, String>,
 ) -> Result<Vec<Value>, String> {
+    // A `constrainOnce()` source — and the seedless `generateSequence`, which
+    // is one — refuses a second traversal, through any pipeline built on it.
+    if let Some(token) = once_token(gen) {
+        if !ONCE_CONSUMED.with(|c| c.borrow_mut().insert(token)) {
+            return Err(
+                "java.lang.IllegalStateException: This sequence can be consumed only once."
+                    .to_string(),
+            );
+        }
+    }
     let (block, items, seed, step, mut stages) =
         gen_parts(gen).ok_or_else(|| format!("unresolved reference on {}", obj_label(gen)))?;
     // THIS traversal's coroutine, entered from the block afresh — see the
@@ -6649,6 +6667,14 @@ fn gen_drive(
     let mut primed = match (&coro, &items) {
         (Some(c), _) => coro_next(vm, c)?,
         (None, Some(_)) => None,
+        // The seedless `generateSequence { … }`: its first element is the
+        // function's first answer, asked for here, lazily, like every later one.
+        (None, None) if seed.as_ref().is_some_and(is_lateinit_unset) => {
+            match invoke_closure(vm, &step, &[])? {
+                Value::Undef => None,
+                v => Some(v),
+            }
+        }
         (None, None) => seed,
     };
     // The element the source yielded last — the step's argument.
@@ -7118,13 +7144,51 @@ fn b_genseq(vm: &mut VM, _argc: u8) -> Value {
     let seed = vm.pop();
     // A `null` seed is an empty sequence, exactly as it ends one.
     let seed = (!matches!(seed, Value::Undef)).then_some(seed);
-    alloc(HeapObj::Gen {
+    // The lateinit marker as the seed is the seedless form, whose elements
+    // all come from the function — see [`gen_drive`]. Kotlin returns it
+    // `constrainOnce()`d.
+    let seedless = seed.as_ref().is_some_and(is_lateinit_unset);
+    let gen = alloc(HeapObj::Gen {
         block: None,
         items: None,
         seed,
         step,
         stages: Vec::new(),
-    })
+    });
+    if seedless {
+        constrain_once(&gen);
+    }
+    gen
+}
+
+thread_local! {
+    /// Sequence handle → its once-only token (see [`constrain_once`]). A side
+    /// table for the reason [`LIST_IMPL`] is one: the token is a property of
+    /// the handle's identity, read only where a traversal starts.
+    static ONCE_TOKEN: RefCell<std::collections::HashMap<u32, u32>> =
+        RefCell::new(std::collections::HashMap::new());
+    /// The tokens a traversal has already spent.
+    static ONCE_CONSUMED: RefCell<std::collections::HashSet<u32>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+fn once_token(v: &Value) -> Option<u32> {
+    let Value::Obj(id) = v else { return None };
+    ONCE_TOKEN.with(|t| t.borrow().get(id).copied())
+}
+
+fn set_once_token(v: &Value, token: u32) {
+    if let Value::Obj(id) = v {
+        ONCE_TOKEN.with(|t| t.borrow_mut().insert(*id, token));
+    }
+}
+
+/// Make `gen` a once-only sequence with a fresh token — its own handle's id,
+/// which no other sequence carries as a token.
+fn constrain_once(gen: &Value) {
+    if let Value::Obj(id) = gen {
+        set_once_token(gen, *id);
+    }
 }
 
 /// `KT_COMPARATOR` — see [`KT_COMPARATOR`].
@@ -10250,7 +10314,153 @@ fn sorted_nav(
     }
 }
 
+/// `v` in `radix` as the JDK's unsigned `toUnsignedString(v, radix)` writes
+/// it: lowercase digits, and a radix outside `2..=36` read as 10.
+fn unsigned_radix(mut v: u64, radix: i64) -> String {
+    let radix = if (2..=36).contains(&radix) {
+        radix as u64
+    } else {
+        10
+    };
+    let mut digits = Vec::new();
+    loop {
+        digits.push(std::char::from_digit((v % radix) as u32, radix as u32).unwrap_or('0'));
+        v /= radix;
+        if v == 0 {
+            break;
+        }
+    }
+    digits.iter().rev().collect()
+}
+
+/// The `java.lang.Integer` / `java.lang.Long` statics that have no Kotlin
+/// member to be rewritten onto, as `#int…` / `#long…` members on the first
+/// argument (see the compiler's qualified-call lowering). Each reads the
+/// receiver at the class's own width — 32 or 64 bits — and the unsigned
+/// family reinterprets that pattern, as the JDK does.
+fn jdk_integral_static(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    // The IEEE bit views. `toBits` canonicalizes NaN (`doubleToLongBits`),
+    // `toRawBits` keeps the payload; a `Float` reads its 32-bit pattern.
+    match name {
+        "#doubletoBits" | "#doubletoRawBits" => {
+            let x = recv.to_float();
+            let bits = if name == "#doubletoBits" && x.is_nan() {
+                0x7ff8_0000_0000_0000
+            } else {
+                x.to_bits()
+            };
+            return Some(Ok(Value::Int(bits as i64)));
+        }
+        "#floattoBits" | "#floattoRawBits" => {
+            let x = f32_box(recv).unwrap_or_else(|| recv.to_float() as f32);
+            let bits = if name == "#floattoBits" && x.is_nan() {
+                0x7fc0_0000
+            } else {
+                x.to_bits()
+            };
+            return Some(Ok(Value::Int(bits as i32 as i64)));
+        }
+        "#doublefromBits" => return Some(Ok(Value::Float(f64::from_bits(num_i64(recv) as u64)))),
+        "#floatfromBits" => {
+            let x = f32::from_bits(num_i64(recv) as i32 as u32);
+            return Some(Ok(Value::Float(f64::from(x))));
+        }
+        _ => {}
+    }
+    let (op, wide) = match (name.strip_prefix("#int"), name.strip_prefix("#long")) {
+        (Some(op), _) => (op, false),
+        (_, Some(op)) => (op, true),
+        _ => return None,
+    };
+    if !matches!(
+        op,
+        "reverse"
+            | "reverseBytes"
+            | "signum"
+            | "toUnsignedString"
+            | "toUnsignedLong"
+            | "divideUnsigned"
+            | "remainderUnsigned"
+            | "compareUnsigned"
+            | "hashCode"
+    ) {
+        return None;
+    }
+    let n = num_i64(recv);
+    // The operand as the class's unsigned pattern, widened to 64 bits.
+    let unsigned = |v: i64| {
+        if wide {
+            v as u64
+        } else {
+            v as i32 as u32 as u64
+        }
+    };
+    let arg = |i: usize| args.get(i).map(num_i64);
+    let int = |v: i64| Value::Int(if wide { v } else { v as i32 as i64 });
+    Some(Ok(match op {
+        "reverse" if wide => Value::Int(n.reverse_bits()),
+        "reverse" => Value::Int((n as i32).reverse_bits() as i64),
+        "reverseBytes" if wide => Value::Int(n.swap_bytes()),
+        "reverseBytes" => Value::Int((n as i32).swap_bytes() as i64),
+        "signum" => Value::Int(n.signum()),
+        "toUnsignedString" => Value::str(unsigned_radix(unsigned(n), arg(0).unwrap_or(10))),
+        "toUnsignedLong" if !wide => Value::Int(unsigned(n) as i64),
+        "divideUnsigned" | "remainderUnsigned" => {
+            let d = arg(0).map(unsigned)?;
+            if d == 0 {
+                return Some(Err("java.lang.ArithmeticException: / by zero".to_string()));
+            }
+            let q = if op == "divideUnsigned" {
+                unsigned(n) / d
+            } else {
+                unsigned(n) % d
+            };
+            int(q as i64)
+        }
+        "compareUnsigned" => {
+            let other = arg(0).map(unsigned)?;
+            Value::Int(match unsigned(n).cmp(&other) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            })
+        }
+        "hashCode" if wide => Value::Int(((n ^ ((n as u64) >> 32) as i64) as i32) as i64),
+        "hashCode" => Value::Int(n as i32 as i64),
+        _ => return None,
+    }))
+}
+
 fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    if let Some(r) = jdk_integral_static(recv, name, args) {
+        return r;
+    }
+    // `seq.constrainOnce()` — a NEW sequence over the same source that allows
+    // one traversal; the receiver itself stays re-iterable.
+    if name == "constrainOnce" && args.is_empty() {
+        let fresh = match gen_parts(recv) {
+            Some((block, items, seed, step, stages)) => Some(HeapObj::Gen {
+                block,
+                items,
+                seed,
+                step,
+                stages,
+            }),
+            None if is_sequence_view(recv) => list_snapshot(recv).map(|items| HeapObj::Gen {
+                block: None,
+                items: Some(items),
+                seed: None,
+                step: Value::Undef,
+                stages: Vec::new(),
+            }),
+            None => None,
+        };
+        if let Some(obj) = fresh {
+            let gen = alloc(obj);
+            constrain_once(&gen);
+            return Ok(gen);
+        }
+    }
     if let Some(r) = random_method(recv, name, args) {
         return r;
     }

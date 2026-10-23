@@ -179,6 +179,10 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   .take(5)` terminates. `yieldAll`, `generateSequence`, and the `map`/`filter`/
   `take`/`drop`/`takeWhile`/`dropWhile`/`onEach` pipeline over either source,
   each element carried through to the terminal before the next is pulled.
+  The seedless `generateSequence { … }` asks its function for every element
+  and, like any `constrainOnce()` sequence, refuses a second traversal
+  through any pipeline built on it; `emptySequence()` and `s.lineSequence()`
+  are the empty and the line-split sequences.
 - **`java.util.stream` pipelines** — `coll.stream()`, `Stream.of(…)` and
   `IntStream.range`/`rangeClosed` lower onto the lazy sequence, which evaluates
   the same way: `filter`, `map`, the `mapTo…`/`boxed` conversions, `flatMap`,
@@ -322,6 +326,12 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `toString(radix)` only for a negative value (`Integer.toHexString(-1)` is
   `ffffffff` where `(-1).toString(2)` is `-1`); plus `Char.code`,
   `Int.toChar()`, and `Any.toString()`.
+  `toBits()`/`toRawBits()` and `Double.fromBits`/`Float.fromBits` read the
+  IEEE pattern at the static width; the `Integer`/`java.lang.Long` statics
+  with no Kotlin member (`reverse`, `reverseBytes`, `signum`, the unsigned
+  `toUnsignedString`/`divideUnsigned`/`remainderUnsigned`/`compareUnsigned`)
+  and the `java.lang.Double`/`Float` statics (`compare`, `isNaN`, `toString`,
+  …) are host members on the argument.
 - **Classes** — `class C(val x: Int, var y: Int) { fun m() {…} }`: primary-
   constructor properties (`val`/`var`), plain constructor parameters (a
   parameter with no `val`/`var` is forwarded, not stored), instance methods

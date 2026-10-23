@@ -11,6 +11,31 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Members that answered `unresolved reference`
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, compiled and run on the same JVM.
+Each failed loudly before; each now answers the reference's value.
+
+| program | reference |
+| --- | --- |
+| `IntRange.EMPTY`, `LongRange.EMPTY`, `CharRange.EMPTY.count()` | `1..0`, `1..0`, `0` |
+| `emptySequence<Int>().toList()`, `"a\nb\r\nc\n".lineSequence().toList()` | `[]`, `[a, b, c, ]` |
+| `12.345.toBits()`, `Double.NaN.toRawBits()`, `1.5f.toBits()`, `Float.NaN.toBits()` | `4623139235229744497`, `9221120237041090560`, `1069547520`, `2143289344` |
+| `Double.fromBits(4613937818241073152L)`, `Float.fromBits(1036831949)` | `3.0`, `0.1` |
+| `var i = 0; generateSequence { if (i < 3) i++ else null }.toList()` | `[0, 1, 2]`; a second traversal throws `IllegalStateException: This sequence can be consumed only once.` |
+| `sequenceOf(1, 2).constrainOnce()` traversed twice | the same `IllegalStateException`; the receiver stays re-iterable |
+| `java.lang.String.valueOf(5)`, `java.lang.String.valueOf(null as String?)` | `5`, `null` |
+| `listOf(Int.MAX_VALUE, 1).sumBy { it }`, `sumByDouble { … }` | `-2147483648` (an `Int` total), the `Double` total |
+| `Integer.reverse(1)`, `Integer.signum(-5)`, `Integer.toUnsignedString(-1)`, `Integer.divideUnsigned(-1, 2)` | `-2147483648`, `-1`, `4294967295`, `2147483647` |
+| `java.lang.Long.reverseBytes(1L)`, `java.lang.Long.toUnsignedString(-1L)` | `72057594037927936`, `18446744073709551615` |
+| `java.lang.Double.compare(0.0, -0.0)`, `java.lang.Double.isNaN(0.0 / 0)`, `java.lang.Double.hashCode(1.5)` | `1`, `true`, `1073217536` |
+
+The seedless `generateSequence` carries the lateinit marker in its seed
+position, which no program value can be, so the traversal knows to ask the
+function for the first element too. A once-only sequence carries a token in a
+side table that every pipeline derived from it shares, so traversing the
+pipeline spends the source.
+
 ## `sequence { }` mid-expression, sequence operators, `Sequence.shuffled`, `toMap(destination)`
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, compiled and run on the same JVM.
