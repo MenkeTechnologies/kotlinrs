@@ -2568,18 +2568,18 @@ fn check_modifiers(
     mro: &[String],
     by_name: &HashMap<&str, &ClassDecl>,
 ) -> Result<(), String> {
-    // A member declared twice is an OVERLOAD SET, and member overloads are not
-    // modelled: the method table holds one signature per name, so the second
-    // declaration would answer for the first — `f(1)` running `f(a: String)`.
-    // Refused here rather than resolved wrongly. (Top-level overloads are
-    // resolved; see `mangle_overloads`.)
+    // Overloads are renamed by signature before this runs (see
+    // `mangle_member_overloads`), so a name seen twice here is two declarations
+    // with the SAME parameters — Kotlin's conflicting overloads.
     let mut seen: HashSet<&str> = HashSet::new();
     for m in &cd.methods {
         if !seen.insert(m.name.as_str()) {
             return Err(format!(
-                "class {}: method {} is declared more than once — member overloads are not \
-                 supported (line {})",
-                cd.name, m.name, m.line
+                "class {}: conflicting overloads: method {} is declared twice with the same \
+                 parameters (line {})",
+                cd.name,
+                unmangled(&m.name),
+                m.line
             ));
         }
     }
