@@ -10299,3 +10299,60 @@ fun main() { println(Holder(3).bigger(5)) }"##
         "5\n"
     );
 }
+
+/// A class implementing `Sequence<T>` (`override fun iterator()`) is a sequence:\n`for`, `toList`, `filter`/`map`/`take`/`first` over it, lazily — an infinite one\nstops at its `take`. It was `unresolved supertype Sequence`. The rest pins\ninit order through a super call, user `equals`/`hashCode` in hash containers,\ncomparator objects and destructuring lambda parameters.
+#[test]
+fn a_user_class_implementing_sequence() {
+    assert_eq!(
+        prog(
+            r##"open class Base(val tag: String) {
+    init { println("Base init $tag") }
+    open val size: Int get() = 1
+    open fun show() = "Base($tag, $size)"
+}
+class Derived(tag: String, val extra: Int) : Base(tag.uppercase()) {
+    init { println("Derived init $extra") }
+    override val size get() = extra * 2
+    override fun show() = "D:" + super.show()
+}
+class Pt(val x: Int, val y: Int) {
+    override fun equals(other: Any?) = other is Pt && other.x == x && other.y == y
+    override fun hashCode() = 31 * x + y
+    override fun toString() = "($x,$y)"
+}
+class Countdown(val from: Int) : Sequence<Int> { override fun iterator() = object : Iterator<Int> { var n = from; override fun hasNext() = n > 0; override fun next() = n-- } }
+fun main() {
+    println(Derived("d", 3).show())
+    println(setOf(Pt(1, 2), Pt(1, 2), Pt(2, 1)).size)
+    println(mapOf(Pt(0, 0) to "o")[Pt(0, 0)])
+    println(listOf(Pt(1, 2), Pt(0, 5)).sortedWith(Comparator { a, b -> a.x - b.x }))
+    println(listOf(Pt(1, 2), Pt(0, 5)).sortedWith(compareByDescending<Pt> { it.y }.thenBy { it.x }))
+    println(listOf(1 to "a", 2 to "b").map { (n, s) -> "$s$n" })
+    println(Countdown(4).toList()); println(Countdown(5).filter { it % 2 == 1 }.joinToString())
+    val cmp = object : Comparator<String> { override fun compare(a: String, b: String) = b.compareTo(a) }
+    println(listOf("b", "c", "a").sortedWith(cmp))
+    println(listOf("bb", "a", "ccc").sortedBy { it.length }.reversed())
+    val lz by lazy { "lazy!" }
+    println(lz)
+    println(Pt(3, 4) == Pt(3, 4)); println(Pt(3, 4) === Pt(3, 4))
+}"##
+        ),
+        "Base init D\nDerived init 3\nD:Base(D, 6)\n2\no\n[(0,5), (1,2)]\n[(0,5), (1,2)]\n[a1, b2]\n[4, 3, 2, 1]\n5, 3, 1\n[c, b, a]\n[ccc, bb, a]\nlazy!\ntrue\nfalse\n"
+    );
+    assert_eq!(
+        prog(
+            r##"class Nat : Sequence<Int> { override fun iterator() = object : Iterator<Int> { var n = 0; override fun hasNext() = true; override fun next() = n++ } }
+fun main() {
+    println(Nat().take(5).toList())
+    println(Nat().map { it * it }.filter { it % 2 == 0 }.take(3).toList())
+    println(Nat().first { it > 10 })
+    for (x in Nat()) { if (x > 3) break; print(x) }
+    println()
+    val s: Sequence<Int> = Nat()
+    println(s.take(2).toList())
+    println(Nat() is Sequence<*>)
+}"##
+        ),
+        "[0, 1, 2, 3, 4]\n[0, 4, 16]\n11\n0123\n[0, 1]\ntrue\n"
+    );
+}

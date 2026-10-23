@@ -69,6 +69,7 @@ fn is_marker_supertype(name: &str) -> bool {
             | "MutableIterator"
             | "Iterable"
             | "MutableIterable"
+            | "Sequence"
     )
 }
 
@@ -89,7 +90,7 @@ fn marker_member(parent: &str, name: &str, arity: usize) -> bool {
         "Iterator" | "MutableIterator" => {
             matches!((name, arity), ("hasNext", 0) | ("next", 0) | ("remove", 0))
         }
-        "Iterable" | "MutableIterable" => name == "iterator" && arity == 0,
+        "Iterable" | "MutableIterable" | "Sequence" => name == "iterator" && arity == 0,
         _ => false,
     }
 }
@@ -11768,13 +11769,12 @@ impl Compiler {
                 // an `Iterable` extension called on the instance itself.
                 if let Some(cls) = self.cur_class.clone() {
                     let iterable = self.classes.get(&cls).is_some_and(|m| {
-                        m.mro
+                        m.mro.iter().chain(&m.parents).any(|p| {
+                            matches!(p.as_str(), "Iterable" | "MutableIterable" | "Sequence")
+                        }) || m
+                            .parents
                             .iter()
-                            .chain(&m.parents)
-                            .any(|p| matches!(p.as_str(), "Iterable" | "MutableIterable"))
-                            || m.parents
-                                .iter()
-                                .any(|p| crate::parser::is_collection_iface(p))
+                            .any(|p| crate::parser::is_collection_iface(p))
                     });
                     if iterable
                         && sc.slot("this").is_some()
@@ -12139,7 +12139,12 @@ impl Compiler {
             .mro
             .iter()
             .chain(&meta.parents)
-            .any(|p| matches!(p.as_str(), "Iterable" | "MutableIterable"));
+            .any(|p| matches!(p.as_str(), "Iterable" | "MutableIterable" | "Sequence"));
+        let sequence = meta
+            .mro
+            .iter()
+            .chain(&meta.parents)
+            .any(|p| p == "Sequence");
         if !iterable
             || meta.methods.contains_key(name)
             || meta.prop(name).is_some()
@@ -12175,6 +12180,45 @@ impl Compiler {
                 },
             )
         };
+        // A user `Sequence` stays LAZY — it may be infinite — as a
+        // `generateSequence` pulling its iterator: `run { val it =
+        // recv.iterator(); generateSequence { if (it.hasNext()) it.next() else
+        // null } }`.
+        if sequence {
+            let pull = Expr::If(IfExpr {
+                cond: Box::new(call(Expr::Var(cursor.clone()), "hasNext", Vec::new())),
+                then: vec![Stmt::new(
+                    line,
+                    StmtKind::Expr(call(Expr::Var(cursor.clone()), "next", Vec::new())),
+                )],
+                els: Some(vec![Stmt::new(line, StmtKind::Expr(Expr::Null))]),
+                line,
+            });
+            let body = vec![
+                let_(&cursor, call(recv.clone(), "iterator", Vec::new())),
+                Stmt::new(
+                    line,
+                    StmtKind::Expr(Expr::Call {
+                        name: "generateSequence".to_string(),
+                        args: vec![Expr::Lambda {
+                            params: Vec::new(),
+                            body: vec![Stmt::new(line, StmtKind::Expr(pull))],
+                            catch_tag: None,
+                        }],
+                        line,
+                    }),
+                ),
+            ];
+            return Some(Expr::Call {
+                name: "run".to_string(),
+                args: vec![Expr::Lambda {
+                    params: Vec::new(),
+                    body,
+                    catch_tag: None,
+                }],
+                line,
+            });
+        }
         let body = vec![
             let_(&cursor, call(recv.clone(), "iterator", Vec::new())),
             let_(

@@ -11,6 +11,18 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## A user class implementing `Sequence`
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | before | reference |
+| --- | --- | --- |
+| `class Countdown(val from: Int) : Sequence<Int> { override fun iterator() = … }`; `toList()`, `filter { }`, `for` | `unresolved supertype Sequence of class Countdown` | `[4, 3, 2, 1]`, … |
+| an infinite `class Nat : Sequence<Int>`; `Nat().map { it * it }.filter { … }.take(3).toList()`, `first { it > 10 }` | refused | `[0, 4, 16]`, `11` |
+
+A sequence member called on such an instance runs over `generateSequence`
+pulling its iterator, so it stays lazy.
+
 ## `where` clauses
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
