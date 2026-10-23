@@ -333,11 +333,12 @@ pub const KT_OBJ_INIT_EXIT: u16 = 155;
 /// `ConcurrentModificationException`, which is what `next()`'s modification
 /// check raises there.
 pub const KT_ITER_MORE: u16 = 156;
-/// `KT_DEPTH_GUARD`: the entry test of a function that can recurse. Pushes
-/// whether the call is to return at once: past [`MAX_CALL_DEPTH`] frames it
-/// raises `java.lang.StackOverflowError` — the JVM's answer to unbounded
-/// recursion — and every frame entered while that error unwinds returns
-/// immediately instead of recursing again. Stack-neutral otherwise.
+/// `KT_DEPTH_GUARD`: the entry op of a function that can recurse. Past
+/// [`MAX_CALL_DEPTH`] frames it raises `java.lang.StackOverflowError` — the
+/// JVM's answer to unbounded recursion — and every frame entered while that
+/// error unwinds returns at once instead of recursing again, by resuming at
+/// the `LoadUndef; ReturnValue` stub the compiler places just before the
+/// entry. Stack-neutral; one dispatched op on the ordinary path.
 pub const KT_DEPTH_GUARD: u16 = 157;
 /// `KT_MODCOUNT`: a collection's modification count — see [`mod_count`].
 /// Stack `[collection]`; pushes an `Int`.
@@ -4513,6 +4514,29 @@ fn fault(vm: &mut VM, msg: impl Into<String>) {
     vm.request_halt();
 }
 
+/// The handler fusevm calls for every `Op::Extended`. The depth guard runs on
+/// every entry to a recursive function, so it is answered here, ahead of the
+/// one-arm-per-op match in [`handle_coercion`].
+fn handle_extension(vm: &mut VM, id: u16, arg: u8) {
+    if id == KT_DEPTH_GUARD {
+        depth_guard(vm);
+    } else {
+        handle_coercion(vm, id, arg);
+    }
+}
+
+/// `KT_DEPTH_GUARD` — see the constant.
+fn depth_guard(vm: &mut VM) {
+    if vm.frames.len() > MAX_CALL_DEPTH {
+        if unwinding() {
+            // `ip` is already past this op: back over it to the stub.
+            vm.ip -= 3;
+        } else {
+            fault(vm, "java.lang.StackOverflowError");
+        }
+    }
+}
+
 /// The Kotlin value coercions (`KT_TO_STRING`/`KT_IDIV`/`KT_IMOD`) that the
 /// language-agnostic ops can't express. Shared by the normal and debug handlers.
 /// `KT_DBG_LINE` is stack-neutral and handled by the caller (a no-op for normal
@@ -5148,13 +5172,6 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             vm.push(Value::Bool(false));
         }
         KT_UNIT => vm.push(unit_value()),
-        KT_DEPTH_GUARD => {
-            let over = vm.frames.len() > MAX_CALL_DEPTH;
-            if over && !unwinding() {
-                fault(vm, "java.lang.StackOverflowError");
-            }
-            vm.push(Value::Bool(over && unwinding()));
-        }
         KT_MODCOUNT => {
             let v = vm.pop();
             vm.push(Value::Int(mod_count(&v) as i64));
@@ -5433,7 +5450,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
 pub fn install(vm: &mut VM) {
     reset_heap();
     register_builtins(vm);
-    vm.set_extension_handler(Box::new(handle_coercion));
+    vm.set_extension_handler(Box::new(handle_extension));
 }
 
 /// Switch `vm` to fusevm's *strict* numeric policy, routing every arithmetic or
@@ -5520,7 +5537,7 @@ pub fn install_debug(vm: &mut VM) {
         if id == KT_DBG_LINE {
             crate::dap::on_debug_line(vm);
         } else {
-            handle_coercion(vm, id, arg);
+            handle_extension(vm, id, arg);
         }
     }));
 }

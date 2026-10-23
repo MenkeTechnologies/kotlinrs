@@ -11,6 +11,24 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## The recursion depth guard is one op
+
+`KT_DEPTH_GUARD` was the entry op of a recursive function followed by a
+`JumpIfFalse` over a `LoadUndef; ReturnValue` stub: two dispatched ops on every
+call. The stub now sits just before the entry, where nothing falls into it, and
+the guard resumes there itself (`ip -= 3`) only when a frame is entered past
+`MAX_CALL_DEPTH` while `StackOverflowError` unwinds. The guard is also answered
+ahead of the general extension dispatch. `StackOverflowError` behaviour is
+unchanged.
+
+Retired instructions, `fib(27)`, debug build (`/usr/bin/time -l`):
+
+| build | instructions | over unguarded |
+| --- | --- | --- |
+| no guard | 10.80 G | — |
+| two-op guard | 11.93 G | 10.4% |
+| one-op guard | 11.19 G | 3.6% |
+
 ## More JVM throwables; suppressed exceptions
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1. Each was `unresolved reference`.

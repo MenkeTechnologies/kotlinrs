@@ -4540,7 +4540,20 @@ impl Compiler {
         caps: &[LocalCap],
         class_ctx: Option<&str>,
     ) -> Result<(), String> {
+        // A function that can recurse tests its depth on entry, so an
+        // unbounded recursion raises `StackOverflowError` as on the JVM. The
+        // test is the entry's one op; the `return` it takes while that error
+        // unwinds is the stub just before the entry, which nothing falls into
+        // (see `KT_DEPTH_GUARD`).
+        let recursive = self.recursive.contains(unmangled(&f.name));
+        if recursive {
+            self.b.emit(Op::LoadUndef, f.line);
+            self.b.emit(Op::ReturnValue, f.line);
+        }
         let entry = self.b.current_pos();
+        if recursive {
+            self.b.emit(Op::Extended(KT_DEPTH_GUARD, 0), f.line);
+        }
         let sub_name = match (class, &f.recv) {
             (Some(cls), _) => method_sub_name(cls, &f.name),
             (None, Some((recv, _, _))) => ext_sub_name(recv, &f.name),
@@ -4548,17 +4561,6 @@ impl Compiler {
         };
         let name_idx = self.b.add_name(&sub_name);
         self.b.add_sub_entry(name_idx, entry);
-        // A function that can recurse tests its depth on entry, so an
-        // unbounded recursion raises `StackOverflowError` as on the JVM; while
-        // that error unwinds, the frame returns at once instead of recursing.
-        if self.recursive.contains(unmangled(&f.name)) {
-            self.b.emit(Op::Extended(KT_DEPTH_GUARD, 0), f.line);
-            let body = self.b.emit(Op::JumpIfFalse(0), f.line);
-            self.b.emit(Op::LoadUndef, f.line);
-            self.b.emit(Op::ReturnValue, f.line);
-            let at = self.b.current_pos();
-            self.b.patch_jump(body, at);
-        }
 
         let mut sc = Scope::new();
         let mut nslots = f.params.len();

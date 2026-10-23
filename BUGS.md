@@ -70,8 +70,10 @@ The UNBOUNDED case is closed since round 21: a function that can reach
 itself by name tests its depth on entry (`KT_DEPTH_GUARD`) and raises
 `StackOverflowError` past a million frames, twenty times the ~45 000 at which
 the reference overflows a one-parameter recursion, so no depth the reference
-completes is cut short. The test costs about 12% on a call-bound benchmark
-(`fib(30)`, debug build: 3.71 s to 4.18 s).
+completes is cut short. The test is one dispatched op per call and costs
+about 3.6% of a call-bound benchmark's retired instructions (`fib(27)`, debug
+build: 10.80 G unguarded, 11.19 G guarded; it was 11.93 G, 10.4%, when the
+guard was two ops).
 
 ### `"ab".repeat(2000000000)` and `"a".padStart(2000000000)`
 

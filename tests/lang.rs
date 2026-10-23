@@ -9031,3 +9031,38 @@ fun main() {
         "fin1\nf1: caught a\nf2: 2\nf3: 111\ninner fin\nouter caught inner\nfin5\nf5: nfe\nf6: 3\nf7: wrapped <- boom\nusing a\nclose a\nuse: 42\nclose b\nuseThrow: EX java.lang.IllegalStateException: in use\ntyped: IndexOutOfBoundsException\nmultiCatch: iae:true\nrethrowFin: fc\nnothing: EX java.lang.IllegalArgumentException: null!\n"
     );
 }
+
+/// The depth guard a recursive function carries is ONE op on its ordinary
+/// path: the entry is `Extended(KT_DEPTH_GUARD)` and the body follows at once,
+/// with the unwinding return (`LoadUndef; ReturnValue`) parked just before the
+/// entry where only the guard's jump reaches it. It used to be the guard plus a
+/// `JumpIfFalse` over that stub, two dispatched ops per call — about 10% of
+/// `fib`'s instructions. A function that cannot recurse carries no guard.
+#[test]
+fn the_depth_guard_is_one_op_ahead_of_the_body() {
+    let out = Command::new(env!("CARGO_BIN_EXE_kotlin"))
+        .arg("--dump-bytecode")
+        .arg("-e")
+        .arg("fun leaf(n: Int) = n + 1\nfun fib(n: Int): Int = if (n < 2) leaf(n) else fib(n - 1) + fib(n - 2)\nfun main() { println(fib(5)) }")
+        .output()
+        .unwrap();
+    let asm = String::from_utf8(out.stdout).unwrap();
+    let entry = |name: &str| -> usize {
+        let tag = format!(";   {name} @ ");
+        let line = asm.lines().find(|l| l.starts_with(&tag)).unwrap();
+        line[tag.len()..].trim().parse().unwrap()
+    };
+    let op = |ip: usize| -> &str {
+        let at = format!("{ip:04} ");
+        let line = asm.lines().find(|l| l.starts_with(&at)).unwrap();
+        line.split_whitespace().nth(2).unwrap()
+    };
+    let fib = entry("fib");
+    assert_eq!(op(fib), "Extended(157,", "fib's entry in:\n{asm}");
+    assert!(!op(fib + 1).starts_with("JumpIf"), "fib's body in:\n{asm}");
+    assert_eq!((op(fib - 2), op(fib - 1)), ("LoadUndef", "ReturnValue"));
+    assert!(
+        !op(entry("leaf")).starts_with("Extended(157"),
+        "leaf in:\n{asm}"
+    );
+}
