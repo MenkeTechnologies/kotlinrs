@@ -36,7 +36,7 @@ use crate::host::{
     KT_OBJ_INIT_EXIT, KT_OBSERVE, KT_OPER_REG, KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT,
     KT_PRINTLN, KT_RANDOM, KT_RANGE, KT_RANGE_STEP, KT_REIFIED, KT_REIFY, KT_RESULT_HOF,
     KT_RUN_CATCHING, KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_STR_ORDER, KT_SYSTEM,
-    KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG, KT_YIELD,
+    KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG, KT_UNIT, KT_YIELD,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
@@ -4667,7 +4667,8 @@ impl Compiler {
         self.pop_unwind_to(here);
         res?;
         // Fallthrough Unit return for `Unit` functions / a missing `return`.
-        self.b.emit(Op::LoadUndef, f.line);
+        // `kotlin.Unit` itself, so the result is not `null` where it lands.
+        self.b.emit(Op::Extended(KT_UNIT, 0), f.line);
         self.b.emit(Op::ReturnValue, f.line);
         Ok(())
     }
@@ -5143,7 +5144,7 @@ impl Compiler {
                         }
                     }
                     None => {
-                        self.b.emit(Op::LoadUndef, 0);
+                        self.b.emit(Op::Extended(KT_UNIT, 0), 0);
                     }
                 }
                 // `return xs.map { if (…) return … }` — a lambda in the
@@ -5909,7 +5910,7 @@ impl Compiler {
                 // The `Unit` object. Its representation is the absent value; the
                 // static type is what makes it display as `kotlin.Unit`.
                 if name == "Unit" {
-                    self.b.emit(Op::LoadUndef, 0);
+                    self.b.emit(Op::Extended(KT_UNIT, 0), 0);
                     return Ok(Type::Unit);
                 }
                 Err(format!("unresolved reference: {name}"))
@@ -8973,6 +8974,12 @@ impl Compiler {
         match res.as_ref() {
             Ok(Type::Float) => {
                 self.b.emit(Op::Extended(KT_BOX_F32, 0), 0);
+            }
+            // A lambda whose body ends in a `Unit` expression answers
+            // `kotlin.Unit`, not `null`: `{ x: Int -> println(x) }(1)` prints it.
+            Ok(Type::Unit) => {
+                self.b.emit(Op::Pop, 0);
+                self.b.emit(Op::Extended(KT_UNIT, 0), 0);
             }
             Ok(Type::Long) => {
                 self.b.emit(Op::Extended(KT_BOX_I64, 0), 0);

@@ -290,22 +290,6 @@ Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 | `java.util.LinkedList<Int>()` | `unresolved reference: java` | the JDK list |
 | `(-1).toUInt()` / `5u + 3u` | `unresolved reference: toUInt on Int` / parse error | `4294967295` / `8` |
 
-## A closure's `Unit` result prints `null`
-
-| program | kotlinrs | reference |
-| --- | --- | --- |
-| `val f = { x: Int -> println(x) }; println(f(1))` | `1` then `null` | `1` then `kotlin.Unit` |
-| `val g = fun(s: String) { s.length }; println(g("a"))` | `null` | `kotlin.Unit` |
-| `val r = x?.let { println(it) }; println(r == null)` | `true` | `false` |
-
-`Unit` and `null` are one runtime value here, and a named function's `Unit`
-result prints `kotlin.Unit` only because the call site knows the declared
-return type. A closure call knows it only from a written annotation
-(`val h: () -> Unit = { 5 }; println(h())` is right); an unannotated lambda or
-anonymous function has none. Telling them apart at run time needs a `Unit`
-value distinct from `null`. The one idiom that USED to go wrong through this,
-`x?.let { println(it) } ?: other` running `other` for a non-null `x`, is
-decided statically now (see CHANGELOG, round 16).
 
 ## `sin` and `cos` — the reference is a platform intrinsic
 
@@ -405,7 +389,6 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
 | program | kotlinrs | reference |
 | --- | --- | --- |
 | `open class A { init { println("A " + name()) }; abstract fun name(): String }` with `class B : A() { val nm = "b"; override fun name() = nm }` | `A ` | `A null` |
-| `println(mutableListOf(1).clear())`, `val f = { }; println(f())` | `null` | `kotlin.Unit` |
 
 **A `String`-typed field read before its initializer.** A field the JVM has not
 yet written is `null`, and a value statically typed `String` concatenates as

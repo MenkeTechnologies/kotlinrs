@@ -8747,3 +8747,52 @@ fun main() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("java.lang.StackOverflowError"));
 }
+
+#[test]
+fn unit_is_a_value_that_prints_kotlin_unit_and_is_not_null() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. `Unit` and `null` were one
+    // runtime value, so a lambda's or a function's `Unit` result printed
+    // `null` wherever its static type was lost, compared equal to `null`, and
+    // `x?.let { println(it) }` read as null.
+    assert_eq!(
+        stdout(
+            r##"fun t(name: String, f: () -> Any?) { try { println("$name: ${f()}") } catch (e: Throwable) { println("$name: EX $e") } }
+fun u() {}
+fun early(x: Int) { if (x > 0) return; println("neg") }
+class C { fun m() {} }
+fun main() {
+    t("lambda") { val f = { x: Int -> println(x) }; f(1) }
+    t("anon") { val g = fun(s: String) { s.length }; g("a") }
+    t("letNonNull") { val x: Int? = 5; val r = x?.let { println(it) }; r == null }
+    t("elvis") { val x: Int? = 5; x?.let { println(it) } ?: "other" }
+    t("clear") { mutableListOf(1).clear() }
+    t("forEach") { listOf(1).forEach { } }
+    t("early") { early(1) }
+    t("method") { C().m() }
+    t("anyUnit") { val a: Any = u(); a.toString() }
+    t("eqUnit") { u() == Unit }
+    t("runUnit") { run { println("r") } }
+    t("applyUnit") { "x".also { } }
+    t("mapUnit") { listOf(1, 2).map { } }
+    t("mapNotNullUnit") { listOf(1).mapNotNull { println(it) } }
+    t("unitHash") { Unit.hashCode() == Unit.hashCode() }
+    t("isUnit") { val a: Any = u(); a is Unit }
+    t("unitString") { "${u()}" + Unit }
+    t("result") { runCatching { println("x") } }
+    t("lazyUnit") { val l by lazy { println("l") }; l }
+    t("ifUnit") { if (true) println("a") else println("b") }
+    t("whenUnit") { when (1) { 1 -> println("one"); else -> {} } }
+    t("assignLambda") { var v = 0; val set = { v = 5 }; set() }
+    t("unitList") { listOf(Unit, null) }
+    more()
+}
+fun more() {
+    t("sortUnit") { mutableListOf(2, 1).sort() }
+    t("addIdx") { mutableListOf(1).add(0, 5) }
+    t("putAllUnit") { mutableMapOf(1 to 1).putAll(mapOf(2 to 2)) }
+    t("fillUnit") { IntArray(2).fill(3) }
+}"##
+        ),
+        "1\nlambda: kotlin.Unit\nanon: kotlin.Unit\n5\nletNonNull: false\n5\nelvis: kotlin.Unit\nclear: kotlin.Unit\nforEach: kotlin.Unit\nearly: kotlin.Unit\nmethod: kotlin.Unit\nanyUnit: kotlin.Unit\neqUnit: true\nr\nrunUnit: kotlin.Unit\napplyUnit: x\nmapUnit: [kotlin.Unit, kotlin.Unit]\n1\nmapNotNullUnit: [kotlin.Unit]\nunitHash: true\nisUnit: true\nunitString: kotlin.Unitkotlin.Unit\nx\nresult: Success(kotlin.Unit)\nl\nlazyUnit: kotlin.Unit\na\nifUnit: kotlin.Unit\none\nwhenUnit: kotlin.Unit\nassignLambda: kotlin.Unit\nunitList: [kotlin.Unit, null]\nsortUnit: kotlin.Unit\naddIdx: kotlin.Unit\nputAllUnit: kotlin.Unit\nfillUnit: kotlin.Unit\n"
+    );
+}

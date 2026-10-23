@@ -11,6 +11,24 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## `kotlin.Unit` is a value
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | before | reference |
+| --- | --- | --- |
+| `val f = { x: Int -> println(x) }; println(f(1))`, `val g = fun(s: String) { s.length }; println(g("a"))` | `null` | `kotlin.Unit` |
+| `val x: Int? = 5; println(x?.let { println(it) } == null)` | `true` | `false` |
+| `fun u() {}`; `val a: Any = u(); println(a)`, `listOf(u())`, `"${u()}"` | `null`, `[null]`, `null` | `kotlin.Unit`, `[kotlin.Unit]`, `kotlin.Unit` |
+| `listOf(1).mapNotNull { println(it) }` | `[]` | `[kotlin.Unit]` |
+| `println(mutableListOf(1).clear())`, `.sort()`, `.add(0, 5)`, `putAll`, `fill` | `null` | `kotlin.Unit` |
+
+`Unit` and `null` were one runtime value, with `kotlin.Unit` printed only
+where the static type said `Unit`. It is now a heap singleton (`KT_UNIT`): a
+`Unit` function's fallthrough and bare `return`, a lambda whose body ends in a
+`Unit` expression, the name `Unit`, and the collection members declared to
+answer `Unit` all produce it.
+
 ## Unbounded recursion raises `StackOverflowError`
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.

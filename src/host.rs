@@ -350,6 +350,9 @@ pub const KT_DEPTH_GUARD: u16 = 157;
 /// 300 MB and 1.5 s in a debug build.
 pub const MAX_CALL_DEPTH: usize = 1_000_000;
 
+/// `KT_UNIT`: push `kotlin.Unit` — see [`unit_value`]. Stack `[]`.
+pub const KT_UNIT: u16 = 158;
+
 /// `KT_SEQ_NEW`: build the lazy `Sequence` a `sequence { … }` block denotes.
 /// Stack `[blockClosure]`; pushes a `Gen` whose source is a fresh coroutine.
 pub const KT_SEQ_NEW: u16 = 49;
@@ -2589,6 +2592,7 @@ fn reset_heap() {
     ONCE_TOKEN.with(|t| t.borrow_mut().clear());
     ONCE_CONSUMED.with(|t| t.borrow_mut().clear());
     ITER_END.with(|c| *c.borrow_mut() = None);
+    UNIT.with(|u| *u.borrow_mut() = None);
     FAILED_INIT.with(|f| f.borrow_mut().clear());
     INIT_DEPTH.with(|d| d.set(0));
     TYPES.with(|t| t.borrow_mut().clear());
@@ -5111,6 +5115,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             }
             vm.push(Value::Bool(false));
         }
+        KT_UNIT => vm.push(unit_value()),
         KT_DEPTH_GUARD => {
             let over = vm.frames.len() > MAX_CALL_DEPTH;
             if over && !unwinding() {
@@ -11280,7 +11285,26 @@ fn jdk_integral_static(recv: &Value, name: &str, args: &[Value]) -> Option<Resul
     }))
 }
 
+/// A member call. The collection members declared to answer `Unit` — whose
+/// host bodies answer the absent value — answer `kotlin.Unit` itself, so
+/// `println(xs.clear())` prints it as the JVM does.
 fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    let unit = matches!(
+        (name, args.len()),
+        (
+            "clear" | "sort" | "sortDescending" | "reverse" | "shuffle" | "putAll",
+            _
+        ) | ("fill", _)
+            | ("add", 2)
+    );
+    let out = kt_method_inner(vm, recv, name, args);
+    match out {
+        Ok(Value::Undef) if unit => Ok(unit_value()),
+        other => other,
+    }
+}
+
+fn kt_method_inner(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     if let Some(r) = jdk_integral_static(recv, name, args) {
         return r;
     }
@@ -17231,6 +17255,7 @@ fn is_builtin_type_name(ty: &str) -> bool {
 
 fn value_is_type(v: &Value, ty: &str) -> bool {
     match ty {
+        "Unit" => is_unit(v),
         // A `Char` has its own runtime representation, so `is Char` and `is Int`
         // answer for exactly one value kind each.
         "Char" => is_char(v),
@@ -17384,15 +17409,17 @@ fn type_label(v: &Value) -> &'static str {
 
 /// Kotlin `Any?.toString()` for the value kinds kotlinrs produces.
 pub fn kotlin_string(v: &Value) -> String {
+    if is_unit(v) {
+        return "kotlin.Unit".to_string();
+    }
     match v {
         Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         Value::Int(n) => n.to_string(),
         Value::Float(f) => format_double(*f),
         Value::Str(s) => s.to_string(),
         // Kotlin `null` (carried as `Undef`) stringifies to `null` in
-        // interpolation / `println`. `Unit` is displayed statically by the
-        // compiler (it emits the literal `kotlin.Unit`), so it never reaches
-        // here as an `Undef`.
+        // interpolation / `println`. `Unit` is a value of its own
+        // ([`unit_value`]), answered above.
         Value::Undef => "null".to_string(),
         // A `Char` is a handle in the reserved region, not a heap object, so it
         // renders as its character wherever a value is displayed — including
@@ -18341,6 +18368,32 @@ fn deque_len(recv: &Value) -> usize {
         _ => 0,
     })
     .unwrap_or(0)
+}
+
+thread_local! {
+    /// The `kotlin.Unit` object — see [`unit_value`].
+    static UNIT: RefCell<Option<Value>> = const { RefCell::new(None) };
+}
+
+/// `kotlin.Unit` as a VALUE: a heap object of its own, so it is not `null`
+/// (`{ println() }() == null` is false, and an elvis does not take it) and it
+/// prints `kotlin.Unit` wherever it lands — a list, a template, an `Any`.
+/// What a `Unit` function or lambda answers, and what the name `Unit` reads.
+fn unit_value() -> Value {
+    UNIT.with(|u| {
+        let mut u = u.borrow_mut();
+        if u.is_none() {
+            *u = Some(alloc(HeapObj::List(Vec::new())));
+        }
+        u.clone().unwrap_or(Value::Undef)
+    })
+}
+
+fn is_unit(v: &Value) -> bool {
+    matches!(v, Value::Obj(_))
+        && UNIT.with(
+            |u| matches!((u.borrow().as_ref(), v), (Some(Value::Obj(a)), Value::Obj(b)) if a == b),
+        )
 }
 
 /// Whether `v` is an EMPTY read-only `Set`/`Map` literal — Kotlin's
