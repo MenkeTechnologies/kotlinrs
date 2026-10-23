@@ -1956,7 +1956,10 @@ enum HeapObj {
     /// The endpoints stay as the typed values they were built from (a
     /// `Value::Float` or a boxed `Float`), so `start` reads back at the width
     /// it was written and the class is told from the first endpoint.
-    FloatRange { start: Value, end: Value },
+    FloatRange {
+        start: Value,
+        end: Value,
+    },
     /// A throwable: its fully-qualified JVM class name (`java.lang.RuntimeException`)
     /// and the constructor message (`None` for the no-arg form, whose `message`
     /// is Kotlin `null`). Kept apart from [`HeapObj::Instance`] because a
@@ -4637,7 +4640,11 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             // the way `kotlinc` refuses them.
             if is_float(&start) || is_float(&end) {
                 if form != RangeForm::Inclusive {
-                    let op = if form == RangeForm::Until { "until" } else { "downTo" };
+                    let op = if form == RangeForm::Until {
+                        "until"
+                    } else {
+                        "downTo"
+                    };
                     fault(vm, format!("unresolved reference: {op} on Double"));
                     vm.push(Value::Undef);
                     return;
@@ -11151,7 +11158,9 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
                     ))
                 }
             };
-            Ok(Value::Int(char::decode_utf16(window.iter().copied()).count() as i64))
+            Ok(Value::Int(
+                char::decode_utf16(window.iter().copied()).count() as i64,
+            ))
         }
         (Value::Str(s), "uppercase" | "toUpperCase") => Ok(Value::str(s.to_uppercase())),
         (Value::Str(s), "lowercase" | "toLowerCase") => Ok(Value::str(s.to_lowercase())),
@@ -12706,9 +12715,8 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             ("equals", [other]) => return Ok(Value::Bool(value_eq(recv, other))),
             _ => {}
         }
-        return float_range_method(&start, &end, name, args).ok_or_else(|| {
-            format!("unresolved reference: {name} on {}", obj_label(recv))
-        });
+        return float_range_method(&start, &end, name, args)
+            .ok_or_else(|| format!("unresolved reference: {name} on {}", obj_label(recv)));
     }
     // A `StringBuilder` resolves first and entirely on its own: it is a
     // `CharSequence`, not a collection, so none of the collection members below
@@ -15818,7 +15826,7 @@ fn heap_eq(a: &HeapObj, b: &HeapObj) -> bool {
             HeapObj::FloatRange { start: sb, end: eb },
         ) => {
             let (sa, ea, sb, eb) = (num_f64(sa), num_f64(ea), num_f64(sb), num_f64(eb));
-            let (empty_a, empty_b) = (!(sa <= ea), !(sb <= eb));
+            let (empty_a, empty_b) = (float_range_empty(sa, ea), float_range_empty(sb, eb));
             (empty_a && empty_b) || (!empty_a && !empty_b && sa == sb && ea == eb)
         }
         // A JVM array inherits `Object.equals`, i.e. reference identity —
@@ -16028,13 +16036,15 @@ fn obj_hash(recv: &Value) -> Option<i32> {
         // `ClosedDoubleRange.hashCode()`: -1 when empty, else `31 * start
         // .hashCode() + endInclusive.hashCode()` — each endpoint hashing at its
         // own width, which is why `1.0f..3.0f` and `1.0..3.0` differ.
-        HeapObj::FloatRange { start, end } => Some(if !(num_f64(start) <= num_f64(end)) {
-            -1
-        } else {
-            value_hash(start, false)
-                .wrapping_mul(31)
-                .wrapping_add(value_hash(end, false))
-        }),
+        HeapObj::FloatRange { start, end } => {
+            Some(if float_range_empty(num_f64(start), num_f64(end)) {
+                -1
+            } else {
+                value_hash(start, false)
+                    .wrapping_mul(31)
+                    .wrapping_add(value_hash(end, false))
+            })
+        }
         // Identity-hashed: `Object.hashCode`.
         HeapObj::Array { .. }
         | HeapObj::Builder { .. }
@@ -17777,7 +17787,7 @@ fn float_range_method(start: &Value, end: &Value, name: &str, args: &[Value]) ->
     match (name, args) {
         ("start", []) => Some(start.clone()),
         ("endInclusive", []) => Some(end.clone()),
-        ("isEmpty", []) => Some(Value::Bool(!(lo <= hi))),
+        ("isEmpty", []) => Some(Value::Bool(float_range_empty(lo, hi))),
         ("contains", [v]) => Some(Value::Bool(float_range_contains(lo, hi, v))),
         _ => None,
     }
@@ -17913,4 +17923,14 @@ fn jvm_interface(ty: &str) -> Option<(&'static str, bool)> {
         "Iterable" | "MutableIterable" => ("java.lang.Iterable", true),
         _ => return None,
     })
+}
+
+/// Whether a floating-point range `lo..hi` is empty: `!(lo <= hi)`, which a
+/// NaN endpoint makes true as well as `lo > hi` — `ClosedFloatingPointRange
+/// .isEmpty()`'s own definition.
+fn float_range_empty(lo: f64, hi: f64) -> bool {
+    !matches!(
+        lo.partial_cmp(&hi),
+        Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+    )
 }
