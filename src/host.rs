@@ -2706,8 +2706,11 @@ struct RangeObj {
     /// decides that its elements and its printed form are characters.
     is_char: bool,
     /// `1u..3u` — a `UIntRange`/`ULongRange` of this width (0 for a signed
-    /// one). The endpoints ride as the values' bits; the elements are boxed
-    /// back into the unsigned type.
+    /// one). A `UIntRange`'s endpoints ride as the values themselves; a
+    /// `ULongRange`'s with the sign bit flipped, which maps unsigned order onto
+    /// signed order so every comparison below holds (stepping is unchanged:
+    /// the flip is an addition of 2^63). The elements are boxed back into the
+    /// unsigned type.
     unsigned: u8,
 }
 
@@ -2792,6 +2795,8 @@ impl RangeObj {
     fn elem_string(&self, n: i64) -> String {
         if self.is_char {
             char_string(n)
+        } else if self.unsigned == 64 {
+            ((n ^ i64::MIN) as u64).to_string()
         } else if self.unsigned > 0 {
             (n as u64).to_string()
         } else {
@@ -2803,6 +2808,8 @@ impl RangeObj {
     fn wrap(&self, n: i64) -> Value {
         if self.is_char {
             char_of(n)
+        } else if self.unsigned == 64 {
+            make_unsigned(64, (n ^ i64::MIN) as u64)
         } else if self.unsigned > 0 {
             make_unsigned(self.unsigned, n as u64)
         } else {
@@ -4664,6 +4671,18 @@ fn box_i64(n: i64) -> Value {
 // to the type's width, so it keeps its class through every position and every
 // operator on one reaches these functions rather than a native signed op.
 
+/// The signed array an unsigned array class (`kotlin.UIntArray`) stores its
+/// elements in, by JVM descriptor; `None` for any other array descriptor.
+fn unsigned_array_storage(desc: &str) -> Option<&'static str> {
+    match desc {
+        "kotlin.UByteArray" => Some("[B"),
+        "kotlin.UShortArray" => Some("[S"),
+        "kotlin.UIntArray" => Some("[I"),
+        "kotlin.ULongArray" => Some("[J"),
+        _ => None,
+    }
+}
+
 /// The width of an unsigned type name, in bits.
 fn unsigned_bits(name: &str) -> Option<u8> {
     match name {
@@ -5702,11 +5721,25 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             // `'a'..'z'` is a `CharRange`, whose elements and printed form are
             // characters; the endpoints ride as code units either way.
             let is_char = is_char(&start) || is_char(&end);
-            let mut range = RangeObj::new(num_of(&start), num_of(&end), form, is_char);
             // A `UByte`/`UShort` range is a `UIntRange`, as their `rangeTo` answers.
-            range.unsigned = unsigned_box(&start)
+            let unsigned = unsigned_box(&start)
                 .or(unsigned_box(&end))
                 .map_or(0, |u| u.0.max(32));
+            let (first, end) = (num_of(&start), num_of(&end));
+            let mut range = if unsigned > 0 && form == RangeForm::Until && end == 0 {
+                // `x until 0u` is the type's `EMPTY`, which is `MAX..0`.
+                match unsigned {
+                    64 => RangeObj::new(i64::MAX, i64::MIN, RangeForm::Inclusive, false),
+                    _ => RangeObj::new(i64::from(u32::MAX), 0, RangeForm::Inclusive, false),
+                }
+            } else if unsigned == 64 {
+                // A `ULongRange` keeps its endpoints sign-flipped (see
+                // `RangeObj::unsigned`), so signed order is unsigned order.
+                RangeObj::new(first ^ i64::MIN, end ^ i64::MIN, form, false)
+            } else {
+                RangeObj::new(first, end, form, is_char)
+            };
+            range.unsigned = unsigned;
             vm.push(alloc(HeapObj::Range(range)));
         }
         KT_RANGE_STEP => {
@@ -6246,7 +6279,12 @@ fn contains_value(vm: &mut VM, container: &Value, value: &Value) -> bool {
             } else {
                 matches!(value, Value::Int(_))
             };
-            Search::Range(kind_fits && r.contains(num_of(value)))
+            let n = if r.unsigned == 64 {
+                num_of(value) ^ i64::MIN
+            } else {
+                num_of(value)
+            };
+            Search::Range(kind_fits && r.contains(n))
         }
         HeapObj::FloatRange { start, end } => {
             Search::Range(float_range_contains(num_f64(start), num_f64(end), value))
@@ -12228,6 +12266,17 @@ fn kt_method_inner(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Res
     }
     // `CharCategory.NAME`, the qualifier dropped by the compiler and the
     // constant's name the receiver.
+    // `UIntArray(n)` built by `Array(n) { 0u }`: retagged as the unsigned
+    // array class the call named.
+    if name == "#unsignedArray" {
+        let class = args.first().map(|a| a.to_str()).unwrap_or_default();
+        with_obj_mut(recv, |o| {
+            if let HeapObj::Array { desc, .. } = o {
+                *desc = class;
+            }
+        });
+        return Ok(recv.clone());
+    }
     if name == "#charCategory" {
         let want = recv.to_str();
         return match CHAR_CATEGORIES
@@ -16741,14 +16790,19 @@ fn sequence_member(
             // `IntRange.reversed()` is an `IntProgression` counting down; a
             // list's is a plain reversed list.
             return Some(Ok(match range {
-                Some((first, last)) => alloc(HeapObj::Range(RangeObj {
-                    first: num_of(&last),
-                    end: num_of(&first),
-                    step: -1,
-                    progression: true,
-                    is_char: is_char(&first),
-                    unsigned: unsigned_box(&first).map_or(0, |u| u.0),
-                })),
+                Some((first, last)) => {
+                    let unsigned = unsigned_box(&first).map_or(0, |u| u.0);
+                    // A `ULongRange` stores its endpoints sign-flipped.
+                    let bias = if unsigned == 64 { i64::MIN } else { 0 };
+                    alloc(HeapObj::Range(RangeObj {
+                        first: num_of(&last) ^ bias,
+                        end: num_of(&first) ^ bias,
+                        step: -1,
+                        progression: true,
+                        is_char: is_char(&first),
+                        unsigned,
+                    }))
+                }
                 None => alloc_ro_list(items.iter().rev().cloned().collect()),
             }));
         }
@@ -17958,6 +18012,17 @@ fn display_obj(id: u32) -> String {
             // identity hash. The hash is the JVM's per-run object address, which
             // no reimplementation can reproduce — the heap handle stands in, so
             // the SHAPE matches (`[I@1b6d3586`) but the digits do not.
+            // An unsigned array is a value class over a signed one, whose
+            // generated `toString` renders the storage's elements:
+            // `UIntArray(storage=[1, 2])`.
+            HeapObj::Array { desc, items } if unsigned_array_storage(desc).is_some() => {
+                let elems: Vec<String> = items.iter().map(kotlin_string).collect();
+                format!(
+                    "{}(storage=[{}])",
+                    desc.trim_start_matches("kotlin."),
+                    elems.join(", ")
+                )
+            }
             HeapObj::Array { desc, .. } => format!("{desc}@{id:x}"),
             // `StringBuilder.toString()` is its content, which is why an
             // interpolated or printed builder reads as plain text.

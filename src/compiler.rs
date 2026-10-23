@@ -11029,6 +11029,7 @@ impl Compiler {
                     args: vec![bits, Expr::Str(vec![StrExpr::Text(kind.to_string())])],
                     line,
                 };
+                let class = format!("kotlin.{kind}Array");
                 if name.ends_with("Of") {
                     let elems: Vec<Expr> = args
                         .iter()
@@ -11039,7 +11040,8 @@ impl Compiler {
                             other => other.clone(),
                         })
                         .collect();
-                    return self.compile_call(sc, "arrayOf", &elems, line);
+                    self.compile_call(sc, "arrayOf", &elems, line)?;
+                    return self.retag_array(&class, line);
                 }
                 let init = match args.get(1) {
                     Some(f) => f.clone(),
@@ -11053,7 +11055,8 @@ impl Compiler {
                     },
                 };
                 let first = args.first().cloned().unwrap_or(Expr::Int(0));
-                self.compile_call(sc, "Array", &[first, init], line)
+                self.compile_call(sc, "Array", &[first, init], line)?;
+                self.retag_array(&class, line)
             }
             // `5u` — the bits, then the type the box is of.
             UNSIGNED_LIT if args.len() == 2 => {
@@ -12714,6 +12717,17 @@ impl Compiler {
     /// Nothing on the native path passes through here, which is what makes the
     /// `Long` box affordable: `listOf(1, 2, 3)` holds `Int`s and boxes nothing,
     /// and every `Op::Add` still sees a `Value::Int`.
+    /// Retag the array on the stack as the unsigned array class `class`
+    /// (`kotlin.UIntArray`), which decides its printed form and `javaClass`.
+    fn retag_array(&mut self, class: &str, line: u32) -> Result<Type, String> {
+        let c = self.b.add_constant(Value::str(class));
+        self.b.emit(Op::LoadConst(c), line);
+        let n = self.b.add_constant(Value::str("#unsignedArray"));
+        self.b.emit(Op::LoadConst(n), line);
+        self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 1), line);
+        Ok(Type::Obj)
+    }
+
     /// `args` with every `Int`-typed one converted to `Long` — the arguments
     /// passed where a `Long` element is expected. Kotlin accepts only an
     /// integer LITERAL there (an `Int` expression is a type error), and types

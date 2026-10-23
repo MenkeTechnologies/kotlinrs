@@ -9703,3 +9703,65 @@ fun main() {
         "Foo\nFoo\nclass D\nObj\nE\nint\njava.lang.String\njava.util.Collections$SingletonList\nArrayList\nFoo\nhello\n42\ne\n15\n"
     );
 }
+
+/// An unsigned array prints as its value class does — `UIntArray(storage=[1, 2])`\n— with a `javaClass` of `kotlin.UIntArray`; it printed `[Ljava.lang.Object;@…`.\nA `ULongRange` above `Long.MAX_VALUE` iterates, tests membership, prints and\nreverses in unsigned order, and `x until 0u` is the type's `EMPTY` (`MAX..0`);\nboth answered in signed order before.
+#[test]
+fn unsigned_arrays_print_their_storage_and_ulong_ranges_order_unsigned() {
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    val a = uintArrayOf(1u, 2u)
+    println(a.toString())
+    println(a.javaClass.name)
+    println(UIntArray(2).toString())
+    println(ulongArrayOf(1uL).toString())
+    println(a.toList())
+    println(a.size)
+    println(a.contentToString())
+    println(ubyteArrayOf(1u).toString())
+}"##
+        ),
+        "UIntArray(storage=[1, 2])\nkotlin.UIntArray\nUIntArray(storage=[0, 0])\nULongArray(storage=[1])\n[1, 2]\n2\n[1, 2]\nUByteArray(storage=[1])\n"
+    );
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    println(uintArrayOf(5u))
+    println("${uintArrayOf(5u, 6u)}")
+    println(listOf(uintArrayOf(1u)))
+}"##
+        ),
+        "UIntArray(storage=[5])\nUIntArray(storage=[5, 6])\n[UIntArray(storage=[1])]\n"
+    );
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    val top = ULong.MAX_VALUE
+    println((top - 1uL..top).toList())
+    println(top - 1uL..top)
+    println(top in (top - 5uL)..top)
+    println(5uL in (top - 5uL)..top)
+    for (x in (top - 2uL)..top) print("$x ")
+    println()
+    println((top downTo top - 2uL).toList())
+    println(0uL until 0uL)
+    println((0uL until 0uL).toList())
+    println((9223372036854775807uL..9223372036854775809uL).toList())
+    println((1uL..10uL step 4).toList())
+    println((0uL..3uL).reversed().toList())
+}"##
+        ),
+        "[18446744073709551614, 18446744073709551615]\n18446744073709551614..18446744073709551615\ntrue\nfalse\n18446744073709551613 18446744073709551614 18446744073709551615 \n[18446744073709551615, 18446744073709551614, 18446744073709551613]\n18446744073709551615..0\n[]\n[9223372036854775807, 9223372036854775808, 9223372036854775809]\n[1, 5, 9]\n[3, 2, 1, 0]\n"
+    );
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    println(0u until 0u)
+    println((0u until 0u).toList())
+    println((3u..1u).toList())
+    println((0u..2u).reversed())
+}"##
+        ),
+        "4294967295..0\n[]\n[]\n2 downTo 0 step 1\n"
+    );
+}

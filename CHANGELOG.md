@@ -11,6 +11,20 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Unsigned arrays print their storage; `ULongRange` in unsigned order
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | before | reference |
+| --- | --- | --- |
+| `println(uintArrayOf(1u, 2u))`, `UIntArray(2)`, `ulongArrayOf(1uL)` | `[Ljava.lang.Object;@…` | `UIntArray(storage=[1, 2])`, `UIntArray(storage=[0, 0])`, `ULongArray(storage=[1])` |
+| `uintArrayOf(1u).javaClass.name` | `[Ljava.lang.Object;` | `kotlin.UIntArray` |
+| `(ULong.MAX_VALUE - 1uL..ULong.MAX_VALUE).toList()`, `in`, `for`, `downTo`, `reversed()` | signed order: empty or wrong | `[18446744073709551614, 18446744073709551615]` … |
+| `0uL until 0uL`, `0u until 0u` | `1..0`, `0..18446744073709551615` | `18446744073709551615..0`, `4294967295..0` (`EMPTY`) |
+
+A `ULongRange` stores its endpoints with the sign bit flipped, which maps
+unsigned order onto the signed comparisons the range code makes.
+
 ## Member overloads; extensions on a companion
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
@@ -51,8 +65,8 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1. Every program was a parse error
 A value is a heap box (`HeapObj::Unsigned`) of its width and bits; the
 compiler types unsigned expressions (`unsigned_class`) so arithmetic reaches the
 host's operator dispatch, and a literal takes a declared unsigned type from a
-binding or parameter. Open: a `ULongRange` above `Long.MAX_VALUE`, and an
-unsigned array's printed form (BUGS.md).
+binding or parameter. A `ULongRange` above `Long.MAX_VALUE` and an unsigned array's printed form
+are closed in the next round (see above).
 
 ## `Any()`, `synchronized`, `Throwable.stackTrace`
 
