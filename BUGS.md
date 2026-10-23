@@ -114,7 +114,9 @@ the member is called, so the view stops tracking at that moment. Measured on
 | `val b = mutableListOf(1, 2, 3); val v = b.asReversed(); b.add(4); println(v)` | `[3, 2, 1]` | `[4, 3, 2, 1]` |
 | `val m = mutableMapOf("a" to 1); val k = m.keys; m["b"] = 2; println(k)` | `[a]` | `[a, b]` |
 | `val l = mutableListOf(1, 2); val s = l.subList(0, 2); l[0] = 9; println(s)` | `[1, 2]` | `[9, 2]` |
-| `val m = mutableMapOf(1 to 2, 3 to 4); m.keys.remove(1); println(m)` (also `m.values.remove(4)`, `m.entries.iterator()` then `remove()`) | `{1=2, 3=4}` | `{3=4}` — a write THROUGH a view reaches the map (measured on kotlinc 2.4.21 / JRE 21.0.12.1) |
+
+A WRITE through a map's `keys`/`values`/`entries` view reaches the map since
+round 21 (see CHANGELOG); the view itself is re-read from the map at that write.
 
 Every read that does not outlive a mutation of the backing collection agrees, so
 this is invisible until a program holds a view across a write. Closing it needs a

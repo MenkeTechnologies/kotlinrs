@@ -1217,6 +1217,152 @@ fn ro_coll_fault(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Optio
     refuse.then_some(UOE)
 }
 
+/// Which projection of its map a `keys`/`values`/`entries` view is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MapView {
+    Keys,
+    Values,
+    Entries,
+}
+
+thread_local! {
+    /// View handle → the map it projects. A view is still a SNAPSHOT for
+    /// reads (see BUGS.md, "Collection VIEWS are snapshots"); this table is
+    /// what lets a WRITE through one — `m.keys.remove(k)`, an `entries`
+    /// iterator's `remove()` — reach the map, as Kotlin's live views do.
+    static MAP_VIEWS: RefCell<std::collections::HashMap<u32, (Value, MapView)>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+fn register_map_view(view: &Value, map: &Value, kind: MapView) {
+    if let Value::Obj(id) = view {
+        MAP_VIEWS.with(|t| t.borrow_mut().insert(*id, (map.clone(), kind)));
+    }
+}
+
+fn map_view_of(view: &Value) -> Option<(Value, MapView)> {
+    let Value::Obj(id) = view else { return None };
+    MAP_VIEWS.with(|t| t.borrow().get(id).cloned())
+}
+
+/// Re-read the view's elements from its map, so the view and the map agree
+/// after a write through either.
+fn refresh_map_view(view: &Value, map: &Value, kind: MapView) {
+    let entries = with_obj(map, |o| match o {
+        HeapObj::Map(entries) => Some(entries.clone()),
+        _ => None,
+    })
+    .flatten()
+    .unwrap_or_default();
+    let items: Vec<Value> = entries
+        .into_iter()
+        .map(|(k, v)| match kind {
+            MapView::Keys => k,
+            MapView::Values => v,
+            MapView::Entries => alloc(HeapObj::Entry(k, v)),
+        })
+        .collect();
+    with_obj_mut(view, |o| {
+        if let HeapObj::List(xs) | HeapObj::Set(xs) = o {
+            *xs = items;
+        }
+    });
+}
+
+/// A write through a map view — `keys`, `values` or `entries` — applied to the
+/// map behind it. `remove(x)` drops the first entry whose projection is `x`
+/// (`values.remove(v)` the first entry holding `v`), `removeAt(i)` (an
+/// iterator's `remove()` over `values`) the `i`-th, `removeAll`/`retainAll`/
+/// `clear` every entry they select, and `add`/`addAll` are refused as the JDK's
+/// views refuse them. `None` for a value that is not a view.
+fn map_view_write(
+    vm: &mut VM,
+    view: &Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    let (map, kind) = map_view_of(view)?;
+    if !matches!(
+        name,
+        "add" | "addAll" | "remove" | "removeAt" | "removeAll" | "retainAll" | "clear"
+    ) {
+        return None;
+    }
+    if matches!(name, "add" | "addAll") {
+        return Some(Err(UOE.to_string()));
+    }
+    refresh_map_view(view, &map, kind);
+    let items = list_snapshot(view).unwrap_or_default();
+    let keys: Vec<Value> = with_obj(&map, |o| match o {
+        HeapObj::Map(entries) => Some(entries.iter().map(|(k, _)| k.clone()).collect()),
+        _ => None,
+    })
+    .flatten()
+    .unwrap_or_default();
+    let doomed: Vec<usize> = match name {
+        "remove" if args.len() == 1 => position_eq(vm, &items, &args[0]).into_iter().collect(),
+        "removeAt" if args.len() == 1 => {
+            let i = args[0].to_int();
+            match usize::try_from(i).ok().filter(|i| *i < items.len()) {
+                Some(i) => vec![i],
+                None => return Some(Err(format!(
+                    "java.lang.IndexOutOfBoundsException: Index {i} out of bounds for length {}",
+                    items.len()
+                ))),
+            }
+        }
+        "removeAll" | "retainAll" if args.len() == 1 => {
+            let other = as_iterable(&args[0]).unwrap_or_default();
+            let want = name == "retainAll";
+            let mut out = Vec::new();
+            for (i, it) in items.iter().enumerate() {
+                if position_eq(vm, &other, it).is_some() != want {
+                    out.push(i);
+                }
+            }
+            out
+        }
+        "clear" => (0..items.len()).collect(),
+        _ => return None,
+    };
+    let answer = match name {
+        "removeAt" => items.get(doomed[0]).cloned().unwrap_or(Value::Undef),
+        "clear" => Value::Undef,
+        _ => Value::Bool(!doomed.is_empty()),
+    };
+    for i in doomed {
+        if let Err(e) = kt_method(vm, &map, "remove", std::slice::from_ref(&keys[i])) {
+            return Some(Err(e));
+        }
+    }
+    refresh_map_view(view, &map, kind);
+    Some(Ok(answer))
+}
+
+/// [`map_view_write`] for the predicate forms — `removeIf { }`, `removeAll {
+/// }`, `retainAll { }` — given which of the view's elements the predicate
+/// keeps.
+fn map_view_filter(vm: &mut VM, view: &Value, keep: &[bool]) -> Option<Result<Value, String>> {
+    let (map, kind) = map_view_of(view)?;
+    let keys: Vec<Value> = with_obj(&map, |o| match o {
+        HeapObj::Map(entries) => Some(entries.iter().map(|(k, _)| k.clone()).collect()),
+        _ => None,
+    })
+    .flatten()
+    .unwrap_or_default();
+    let mut removed = false;
+    for (k, kept) in keys.iter().zip(keep) {
+        if !kept {
+            removed = true;
+            if let Err(e) = kt_method(vm, &map, "remove", std::slice::from_ref(k)) {
+                return Some(Err(e));
+            }
+        }
+    }
+    refresh_map_view(view, &map, kind);
+    Some(Ok(Value::Bool(removed)))
+}
+
 /// Record `list`'s implementation class. A no-op for a non-handle.
 fn tag_list_impl(list: &Value, which: ListImpl) {
     if let Value::Obj(id) = list {
@@ -2300,6 +2446,7 @@ fn reset_heap() {
     MAP_INDEX.with(|t| t.borrow_mut().clear());
     LIST_IMPL.with(|t| t.borrow_mut().clear());
     SEQ_VIEW.with(|t| t.borrow_mut().clear());
+    MAP_VIEWS.with(|t| t.borrow_mut().clear());
     ONCE_TOKEN.with(|t| t.borrow_mut().clear());
     ONCE_CONSUMED.with(|t| t.borrow_mut().clear());
     ITER_END.with(|c| *c.borrow_mut() = None);
@@ -9239,6 +9386,9 @@ fn coll_hof(
             for it in &items {
                 keep.push(truthy(&invoke_closure(vm, clo, std::slice::from_ref(it))?) == want);
             }
+            if let Some(r) = map_view_filter(vm, recv, &keep) {
+                return r;
+            }
             if let Some(kind) = ro_list_write(recv) {
                 let removes = keep.iter().any(|k| !k);
                 match (kind, name) {
@@ -12986,6 +13136,10 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     if let Some(e) = ro_coll_fault(vm, recv, name, args) {
         return Err(e.to_string());
     }
+    // A write through a map's `keys`/`values`/`entries` view reaches the map.
+    if let Some(r) = map_view_write(vm, recv, name, args) {
+        return r;
+    }
     // Mutating list operations need a mutable borrow.
     match name {
         // `MutableList.add` always appends and answers `true`; `MutableSet.add`
@@ -13613,12 +13767,16 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             })
             .flatten();
             return match out {
-                Some(entries) => Ok(alloc(HeapObj::Set(
-                    entries
-                        .into_iter()
-                        .map(|(k, v)| alloc(HeapObj::Entry(k, v)))
-                        .collect(),
-                ))),
+                Some(entries) => {
+                    let view = alloc(HeapObj::Set(
+                        entries
+                            .into_iter()
+                            .map(|(k, v)| alloc(HeapObj::Entry(k, v)))
+                            .collect(),
+                    ));
+                    register_map_view(&view, recv, MapView::Entries);
+                    Ok(view)
+                }
                 None => Err(format!(
                     "unresolved reference: entries on {}",
                     obj_label(recv)
@@ -13678,8 +13836,15 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             })
             .flatten();
             return match out {
-                Some(items) if want_keys => Ok(alloc(HeapObj::Set(items))),
-                Some(items) => Ok(alloc(HeapObj::List(items))),
+                Some(items) => {
+                    let (view, kind) = if want_keys {
+                        (alloc(HeapObj::Set(items)), MapView::Keys)
+                    } else {
+                        (alloc(HeapObj::List(items)), MapView::Values)
+                    };
+                    register_map_view(&view, recv, kind);
+                    Ok(view)
+                }
                 None => Err(format!(
                     "unresolved reference: {name} on {}",
                     obj_label(recv)

@@ -11,6 +11,22 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## A write through `keys`/`values`/`entries` reaches the map
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | before | reference |
+| --- | --- | --- |
+| `val m = mutableMapOf(1 to 2, 3 to 4); m.keys.remove(1); m` | `{1=2, 3=4}` | `{3=4}` |
+| `mutableMapOf(1 to 4, 2 to 4, 3 to 5).values.remove(4)` | the map unchanged | `{2=4, 3=5}` — the first entry holding the value |
+| `m.entries.iterator()`, `next()`, `remove()` / the same over `keys`, `values` | the map unchanged | the entry removed |
+| `m.keys.removeAll(…)`, `.retainAll(…)`, `m.values.removeIf { … }`, `m.keys.clear()` | the map unchanged | the selected entries removed |
+| `m.keys.add(5)` | the element added to the copy | `UnsupportedOperationException` |
+
+Each view records the map it projects; a write through it is applied to the
+map entry by entry and the view re-read from it. Reads through a view held
+across a later write to the MAP stay snapshots (BUGS.md).
+
 ## A throwing `object` initializer
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, compiled and run on the same JVM.

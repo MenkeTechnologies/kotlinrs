@@ -8629,3 +8629,34 @@ fun main() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "start\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("java.lang.ExceptionInInitializerError"));
 }
+
+#[test]
+fn a_write_through_a_map_view_reaches_the_map() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. `keys`/`values`/`entries`
+    // were detached copies, so a removal through one left the map whole.
+    assert_eq!(
+        stdout(
+            r##"fun t(name: String, f: () -> Any?) { try { println("$name: ${f()}") } catch (e: Throwable) { println("$name: EX $e") } }
+fun main() {
+    t("keysRemove") { val m = mutableMapOf(1 to 2, 3 to 4); println(m.keys.remove(1)); m }
+    t("keysRemoveAbsent") { val m = mutableMapOf(1 to 2); println(m.keys.remove(9)); m }
+    t("valuesRemove") { val m = mutableMapOf(1 to 4, 2 to 4, 3 to 5); println(m.values.remove(4)); m }
+    t("entriesIter") { val m = mutableMapOf(1 to 2, 3 to 4); val it = m.entries.iterator(); it.next(); it.remove(); m }
+    t("keysIter") { val m = mutableMapOf("a" to 1, "b" to 2, "c" to 3); val it = m.keys.iterator(); while (it.hasNext()) if (it.next() == "b") it.remove(); m }
+    t("valuesIter") { val m = linkedMapOf(1 to "x", 2 to "y"); val it = m.values.iterator(); it.next(); it.remove(); m }
+    t("keysRemoveAll") { val m = mutableMapOf(1 to 1, 2 to 2, 3 to 3); m.keys.removeAll(listOf(1, 3)); m }
+    t("keysRetainAll") { val m = mutableMapOf(1 to 1, 2 to 2, 3 to 3); m.keys.retainAll(setOf(2)); m }
+    t("valuesRemoveIf") { val m = mutableMapOf(1 to 10, 2 to 20, 3 to 30); m.values.removeIf { it > 15 }; m }
+    t("entriesRemoveIf") { val m = mutableMapOf(1 to 10, 2 to 20); m.entries.removeIf { it.key == 1 }; m }
+    t("keysRemoveAllLambda") { val m = mutableMapOf(1 to 1, 2 to 2); m.keys.removeAll { it == 2 }; m }
+    t("keysClear") { val m = mutableMapOf(1 to 1); m.keys.clear(); m }
+    t("valuesClear") { val m = mutableMapOf(1 to 1); m.values.clear(); m.size }
+    t("keysAdd") { mutableMapOf(1 to 1).keys.add(5) }
+    t("viewAfter") { val m = mutableMapOf(1 to 2, 3 to 4); val k = m.keys; k.remove(1); k }
+    t("hashMapKeys") { val m = hashMapOf("x" to 1, "y" to 2, "z" to 3); m.keys.remove("y"); m }
+    t("entriesRemove") { val m = mutableMapOf(1 to 2, 3 to 4); val e = m.entries.first(); m.entries.remove(e); m }
+}"##
+        ),
+        "true\nkeysRemove: {3=4}\nfalse\nkeysRemoveAbsent: {1=2}\ntrue\nvaluesRemove: {2=4, 3=5}\nentriesIter: {3=4}\nkeysIter: {a=1, c=3}\nvaluesIter: {2=y}\nkeysRemoveAll: {2=2}\nkeysRetainAll: {2=2}\nvaluesRemoveIf: {1=10}\nentriesRemoveIf: {2=20}\nkeysRemoveAllLambda: {1=1}\nkeysClear: {}\nvaluesClear: 0\nkeysAdd: EX java.lang.UnsupportedOperationException\nviewAfter: [3]\nhashMapKeys: {x=1, z=3}\nentriesRemove: {3=4}\n"
+    );
+}
