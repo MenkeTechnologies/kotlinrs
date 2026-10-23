@@ -8621,7 +8621,7 @@ impl Compiler {
         self.b.emit(Op::LoadConst(nidx), line);
         self.b
             .emit(Op::CallBuiltin(KT_METHOD_VM, args.len() as u8), line);
-        Ok(self.long_member_ret(sc, recv, name))
+        Ok(self.long_member_ret(sc, recv, name, args))
     }
 
     /// Lower a `data class` `copy(...)`: build a fresh instance whose fields are
@@ -12132,6 +12132,13 @@ impl Compiler {
     /// and every `Op::Add` still sees a `Value::Int`.
     fn compile_erased(&mut self, sc: &mut Scope, e: &Expr) -> Result<Type, String> {
         let t = self.compile_expr(sc, e)?;
+        // A member the lowering answers untyped (a range's `first()`, a
+        // `List<Long>` element) may still be one `infer` knows is a `Long`,
+        // and the box is what `is Long` and `equals` read.
+        let t = match t {
+            Type::Unknown if self.infer(sc, e) == Type::Long => Type::Long,
+            other => other,
+        };
         match t {
             Type::Float => self.b.emit(Op::Extended(KT_BOX_F32, 0), 0),
             Type::Long => self.b.emit(Op::Extended(KT_BOX_I64, 0), 0),
@@ -13184,6 +13191,16 @@ impl Compiler {
             {
                 Type::Obj
             }
+            // `x.absoluteValue` keeps the receiver's width, `Long` included.
+            Expr::Member { recv, name, .. }
+                if name == "absoluteValue"
+                    && matches!(
+                        self.infer(sc, recv),
+                        Type::Int | Type::Long | Type::Double | Type::Float
+                    ) =>
+            {
+                self.infer(sc, recv)
+            }
             Expr::Super { .. } => Type::Unknown,
             // The result of invoking a function value. The declared return type
             // of a `(Int) -> Int` is not tracked through the value, so this is
@@ -13539,6 +13556,7 @@ impl Compiler {
                         | "elementAt"
                         | "single"
                         | "random"
+                        | "sum"
                         | "max"
                         | "min"
                         | "reduce"
@@ -13568,7 +13586,7 @@ impl Compiler {
                         return nullable_if_safe(self.method_ret(sc, recv, sig, args), *safe);
                     }
                 }
-                nullable_if_safe(self.long_member_ret(sc, recv, name), *safe)
+                nullable_if_safe(self.long_member_ret(sc, recv, name, args), *safe)
             }
             Expr::Elvis { left, right } => {
                 let lt = self.infer(sc, left);
@@ -13789,6 +13807,9 @@ impl Compiler {
                 },
                 "intArrayOf" | "shortArrayOf" | "byteArrayOf" => Type::Int,
                 "longArrayOf" => Type::Long,
+                // `LongRange(a, b)` / `IntRange(a, b)` — the constructor spellings.
+                "LongRange" if args.len() == 2 => Type::Long,
+                "IntRange" if args.len() == 2 => Type::Int,
                 "doubleArrayOf" => Type::Double,
                 "floatArrayOf" => Type::Float,
                 "charArrayOf" => Type::Char,
@@ -13810,7 +13831,8 @@ impl Compiler {
                 | "reversed" | "asReversed" | "take" | "takeLast" | "takeWhile" | "drop"
                 | "takeLastWhile" | "dropLastWhile" | "dropLast" | "dropWhile" | "distinct"
                 | "toList" | "toMutableList" | "toSet" | "toMutableSet" | "shuffled" | "slice"
-                | "subList" | "plus" | "minus" | "union" | "intersect" | "subtract" => {
+                | "subList" | "plus" | "minus" | "union" | "intersect" | "subtract"
+                | "asSequence" | "asIterable" | "constrainOnce" | "onEach" => {
                     self.infer_elem(sc, recv)
                 }
                 // A transform's elements are what its lambda answers.
@@ -16564,7 +16586,16 @@ impl Compiler {
     /// clamping members answer a `Long` too, and naming it lets the value be
     /// boxed (`xs.map { it.toLong().coerceAtMost(3) }`) where a result of
     /// unknown width reads back as an `Int`.
-    fn long_member_ret(&self, sc: &Scope, recv: &Expr, name: &str) -> Type {
+    fn long_member_ret(&self, sc: &Scope, recv: &Expr, name: &str, args: &[Expr]) -> Type {
+        // `mod` answers the DIVISOR's width: `Int.mod(Long)` is a `Long`,
+        // `Long.mod(Int)` an `Int` — unlike `rem`, which widens.
+        if name == "mod" && args.len() == 1 {
+            match (self.infer(sc, recv), self.infer(sc, &args[0])) {
+                (Type::Int | Type::Long, Type::Long) => return Type::Long,
+                (Type::Long, Type::Int) => return Type::Int,
+                _ => {}
+            }
+        }
         let ty = method_ret_type(name);
         let preserves_long = matches!(
             name,

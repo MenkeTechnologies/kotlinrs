@@ -8922,3 +8922,49 @@ fn char_category_answers_from_the_jdk_type_data() {
         "[LOWERCASE_LETTER, UPPERCASE_LETTER, DECIMAL_DIGIT_NUMBER, SPACE_SEPARATOR, CONNECTOR_PUNCTUATION, DASH_PUNCTUATION, START_PUNCTUATION, LOWERCASE_LETTER, LINE_SEPARATOR, CURRENCY_SYMBOL, INITIAL_QUOTE_PUNCTUATION, TITLECASE_LETTER, NON_SPACING_MARK, PRIVATE_USE]\nLl\n1\n9\ntrue\nfalse\nMATH_SYMBOL\ntrue\n[B, b, 9]\nUNASSIGNED\n46126\nlower\n"
     );
 }
+
+#[test]
+fn long_elements_and_results_keep_their_width_in_erased_positions() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. A `LongRange`'s elements,
+    // `sum()`, `random()`, `LongRange(a, b)`, `absoluteValue` and `Int.mod(Long)`
+    // read as `Int`s once erased, so `is Long` was false and `== 2L` missed.
+    assert_eq!(
+        stdout(
+            r##"fun t(name: String, f: () -> Any?) { try { println("$name: ${f()}") } catch (e: Throwable) { println("$name: EX $e") } }
+fun main() {
+    t("rangeFirst") { (1L..3L).first() is Long }
+    t("rangeFilter") { (1L..3L).filter { it == 2L } }
+    t("rangeSum") { (1L..3L).sum() is Long }
+    t("rangeToList") { (1L..3L).toList().map { it is Long } }
+    t("rangeMap") { (1L..3L).map { it * 3000000000L } }
+    t("forRange") { var s = 0L; for (x in 1L..3L) s += x * 3000000000L; s }
+    t("listOfLongLit") { listOf(1L, 2L)[0] is Long }
+    t("absValue") { kotlin.math.abs(5L) is Long }
+    t("modIntLong") { 5.mod(3L) is Long }
+    t("modLongInt") { 5L.mod(3) is Int }
+    t("eqAnyLong") { val a: Any = 5L; a == 5L }
+    t("eqAnyInt") { val a: Any = 5; a == 5L }
+    t("setLong") { setOf(1L, 2L).contains(1L) }
+    t("mapKeyLong") { mapOf(1L to "a")[1L] }
+    t("longStep") { (1L..10L step 3L).toList() }
+    t("downTo") { (5L downTo 1L).last() is Long }
+    t("untilLong") { (0L until 3L).count() }
+    t("genLong") { generateSequence(1L) { if (it < 3L) it + 1 else null }.toList().map { it is Long } }
+    t("longRangeContains") { 2L in 1L..3L }
+}"##
+        ),
+        "rangeFirst: true\nrangeFilter: [2]\nrangeSum: true\nrangeToList: [true, true, true]\nrangeMap: [3000000000, 6000000000, 9000000000]\nforRange: 18000000000\nlistOfLongLit: true\nabsValue: true\nmodIntLong: true\nmodLongInt: true\neqAnyLong: true\neqAnyInt: false\nsetLong: true\nmapKeyLong: a\nlongStep: [1, 4, 7, 10]\ndownTo: true\nuntilLong: 3\ngenLong: [true, true, true]\nlongRangeContains: true\n"
+    );
+    assert_eq!(
+        stdout(
+            r##"import kotlin.math.absoluteValue
+fun main() {
+    println((1L..3L).random() is Long)
+    println((1L..3L).asSequence().map { it is Long }.toList())
+    println(LongRange(1L, 3L).filter { it == 2L })
+    println(5L.absoluteValue is Long)
+}"##
+        ),
+        "true\n[true, true, true]\n[2]\ntrue\n"
+    );
+}

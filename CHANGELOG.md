@@ -11,6 +11,23 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## `Long` values keep their width once erased
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | before | reference |
+| --- | --- | --- |
+| `(1L..3L).first() is Long`, `.sum() is Long`, `.random() is Long`, `(5L downTo 1L).last() is Long` | `false` | `true` |
+| `LongRange(1L, 3L).filter { it == 2L }` | `[]` | `[2]` |
+| `(1L..3L).asSequence().map { it is Long }` | `[false, false, false]` | `[true, true, true]` |
+| `5L.absoluteValue is Long`, `5.mod(3L) is Long`, `5L.mod(3) is Int` | `false`, `false`, `false` | `true`, `true`, `true` |
+
+An erased position now boxes a value that `infer` knows is a `Long` even
+where the member's lowering answered untyped; a `Long` range's `sum()`, the
+`LongRange(a, b)` constructor, `asSequence()` and `absoluteValue` carry the
+width, and `mod` answers the divisor's width. A generic constructor's
+explicit type argument (`mutableListOf<Long>(1)`) is still not read (BUGS.md).
+
 ## `Char.category`
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1. Each was `unresolved reference`.

@@ -428,9 +428,7 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
 
 | program | kotlinrs | reference |
 | --- | --- | --- |
-| `(1L..3L).first()`, `.sum()`, `.random()`, `.asSequence().map { it is Long }`, `LongRange(1L, 3L).filter { it == 2L }` | the element reads as an `Int`, so `== 2L` is false | a `Long` |
 | `mutableListOf<Long>(1)[0] is Long`, `ArrayDeque<Long>().apply { addLast(1L) }.first() is Long` | `Int` | `Long` |
-| `5L.absoluteValue is Long`, `5.mod(3L) is Long`, `5L.mod(3) is Int` | `Int`, `Int`, `Long` | `Long`, `Long`, `Int` |
 | `Any()`, `generateSequence { 5L }`, `Throwable().stackTrace`, `5L.toULong()` | `unresolved reference` | the value |
 | `import java.util.*` then `kotlin.collections.ArrayDeque` `.push(0)` | `unresolved reference: push` | `java.util.ArrayDeque` wins the star import |
 | `java.util.LinkedList`, `java.util.BitSet`, `java.util.Optional`, `System.getProperty` | `unresolved reference` | the JDK member |
