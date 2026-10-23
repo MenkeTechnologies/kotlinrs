@@ -11,6 +11,22 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## A write through `subList` reaches the backing list
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | before | reference |
+| --- | --- | --- |
+| `val l = mutableListOf(1, 2, 3, 4, 5); l.subList(1, 3).clear(); l` | `[1, 2, 3, 4, 5]` | `[1, 4, 5]` |
+| `mutableListOf(1, 2, 3, 4).also { it.subList(1, 3).reverse() }`, `.sort()`, `.fill(8)`, `s[0] = 9`, `removeIf { }`, `sortWith(…)` | the backing list unchanged | the range rewritten |
+| `val s = l.subList(0, 1); s.add(7)` | `l` unchanged | `7` inserted into `l` after the view's range |
+| `(listOf(1, 2, 3).subList(0, 2) as MutableList<Int>).add(3)` | the write happened | `UnsupportedOperationException` — the backing `Arrays$ArrayList` refuses; `set` goes through |
+
+Each `subList` records its backing list and range. A write through it re-reads
+the view from that range, runs on the view, and splices the result back,
+moving the range's end by the size change; a read-only backing list refuses the
+write as its own class does.
+
 ## `ConcurrentModificationException` from a `for` loop
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.

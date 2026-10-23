@@ -1120,6 +1120,18 @@ fn ro_list_write(recv: &Value) -> Option<RoList> {
 /// succeed even where every real change faults.
 fn ro_list_fault(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Option<&'static str> {
     let kind = ro_list_write(recv)?;
+    ro_list_fault_for(vm, kind, recv, name, args)
+}
+
+/// [`ro_list_fault`] for a list of the given class — a list's own, or the
+/// backing list's for a `subList` view (see [`sublist_write`]).
+fn ro_list_fault_for(
+    vm: &mut VM,
+    kind: RoList,
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+) -> Option<&'static str> {
     let items = list_snapshot(recv).unwrap_or_default();
     let len = items.len();
     let arg_items = || args.last().and_then(list_snapshot).unwrap_or_default();
@@ -1371,6 +1383,106 @@ fn map_view_filter(vm: &mut VM, view: &Value, keep: &[bool]) -> Option<Result<Va
     }
     refresh_map_view(view, &map, kind);
     Some(Ok(Value::Bool(removed)))
+}
+
+thread_local! {
+    /// `subList` view handle → `(backing list, fromIndex, toIndex)`. As with
+    /// [`MAP_VIEWS`], reads stay snapshots; a WRITE through the view is
+    /// applied to the backing list's range, so `xs.subList(1, 3).clear()` —
+    /// the idiomatic range removal — removes from `xs`.
+    static SUBLISTS: RefCell<std::collections::HashMap<u32, (Value, usize, usize)>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+fn sublist_of(v: &Value) -> Option<(Value, usize, usize)> {
+    let Value::Obj(id) = v else { return None };
+    SUBLISTS.with(|t| t.borrow().get(id).cloned())
+}
+
+fn set_sublist(v: &Value, entry: Option<(Value, usize, usize)>) {
+    if let Value::Obj(id) = v {
+        SUBLISTS.with(|t| match entry {
+            Some(e) => {
+                t.borrow_mut().insert(*id, e);
+            }
+            None => {
+                t.borrow_mut().remove(id);
+            }
+        });
+    }
+}
+
+/// The `MutableList` members that write, for [`sublist_write`].
+fn is_list_write(name: &str) -> bool {
+    matches!(
+        name,
+        "add"
+            | "addAll"
+            | "remove"
+            | "removeAt"
+            | "removeAll"
+            | "retainAll"
+            | "clear"
+            | "set"
+            | "sort"
+            | "sortDescending"
+            | "reverse"
+            | "shuffle"
+            | "fill"
+            | "removeFirst"
+            | "removeLast"
+            | "removeFirstOrNull"
+            | "removeLastOrNull"
+            | "addFirst"
+            | "addLast"
+            | "replaceAll"
+            | "removeIf"
+            | "sortBy"
+            | "sortByDescending"
+            | "sortWith"
+    )
+}
+
+/// Run `write` — a mutating member on a `subList` view — and carry its
+/// effect into the backing list: the view is first re-read from the backing
+/// range, the write runs on the view, and the backing range is replaced by
+/// what the view then holds. A read-only backing list refuses the write the
+/// way its own class does. `None` for a value that is not a view.
+fn sublist_write(
+    vm: &mut VM,
+    view: &Value,
+    name: &str,
+    args: &[Value],
+    write: &mut dyn FnMut(&mut VM) -> Result<Value, String>,
+) -> Option<Result<Value, String>> {
+    let (parent, from, to) = sublist_of(view)?;
+    if !is_list_write(name) {
+        return None;
+    }
+    let backing = list_snapshot(&parent).unwrap_or_default();
+    let to = to.min(backing.len());
+    let from = from.min(to);
+    with_obj_mut(view, |o| {
+        if let HeapObj::List(xs) = o {
+            *xs = backing[from..to].to_vec();
+        }
+    });
+    if let Some(kind) = ro_list(&parent) {
+        if let Some(e) = ro_list_fault_for(vm, kind, view, name, args) {
+            return Some(Err(e.to_string()));
+        }
+    }
+    set_sublist(view, None);
+    let out = write(vm);
+    let now = list_snapshot(view).unwrap_or_default();
+    let len = now.len();
+    with_obj_mut(&parent, |o| {
+        if let HeapObj::List(xs) = o {
+            xs.splice(from..to, now);
+        }
+    });
+    set_sublist(view, Some((parent, from, from + len)));
+    Some(out)
 }
 
 /// Record `list`'s implementation class. A no-op for a non-handle.
@@ -2457,6 +2569,7 @@ fn reset_heap() {
     LIST_IMPL.with(|t| t.borrow_mut().clear());
     SEQ_VIEW.with(|t| t.borrow_mut().clear());
     MAP_VIEWS.with(|t| t.borrow_mut().clear());
+    SUBLISTS.with(|t| t.borrow_mut().clear());
     ONCE_TOKEN.with(|t| t.borrow_mut().clear());
     ONCE_CONSUMED.with(|t| t.borrow_mut().clear());
     ITER_END.with(|c| *c.borrow_mut() = None);
@@ -8448,6 +8561,13 @@ fn coll_hof(
     // neither is the type whose diagnostics Kotlin spells.
     kind: SeqKind,
 ) -> Result<Value, String> {
+    // An in-place higher-order write through a `subList` view reaches the
+    // backing list.
+    if let Some(r) = sublist_write(vm, recv, name, extras, &mut |vm| {
+        coll_hof(vm, name, recv, extras, clo, kind)
+    }) {
+        return r;
+    }
     // A `Result` whose static type was lost — `runCatching { … }.map { … }
     // .getOrElse { … }` — reaches here because `map`/`getOrElse` are also
     // collection members; its own lambda members answer.
@@ -13160,6 +13280,12 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         _ => {}
     }
 
+    // A write through a `subList` view reaches the backing list.
+    if let Some(r) = sublist_write(vm, recv, name, args, &mut |vm| {
+        obj_method(vm, recv, name, args)
+    }) {
+        return r;
+    }
     // A read-only list reached through a `MutableList` cast faults the way
     // the JVM class behind it does.
     if let Some(e) = ro_list_fault(vm, recv, name, args) {
@@ -14833,9 +14959,13 @@ fn sequence_member(
             if let Some(e) = sublist_fault(from, to, items.len()) {
                 return Some(Err(e));
             }
-            return Some(Ok(alloc(HeapObj::List(
-                items[from as usize..to as usize].to_vec(),
-            ))));
+            let view = alloc(HeapObj::List(items[from as usize..to as usize].to_vec()));
+            if let Some(parent) =
+                recv.filter(|r| with_obj(r, |o| matches!(o, HeapObj::List(_))).unwrap_or(false))
+            {
+                set_sublist(&view, Some((parent.clone(), from as usize, to as usize)));
+            }
+            return Some(Ok(view));
         }
         // A sorted set built with a comparator finds its elements by that
         // comparator, not by `equals` — see [`COLL_CMP`].
@@ -15887,6 +16017,12 @@ fn store_at(items: &mut [Value], i: i64, value: Value, kind: &str) -> Result<(),
 
 /// `recv[index] = value` — list set (bounds-checked) or map put.
 fn index_set(vm: &mut VM, recv: &Value, index: &Value, value: Value) -> Result<(), String> {
+    let pair = [index.clone(), value.clone()];
+    if let Some(r) = sublist_write(vm, recv, "set", &pair, &mut |vm| {
+        index_set(vm, recv, &pair[0], pair[1].clone()).map(|()| Value::Undef)
+    }) {
+        return r.map(|_| ());
+    }
     if let Some(e) = ro_list_fault(vm, recv, "set", &[index.clone(), value.clone()]) {
         return Err(e.to_string());
     }

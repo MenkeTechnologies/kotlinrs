@@ -8689,3 +8689,32 @@ fun main() {
         "removeFirst: EX java.util.ConcurrentModificationException\nremoveSecondToLast: [1, 3]\nremoveLast: EX java.util.ConcurrentModificationException\naddDuring: EX java.util.ConcurrentModificationException\naddAtLast: EX java.util.ConcurrentModificationException\nsetDuring: [5, 2]\nmapPut: EX java.util.ConcurrentModificationException\nsetRemove: EX java.util.ConcurrentModificationException\nindexLoop: [2, 3]\nnoChange: 6\narr: 8\nbreakAfter: [1, 2, 3, 4]\n"
     );
 }
+
+#[test]
+fn a_write_through_a_sub_list_reaches_the_backing_list() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. `subList` was a detached
+    // copy, so `xs.subList(1, 3).clear()` — the idiomatic range removal — and
+    // every other write through the view left `xs` unchanged.
+    assert_eq!(
+        stdout(
+            r##"fun t(name: String, f: () -> Any?) { try { println("$name: ${f()}") } catch (e: Throwable) { println("$name: EX $e") } }
+@Suppress("UNCHECKED_CAST") fun <T> m(l: List<T>) = l as MutableList<T>
+fun main() {
+    t("clearRange") { val l = mutableListOf(1, 2, 3, 4, 5); l.subList(1, 3).clear(); l }
+    t("reverseRange") { mutableListOf(1, 2, 3, 4).also { it.subList(1, 3).reverse() } }
+    t("sortRange") { mutableListOf(5, 4, 3, 2, 1).also { it.subList(0, 3).sort() } }
+    t("setThrough") { val l = mutableListOf(1, 2, 3); val s = l.subList(1, 3); s[0] = 9; l }
+    t("addThrough") { val l = mutableListOf(1, 2, 3); val s = l.subList(0, 1); s.add(7); println(s); l }
+    t("removeIfThrough") { val l = mutableListOf(1, 2, 3, 4); l.subList(1, 4).removeIf { it % 2 == 0 }; l }
+    t("fillThrough") { val l = MutableList(5) { 0 }; l.subList(1, 3).fill(8); l }
+    t("twoWrites") { val l = mutableListOf(1, 2, 3, 4); val s = l.subList(1, 3); s.add(5); s.removeAt(0); println(s); l }
+    t("roSubAdd") { m(listOf(1, 2, 3).subList(0, 2)).add(3) }
+    t("roSubSet") { val base = listOf(1, 2, 3); m(base.subList(0, 2))[0] = 9; base }
+    t("sortWithThrough") { mutableListOf(1, 3, 2, 0).also { it.subList(1, 4).sortWith(compareByDescending { x -> x }) } }
+    t("shuffleNoop") { val l = mutableListOf(1, 2); l.subList(0, 1).shuffle(); l }
+    t("readOnlyView") { val l = mutableListOf(1, 2, 3); l.subList(0, 2).sum() }
+}"##
+        ),
+        "clearRange: [1, 4, 5]\nreverseRange: [1, 3, 2, 4]\nsortRange: [3, 4, 5, 2, 1]\nsetThrough: [1, 9, 3]\n[1, 7]\naddThrough: [1, 7, 2, 3]\nremoveIfThrough: [1, 3]\nfillThrough: [0, 8, 8, 0, 0]\n[3, 5]\ntwoWrites: [1, 3, 5, 4]\nroSubAdd: EX java.lang.UnsupportedOperationException\nroSubSet: [9, 2, 3]\nsortWithThrough: [1, 3, 2, 0]\nshuffleNoop: [1, 2]\nreadOnlyView: 3\n"
+    );
+}
