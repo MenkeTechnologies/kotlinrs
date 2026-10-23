@@ -11,6 +11,20 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## `array.asList()` is an `Arrays$ArrayList` over the array
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | before | reference |
+| --- | --- | --- |
+| `(arrayOf(1, 2).asList() as MutableList<Int>).add(3)`, `.remove(1)`, `.clear()` | the write happened on a copy | `UnsupportedOperationException` (`remove` with `: remove`) |
+| `val a = arrayOf(1, 2); (a.asList() as MutableList<Int>)[0] = 9; a.toList()`, `.sort()` through the view | the array unchanged | `[9, 2]`, the array sorted |
+| `arrayOf(1).asList()[5]` | `IndexOutOfBoundsException` | `ArrayIndexOutOfBoundsException: Index 5 out of bounds for length 1` |
+
+The view is a `subList`-style view (see below) whose backing store is the
+array, refused any size change at every length. A write to the ARRAY is not
+yet seen through an earlier view (BUGS.md).
+
 ## `kotlin.Unit` is a value
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.

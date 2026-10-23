@@ -1486,7 +1486,14 @@ fn sublist_write(
             *xs = backing[from..to].to_vec();
         }
     });
-    if let Some(kind) = ro_list(&parent) {
+    // An array behind the view (`asList`) is an `Arrays$ArrayList` at every
+    // size: `set` goes through, a size change does not.
+    let backing_kind = if array_items(&parent).is_some() {
+        Some(RoList::Arrays)
+    } else {
+        ro_list(&parent)
+    };
+    if let Some(kind) = backing_kind {
         if let Some(e) = ro_list_fault_for(vm, kind, view, name, args) {
             return Some(Err(e.to_string()));
         }
@@ -1496,7 +1503,7 @@ fn sublist_write(
     let now = list_snapshot(view).unwrap_or_default();
     let len = now.len();
     with_obj_mut(&parent, |o| {
-        if let HeapObj::List(xs) = o {
+        if let HeapObj::List(xs) | HeapObj::Array { items: xs, .. } = o {
             xs.splice(from..to, now);
         }
     });
@@ -14798,6 +14805,15 @@ fn index_fault(kind: SeqKind, recv: Option<&Value>, i: i64, len: usize) -> Strin
                 Value::Obj(id) => LIST_IMPL.with(|t| t.borrow().get(id).copied()),
                 _ => None,
             });
+            // `array.asList()` wraps the array itself at every size.
+            let over_array = recv
+                .and_then(sublist_of)
+                .is_some_and(|(p, _, _)| array_items(&p).is_some());
+            if over_array {
+                return format!(
+                    "java.lang.ArrayIndexOutOfBoundsException: Index {i} out of bounds for length {len}"
+                );
+            }
             match (which, len) {
                 // The builder collapses at NO size and words the fault its own
                 // way, so it is decided before the two small-size rows.
@@ -15253,6 +15269,17 @@ fn sequence_member(
                 items: items.to_vec(),
                 desc: array_desc(items),
             })))
+        }
+        // `array.asList()` is `java.util.Arrays$ArrayList` over the ARRAY: a
+        // write through it reaches the array, and a size change is refused —
+        // the `subList` view machinery with the array as the backing store.
+        "asList" if recv.is_some_and(|r| array_items(r).is_some()) => {
+            let view = alloc(HeapObj::List(items.to_vec()));
+            set_sublist(
+                &view,
+                Some((recv.cloned().unwrap_or(Value::Undef), 0, items.len())),
+            );
+            return Some(Ok(view));
         }
         "toMutableList" | "asList" | "asIterable" => {
             return Some(Ok(alloc(HeapObj::List(items.to_vec()))))

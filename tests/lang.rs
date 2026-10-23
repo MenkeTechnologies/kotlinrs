@@ -8796,3 +8796,27 @@ fun more() {
         "1\nlambda: kotlin.Unit\nanon: kotlin.Unit\n5\nletNonNull: false\n5\nelvis: kotlin.Unit\nclear: kotlin.Unit\nforEach: kotlin.Unit\nearly: kotlin.Unit\nmethod: kotlin.Unit\nanyUnit: kotlin.Unit\neqUnit: true\nr\nrunUnit: kotlin.Unit\napplyUnit: x\nmapUnit: [kotlin.Unit, kotlin.Unit]\n1\nmapNotNullUnit: [kotlin.Unit]\nunitHash: true\nisUnit: true\nunitString: kotlin.Unitkotlin.Unit\nx\nresult: Success(kotlin.Unit)\nl\nlazyUnit: kotlin.Unit\na\nifUnit: kotlin.Unit\none\nwhenUnit: kotlin.Unit\nassignLambda: kotlin.Unit\nunitList: [kotlin.Unit, null]\nsortUnit: kotlin.Unit\naddIdx: kotlin.Unit\nputAllUnit: kotlin.Unit\nfillUnit: kotlin.Unit\n"
     );
 }
+
+#[test]
+fn as_list_is_an_arrays_array_list_over_the_array() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1: a size change through
+    // `array.asList()` is refused, a `set` or `sort` writes the array, and an
+    // out-of-range index is the ARRAY subclass at every size.
+    assert_eq!(
+        stdout(
+            r##"fun t(name: String, f: () -> Any?) { try { println("$name: ${f()}") } catch (e: Throwable) { println("$name: EX $e") } }
+@Suppress("UNCHECKED_CAST") fun <T> m(l: List<T>) = l as MutableList<T>
+fun main() {
+    t("add") { m(arrayOf(1, 2).asList()).add(3) }
+    t("add1") { m(arrayOf(1).asList()).add(3) }
+    t("set") { val a = arrayOf(1, 2); m(a.asList())[0] = 9; a.toList() }
+    t("set1") { val a = arrayOf(1); m(a.asList())[0] = 9; a.toList() }
+    t("sortThrough") { val a = arrayOf(3, 1, 2); m(a.asList()).sort(); a.toList() }
+    t("remove") { m(arrayOf(1, 2).asList()).remove(1) }
+    t("clear") { m(arrayOf(1, 2).asList()).clear() }
+    t("idx") { arrayOf(1).asList()[5] }
+}"##
+        ),
+        "add: EX java.lang.UnsupportedOperationException\nadd1: EX java.lang.UnsupportedOperationException\nset: [9, 2]\nset1: [9]\nsortThrough: [1, 2, 3]\nremove: EX java.lang.UnsupportedOperationException: remove\nclear: EX java.lang.UnsupportedOperationException\nidx: EX java.lang.ArrayIndexOutOfBoundsException: Index 5 out of bounds for length 1\n"
+    );
+}

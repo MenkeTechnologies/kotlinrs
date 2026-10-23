@@ -450,7 +450,7 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
 | `fun <T> id(x: T) = x`; `println(id(listOf(1)) + 5)` | `5.0` | `[1, 5]` |
 | `open class M(val c: Int)`; `class N(c: Int) : M(c)`; `operator fun M.plus(o: M)` and `operator fun N.plus(o: M)`; `listOf<M>(N(1), M(2)).reduce { a, b -> a + b }` | `unresolved reference: plus on N` | `M.plus`, chosen by the static type `M` |
 | `class C { fun f(a: String) = "s"; fun f(a: Int) = "i" }`; `C().f(1)` | `class C: method f is declared more than once — member overloads are not supported` | `i` |
-| `m(arrayOf(1, 2).asList()).add(3)` | the write happens | `UnsupportedOperationException` — a view over an `Arrays$ArrayList` |
+| `val a = arrayOf(1, 2); val l = a.asList(); a[0] = 7; println(l)` | `[1, 2]` | `[7, 2]` — a write to the ARRAY shows through the view; writes through the view reach the array since round 21 |
 | `'a'.category` | `unresolved reference: category on Char` | `LOWERCASE_LETTER` |
 | `class Bag(…) : Iterable<Int>`; `b.let { it.toList() }` — an `Iterable` user object reached through a receiver of no static class | `unresolved reference: toList on Bag` | the list — the extensions route only where the static class says `Iterable` |
 
@@ -465,8 +465,9 @@ sound when no one instance could match two candidates; where it could (an
 extension on a class and on its subclass), the chain declines and the call
 fails loudly, because the runtime class does not say which the source meant.
 
-`asList` is an untagged view (see "Collection VIEWS are snapshots"); a
-write through a `subList` reaches its backing list since round 21. A `for` loop over a collection raises `ConcurrentModificationException`
+A write through a `subList` or an `asList` view reaches its backing store
+since round 21; reads through either stay snapshots (see "Collection VIEWS
+are snapshots"). A `for` loop over a collection raises `ConcurrentModificationException`
 from a SIZE change since round 21; a body that changes the collection
 without changing its size (an `add` and a `remove` in one pass, a `sort`)
 is not detected, which the JDK's modification count would.
