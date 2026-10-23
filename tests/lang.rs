@@ -7865,3 +7865,99 @@ fun main() {
         "genSeedless: [0, 1, 2]\nbuilt 0\nseedlessLazy: [10, 20]\nseedlessTwice: EX java.lang.IllegalStateException: This sequence can be consumed only once.\n[0, 2]\nseedlessMapTwice: EX java.lang.IllegalStateException: This sequence can be consumed only once.\nconstrain: EX java.lang.IllegalStateException: This sequence can be consumed only once.\nconstrainOrig: [1, 2]\n[1, 2, 3]\nconstrainGen: EX java.lang.IllegalStateException: This sequence can be consumed only once.\n1\nconstrainBlock: EX java.lang.IllegalStateException: This sequence can be consumed only once.\nseedTake: [0, 1, 2, 3]\n"
     );
 }
+
+#[test]
+fn top_level_overloads_resolve_by_argument_types() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. Every overload of a name
+    // used to collapse onto the first declaration: `describe(1L)`,
+    // `describe("s")` and `describe(1.5)` all printed `Int …`.
+    assert_eq!(
+        stdout(
+            r#"open class Animal(val n: String)
+class Dog(n: String) : Animal(n)
+class Cat(n: String) : Animal(n)
+fun describe(x: Int) = "Int $x"
+fun describe(x: Long) = "Long $x"
+fun describe(x: Double) = "Double $x"
+fun describe(x: String) = "String $x"
+fun describe(x: Boolean) = "Boolean $x"
+fun describe(x: Char) = "Char $x"
+fun describe(x: List<Int>) = "List ${x.size}"
+fun describe(x: Animal) = "Animal ${x.n}"
+fun describe(x: Dog) = "Dog ${x.n}"
+fun describe(x: Any?) = "Any $x"
+fun area(r: Double) = 3.0 * r * r
+fun area(w: Double, h: Double) = w * h
+fun area(w: Int, h: Int, d: Int = 1) = w * h * d
+fun greet(name: String, greeting: String = "Hello") = "$greeting, $name"
+fun greet(times: Int) = "hi".repeat(times)
+fun sum(vararg xs: Int) = xs.sum()
+fun sum(a: Int, b: Int) = a + b + 1000
+fun fact(n: Int): Long = if (n <= 1) 1L else n * fact(n - 1)
+fun fact(n: Long): Long = if (n <= 1L) 1L else n * fact(n - 1L)
+fun main() {
+    println(describe(1)); println(describe(1L)); println(describe(1.5)); println(describe("s")); println(describe(true)); println(describe('c'))
+    println(describe(listOf(1, 2))); println(describe(Dog("rex"))); println(describe(Cat("tom"))); println(describe(Animal("a")))
+    println(describe(null)); println(describe(2.5f)); println(describe(setOf(1)))
+    val a: Animal = Dog("d"); println(describe(a))
+    val n = 7; println(describe(n)); val l = 8L; println(describe(l * 2))
+    println(area(2.0)); println(area(2.0, 3.0)); println(area(2, 3)); println(area(2, 3, 4))
+    println(greet("Bob")); println(greet("Ann", "Hey")); println(greet(3)); println(greet(name = "Z"))
+    println(sum(1, 2)); println(sum(1, 2, 3)); println(sum())
+    println(fact(5)); println(fact(20L))
+    println(listOf(1, 2).map { describe(it) }); println(listOf("x").map { describe(it) })
+}"#
+        ),
+        "Int 1\nLong 1\nDouble 1.5\nString s\nBoolean true\nChar c\nList 2\nDog rex\nAnimal tom\nAnimal a\nAny null\nAny 2.5\nAny [1]\nAnimal d\nInt 7\nLong 16\n12.0\n6.0\n6\n24\nHello, Bob\nHey, Ann\nhihihi\nHello, Z\n1003\n6\n0\n120\n2432902008176640000\n[Int 1, Int 2]\n[String x]\n"
+    );
+}
+
+#[test]
+fn overload_selection_reads_the_static_type_and_smart_casts() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1: `val a: Animal = Dog()`
+    // picks `describe(Animal)` — the annotation, not the instance — until an
+    // `is Dog` check smart-casts it.
+    assert_eq!(
+        stdout(
+            r#"open class Animal(val n: String)
+class Dog(n: String) : Animal(n)
+fun describe(x: Animal) = "Animal ${x.n}"
+fun describe(x: Dog) = "Dog ${x.n}"
+fun apply(f: (Int) -> Int) = f(10)
+fun apply(x: Int) = x + 1
+fun <T> show(x: T) = "T $x"
+fun show(x: Int) = "Int $x"
+fun pick(a: Int, b: String = "d") = "IS $a$b"
+fun pick(a: String, b: Int = 0) = "SI $a$b"
+fun nums(xs: List<Int>) = "list ${xs.sum()}"
+fun nums(xs: Set<Int>) = "set ${xs.size}"
+fun nums(xs: Map<Int, Int>) = "map ${xs.size}"
+fun main() {
+    val a: Animal = Dog("d")
+    if (a is Dog) println(describe(a))
+    println(describe(a))
+    println(apply { it * 2 }); println(apply(5))
+    println(show("s")); println(show(3)); println(show(3L))
+    println(pick(1)); println(pick("x")); println(pick(b = 2, a = "y")); println(pick(a = 4, b = "z"))
+    println(nums(listOf(1, 2))); println(nums(setOf(1, 2, 3))); println(nums(mapOf(1 to 2))); println(nums(mutableListOf(5))); println(nums(hashSetOf(1)))
+    val xs = listOf(Dog("q"), Animal("r")); println(xs.map { describe(it) })
+}"#
+        ),
+        "Dog d\nAnimal d\n20\n6\nT s\nInt 3\nT 3\nIS 1d\nSI x0\nSI y2\nIS 4z\nlist 3\nset 3\nmap 1\nlist 5\nset 1\n[Animal q, Animal r]\n"
+    );
+}
+
+#[test]
+fn a_class_declaring_one_method_twice_is_refused_rather_than_resolved_wrongly() {
+    // Member overloads are not modelled: the second declaration used to
+    // answer for the first (`C().f(1)` ran `f(a: String)`).
+    let out = eval(
+        "class C { fun f(a: String) = 1; fun f(a: Int) = 2 }\nfun main() { println(C().f(1)) }",
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("member overloads are not supported"),
+        "stderr was: {err}"
+    );
+}

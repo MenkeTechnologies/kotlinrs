@@ -255,6 +255,12 @@ struct Binding {
     /// a read checks it for the unset marker — the `init` block that reads one
     /// before assigning it raises exactly as a read through the instance does.
     lateinit: bool,
+    /// The user class the binding's ANNOTATION named, where `class` follows the
+    /// initializer instead (`val a: Animal = Dog()` dispatches as the `Dog` it
+    /// holds). Overload selection reads this one: Kotlin picks an overload by
+    /// the static type, so `describe(a)` is `describe(Animal)`. Dropped by a
+    /// smart cast, which changes what the static type is.
+    declared: Option<String>,
 }
 
 /// A checkpoint of scope state, taken on block entry and restored on block exit
@@ -352,6 +358,7 @@ impl Scope {
                 lazy: false,
                 delegated: false,
                 lateinit: false,
+                declared: None,
             },
         );
         self.undo.push((name.to_string(), prev));
@@ -402,6 +409,30 @@ impl Scope {
             let narrowed = Binding {
                 ty,
                 class: None,
+                declared: None,
+                ..b.clone()
+            };
+            self.map.insert(name.to_string(), narrowed);
+            self.undo.push((name.to_string(), Some(b)));
+        }
+    }
+    /// Apply the smart casts `cond` holding (or failing, `holds == false`)
+    /// implies: the primitive retypes of [`smart_casts`], and the USER-CLASS
+    /// ones of [`class_casts`], which only overload selection reads (see
+    /// [`Binding::declared`]).
+    fn narrow_cond(&mut self, cond: &Expr, holds: bool) {
+        let casts = smart_casts(self, cond, holds);
+        self.narrow_all(&casts);
+        for (n, c) in class_casts(self, cond, holds) {
+            self.narrow_declared(&n, c);
+        }
+    }
+    /// Retype `name`'s STATIC class to `class` until the enclosing
+    /// [`Scope::exit`] — a smart cast `x is C` to a user class.
+    fn narrow_declared(&mut self, name: &str, class: String) {
+        if let Some(b) = self.map.get(name).cloned() {
+            let narrowed = Binding {
+                declared: Some(class),
                 ..b.clone()
             };
             self.map.insert(name.to_string(), narrowed);
@@ -413,6 +444,16 @@ impl Scope {
         for (n, t) in casts {
             self.narrow(n, *t);
         }
+    }
+    /// Record the user class `name`'s annotation named — see [`Binding::declared`].
+    fn set_declared(&mut self, name: &str, class: String) {
+        if let Some(b) = self.map.get_mut(name) {
+            b.declared = Some(class);
+        }
+    }
+    /// The user class `name`'s annotation named, if it named one.
+    fn declared_of(&self, name: &str) -> Option<String> {
+        self.map.get(name).and_then(|b| b.declared.clone())
     }
     /// The class/container name bound to `name`, if any.
     fn class_of(&self, name: &str) -> Option<String> {
@@ -1964,6 +2005,11 @@ pub struct Compiler {
     b: ChunkBuilder,
     /// name → signature for user functions, filled before lowering.
     fun_sig: HashMap<String, FnSig>,
+    /// A top-level function name declared more than once → the mangled names
+    /// its overloads were renamed to, in declaration order (see
+    /// [`mangle_overloads`]). Each lives in `fun_sig` under its mangled name;
+    /// a call selects one with [`Compiler::select_overload`].
+    overloads: HashMap<String, Vec<String>>,
     /// `(receiver type name, function name)` → signature, for the extension
     /// functions the program declares (`fun Int.dbl()`). Keyed on the receiver
     /// because the same name may be extended onto several types.
@@ -2412,6 +2458,21 @@ fn check_modifiers(
     mro: &[String],
     by_name: &HashMap<&str, &ClassDecl>,
 ) -> Result<(), String> {
+    // A member declared twice is an OVERLOAD SET, and member overloads are not
+    // modelled: the method table holds one signature per name, so the second
+    // declaration would answer for the first — `f(1)` running `f(a: String)`.
+    // Refused here rather than resolved wrongly. (Top-level overloads are
+    // resolved; see `mangle_overloads`.)
+    let mut seen: HashSet<&str> = HashSet::new();
+    for m in &cd.methods {
+        if !seen.insert(m.name.as_str()) {
+            return Err(format!(
+                "class {}: method {} is declared more than once — member overloads are not \
+                 supported (line {})",
+                cd.name, m.name, m.line
+            ));
+        }
+    }
     for p in &cd.parents {
         if let Some(d) = by_name.get(p.as_str()) {
             if !d.is_interface && !(d.is_open || d.is_abstract || d.is_sealed) {
@@ -2937,6 +2998,36 @@ fn build_method_index(
 }
 
 /// Compile a program to a runnable chunk. Requires a `fun main`.
+/// Rename every member of a top-level OVERLOAD SET — a function name declared
+/// more than once, with no receiver — to `name$ov<k>`, `k` its declaration
+/// index, and answer each original name's mangled set. Every later table
+/// (`fun_sig`, the emitted subs) then holds each overload under its own name,
+/// and a call picks one by its arguments ([`Compiler::select_overload`]).
+/// `main` is never mangled: it is the entry point, found by that name.
+fn mangle_overloads(program: &mut Program) -> HashMap<String, Vec<String>> {
+    let mut count: HashMap<String, usize> = HashMap::new();
+    for f in &program.funs {
+        if f.recv.is_none() && f.name != "main" {
+            *count.entry(f.name.clone()).or_default() += 1;
+        }
+    }
+    let mut sets: HashMap<String, Vec<String>> = HashMap::new();
+    for f in program.funs.iter_mut() {
+        if f.recv.is_none() && count.get(&f.name).is_some_and(|n| *n > 1) {
+            let set = sets.entry(f.name.clone()).or_default();
+            let mangled = format!("{}$ov{}", f.name, set.len());
+            set.push(mangled.clone());
+            f.name = mangled;
+        }
+    }
+    sets
+}
+
+/// The name a mangled overload was written with — what a diagnostic names.
+fn unmangled(name: &str) -> &str {
+    name.split_once("$ov").map_or(name, |(base, _)| base)
+}
+
 pub fn compile(program: &Program) -> Result<Chunk, String> {
     compile_with(program, false)
 }
@@ -2967,6 +3058,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
     unqualify_jdk_ctors(&mut annotated);
     lower_java_streams(&mut annotated);
     capture_object_locals(&mut annotated);
+    let overloads = mangle_overloads(&mut annotated);
     let program = &annotated;
     // Extensions live in their own table keyed by `(receiver type, name)`: they
     // are NOT callable as free functions, and two receivers may each declare one
@@ -3033,6 +3125,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
     let mut c = Compiler {
         b: ChunkBuilder::new(),
         fun_sig,
+        overloads,
         extensions,
         classes,
         class_alias,
@@ -4799,6 +4892,12 @@ impl Compiler {
                     class
                 };
                 let slot = sc.declare_full(name, vty, *mutable, class, elem);
+                if let Some(ann) = annotated_class
+                    .clone()
+                    .filter(|c| self.classes.contains_key(c))
+                {
+                    sc.set_declared(name, ann);
+                }
                 if !type_args.is_empty() {
                     sc.set_type_args(name, type_args);
                 }
@@ -9007,7 +9106,7 @@ impl Compiler {
                 // `x is Int && x > 3` — the right operand runs only where the
                 // left held, so it sees the left's smart casts.
                 let mark = sc.enter();
-                sc.narrow_all(&smart_casts(sc, l, true));
+                sc.narrow_cond(l, true);
                 let rt = self.compile_expr(sc, r);
                 sc.exit(mark);
                 rt?;
@@ -9022,7 +9121,7 @@ impl Compiler {
                 // `x !is Int || x > 3` — the right operand runs only where the
                 // left failed.
                 let mark = sc.enter();
-                sc.narrow_all(&smart_casts(sc, l, false));
+                sc.narrow_cond(l, false);
                 let rt = self.compile_expr(sc, r);
                 sc.exit(mark);
                 rt?;
@@ -9535,7 +9634,7 @@ impl Compiler {
         if args.iter().any(|a| matches!(a, Expr::Spread(_)))
             && self.class_meta(name).is_none()
             && !self.local_sigs.contains_key(name)
-            && !self.fun_sig.contains_key(name)
+            && !self.declares_fun(name)
         {
             if let Some((elem, conv)) = spread_factory(name) {
                 let packed = spread_concat(elem, args);
@@ -9619,7 +9718,7 @@ impl Compiler {
             && args.len() == 1
             && is_lambda(&args[0])
             && sc.slot("this").is_some()
-            && !self.fun_sig.contains_key(name)
+            && !self.declares_fun(name)
             && !self.local_sigs.contains_key(name)
             && !self
                 .cur_class
@@ -9738,8 +9837,8 @@ impl Compiler {
         // name (`fun check(a: Int)`, `fun max(…)`): Kotlin resolves the file's
         // own package before the default imports, whenever the user function
         // accepts the call.
-        if let Some(sig) = self.shadowing_user_fun(name, args) {
-            return self.compile_user_fun_call(sc, name, sig, args, line);
+        if let Some((sub, sig)) = self.shadowing_user_fun(sc, name, args) {
+            return self.compile_user_fun_call(sc, &sub, sig, args, line);
         }
         match name {
             "println" | "print" => {
@@ -9960,7 +10059,7 @@ impl Compiler {
             // `sortedWith`/`maxWith`/`toSortedMap` consumer already takes.
             "naturalOrder" | "reverseOrder"
                 if args.is_empty()
-                    && !self.fun_sig.contains_key(name)
+                    && !self.declares_fun(name)
                     && !self.local_sigs.contains_key(name) =>
             {
                 let (a, b) = ("#ord_a".to_string(), "#ord_b".to_string());
@@ -9991,7 +10090,7 @@ impl Compiler {
             // `cmp` is evaluated once, into a hidden local the lambda captures.
             "nullsFirst" | "nullsLast"
                 if args.len() <= 1
-                    && !self.fun_sig.contains_key(name)
+                    && !self.declares_fun(name)
                     && !self.local_sigs.contains_key(name) =>
             {
                 let inner = match args.first() {
@@ -10375,7 +10474,7 @@ impl Compiler {
                 Ok(Type::Obj)
             }
             // `emptyArray<T>()` — `arrayOf<T>()` with nothing in it.
-            "emptyArray" if args.is_empty() && !self.fun_sig.contains_key(name) => {
+            "emptyArray" if args.is_empty() && !self.declares_fun(name) => {
                 let didx = self
                     .b
                     .add_constant(Value::str(array_literal_desc("arrayOf")));
@@ -10385,7 +10484,7 @@ impl Compiler {
             }
             // `arrayOfNulls<T>(n)` — an `Array<T?>` of `n` nulls: the generic
             // `Array(n) { null }`, which shares its size check and descriptor.
-            "arrayOfNulls" if args.len() == 1 && !self.fun_sig.contains_key(name) => {
+            "arrayOfNulls" if args.len() == 1 && !self.declares_fun(name) => {
                 let fill = Expr::Lambda {
                     params: Vec::new(),
                     body: vec![Stmt::new(line, StmtKind::Expr(Expr::Null))],
@@ -11193,7 +11292,7 @@ impl Compiler {
         line: u32,
     ) -> Result<Type, String> {
         let full = self.expand_args(
-            &format!("function {name}"),
+            &format!("function {}", unmangled(name)),
             sig.owner.as_deref(),
             &sig.params,
             args,
@@ -11227,25 +11326,152 @@ impl Compiler {
     /// the file's own package before the default imports, so `fun check(a:
     /// Int)` makes `check(5)` the user's, and a call it cannot accept falls
     /// through to the stdlib as before.
-    fn shadowing_user_fun(&self, name: &str, args: &[Expr]) -> Option<FnSig> {
+    fn shadowing_user_fun(&self, sc: &Scope, name: &str, args: &[Expr]) -> Option<(String, FnSig)> {
         if self.class_meta(name).is_some() {
             return None;
         }
-        let sig = self
-            .local_sigs
-            .get(name)
-            .or_else(|| self.fun_sig.get(name))?;
-        if args.iter().any(|a| matches!(a, Expr::Named { .. })) {
-            return Some(sig.clone());
+        let Some(sig) = self.local_sigs.get(name).or_else(|| self.fun_sig.get(name)) else {
+            return self.select_overload(sc, name, args);
+        };
+        // A named argument the function lacks is ITS diagnostic, not a reason
+        // to fall through to a stdlib function of the same name.
+        let named = args.iter().any(|a| matches!(a, Expr::Named { .. }));
+        (named || call_fits(sig, args)).then(|| (name.to_string(), sig.clone()))
+    }
+
+    /// Whether the program declares a top-level (or local) `fun name`, overloaded
+    /// or not — what keeps a stdlib arm of the same name from claiming a call.
+    fn declares_fun(&self, name: &str) -> bool {
+        self.fun_sig.contains_key(name) || self.overloads.contains_key(name)
+    }
+
+    /// The overload of `name` a call with `args` runs: `(mangled sub, sig)`.
+    ///
+    /// The candidates are the ones that can bind the arguments at all. Among
+    /// them each argument scores its parameter by how exactly its static type
+    /// matches ([`Compiler::arg_fit`]), and the highest total wins — the
+    /// most specific candidate, as Kotlin's resolution picks `f(Int)` over
+    /// `f(Long)` and `f(Any)` for `f(1)`. A tie goes to the earlier
+    /// declaration. A candidate one argument cannot reach is out.
+    fn select_overload(&self, sc: &Scope, name: &str, args: &[Expr]) -> Option<(String, FnSig)> {
+        let set = self.overloads.get(name)?;
+        let mut best: Option<(u32, &String, &FnSig)> = None;
+        for mangled in set {
+            let Some(sig) = self.fun_sig.get(mangled) else {
+                continue;
+            };
+            if !call_fits(sig, args) {
+                continue;
+            }
+            let mut score = 0u32;
+            let mut ok = true;
+            for (i, a) in args.iter().enumerate() {
+                let (p, value) = match a {
+                    Expr::Named { name: n, value } => {
+                        (sig.params.iter().find(|p| &p.name == n), &**value)
+                    }
+                    _ => (sig.params.get(i).or_else(|| sig.params.last()), a),
+                };
+                match p.and_then(|p| self.arg_fit(sc, value, p)) {
+                    Some(s) => score += s,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok && !best.is_some_and(|(b, _, _)| score <= b) {
+                best = Some((score, mangled, sig));
+            }
         }
-        let required = sig
-            .params
-            .iter()
-            .filter(|p| p.default.is_none() && p.vararg.is_none())
-            .count();
-        let variadic = sig.params.iter().any(|p| p.vararg.is_some());
-        let n = args.len();
-        (n >= required && (variadic || n <= sig.params.len())).then(|| sig.clone())
+        best.map(|(_, m, s)| (m.clone(), s.clone()))
+    }
+
+    /// How well argument `a` fits parameter `p`: `3` for the parameter's own
+    /// type, `2` for one it accepts by subtyping or by an integer literal
+    /// taking a `Long`'s width, `1` where the static type does not say, and
+    /// `None` where the argument cannot be passed at all.
+    fn arg_fit(&self, sc: &Scope, a: &Expr, p: &Param) -> Option<u32> {
+        if p.vararg.is_some() {
+            return Some(1);
+        }
+        let at = self.infer(sc, a);
+        let ac = match a {
+            Expr::Var(n) => sc.declared_of(n).or_else(|| self.infer_class(sc, a)),
+            _ => self.infer_class(sc, a),
+        };
+        let int_literal = matches!(a, Expr::Int(_))
+            || matches!(a, Expr::Unary { op: UnOp::Neg, expr } if matches!(**expr, Expr::Int(_)));
+        let primitive = |t: Type| {
+            matches!(
+                t,
+                Type::Int
+                    | Type::Long
+                    | Type::Float
+                    | Type::Double
+                    | Type::Boolean
+                    | Type::Char
+                    | Type::String
+                    | Type::NullableString
+            )
+        };
+        match p.ty {
+            Type::Int
+            | Type::Long
+            | Type::Float
+            | Type::Double
+            | Type::Boolean
+            | Type::Char
+            | Type::String => {
+                if at == p.ty {
+                    Some(3)
+                } else if p.ty == Type::Long && at == Type::Int && int_literal {
+                    Some(2)
+                } else if matches!(a, Expr::Null) {
+                    // Only a `T?` parameter takes `null`, and nullability is not
+                    // carried here, so this one ranks below any `Any?`.
+                    Some(0)
+                } else if at == Type::Unknown || (at == Type::Obj && ac.is_none()) {
+                    Some(1)
+                } else {
+                    None
+                }
+            }
+            Type::NullableString => match at {
+                Type::String | Type::NullableString => Some(3),
+                _ if matches!(a, Expr::Null) => Some(3),
+                Type::Unknown => Some(1),
+                _ => None,
+            },
+            _ => match p.class.as_deref() {
+                // `Any` takes every argument and prefers none.
+                None | Some("Any") => Some(1),
+                // `null` reaches a class parameter only if it was written `C?`,
+                // which is not carried — so below `Any?`, as for a primitive.
+                Some(_) if matches!(a, Expr::Null) => Some(0),
+                Some(c) => {
+                    if ac.as_deref() == Some(c) {
+                        Some(3)
+                    } else if primitive(at) {
+                        None
+                    } else if let Some(ac) = ac.as_deref() {
+                        let sub = self
+                            .classes
+                            .get(ac)
+                            .is_some_and(|m| m.mro.iter().any(|x| x == c));
+                        if sub {
+                            Some(2)
+                        } else if self.classes.contains_key(ac) || self.classes.contains_key(c) {
+                            None
+                        } else {
+                            builtin_fit(ac, c)
+                        }
+                    } else {
+                        Some(1)
+                    }
+                }
+            },
+        }
     }
 
     fn compile_call_args(
@@ -11337,7 +11563,7 @@ impl Compiler {
     fn is_throwable_ctor(&self, name: &str) -> bool {
         crate::host::throwable_fqn(name).is_some()
             && !self.classes.contains_key(name)
-            && !self.fun_sig.contains_key(name)
+            && !self.declares_fun(name)
     }
 
     /// Whether an ALIASED import has taken the ORIGINAL spelling of `name` out
@@ -11891,7 +12117,7 @@ impl Compiler {
         self.compile_expr(sc, &ie.cond)?;
         let jf = self.b.emit(Op::JumpIfFalse(0), ie.line);
         let mark = sc.enter();
-        sc.narrow_all(&smart_casts(sc, &ie.cond, true));
+        sc.narrow_cond(&ie.cond, true);
         let then = self.compile_block_stmts(sc, &ie.then);
         sc.exit(mark);
         then?;
@@ -11901,7 +12127,7 @@ impl Compiler {
                 let else_pos = self.b.current_pos();
                 self.b.patch_jump(jf, else_pos);
                 let mark = sc.enter();
-                sc.narrow_all(&smart_casts(sc, &ie.cond, false));
+                sc.narrow_cond(&ie.cond, false);
                 let els = self.compile_block_stmts(sc, els);
                 sc.exit(mark);
                 els?;
@@ -11935,7 +12161,7 @@ impl Compiler {
         self.compile_expr(sc, &ie.cond)?;
         let jf = self.b.emit(Op::JumpIfFalse(0), ie.line);
         let mark = sc.enter();
-        sc.narrow_all(&smart_casts(sc, &ie.cond, true));
+        sc.narrow_cond(&ie.cond, true);
         let tt = self.compile_block_value(sc, &ie.then);
         sc.exit(mark);
         let tt = tt?;
@@ -11945,7 +12171,7 @@ impl Compiler {
         let et = match &ie.els {
             Some(els) => {
                 let mark = sc.enter();
-                sc.narrow_all(&smart_casts(sc, &ie.cond, false));
+                sc.narrow_cond(&ie.cond, false);
                 let et = self.compile_block_value(sc, els);
                 sc.exit(mark);
                 et?
@@ -12053,6 +12279,31 @@ impl Compiler {
                     };
                     let arm_mark = sc.enter();
                     sc.narrow_all(&casts);
+                    // The user-class half, for overload selection in the arm.
+                    match (conds.as_slice(), &w.subject) {
+                        (
+                            [WhenCond::Is {
+                                negated: false,
+                                nullable: false,
+                                ty,
+                            }],
+                            Some(subject),
+                        ) => {
+                            let name = match (&w.binding, &**subject) {
+                                (Some(n), _) | (None, Expr::Var(n)) => Some(n.clone()),
+                                _ => None,
+                            };
+                            if let Some(n) = name.filter(|_| Type::from_name(ty) == Type::Unknown) {
+                                sc.narrow_declared(&n, ty.clone());
+                            }
+                        }
+                        ([WhenCond::Expr(e)], None) => {
+                            for (n, c) in class_casts(sc, e, true) {
+                                sc.narrow_declared(&n, c);
+                            }
+                        }
+                        _ => {}
+                    }
                     let t = self.compile_arm_body(sc, &arm.body, want_value);
                     sc.exit(arm_mark);
                     let t = t?;
@@ -12412,8 +12663,10 @@ impl Compiler {
             },
             // A user `fun` shadowing a stdlib name types as the user's (see
             // [`Compiler::shadowing_user_fun`]).
-            Expr::Call { name, args, .. } if self.shadowing_user_fun(name, args).is_some() => {
-                let sig = self.shadowing_user_fun(name, args).expect("just matched");
+            Expr::Call { name, args, .. } if self.shadowing_user_fun(sc, name, args).is_some() => {
+                let (_, sig) = self
+                    .shadowing_user_fun(sc, name, args)
+                    .expect("just matched");
                 self.call_ret(sc, &sig, args)
             }
             Expr::Call { name, args, .. } => match name.as_str() {
@@ -12470,7 +12723,7 @@ impl Compiler {
                     }
                     // An unqualified call inside an extension body is a call on
                     // its receiver (`fun Int.quad() = dbl().dbl()`).
-                    if !self.fun_sig.contains_key(name) && sc.slot("this").is_some() {
+                    if !self.declares_fun(name) && sc.slot("this").is_some() {
                         if let Some(t) =
                             self.ext_ret(sc, &Expr::Var("this".into()), name, args.len())
                         {
@@ -13167,11 +13420,13 @@ impl Compiler {
             // A call to a user function whose RETURN annotation wrote its type
             // arguments: `fun mk(): Box<Int>` makes `mk().v * 2000000000` `Int`
             // arithmetic, with nothing at the call site to say so.
-            Expr::Call { name, .. } => {
+            Expr::Call { name, args, .. } => {
+                let ov = self.select_overload(sc, name, args).map(|(_, s)| s);
                 let sig = self
                     .local_sigs
                     .get(name)
-                    .or_else(|| self.fun_sig.get(name))?;
+                    .or_else(|| self.fun_sig.get(name))
+                    .or(ov.as_ref())?;
                 Some(TypeArg {
                     ty: sig.ret,
                     class: sig.ret_class.clone(),
@@ -13529,7 +13784,7 @@ impl Compiler {
                 }
                 None
             }
-            Expr::Call { name, .. } => {
+            Expr::Call { name, args, .. } => {
                 if let Some(meta) = self.class_meta(name) {
                     return Some(meta.name.clone()); // constructor
                 }
@@ -13562,10 +13817,12 @@ impl Compiler {
                     _ => {}
                 }
                 // A local `fun` shadows a top-level one, as at the call.
-                self.local_sigs
-                    .get(name)
-                    .or_else(|| self.fun_sig.get(name))
-                    .and_then(|s| s.ret_class.clone())
+                match self.local_sigs.get(name).or_else(|| self.fun_sig.get(name)) {
+                    Some(s) => s.ret_class.clone(),
+                    None => self
+                        .select_overload(sc, name, args)
+                        .and_then(|(_, s)| s.ret_class),
+                }
             }
             Expr::Member { recv, name, .. } => {
                 // A `T`-typed property names whatever class the receiver's type
@@ -14375,6 +14632,50 @@ fn smart_casts(sc: &Scope, cond: &Expr, holds: bool) -> Vec<(String, Type)> {
             op: UnOp::Not,
             expr,
         } => smart_casts(sc, expr, !holds),
+        _ => Vec::new(),
+    }
+}
+
+/// The user-class half of [`smart_casts`]: each local `x` that `cond`
+/// proves to be an instance of a declared class `C` (`x is C`, through `&&`,
+/// `||` and `!` as there), paired with `C`. The names are checked against
+/// the scope only; whether `C` is a user class is the caller's question,
+/// answered by the overload scorer that reads it.
+fn class_casts(sc: &Scope, cond: &Expr, holds: bool) -> Vec<(String, String)> {
+    match cond {
+        Expr::Is {
+            value,
+            ty,
+            negated,
+            nullable: false,
+        } if *negated != holds => match &**value {
+            Expr::Var(n) if sc.slot(n).is_some() && Type::from_name(ty) == Type::Unknown => {
+                vec![(n.clone(), ty.clone())]
+            }
+            _ => Vec::new(),
+        },
+        Expr::Binary {
+            op: BinOp::And,
+            l,
+            r,
+        } if holds => {
+            let mut v = class_casts(sc, l, true);
+            v.extend(class_casts(sc, r, true));
+            v
+        }
+        Expr::Binary {
+            op: BinOp::Or,
+            l,
+            r,
+        } if !holds => {
+            let mut v = class_casts(sc, l, false);
+            v.extend(class_casts(sc, r, false));
+            v
+        }
+        Expr::Unary {
+            op: UnOp::Not,
+            expr,
+        } => class_casts(sc, expr, !holds),
         _ => Vec::new(),
     }
 }
@@ -15628,4 +15929,48 @@ fn regex_with_options(pattern: &Expr, opts: &Expr, line: u32) -> Option<Expr> {
         StrExpr::Text(format!("(?{flags})")),
         StrExpr::Expr(Box::new(body)),
     ]))
+}
+
+/// Whether a call with `args` can bind `sig`'s parameters by count — and, for
+/// named arguments, by name: every name it writes must be a parameter.
+fn call_fits(sig: &FnSig, args: &[Expr]) -> bool {
+    if args.iter().any(|a| matches!(a, Expr::Named { .. })) {
+        return args.iter().all(|a| match a {
+            Expr::Named { name, .. } => sig.params.iter().any(|p| &p.name == name),
+            _ => true,
+        });
+    }
+    let required = sig
+        .params
+        .iter()
+        .filter(|p| p.default.is_none() && p.vararg.is_none())
+        .count();
+    let variadic = sig.params.iter().any(|p| p.vararg.is_some());
+    let n = args.len();
+    n >= required && (variadic || n <= sig.params.len())
+}
+
+/// How a built-in container class `arg` fits a parameter of built-in class
+/// `param` — the [`Compiler::arg_fit`] score. The frontend's class names do
+/// not say MUTABILITY (`mutableListOf` and `listOf` are both a `List` here),
+/// so within one family the answer is "cannot tell" rather than a mismatch;
+/// across families (`Set` for `List`) it is a mismatch, and a collection for
+/// `Collection`/`Iterable` is a subtype.
+fn builtin_fit(arg: &str, param: &str) -> Option<u32> {
+    let family = |c: &str| match c {
+        "List" | "MutableList" | "ArrayList" => Some("list"),
+        "Set" | "MutableSet" | "HashSet" | "LinkedHashSet" | "TreeSet" => Some("set"),
+        "Map" | "MutableMap" | "HashMap" | "LinkedHashMap" | "TreeMap" => Some("map"),
+        "Collection" | "MutableCollection" | "Iterable" => Some("collection"),
+        "Sequence" => Some("sequence"),
+        "Pair" => Some("pair"),
+        "Triple" => Some("triple"),
+        _ => None,
+    };
+    match (family(arg), family(param)) {
+        (Some(a), Some(p)) if a == p => Some(1),
+        (Some("list" | "set"), Some("collection")) => Some(2),
+        (Some(_), Some(_)) => None,
+        _ => Some(1),
+    }
 }

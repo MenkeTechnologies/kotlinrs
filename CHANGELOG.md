@@ -11,6 +11,26 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Top-level function overloads
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, compiled and run on the same JVM.
+
+| program | before | reference |
+| --- | --- | --- |
+| `fun describe(x: Int)`, `(x: Long)`, `(x: String)`, `(x: Any?)`; `describe(1L)`, `describe("s")`, `describe(2.5f)` | `Int 1`, `Int s`, `Int 2.5` — every call ran the first declaration | `Long 1`, `String s`, `Any 2.5` |
+| `fun area(r: Double)`, `fun area(w: Double, h: Double)`; `area(2.0, 3.0)` | `function area has no argument for …` / the wrong body | `6.0` |
+| `fun describe(x: Animal)`, `fun describe(x: Dog)`; `val a: Animal = Dog("d"); describe(a)`, then `if (a is Dog) describe(a)` | `Dog d`, `Dog d` | `Animal d`, `Dog d` |
+| `fun nums(xs: List<Int>)`, `(xs: Set<Int>)`, `(xs: Map<Int, Int>)` | the `List` body for all three | each its own |
+| `class C { fun f(a: String) = "s"; fun f(a: Int) = "i" }`; `C().f(1)` | `s` (silently) | `i` — now a compile error here, recorded in BUGS.md |
+
+Each declaration of a repeated top-level name is renamed `name$ov<k>` before
+the signature table is built, and a call scores every candidate that can bind
+its arguments: 3 for the parameter's own type, 2 for a subtype or an integer
+literal taking a `Long`, 1 where the static type does not say, out where it
+cannot be passed; the highest total wins, the earlier declaration on a tie.
+The static type is a binding's annotation where it named a user class, and an
+`is` smart cast narrows it for the branch.
+
 ## Members that answered `unresolved reference`
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, compiled and run on the same JVM.

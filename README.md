@@ -868,8 +868,13 @@ hash container does short-circuit (`HashMap.getNode` tests `k == key` first), so
 a lookup by the stored object skips the body. This is only observable through an
 `equals` with an effect, and it is checked by the frozen corpus.
 
-Method overloading is not supported — two `fun f` at different arities in one
-class is a compile error here.
+Top-level functions OVERLOAD: each declaration of a repeated name is kept
+under its own mangled sub, and a call picks the one whose parameters its
+arguments' static types fit best — an exact type over a subtype or an integer
+literal taking a `Long`, over `Any`; a tie goes to the earlier declaration.
+The static type is the annotation (`val a: Animal = Dog()` passes an `Animal`)
+until an `is` check smart-casts it. MEMBER overloading is not supported: a class
+that declares one method name twice is a compile error here.
 
 One equality corner is **excluded** rather than modelled, and the exclusion is
 deliberate: a 1-element `setOf`/`mapOf` is `java.util.Collections.singleton` /
