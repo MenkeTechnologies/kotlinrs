@@ -3142,24 +3142,18 @@ fn mangle_overloads(program: &mut Program) -> HashMap<String, Vec<String>> {
     sets
 }
 
-/// The member names the host calls BY NAME on a user object (`toString`,
-/// `compareTo`, an iterator's `next`, …): renaming one would hide it from that
-/// call, so an overload set of one of these stays refused.
-fn host_called_member(name: &str) -> bool {
-    matches!(
-        name,
-        "toString"
-            | "equals"
-            | "hashCode"
-            | "compareTo"
-            | "iterator"
-            | "hasNext"
-            | "next"
-            | "getValue"
-            | "setValue"
-            | "close"
-            | "invoke"
-    )
+/// The arity of the declaration the host calls BY NAME on a user object
+/// (`toString()`, `equals(other)`, an iterator's `next()`, …), for a member it
+/// calls; `None` for every other name. In an overload set of one of these, the
+/// declaration the host calls keeps its plain name.
+fn host_called_arity(name: &str) -> Option<usize> {
+    Some(match name {
+        "toString" | "hashCode" | "iterator" | "hasNext" | "next" | "close" => 0,
+        "equals" | "compareTo" => 1,
+        "getValue" => 2,
+        "setValue" => 3,
+        _ => return None,
+    })
 }
 
 /// Rename every method of a member OVERLOAD SET — a name some class declares
@@ -3172,16 +3166,32 @@ fn mangle_member_overloads(program: &mut Program) -> HashSet<String> {
     for cd in &program.classes {
         let mut seen = HashSet::new();
         for m in &cd.methods {
-            if !seen.insert(m.name.as_str()) && !host_called_member(&m.name) {
+            if !seen.insert(m.name.as_str()) {
                 names.insert(m.name.clone());
             }
         }
     }
     let key = |p: &Param| p.class.clone().unwrap_or_else(|| format!("{:?}", p.ty));
     for cd in program.classes.iter_mut() {
-        for m in cd.methods.iter_mut().filter(|m| names.contains(&m.name)) {
-            let sig: Vec<String> = m.params.iter().map(key).collect();
-            m.name = format!("{}$ov({})", m.name, sig.join(","));
+        // Of a host-called name, the declaration the host calls — the
+        // `override` of that arity, else the first of that arity — keeps its
+        // plain name; every other declaration of an overloaded name is renamed.
+        let kept: Vec<usize> = names
+            .iter()
+            .filter_map(|n| {
+                let arity = host_called_arity(n)?;
+                let fits = |m: &FunDecl| &m.name == n && m.params.len() == arity;
+                let ms = &cd.methods;
+                ms.iter()
+                    .position(|m| fits(m) && m.is_override)
+                    .or_else(|| ms.iter().position(fits))
+            })
+            .collect();
+        for (i, m) in cd.methods.iter_mut().enumerate() {
+            if names.contains(&m.name) && !kept.contains(&i) {
+                let sig: Vec<String> = m.params.iter().map(key).collect();
+                m.name = format!("{}$ov({})", m.name, sig.join(","));
+            }
         }
     }
     names
@@ -6959,6 +6969,9 @@ impl Compiler {
                 .infer_class(sc, recv)
                 .is_some_and(|c| self.classes.contains_key(&c));
             match self.select_member_overload(sc, recv, name, args) {
+                // The plain declaration of a host-called name: compiled as
+                // the ordinary member it is.
+                Some(m) if m == name => {}
                 Some(m) if known => return self.compile_member(sc, recv, &m, args, safe, line),
                 // A receiver of no static class may be a user object or a
                 // stdlib one with a member of the same name (`xs.add(1)`), so
@@ -9097,6 +9110,29 @@ impl Compiler {
     /// The parameter names are unspellable in Kotlin source, so a reference
     /// written inside a lambda cannot collide with `it` or with anything the
     /// program bound.
+    /// The declaration of the overloaded member `name` on `meta` whose
+    /// parameters the expected function type names — [`Compiler::lambda_hint`],
+    /// read from its `skip`-th parameter on (1 past an unbound reference's
+    /// receiver). `None` unless exactly one declaration fits.
+    fn overload_by_hint(&self, meta: &ClassMeta, name: &str, skip: usize) -> Option<String> {
+        if !self.member_overloads.contains(name) {
+            return None;
+        }
+        let hint = self.lambda_hint.as_ref()?;
+        let wanted = hint.get(skip..)?;
+        let mut fits = meta.methods.iter().filter(|(m, sig)| {
+            unmangled(m) == name
+                && sig.params.len() == wanted.len()
+                && sig
+                    .params
+                    .iter()
+                    .zip(wanted)
+                    .all(|(p, (t, _))| *t == Type::Unknown || p.ty == *t)
+        });
+        let first = fits.next()?;
+        fits.next().is_none().then(|| first.0.clone())
+    }
+
     fn compile_fun_ref(
         &mut self,
         sc: &mut Scope,
@@ -9154,6 +9190,11 @@ impl Compiler {
             let shadowed = sc.slot(t).is_some() || self.globals.contains_key(t);
             if !shadowed {
                 if let Some(meta) = self.classes.get(t).cloned() {
+                    // `C::f` of an overloaded `f`: the declaration the
+                    // expected function type's parameters (after the receiver)
+                    // select.
+                    let picked = self.overload_by_hint(&meta, name, 1);
+                    let name = picked.as_deref().unwrap_or(name);
                     if let Some(sig) = meta.methods.get(name) {
                         let n = sig.arity;
                         let body = Expr::MethodCall {
@@ -9226,11 +9267,12 @@ impl Compiler {
                 synth
             }
         };
-        let n = self
+        let meta = self
             .infer_class(sc, &Expr::Var(bound.clone()))
-            .and_then(|c| self.classes.get(&c))
-            .and_then(|m| m.methods.get(name))
-            .map(|s| s.arity);
+            .and_then(|c| self.classes.get(&c));
+        let picked = meta.and_then(|m| self.overload_by_hint(m, name, 0));
+        let name = picked.as_deref().unwrap_or(name);
+        let n = meta.and_then(|m| m.methods.get(name)).map(|s| s.arity);
         let body = match n {
             Some(n) => Expr::MethodCall {
                 recv: Box::new(Expr::Var(bound)),
@@ -10198,10 +10240,15 @@ impl Compiler {
             if self
                 .classes
                 .get(&cls)
-                .is_some_and(|m| m.methods.contains_key("invoke"))
+                .is_some_and(|m| m.methods.keys().any(|k| unmangled(k) == "invoke"))
             {
                 return self.compile_member(sc, target, "invoke", args, false, line);
             }
+        }
+        // A target of no static class in a program that overloads `invoke`: the
+        // member call, whose runtime test tells a user object from a function value.
+        if self.member_overloads.contains("invoke") && self.infer_class(sc, target).is_none() {
+            return self.compile_member(sc, target, "invoke", args, false, line);
         }
         self.compile_expr(sc, target)?;
         for a in args {
@@ -10226,7 +10273,10 @@ impl Compiler {
             && !self.declares_fun(name)
         {
             let this = Expr::Var("this".to_string());
-            if let Some(m) = self.select_member_overload(sc, &this, name, args) {
+            if let Some(m) = self
+                .select_member_overload(sc, &this, name, args)
+                .filter(|m| m != name)
+            {
                 return self.compile_member(sc, &this, &m, args, false, line);
             }
         }
@@ -10515,7 +10565,7 @@ impl Compiler {
                 if self
                     .classes
                     .get(&cls)
-                    .is_some_and(|m| m.methods.contains_key("invoke"))
+                    .is_some_and(|m| m.methods.keys().any(|k| unmangled(k) == "invoke"))
                 {
                     let recv = Expr::Var(name.to_string());
                     return self.compile_member(sc, &recv, "invoke", args, false, line);
@@ -12443,7 +12493,7 @@ impl Compiler {
         let mut best: Option<(u32, &String)> = None;
         let mut tied = false;
         for (mangled, sig) in candidates {
-            if unmangled(mangled) != name || !mangled.contains("$ov") || !call_fits(sig, args) {
+            if unmangled(mangled) != name || !call_fits(sig, args) {
                 continue;
             }
             let mut score = 0u32;

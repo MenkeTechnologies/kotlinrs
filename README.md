@@ -910,9 +910,11 @@ declaration of a repeated method name is renamed by its parameter types — the
 same name in every class of the hierarchy, so an `override` lands on what it
 overrides — and a call picks by its arguments, on a receiver of known class or
 on implicit `this`. On a receiver of no static class the value decides between
-the selected user overload and a stdlib member of the same name. An overload
-set of a member the host calls by name (`toString`, `compareTo`, `next`, …) is
-still refused.
+the selected user overload and a stdlib member of the same name. In an
+overload set of a member the runtime calls by name (`toString()`, `equals(o)`,
+`compareTo(o)`, `next()`, …) the declaration it calls keeps its plain name. A
+callable reference to an overloaded member (`C::f`, `x::f`) takes the
+declaration its expected function type selects.
 
 One equality corner is **excluded** rather than modelled, and the exclusion is
 deliberate: a 1-element `setOf`/`mapOf` is `java.util.Collections.singleton` /

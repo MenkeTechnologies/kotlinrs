@@ -9765,3 +9765,79 @@ fn unsigned_arrays_print_their_storage_and_ulong_ranges_order_unsigned() {
         "4294967295..0\n[]\n[]\n2 downTo 0 step 1\n"
     );
 }
+
+/// An overload set of a member the runtime calls by name — `toString`, `equals`,\n`compareTo`, an iterator's `next`, `invoke` — keeps the declaration it calls\nunder its plain name and resolves the rest by arguments; a callable reference\nto an overloaded member (`Printer::put`, `p::put`) takes the declaration its\nexpected function type selects. Each was refused or unresolved.
+#[test]
+fn overloads_of_host_called_members_and_overloaded_references() {
+    assert_eq!(
+        prog(
+            r##"class V(val x: Int) : Comparable<V> {
+    override fun toString() = "V($x)"
+    fun toString(radix: Int) = x.toString(radix)
+    override fun equals(other: Any?) = other is V && other.x == x
+    fun equals(other: V, slack: Int) = kotlin.math.abs(other.x - x) <= slack
+    override fun hashCode() = x
+    override fun compareTo(other: V) = x.compareTo(other.x)
+    fun compareTo(other: Int) = x.compareTo(other)
+}
+class Cnt(val n: Int) : Iterator<Int> {
+    var i = 0
+    override fun hasNext() = i < n
+    override fun next() = i++
+    fun next(skip: Int): Int { i += skip; return i }
+}
+fun main() {
+    val v = V(10)
+    println(v)
+    println("$v")
+    println(v.toString(16))
+    println(v == V(10))
+    println(v.equals(V(12), 3))
+    println(setOf(V(1), V(1)).size)
+    println(listOf(V(3), V(1)).sorted())
+    println(v > V(2))
+    println(v.compareTo(11))
+    val c = Cnt(5)
+    println(c.next(2))
+    for (x in c) print("$x ")
+    println()
+}"##
+        ),
+        "V(10)\nV(10)\na\ntrue\ntrue\n1\n[V(1), V(3)]\ntrue\n-1\n2\n2 3 4 \n"
+    );
+    assert_eq!(
+        prog(
+            r##"class Printer {
+    fun put(x: Int) = "int $x"
+    fun put(x: String) = "str $x"
+}
+fun main() {
+    val f: (Printer, Int) -> String = Printer::put
+    println(f(Printer(), 3))
+    val g: (Printer, String) -> String = Printer::put
+    println(g(Printer(), "a"))
+    val p = Printer()
+    val h: (Int) -> String = p::put
+    println(h(9))
+    println(listOf(1, 2).map(p::put))
+    println(listOf("x").map(p::put))
+}"##
+        ),
+        "int 3\nstr a\nint 9\n[int 1, int 2]\n[str x]\n"
+    );
+    assert_eq!(
+        prog(
+            r##"class C { operator fun invoke(a: String) = 1; operator fun invoke(a: Int) = 2; operator fun invoke() = 0 }
+fun main() { val c = C(); println(c(1)); println(c("s")); println(c()); println(C()(5)); val l = listOf(C()); println(l[0](3)) }"##
+        ),
+        "2\n1\n0\n2\n2\n"
+    );
+    assert_eq!(
+        prog(
+            r##"class C { operator fun invoke(a: String) = 1; operator fun invoke(a: Int) = 2 }
+fun <T> id(x: T) = x
+fun main() { val l = listOf(C()); println(l[0](3)); val f = id { x: Int -> x * 10 }; println(f(4)); val fs = listOf({ x: Int -> x + 1 }); println(fs[0](1)) }"##
+        ),
+        "2\n40\n2\n"
+    );
+}

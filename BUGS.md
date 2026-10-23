@@ -458,12 +458,11 @@ from a size change or a modification-count change since round 21; a
 structural write through a `subList` view does not bump the BACKING list's
 count.
 
-Member overloads resolve since the parity fan-out's fourth round (CHANGELOG,
-"Member overloads"). Two limits remain: an overload set of a member the host
-calls by name (`toString`, `equals`, `hashCode`, `compareTo`, `iterator`,
-`hasNext`, `next`, `getValue`, `setValue`, `close`, `invoke`) is still refused,
-and a callable reference to an overloaded member (`C::f`) is unresolved where
-the reference resolves it from the expected function type.
+Member overloads resolve since the parity fan-out's fourth round, including
+overload sets of the members the runtime calls by name and callable references
+to an overloaded member (CHANGELOG, "Member overloads" and "Overloads of
+host-called members"). A reference with no expected function type to select
+by (`val f = C::f`) stays unresolved, as `kotlinc` reports it ambiguous.
 
 ## Round 22: measured and not closed
 

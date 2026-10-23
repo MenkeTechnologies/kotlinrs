@@ -11,6 +11,21 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Overloads of host-called members; references to overloaded members
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | before | reference |
+| --- | --- | --- |
+| `override fun toString()` beside `fun toString(radix: Int)`; `equals(o)` beside `equals(o, slack)`; `compareTo(V)` beside `compareTo(Int)`; an iterator's `next()` beside `next(skip)` | `member overloads are not supported` | each call its own declaration; `println(v)`, `==`, `sorted()`, `for` use the plain one |
+| `operator fun invoke(a: String)` / `invoke(a: Int)` / `invoke()`; `c(1)`, `listOf(C())[0](3)` | refused | `2`, `2` |
+| `val f: (Printer, Int) -> String = Printer::put`; `p::put` as `(Int) -> String`; `listOf("x").map(p::put)` | `unresolved reference: put on Printer` | the declaration the function type selects |
+
+In an overload set of a member the runtime calls by name, the declaration it
+calls (the `override` of that arity, else the first) keeps its plain name and
+the others are renamed by signature. The test that pinned the `next` overload
+refusal is updated to the reference's `2` in its own commit.
+
 ## Unsigned arrays print their storage; `ULongRange` in unsigned order
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
