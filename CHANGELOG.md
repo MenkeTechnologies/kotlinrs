@@ -11,6 +11,23 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Read-only `Set`/`Map` writes; casts to a collection interface
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, compiled and run on the same JVM.
+
+| program | before | reference |
+| --- | --- | --- |
+| `(setOf(1) as MutableSet<Int>).add(2)`, `.remove(1)`, `.clear()` | the write happened | `UnsupportedOperationException` (`SingletonSet`); `remove(9)` is `false` |
+| `(mapOf(1 to 1) as MutableMap<Int, Int>)[7] = 7`, `.getOrPut(5) { 9 }` | the write happened | `UnsupportedOperationException` (`SingletonMap`); `getOrPut(1) { 9 }` is `1` |
+| `setOf<Int>() as MutableSet<Int>`, `emptyMap<Int, Int>() is MutableMap<*, *>` | the cast passed, `true` | `ClassCastException: kotlin.collections.EmptySet cannot be cast to kotlin.collections.MutableSet`, `false` |
+| `listOf(1).toSet()` / `listOf(1 to 1).toMap()` written through a cast | the write happened | `UnsupportedOperationException` — `toSet`/`toMap` collapse by the RECEIVER's size, so `listOf(1, 1).toSet()` stays a writable `LinkedHashSet` |
+| `val a: Any = 1; a as List<*>` | `class value cannot be cast to class List` | `class java.lang.Integer cannot be cast to class java.util.List (java.lang.Integer and java.util.List are in module java.base of loader 'bootstrap')` |
+
+The read-only literal tag a `Set`/`Map` already carried for its JVM class name
+now also gates the writes, exactly as the `List` provenance tag does, and is
+dropped at the first write to a literal of two or more elements. A cast's
+target `List`/`Set`/`Map`/`Collection`/`Iterable` names its JDK interface.
+
 ## `for` over a lazy sequence pulls one element per pass
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, compiled and run on the same JVM.

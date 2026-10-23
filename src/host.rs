@@ -1149,6 +1149,62 @@ fn ro_list_fault(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Optio
     }
 }
 
+/// [`ro_list_fault`] for a read-only `Set`/`Map` literal ([`COLL_LITERAL`]):
+/// `setOf(x)` is a `java.util.Collections$SingletonSet` and `mapOf(k to v)` a
+/// `SingletonMap`, which refuse every write that would change them — and
+/// `add`/`put` even when it would not; from two elements up the literal is
+/// the `LinkedHashSet`/`LinkedHashMap` the mutable builders build, and its tag
+/// is dropped at its first write so a later size cannot re-collapse it.
+/// Measured on kotlinc 2.4.21 / JRE 21.0.12.1.
+fn ro_coll_fault(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Option<&'static str> {
+    let Value::Obj(id) = recv else { return None };
+    if !COLL_LITERAL_TAG.with(|t| t.borrow().contains(id)) {
+        return None;
+    }
+    let (is_set, items, keys) = with_obj(recv, |o| match o {
+        HeapObj::Set(items) => Some((true, items.clone(), Vec::new())),
+        HeapObj::Map(entries) => Some((
+            false,
+            Vec::new(),
+            entries.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+        )),
+        _ => None,
+    })
+    .flatten()?;
+    let len = if is_set { items.len() } else { keys.len() };
+    if len >= 2 {
+        COLL_LITERAL_TAG.with(|t| t.borrow_mut().remove(id));
+        return None;
+    }
+    let arg_items = || args.last().and_then(as_iterable).unwrap_or_default();
+    let refuse = if is_set {
+        match name {
+            "add" | "clear" => true,
+            "addAll" => !arg_items().is_empty(),
+            "remove" if args.len() == 1 => position_eq(vm, &items, &args[0]).is_some(),
+            "removeAll" | "retainAll" if args.len() == 1 => {
+                let other = arg_items();
+                let want = name == "retainAll";
+                items
+                    .iter()
+                    .any(|it| position_eq(vm, &other, it).is_some() != want)
+            }
+            _ => false,
+        }
+    } else {
+        match name {
+            "put" | "clear" | "putIfAbsent" | "compute" | "computeIfAbsent"
+            | "computeIfPresent" | "merge" => true,
+            "putAll" => args.first().is_some_and(|m| {
+                with_obj(m, |o| !matches!(o, HeapObj::Map(e) if e.is_empty())).unwrap_or(true)
+            }),
+            "remove" if !args.is_empty() => position_eq(vm, &keys, &args[0]).is_some(),
+            _ => false,
+        }
+    };
+    refuse.then_some(UOE)
+}
+
 /// Record `list`'s implementation class. A no-op for a non-handle.
 fn tag_list_impl(list: &Value, which: ListImpl) {
     if let Value::Obj(id) = list {
@@ -4514,6 +4570,14 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
                 // Kotlin's own `TypeIntrinsics` check, spelled its own way.
                 let msg = if ty == "MutableList" && ro_list(&v) == Some(RoList::Empty) {
                     "java.lang.ClassCastException: kotlin.collections.EmptyList cannot be cast to kotlin.collections.MutableList".to_string()
+                } else if matches!(ty.as_str(), "MutableSet" | "MutableMap") && is_empty_literal(&v)
+                {
+                    let (from, to) = if ty == "MutableSet" {
+                        ("EmptySet", "MutableSet")
+                    } else {
+                        ("EmptyMap", "MutableMap")
+                    };
+                    format!("java.lang.ClassCastException: kotlin.collections.{from} cannot be cast to kotlin.collections.{to}")
                 } else {
                     cast_failure(&v, &ty)
                 };
@@ -6158,6 +6222,15 @@ fn operator_apply(vm: &mut VM, lhs: &Value, name: &str, rhs: &Value) -> Result<V
             (false, true) => "removeAll",
         };
         if let Some(e) = ro_list_fault(vm, lhs, member, std::slice::from_ref(rhs)) {
+            return Err(e.to_string());
+        }
+        let is_map = with_obj(lhs, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false);
+        let coll_member = match (is_map, adding) {
+            (true, true) => "putAll",
+            (true, false) => "remove",
+            (false, _) => member,
+        };
+        if let Some(e) = ro_coll_fault(vm, lhs, coll_member, std::slice::from_ref(rhs)) {
             return Err(e.to_string());
         }
     }
@@ -8916,6 +8989,9 @@ fn coll_hof(
                 return Ok(existing);
             }
             let fresh = invoke_closure(vm, clo, &[])?;
+            if let Some(e) = ro_coll_fault(vm, recv, "put", &[k.clone(), fresh.clone()]) {
+                return Err(e.to_string());
+            }
             with_obj_mut(recv, |o| {
                 if let HeapObj::Map(entries) = o {
                     match at.and_then(|i| entries.get_mut(i)) {
@@ -12559,6 +12635,9 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     if let Some(e) = ro_list_fault(vm, recv, name, args) {
         return Err(e.to_string());
     }
+    if let Some(e) = ro_coll_fault(vm, recv, name, args) {
+        return Err(e.to_string());
+    }
     // Mutating list operations need a mutable borrow.
     match name {
         // `MutableList.add` always appends and answers `true`; `MutableSet.add`
@@ -13078,7 +13157,15 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             })
             .flatten()
             {
-                return Ok(alloc(HeapObj::Map(entries)));
+                // `Map.toMap()` collapses as `mapOf` does — an `EmptyMap` or a
+                // `SingletonMap` below two entries — where `toMutableMap()`
+                // is always a `LinkedHashMap`.
+                let small = entries.len() <= 1;
+                let copy = alloc(HeapObj::Map(entries));
+                if name == "toMap" && small {
+                    tag_literal(&copy);
+                }
+                return Ok(copy);
             }
         }
         "keys" | "values" => {
@@ -14340,11 +14427,27 @@ fn sequence_member(
                     None => entries.push((k, v)),
                 }
             }
-            return Some(Ok(alloc(HeapObj::Map(entries))));
+            // `toMap()` over pairs collapses as `mapOf` does — decided by the
+            // RECEIVER's size, so two pairs with one key are a `LinkedHashMap`.
+            let map = alloc(HeapObj::Map(entries));
+            if items.len() <= 1 {
+                tag_literal(&map);
+            }
+            return Some(Ok(map));
         }
         // `toSet` yields a `Set`; `distinct` yields a `List` with the same
-        // elements — the pair Kotlin draws the distinction between.
-        "toSet" | "toMutableSet" => return Some(Ok(alloc(HeapObj::Set(distinct(vm, items))))),
+        // elements — the pair Kotlin draws the distinction between. `toSet`
+        // collapses as `setOf` does (`EmptySet`, `SingletonSet`), by the
+        // RECEIVER's element count — `listOf(1, 1).toSet()` is a
+        // `LinkedHashSet` of one; `toMutableSet` is always a `LinkedHashSet`.
+        "toSet" => {
+            let set = alloc(HeapObj::Set(distinct(vm, items)));
+            if items.len() <= 1 {
+                tag_literal(&set);
+            }
+            return Some(Ok(set));
+        }
+        "toMutableSet" => return Some(Ok(alloc(HeapObj::Set(distinct(vm, items))))),
         // `toHashSet` is a `java.util.HashSet`, iterating in bucket order from
         // the capacity the stdlib asks for: `mapCapacity(size)` for a
         // collection or an array, `mapCapacity(12)` for any other `Iterable`
@@ -15037,6 +15140,9 @@ fn store_at(items: &mut [Value], i: i64, value: Value, kind: &str) -> Result<(),
 /// `recv[index] = value` — list set (bounds-checked) or map put.
 fn index_set(vm: &mut VM, recv: &Value, index: &Value, value: Value) -> Result<(), String> {
     if let Some(e) = ro_list_fault(vm, recv, "set", &[index.clone(), value.clone()]) {
+        return Err(e.to_string());
+    }
+    if let Some(e) = ro_coll_fault(vm, recv, "put", &[index.clone(), value.clone()]) {
         return Err(e.to_string());
     }
     // Only a `Map` looks its slot up by equality; a list/array indexes by
@@ -16122,6 +16228,7 @@ fn cast_failure(v: &Value, ty: &str) -> String {
         .or_else(|| runtime_jvm_class(v))
         .or_else(|| is_instance.then(|| (from_label.clone(), false)));
     let target = jvm_class(ty)
+        .or_else(|| jvm_interface(ty))
         .map(|(n, b)| (n.to_string(), b))
         .or_else(|| (!is_builtin_type_name(ty)).then(|| (ty.to_string(), false)));
     let (Some((a, a_base)), Some((b, b_base))) = (recv, target) else {
@@ -16252,8 +16359,15 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         "Collection" => {
             with_obj(v, |o| matches!(o, HeapObj::List(_) | HeapObj::Set(_))).unwrap_or(false)
         }
-        "Set" | "MutableSet" => with_obj(v, |o| matches!(o, HeapObj::Set(_))).unwrap_or(false),
-        "Map" | "MutableMap" => with_obj(v, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false),
+        "Set" => with_obj(v, |o| matches!(o, HeapObj::Set(_))).unwrap_or(false),
+        "Map" => with_obj(v, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false),
+        // `EmptySet`/`EmptyMap` implement the read-only interfaces only.
+        "MutableSet" => {
+            with_obj(v, |o| matches!(o, HeapObj::Set(_))).unwrap_or(false) && !is_empty_literal(v)
+        }
+        "MutableMap" => {
+            with_obj(v, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false) && !is_empty_literal(v)
+        }
         "Pair" => with_obj(v, |o| matches!(o, HeapObj::Pair(_, _))).unwrap_or(false),
         "Triple" => with_obj(v, |o| matches!(o, HeapObj::Triple(_, _, _))).unwrap_or(false),
         // Each array type is its own JVM class, told apart by the descriptor:
@@ -17223,4 +17337,43 @@ fn deque_len(recv: &Value) -> usize {
         _ => 0,
     })
     .unwrap_or(0)
+}
+
+/// Whether `v` is an EMPTY read-only `Set`/`Map` literal — Kotlin's
+/// `EmptySet`/`EmptyMap`, which no `MutableSet`/`MutableMap` cast accepts.
+fn is_empty_literal(v: &Value) -> bool {
+    let Value::Obj(id) = v else { return false };
+    COLL_LITERAL_TAG.with(|t| t.borrow().contains(id))
+        && with_obj(v, |o| match o {
+            HeapObj::Set(items) => items.is_empty(),
+            HeapObj::Map(entries) => entries.is_empty(),
+            _ => false,
+        })
+        .unwrap_or(false)
+}
+
+/// Mark `v` as built by a collapsing read-only builder — see [`COLL_LITERAL`] —
+/// and hand it back.
+fn tag_literal(v: &Value) -> Value {
+    if let Value::Obj(id) = v {
+        COLL_LITERAL_TAG.with(|t| {
+            t.borrow_mut().insert(*id);
+        });
+    }
+    v.clone()
+}
+
+/// The JDK interface a Kotlin collection type NAME erases to, as a cast's
+/// TARGET names it: `x as List<*>` checks `java.util.List`, which the mutable
+/// and read-only spellings share. Only for the target — a receiver is named by
+/// its runtime class ([`runtime_jvm_class`]), never by an interface.
+fn jvm_interface(ty: &str) -> Option<(&'static str, bool)> {
+    Some(match ty {
+        "List" | "MutableList" => ("java.util.List", true),
+        "Set" | "MutableSet" => ("java.util.Set", true),
+        "Map" | "MutableMap" => ("java.util.Map", true),
+        "Collection" | "MutableCollection" => ("java.util.Collection", true),
+        "Iterable" | "MutableIterable" => ("java.lang.Iterable", true),
+        _ => return None,
+    })
 }

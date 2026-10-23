@@ -459,7 +459,6 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
 | `fun <T> id(x: T) = x`; `println(id(listOf(1)) + 5)` | `5.0` | `[1, 5]` |
 | `open class M(val c: Int)`; `class N(c: Int) : M(c)`; `operator fun M.plus(o: M)` and `operator fun N.plus(o: M)`; `listOf<M>(N(1), M(2)).reduce { a, b -> a + b }` | `unresolved reference: plus on N` | `M.plus`, chosen by the static type `M` |
 | `class C { fun f(a: String) = "s"; fun f(a: Int) = "i" }`; `C().f(1)` | `class C: method f is declared more than once — member overloads are not supported` | `i` |
-| `(setOf(1) as MutableSet<Int>).add(2)`, `(mapOf(1 to 2) as MutableMap<Int, Int>).put(3, 4)` | `true`, `null` | `UnsupportedOperationException` (`SingletonSet`, `SingletonMap`) |
 | `m(arrayOf(1, 2).asList()).add(3)`, `m(listOf(1, 2, 3).subList(0, 2)).add(3)` | the write happens | `UnsupportedOperationException` — both are views over an `Arrays$ArrayList` |
 | `val l = mutableListOf(1, 2, 3); for (x in l) l.remove(x)` | `[2]` | `ConcurrentModificationException` |
 
@@ -474,9 +473,7 @@ sound when no one instance could match two candidates; where it could (an
 extension on a class and on its subclass), the chain declines and the call
 fails loudly, because the runtime class does not say which the source meant.
 
-The read-only `Set`/`Map` rows are the `List` fix (see CHANGELOG) still to be
-carried over: the singleton set and map need the same provenance tag lists
-have. `asList`/`subList` are untagged views (see "Collection VIEWS are
+`asList`/`subList` are untagged views (see "Collection VIEWS are
 snapshots"). The `for` row needs a modification count on the list: the loop
 lowers to an index and a size, so a removal inside the body shifts the next
 element under the index instead of failing the next `next()`.
