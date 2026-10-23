@@ -1073,6 +1073,18 @@ impl Parser {
             || matches!(self.peek(), Tok::Ident(w) if w == "interface")
     }
 
+    /// Consume `Companion.` after a receiver type's `.`, answering whether it
+    /// was there — the receiver is then that type's companion object.
+    fn companion_qualifier(&mut self) -> bool {
+        let named = matches!(self.peek(), Tok::Ident(n) if n == "Companion");
+        if named && matches!(self.peek_at(1), Tok::Dot) && matches!(self.peek_at(2), Tok::Ident(_)) {
+            self.advance();
+            self.advance();
+            return true;
+        }
+        false
+    }
+
     fn fun_decl(&mut self) -> Result<FunDecl, String> {
         self.fun_decl_mods(Mods::default())
     }
@@ -1130,6 +1142,12 @@ impl Parser {
             }
             if self.at(&Tok::Dot) {
                 self.advance();
+                // `fun String.Companion.f()` — an extension on a type's
+                // companion object, called as `String.f()`.
+                let first = match self.companion_qualifier() {
+                    true => format!("{first}$Companion"),
+                    false => first,
+                };
                 let (ty, class) = (Type::from_name(&first), None);
                 let class = if ty == Type::Unknown {
                     Some(first.clone())
@@ -2326,6 +2344,10 @@ impl Parser {
                 name = self.ident()?;
             } else if self.at(&Tok::Dot) && matches!(self.peek_at(1), Tok::Ident(_)) {
                 self.advance();
+                // `val String.Companion.x` — on the companion, as for a `fun`.
+                if self.companion_qualifier() {
+                    name = format!("{name}$Companion");
+                }
                 let ty = Type::from_name(&name);
                 recv = Some(if ty == Type::Unknown {
                     (name.clone(), Type::Obj, Some(name.clone()))

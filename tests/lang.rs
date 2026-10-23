@@ -9565,3 +9565,132 @@ fn unsigned_classes_formats_and_range_kinds() {
         "true\nkotlin.ranges.UIntRange\n"
     );
 }
+
+/// A class may declare one method name several times: each declaration is\nrenamed by its parameter types, and a call picks one by its arguments the way\ntop-level overloads are picked — through a subclass override, an interface\ndefault, a named argument and a default, an implicit-`this` call, and a\nreceiver of no static class (where the value decides between the user overload\nand a stdlib member of the same name). Every program was refused with\n`member overloads are not supported`.
+#[test]
+fn member_overloads_resolve_by_argument_types() {
+    assert_eq!(
+        prog(
+            r##"interface Shape
+class Sq(val s: Int) : Shape
+class Circ(val r: Int) : Shape
+open class Printer {
+    open fun put(x: Int) = "int $x"
+    open fun put(x: String) = "str $x"
+    fun put(x: Long) = "long $x"
+    fun put(x: Shape) = "shape"
+    fun put(x: Sq) = "square ${x.s}"
+    fun both() = put(1) + "/" + put("a") + "/" + put(Circ(1))
+    fun pad(x: Int, width: Int = 3) = x.toString().padStart(width, '0')
+    fun pad(x: String) = "[$x]"
+}
+class Loud : Printer() {
+    override fun put(x: Int) = "INT $x"
+}
+interface Greeter {
+    fun greet(name: String): String
+    fun greet(n: Int): String = "hi #$n"
+}
+class G : Greeter {
+    override fun greet(name: String) = "hi $name"
+}
+fun main() {
+    val p = Printer()
+    println(p.put(1))
+    println(p.put("x"))
+    println(p.put(5L))
+    println(p.put(3000000000))
+    println(p.put(Sq(2)))
+    println(p.put(Circ(2)))
+    val sh: Shape = Sq(9)
+    println(p.put(sh))
+    println(p.both())
+    println(p.pad(7))
+    println(p.pad(7, width = 5))
+    println(p.pad("q"))
+    val l: Printer = Loud()
+    println(l.put(1))
+    println(l.put("y"))
+    println(l.both())
+    val g: Greeter = G()
+    println(g.greet("bob"))
+    println(g.greet(4))
+}"##
+        ),
+        "int 1\nstr x\nlong 5\nlong 3000000000\nsquare 2\nshape\nshape\nint 1/str a/shape\n007\n00007\n[q]\nINT 1\nstr y\nINT 1/str a/shape\nhi bob\nhi #4\n"
+    );
+    assert_eq!(
+        prog(
+            r##"class Printer {
+    fun put(x: Int) = "int $x"
+    fun put(x: String) = "str $x"
+}
+fun <T> id(x: T): T = x
+fun main() {
+    println(listOf(Printer()).map { it.put(1) })
+    val a: Any = Printer()
+    println((a as Printer).put("z"))
+    println(id(Printer()).put(2))
+    val ps = mutableListOf(Printer())
+    for (q in ps) println(q.put("w"))
+}"##
+        ),
+        "[int 1]\nstr z\nint 2\nstr w\n"
+    );
+    assert_eq!(
+        prog(
+            r##"class Printer {
+    fun put(x: Int) = "int $x"
+    fun put(x: String) = "str $x"
+}
+fun <T> id(x: T): T = x
+fun main() {
+    val p = Printer()
+    val xs: List<Any> = listOf(1, "a")
+    for (x in xs) {
+        when (x) {
+            is Int -> println(p.put(x))
+            is String -> println(p.put(x))
+        }
+    }
+    println(p.put(id(5)))
+}"##
+        ),
+        "int 1\nstr a\nint 5\n"
+    );
+}
+
+/// `fun String.Companion.hello()`, `val String.Companion.x` and\n`fun Foo.Companion.f()` are called on the type name (`String.hello()`); a user\nclass's companion is `this` inside. They were a parse error\n(`expected LParen, found Dot`).
+#[test]
+fn extensions_on_a_types_companion() {
+    assert_eq!(
+        prog(
+            r##"class Foo
+data class D(val x: Int)
+object Obj
+enum class E { A }
+class WithComp { companion object { val base = 10 } }
+fun String.Companion.hello() = "hello"
+fun Int.Companion.answer() = 42
+val String.Companion.EMPTY_ISH: String get() = "e"
+fun WithComp.Companion.plusBase(n: Int) = base + n
+fun main() {
+    println(Foo().javaClass.name)
+    println(Foo().javaClass.simpleName)
+    println(D(1).javaClass)
+    println(Obj.javaClass.name)
+    println(E.A.javaClass.name)
+    println(1.javaClass)
+    println("s".javaClass.name)
+    println(listOf(1).javaClass.name)
+    println(mutableListOf(1).javaClass.simpleName)
+    println(Foo::class.java.name)
+    println(String.hello())
+    println(Int.answer())
+    println(String.EMPTY_ISH)
+    println(WithComp.plusBase(5))
+}"##
+        ),
+        "Foo\nFoo\nclass D\nObj\nE\nint\njava.lang.String\njava.util.Collections$SingletonList\nArrayList\nFoo\nhello\n42\ne\n15\n"
+    );
+}

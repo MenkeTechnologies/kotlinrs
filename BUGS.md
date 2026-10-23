@@ -441,7 +441,6 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
 | --- | --- | --- |
 | `fun <T> id(x: T) = x`; `println(id(listOf(1)) + 5)` | `5.0` | `[1, 5]` |
 | `open class M(val c: Int)`; `class N(c: Int) : M(c)`; `operator fun M.plus(o: M)` and `operator fun N.plus(o: M)`; `listOf<M>(N(1), M(2)).reduce { a, b -> a + b }` | `unresolved reference: plus on N` | `M.plus`, chosen by the static type `M` |
-| `class C { fun f(a: String) = "s"; fun f(a: Int) = "i" }`; `C().f(1)` | `class C: method f is declared more than once — member overloads are not supported` | `i` |
 | `val a = arrayOf(1, 2); val l = a.asList(); a[0] = 7; println(l)` | `[1, 2]` | `[7, 2]` — a write to the ARRAY shows through the view; writes through the view reach the array since round 21 |
 
 The first is an untyped left operand against a PRIMITIVE right one: the native
@@ -461,11 +460,12 @@ from a size change or a modification-count change since round 21; a
 structural write through a `subList` view does not bump the BACKING list's
 count.
 
-Member overloads were silently resolved to the FIRST declaration of the name;
-they are refused now, which is the measurement above. Resolving them needs a
-method table keyed by signature and a mangled sub per overload that every
-override in the hierarchy agrees on, plus a runtime dispatch by signature for
-a receiver of no static class.
+Member overloads resolve since the parity fan-out's fourth round (CHANGELOG,
+"Member overloads"). Two limits remain: an overload set of a member the host
+calls by name (`toString`, `equals`, `hashCode`, `compareTo`, `iterator`,
+`hasNext`, `next`, `getValue`, `setValue`, `close`, `invoke`) is still refused,
+and a callable reference to an overloaded member (`C::f`) is unresolved where
+the reference resolves it from the expected function type.
 
 ## Round 22: measured and not closed
 

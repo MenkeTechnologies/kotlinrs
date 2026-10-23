@@ -2109,6 +2109,10 @@ pub struct Compiler {
     /// [`mangle_overloads`]). Each lives in `fun_sig` under its mangled name;
     /// a call selects one with [`Compiler::select_overload`].
     overloads: HashMap<String, Vec<String>>,
+    /// The method names some class declares more than once — each declaration
+    /// renamed by its parameter types (see [`mangle_member_overloads`]), and a
+    /// call picking one by its arguments ([`Compiler::select_member_overload`]).
+    member_overloads: HashSet<String>,
     /// The function names that can reach themselves through calls by name —
     /// the ones whose entry carries the `KT_DEPTH_GUARD` test (see
     /// [`recursive_names`]).
@@ -2250,6 +2254,9 @@ pub struct Compiler {
     /// an extension's runtime receiver check (see [`Compiler::compile_member`]),
     /// which must not pick the same extension again. Identified by address.
     skip_ext_recv: Option<*const Expr>,
+    /// Set while compiling the stdlib half of a runtime overload test (see
+    /// [`Compiler::compile_member`]), whose member name is the unmangled one.
+    skip_overload: bool,
     /// The `kotlin.math` names the program's imports brought into scope, as
     /// *visible spelling* → *runtime name*. Kotlin does NOT auto-import
     /// `kotlin.math`, so `abs`/`sqrt`/`PI` are compile errors without an import,
@@ -3135,6 +3142,51 @@ fn mangle_overloads(program: &mut Program) -> HashMap<String, Vec<String>> {
     sets
 }
 
+/// The member names the host calls BY NAME on a user object (`toString`,
+/// `compareTo`, an iterator's `next`, …): renaming one would hide it from that
+/// call, so an overload set of one of these stays refused.
+fn host_called_member(name: &str) -> bool {
+    matches!(
+        name,
+        "toString"
+            | "equals"
+            | "hashCode"
+            | "compareTo"
+            | "iterator"
+            | "hasNext"
+            | "next"
+            | "getValue"
+            | "setValue"
+            | "close"
+            | "invoke"
+    )
+}
+
+/// Rename every method of a member OVERLOAD SET — a name some class declares
+/// more than once — to `name$ov(T1,T2)` by its parameter types, in EVERY class
+/// that declares the name. The key is the signature, not a declaration index,
+/// so an `override` in a subclass lands on the same name as what it overrides.
+/// Answers the overloaded names.
+fn mangle_member_overloads(program: &mut Program) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for cd in &program.classes {
+        let mut seen = HashSet::new();
+        for m in &cd.methods {
+            if !seen.insert(m.name.as_str()) && !host_called_member(&m.name) {
+                names.insert(m.name.clone());
+            }
+        }
+    }
+    let key = |p: &Param| p.class.clone().unwrap_or_else(|| format!("{:?}", p.ty));
+    for cd in program.classes.iter_mut() {
+        for m in cd.methods.iter_mut().filter(|m| names.contains(&m.name)) {
+            let sig: Vec<String> = m.params.iter().map(key).collect();
+            m.name = format!("{}$ov({})", m.name, sig.join(","));
+        }
+    }
+    names
+}
+
 /// The name a mangled overload was written with — what a diagnostic names.
 fn unmangled(name: &str) -> &str {
     name.split_once("$ov").map_or(name, |(base, _)| base)
@@ -3171,6 +3223,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
     lower_java_streams(&mut annotated);
     capture_object_locals(&mut annotated);
     let overloads = mangle_overloads(&mut annotated);
+    let member_overloads = mangle_member_overloads(&mut annotated);
     let program = &annotated;
     // Extensions live in their own table keyed by `(receiver type, name)`: they
     // are NOT callable as free functions, and two receivers may each declare one
@@ -3238,6 +3291,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         b: ChunkBuilder::new(),
         fun_sig,
         overloads,
+        member_overloads,
         recursive: recursive_names(program),
         extensions,
         classes,
@@ -3280,6 +3334,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         lambda_recv_it: false,
         zero_arity_body: None,
         skip_ext_recv: None,
+        skip_overload: false,
         math_scope: HashMap::new(),
         math_star: false,
         random_imported: false,
@@ -6898,6 +6953,46 @@ impl Compiler {
         safe: bool,
         line: u32,
     ) -> Result<Type, String> {
+        // A member overload set: the declaration the arguments select.
+        if self.member_overloads.contains(name) && !std::mem::take(&mut self.skip_overload) {
+            let known = self
+                .infer_class(sc, recv)
+                .is_some_and(|c| self.classes.contains_key(&c));
+            match self.select_member_overload(sc, recv, name, args) {
+                Some(m) if known => return self.compile_member(sc, recv, &m, args, safe, line),
+                // A receiver of no static class may be a user object or a
+                // stdlib one with a member of the same name (`xs.add(1)`), so
+                // the value decides: the selected declaration on an instance
+                // of a class declaring it, the plain member otherwise.
+                Some(m) => return self.compile_overload_test(sc, recv, name, &m, args, safe, line),
+                None if known => {
+                    return Err(format!(
+                        "overload resolution ambiguity: no single `{name}` fits these arguments (line {line})"
+                    ))
+                }
+                None => {}
+            }
+        }
+        // `String.hello()` / `Foo.bar` for an extension declared on the type's
+        // companion (`fun String.Companion.hello()`): a call on the TYPE name.
+        if let Some((sub, sig)) = self.companion_ext(sc, recv, name) {
+            let full = self.expand_args(name, sig.owner.as_deref(), &sig.params, args)?;
+            let Expr::Var(t) = recv else {
+                unreachable!("companion_ext matched a type name")
+            };
+            // A user class's companion is an object to bind as `this`; a stdlib
+            // type's carries nothing this frontend models.
+            let companion = format!("{t}$Companion");
+            if self.classes.contains_key(&companion) {
+                self.compile_expr(sc, &Expr::Var(companion))?;
+            } else {
+                self.b.emit(Op::LoadUndef, line);
+            }
+            self.compile_call_args(sc, &sig.params, &full)?;
+            let idx = self.b.add_name(&sub);
+            self.b.emit(Op::Call(idx, (full.len() + 1) as u8), line);
+            return Ok(sig.ret);
+        }
         // The deprecated `sumBy { }` / `sumByDouble { }` — still accepted with a
         // warning — are `sumOf` at a fixed width: `sumBy`'s selector and total
         // are `Int`, so the total wraps at 32 bits whatever inference saw.
@@ -10124,6 +10219,17 @@ impl Compiler {
         args: &[Expr],
         line: u32,
     ) -> Result<Type, String> {
+        // `add(1, 2)` inside a class whose `add` is overloaded: the member the
+        // arguments select, on the implicit `this`.
+        if self.member_overloads.contains(name)
+            && self.cur_class.is_some()
+            && !self.declares_fun(name)
+        {
+            let this = Expr::Var("this".to_string());
+            if let Some(m) = self.select_member_overload(sc, &this, name, args) {
+                return self.compile_member(sc, &this, &m, args, false, line);
+            }
+        }
         // A lambda passed as a `() -> R` declares no implicit `it`.
         if zero_arity_free_fun(name) {
             self.mark_zero_arity_lambda(args);
@@ -11750,6 +11856,21 @@ impl Compiler {
     /// to a sole program-wide extension of that name — the shape a generic or
     /// container receiver takes — and an ambiguous one is a compile error rather
     /// than an arbitrary pick.
+    /// The extension `name` declared on the companion of the type `recv` names
+    /// (`fun String.Companion.hello()` for `String.hello()`), when `recv` is a
+    /// type name rather than a value in scope.
+    fn companion_ext(&self, sc: &Scope, recv: &Expr, name: &str) -> Option<(String, FnSig)> {
+        let Expr::Var(t) = recv else { return None };
+        if sc.slot(t).is_some() || self.globals.contains_key(t) {
+            return None;
+        }
+        let companion = format!("{t}$Companion");
+        let sig = self
+            .extensions
+            .get(&(companion.clone(), name.to_string()))?;
+        Some((ext_sub_name(&companion, name), sig.clone()))
+    }
+
     fn resolve_ext(&self, sc: &Scope, recv: &Expr, name: &str) -> Option<(String, FnSig)> {
         if self.extensions.is_empty() {
             return None;
@@ -12292,6 +12413,133 @@ impl Compiler {
     /// most specific candidate, as Kotlin's resolution picks `f(Int)` over
     /// `f(Long)` and `f(Any)` for `f(1)`. A tie goes to the earlier
     /// declaration. A candidate one argument cannot reach is out.
+    /// The member of `recv`'s class that a call of the overloaded `name` with
+    /// `args` resolves to — its mangled name — by the scoring top-level
+    /// overloads use. A receiver of no static class picks among every class's
+    /// declarations: the mangled name is the SIGNATURE, so whichever class the
+    /// value turns out to be dispatches it. `None` when no candidate accepts
+    /// the arguments, or two fit equally well with different signatures.
+    fn select_member_overload(
+        &self,
+        sc: &Scope,
+        recv: &Expr,
+        name: &str,
+        args: &[Expr],
+    ) -> Option<String> {
+        let own = self
+            .infer_class(sc, recv)
+            .and_then(|c| self.classes.get(&c));
+        let candidates: Vec<(&String, &FnSig)> = match own {
+            Some(meta) => meta.methods.iter().collect(),
+            None => self
+                .classes
+                .values()
+                .flat_map(|m| m.methods.iter())
+                .collect(),
+        };
+        let mut best: Option<(u32, &String)> = None;
+        let mut tied = false;
+        for (mangled, sig) in candidates {
+            if unmangled(mangled) != name || !mangled.contains("$ov") || !call_fits(sig, args) {
+                continue;
+            }
+            let mut score = 0u32;
+            let mut ok = true;
+            for (i, a) in args.iter().enumerate() {
+                let (p, value) = match a {
+                    Expr::Named { name: n, value } => {
+                        (sig.params.iter().find(|p| &p.name == n), &**value)
+                    }
+                    _ => (sig.params.get(i).or_else(|| sig.params.last()), a),
+                };
+                match p.and_then(|p| self.arg_fit(sc, value, p)) {
+                    Some(s) => score += s,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            // Ties go to the first name in a fixed order, so the pick never
+            // depends on the method table's iteration order.
+            if !ok {
+                continue;
+            }
+            match best {
+                Some((b, m)) if score == b && mangled != m => tied = true,
+                Some((b, _)) if score <= b => {}
+                _ => {
+                    best = Some((score, mangled));
+                    tied = false;
+                }
+            }
+        }
+        best.filter(|_| !tied).map(|(_, m)| m.clone())
+    }
+
+    /// `recv.name(args)` where `recv` has no static class but `mangled` is the
+    /// user overload the arguments select: `mangled` on an instance of a class
+    /// declaring it, the unmangled member on anything else.
+    #[allow(clippy::too_many_arguments)]
+    fn compile_overload_test(
+        &mut self,
+        sc: &mut Scope,
+        recv: &Expr,
+        name: &str,
+        mangled: &str,
+        args: &[Expr],
+        safe: bool,
+        line: u32,
+    ) -> Result<Type, String> {
+        let tmp = format!("$ovr{}", self.b.current_pos());
+        let mut owners: Vec<&String> = self
+            .classes
+            .iter()
+            .filter(|(_, m)| m.own_methods.contains(mangled))
+            .map(|(c, _)| c)
+            .collect();
+        owners.sort();
+        let is = |c: &String| Expr::Is {
+            value: Box::new(Expr::Var(tmp.clone())),
+            ty: c.clone(),
+            negated: false,
+            nullable: false,
+        };
+        let Some(cond) = owners.iter().map(|c| is(c)).reduce(|a, b| Expr::Binary {
+            op: BinOp::Or,
+            l: Box::new(a),
+            r: Box::new(b),
+        }) else {
+            return Err(format!("no class declares `{name}` (line {line})"));
+        };
+        let call = |n: &str| Expr::MethodCall {
+            recv: Box::new(Expr::Var(tmp.clone())),
+            name: n.to_string(),
+            args: args.to_vec(),
+            safe,
+            line,
+        };
+        let mark = sc.enter();
+        let rt = self.compile_expr(sc, recv)?;
+        let class = self.infer_class(sc, recv);
+        let slot = sc.declare_obj(&tmp, rt, false, class);
+        self.b.emit(Op::SetSlot(slot), line);
+        self.compile_expr(sc, &cond)?;
+        let to_else = self.b.emit(Op::JumpIfFalse(0), line);
+        self.compile_expr(sc, &call(mangled))?;
+        let to_end = self.b.emit(Op::Jump(0), line);
+        let at_else = self.b.current_pos();
+        self.b.patch_jump(to_else, at_else);
+        self.skip_overload = true;
+        let r = self.compile_expr(sc, &call(name));
+        self.skip_overload = false;
+        r?;
+        let end = self.b.current_pos();
+        self.b.patch_jump(to_end, end);
+        sc.exit(mark);
+        Ok(Type::Unknown)
+    }
+
     fn select_overload(&self, sc: &Scope, name: &str, args: &[Expr]) -> Option<(String, FnSig)> {
         let set = self.overloads.get(name)?;
         let mut best: Option<(u32, &String, &FnSig)> = None;

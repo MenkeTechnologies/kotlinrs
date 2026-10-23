@@ -11,6 +11,25 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Member overloads; extensions on a companion
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | before | reference |
+| --- | --- | --- |
+| `class C { fun f(a: String) = 1; fun f(a: Int) = 2 }`; `C().f(1)` | `member overloads are not supported` | `2` |
+| `put(Int)`/`put(String)`/`put(Long)`/`put(Shape)`/`put(Sq)` on one class; a subclass overriding `put(Int)`; an interface default `greet(Int)` beside an abstract `greet(String)` | refused | each call its own declaration |
+| `listOf(Printer()).map { it.put(1) }`, `id(Printer()).put(2)` | refused | `int 1`, `int 2` |
+| `fun String.Companion.hello() = "hello"`; `String.hello()`; `val String.Companion.E: String get() = "e"`; `fun C.Companion.plusBase(n: Int) = base + n` | `expected LParen, found Dot` | `hello`, `e`, the companion's `base` |
+
+Each declaration of a method name some class repeats is renamed by its
+parameter types (`put$ov(Int)`), in every class, so overrides agree; a call
+selects by the arguments' static types as top-level overloads do. A receiver of
+no static class tests the value: the selected overload on an instance of a
+class declaring it, the stdlib member of the same name otherwise. The existing
+test that pinned the refusal is updated to the reference's `2` in its own
+commit.
+
 ## Unsigned integer types
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1. Every program was a parse error

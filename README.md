@@ -379,7 +379,10 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `NoClassDefFoundError: Could not initialize class …`, as on the JVM.
   A **`companion object`** (one per class, named or not) is hoisted to a
   singleton reached through the class name — `C.K`, `C.of(…)` — and, from inside
-  the class, with no qualifier at all.
+  the class, with no qualifier at all. An extension on a companion —
+  `fun C.Companion.f()`, `val String.Companion.x`, `fun Int.Companion.g()` — is
+  called on the type name (`C.f()`, `String.x`), with a user class's companion as
+  `this`.
   A property may be **computed** instead of stored — `val label: String get() =
   "$name($code)"`, with an `= expr` or a block getter. The type may be left to the
   getter (`val size get() = items.size`). It has no backing field,
@@ -902,8 +905,14 @@ under its own mangled sub, and a call picks the one whose parameters its
 arguments' static types fit best — an exact type over a subtype or an integer
 literal taking a `Long`, over `Any`; a tie goes to the earlier declaration.
 The static type is the annotation (`val a: Animal = Dog()` passes an `Animal`)
-until an `is` check smart-casts it. MEMBER overloading is not supported: a class
-that declares one method name twice is a compile error here.
+until an `is` check smart-casts it. MEMBER overloads resolve the same way: each
+declaration of a repeated method name is renamed by its parameter types — the
+same name in every class of the hierarchy, so an `override` lands on what it
+overrides — and a call picks by its arguments, on a receiver of known class or
+on implicit `this`. On a receiver of no static class the value decides between
+the selected user overload and a stdlib member of the same name. An overload
+set of a member the host calls by name (`toString`, `compareTo`, `next`, …) is
+still refused.
 
 One equality corner is **excluded** rather than modelled, and the exclusion is
 deliberate: a 1-element `setOf`/`mapOf` is `java.util.Collections.singleton` /
