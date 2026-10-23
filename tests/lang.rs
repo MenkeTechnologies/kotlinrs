@@ -8394,3 +8394,30 @@ fun extra5() {
         "splitChars: [a, b, c, d]\nsplitCharsLimit: [a, b,c,d]\nsplitCharCI: [a, b, c]\nsplitMultiStrLimit: [a, b, c--d]\ntrimEndChars: abc\ntrimStartChars: ab\nstartsWithChar: (true, true)\nremoveSurroundingSame: q\nsubstringAfterLast: (c, none)\nsubstringBeforeChar: (a, b.c)\nreplaceAfter: (a.X, Y.b.c)\nreplaceAfterLast: (a.b.Z, W.c)\npadEndChar: ab***\nchunkedSeqStr: [abc, def, g]\ntakeLastStr: (llo, hel)\ntakeWhileStr: (aa, b)\ntakeLastWhileStr: bb\nfilterIndexedStr: ac\nmapIndexedStr: [0a, 1b]\nanyStr: (true, true)\nfirstOrNullStr: (b, null)\nsingleStr: a\nsingleStrBad: EX java.lang.IllegalArgumentException: Char sequence has more than one element.\nreduceStr: c\ncharRangeStep: adgj\nstringCompareNull: true\ntoUpperChar: (SS, ß)\nlowercaseTurkish: 2\nisLetterDigit: [true, 3, false]\nifBlank: (dflt, x)\norEmptyStr: 0\nstrLinesSeq: [a, b, c]\nindent: > a\n> b\nreplaceIndent: |a\n|  b\ntrimMarginCustom: a\nb\nformat0:  c  a  b\nreplaceAfterChar: a.Q\nreplaceAfterMissing: (abc, miss)\nreplaceBeforeLastMulti: W::z\nwindowedSeqStr: [ab, cd, e]\nchunkedSeqTransform: [ba, dc, fe]\n"
     );
 }
+
+#[test]
+fn when_in_a_literal_range_tests_membership_not_magnitude_for_an_untyped_subject() {
+    // Measured on kotlinc 2.4.21 / JDK 25. A subject of no primitive static
+    // type is tested with `IntRange.contains`, so only an `Int` can be a
+    // member: `2.0`, a boxed `Long`, `"2"` and `null` all fall to `!in 1..100`.
+    // A `Double` subject still compares by magnitude against a `Double` range,
+    // and a statically `Int` one keeps the native comparison.
+    assert_eq!(
+        stdout(
+            r#"
+fun d(x: Any?) = when (x) {
+    in 1..3 -> "small"
+    !in 1..100 -> "out"
+    else -> "big"
+}
+fun main() {
+    println(listOf<Any?>(2, 2.0, 5L, "2", null, 50).map { d(it) })
+    val y = 2.5
+    println(when (y) { in 1.0..3.0 -> "in"; else -> "out" })
+    val n = 3
+    println(when (n) { in 1..3 -> "edge"; else -> "past" })
+}"#
+        ),
+        "[small, out, out, out, out, big]\nin\nedge\n"
+    );
+}

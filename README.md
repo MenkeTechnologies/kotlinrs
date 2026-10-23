@@ -547,7 +547,11 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   (`IntRange` shows `1..5`, `IntProgression` shows `1..9 step 2` — its last
   *reachable* element), aggregated (`(1..3).sum()`), mapped/filtered, and
   iterated. `x in r` / `x !in r` is step-aligned membership; `in` also works over
-  a `List`, a `Map`'s keys, and a `String`'s substrings.
+  a `List`, a `Map`'s keys, and a `String`'s substrings. An `IntRange` admits only
+  an `Int` through an untyped subject (`when (x: Any?) { in 1..3 -> }` does not
+  match `2.0`). `1.0..3.0` and `1.0f..3.0f` are `ClosedDoubleRange` /
+  `ClosedFloatRange`, with `start`, `endInclusive`, `isEmpty()` and an IEEE
+  `contains`.
   `List(n) { … }` and `MutableList(n) { … }` build the same way an array
   initializer does, into an `ArrayList`; a negative size is
   `IllegalArgumentException: Illegal Capacity: -1`.

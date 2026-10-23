@@ -1947,6 +1947,16 @@ enum HeapObj {
     },
     /// An `IntRange` / `IntProgression`. See [`RangeObj`].
     Range(RangeObj),
+    /// A `ClosedFloatingPointRange` — `1.0..3.0` (`ClosedDoubleRange`) or
+    /// `1.0f..3.0f` (`ClosedFloatRange`). Kept apart from [`RangeObj`] because
+    /// it is not a progression at all: no step, no elements, no iteration —
+    /// `for (x in 1.0..3.0)` does not compile — only `start`, `endInclusive`,
+    /// an IEEE `<=` membership test, and `isEmpty()` when `start > end`.
+    ///
+    /// The endpoints stay as the typed values they were built from (a
+    /// `Value::Float` or a boxed `Float`), so `start` reads back at the width
+    /// it was written and the class is told from the first endpoint.
+    FloatRange { start: Value, end: Value },
     /// A throwable: its fully-qualified JVM class name (`java.lang.RuntimeException`)
     /// and the constructor message (`None` for the no-arg form, whose `message`
     /// is Kotlin `null`). Kept apart from [`HeapObj::Instance`] because a
@@ -4620,6 +4630,21 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
                 2 => RangeForm::DownTo,
                 _ => RangeForm::Inclusive,
             };
+            // `1.0..3.0` is a `ClosedFloatingPointRange`, not a progression:
+            // the endpoints are kept whole rather than truncated into an
+            // `IntRange` (which made `3.5 in 1.0..3.0` true). `until` and
+            // `downTo` have no floating-point overload, so those are refused
+            // the way `kotlinc` refuses them.
+            if is_float(&start) || is_float(&end) {
+                if form != RangeForm::Inclusive {
+                    let op = if form == RangeForm::Until { "until" } else { "downTo" };
+                    fault(vm, format!("unresolved reference: {op} on Double"));
+                    vm.push(Value::Undef);
+                    return;
+                }
+                vm.push(alloc(HeapObj::FloatRange { start, end }));
+                return;
+            }
             // `'a'..'z'` is a `CharRange`, whose elements and printed form are
             // characters; the endpoints ride as code units either way.
             let is_char = is_char(&start) || is_char(&end);
@@ -5068,8 +5093,24 @@ fn contains_value(vm: &mut VM, container: &Value, value: &Value) -> bool {
     }
     let search = with_obj(container, |o| match o {
         // `'x' in 'a'..'z'` compares code units, like every other range test.
+        //
+        // An `IntRange` takes an `Int`, a `Long` (`ClosedRange<Int>.contains(
+        // Long)`) or a `Char` for a `CharRange`. Anything else can only have
+        // arrived through an erased position — `when (x: Any?) { in 1..3 -> }`
+        // — where the resolution is `Iterable<Any?>.contains`, i.e. `equals`
+        // against each element, and a `Double`, a boxed `Long`, a `String` or
+        // `null` equals no `Int`. Coercing those to a number made `2.0` and
+        // `"2"` members of `1..3`.
         HeapObj::Range(r) => {
-            Search::Range(r.is_char == is_char(value) && r.contains(num_of(value)))
+            let kind_fits = if r.is_char {
+                is_char(value)
+            } else {
+                matches!(value, Value::Int(_))
+            };
+            Search::Range(kind_fits && r.contains(num_of(value)))
+        }
+        HeapObj::FloatRange { start, end } => {
+            Search::Range(float_range_contains(num_f64(start), num_f64(end), value))
         }
         HeapObj::List(items) | HeapObj::Array { items, .. } => Search::Elems(items.clone(), false),
         HeapObj::Set(items) => Search::Elems(items.clone(), true),
@@ -11014,6 +11055,26 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
     match (recv, name) {
         // ── kotlin.String ──
         (Value::Str(s), "length") => Ok(Value::Int(s.encode_utf16().count() as i64)),
+        // `String.codePointCount(beginIndex, endIndex)` — the JDK member, over
+        // UTF-16 indices: a surrogate PAIR inside the window counts once, a
+        // lone surrogate (or a pair cut by the window) counts per unit. The
+        // bounds check is `Preconditions.checkFromToIndex`, whose fault is a
+        // plain `IndexOutOfBoundsException`, not the `String…` one.
+        (Value::Str(s), "codePointCount") if args.len() == 2 => {
+            let units: Vec<u16> = s.encode_utf16().collect();
+            let (from, to) = (args[0].to_int(), args[1].to_int());
+            let window = match (usize::try_from(from), usize::try_from(to)) {
+                (Ok(b), Ok(e)) if b <= e && e <= units.len() => &units[b..e],
+                _ => {
+                    return Err(format!(
+                        "java.lang.IndexOutOfBoundsException: \
+                         Range [{from}, {to}) out of bounds for length {}",
+                        units.len()
+                    ))
+                }
+            };
+            Ok(Value::Int(char::decode_utf16(window.iter().copied()).count() as i64))
+        }
         (Value::Str(s), "uppercase" | "toUpperCase") => Ok(Value::str(s.to_uppercase())),
         (Value::Str(s), "lowercase" | "toLowerCase") => Ok(Value::str(s.to_lowercase())),
         // `trim()` is whitespace; `trim(vararg chars: Char)` is a character set.
@@ -12555,6 +12616,21 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             at: 0,
             last: -1,
         }));
+    }
+    // A `ClosedFloatingPointRange` is not a collection either: it has the four
+    // members below and nothing of `Iterable`'s.
+    if let Some((start, end)) = float_range_of(recv) {
+        // The `Any` members, which the range class overrides structurally.
+        match (name, args) {
+            // `hashCode()` arrives with the receiver's static width appended.
+            ("hashCode", _) => return Ok(Value::Int(value_hash(recv, false) as i64)),
+            ("toString", []) => return Ok(Value::str(kotlin_string(recv))),
+            ("equals", [other]) => return Ok(Value::Bool(value_eq(recv, other))),
+            _ => {}
+        }
+        return float_range_method(&start, &end, name, args).ok_or_else(|| {
+            format!("unresolved reference: {name} on {}", obj_label(recv))
+        });
     }
     // A `StringBuilder` resolves first and entirely on its own: it is a
     // `CharSequence`, not a collection, so none of the collection members below
@@ -15070,6 +15146,7 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
         | HeapObj::Iter { .. }
         | HeapObj::Klass { .. }
         | HeapObj::Range(_)
+        | HeapObj::FloatRange { .. }
         | HeapObj::Builder { .. }
         | HeapObj::Exc { .. } => None,
     })
@@ -15645,6 +15722,16 @@ fn heap_eq(a: &HeapObj, b: &HeapObj) -> bool {
             (ea && eb)
                 || (!ea && !eb && a.first == b.first && a.last() == b.last() && a.step == b.step)
         }
+        // `ClosedDoubleRange.equals`: two empty ranges are equal, otherwise the
+        // endpoints compare with the IEEE `==` — so `0.0..1.0 == -0.0..1.0`.
+        (
+            HeapObj::FloatRange { start: sa, end: ea },
+            HeapObj::FloatRange { start: sb, end: eb },
+        ) => {
+            let (sa, ea, sb, eb) = (num_f64(sa), num_f64(ea), num_f64(sb), num_f64(eb));
+            let (empty_a, empty_b) = (!(sa <= ea), !(sb <= eb));
+            (empty_a && empty_b) || (!empty_a && !empty_b && sa == sb && ea == eb)
+        }
         // A JVM array inherits `Object.equals`, i.e. reference identity —
         // `arrayOf(1) == arrayOf(1)` is `false`. Two handles reaching here are
         // distinct objects by construction, so this is always false.
@@ -15849,6 +15936,16 @@ fn obj_hash(recv: &Value) -> Option<i32> {
                 base
             }
         }),
+        // `ClosedDoubleRange.hashCode()`: -1 when empty, else `31 * start
+        // .hashCode() + endInclusive.hashCode()` — each endpoint hashing at its
+        // own width, which is why `1.0f..3.0f` and `1.0..3.0` differ.
+        HeapObj::FloatRange { start, end } => Some(if !(num_f64(start) <= num_f64(end)) {
+            -1
+        } else {
+            value_hash(start, false)
+                .wrapping_mul(31)
+                .wrapping_add(value_hash(end, false))
+        }),
         // Identity-hashed: `Object.hashCode`.
         HeapObj::Array { .. }
         | HeapObj::Builder { .. }
@@ -15907,6 +16004,7 @@ fn obj_label(recv: &Value) -> String {
             (false, false) => "IntRange",
         }
         .to_string(),
+        HeapObj::FloatRange { start, .. } => float_range_class(start).to_string(),
         HeapObj::Array { .. } => "Array".to_string(),
         HeapObj::Builder { .. } => "StringBuilder".to_string(),
         HeapObj::Exc { class, .. } => class.rsplit('.').next().unwrap_or(class).to_string(),
@@ -16137,6 +16235,11 @@ fn display_obj(id: u32) -> String {
                 } else {
                     format!("{first} downTo {last} step {}", -r.step)
                 }
+            }
+            // `ClosedDoubleRange.toString()` is `"$start..$endInclusive"`, each
+            // endpoint rendered at its own width (`1.0..Infinity`).
+            HeapObj::FloatRange { start, end } => {
+                format!("{}..{}", kotlin_string(start), kotlin_string(end))
             }
             // An array inherits `Object.toString`: its JVM type descriptor and
             // identity hash. The hash is the JVM's per-run object address, which
@@ -16401,6 +16504,9 @@ fn runtime_jvm_class(v: &Value) -> Option<(String, bool)> {
             .to_string(),
             false,
         )),
+        HeapObj::FloatRange { start, .. } => {
+            Some((format!("kotlin.ranges.{}", float_range_class(start)), false))
+        }
         _ => None,
     })
     .flatten()
@@ -16638,6 +16744,17 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
             matches!(o, HeapObj::List(_) | HeapObj::Set(_) | HeapObj::Range(_))
         })
         .unwrap_or(false),
+        // `IntRange`/`CharRange` and the floating-point ranges implement
+        // `ClosedRange`; a progression does not.
+        "ClosedRange" => with_obj(v, |o| match o {
+            HeapObj::Range(r) => !r.progression,
+            HeapObj::FloatRange { .. } => true,
+            _ => false,
+        })
+        .unwrap_or(false),
+        "ClosedFloatingPointRange" => {
+            with_obj(v, |o| matches!(o, HeapObj::FloatRange { .. })).unwrap_or(false)
+        }
         "Collection" => {
             with_obj(v, |o| matches!(o, HeapObj::List(_) | HeapObj::Set(_))).unwrap_or(false)
         }
@@ -17536,6 +17653,55 @@ fn deep_to_string(a: &Value, seen: &mut Vec<u32>, out: &mut String) {
 /// boxed `Long`/`Float`.
 fn is_number(v: &Value) -> bool {
     matches!(v, Value::Int(_) | Value::Float(_)) || i64_box(v).is_some() || f32_box(v).is_some()
+}
+
+/// Whether `v` is a floating-point number: a `Double` or a boxed `Float`.
+fn is_float(v: &Value) -> bool {
+    matches!(v, Value::Float(_)) || f32_box(v).is_some()
+}
+
+/// The `ClosedFloatingPointRange` behind `v`, as `(start, end)`, or `None`.
+fn float_range_of(v: &Value) -> Option<(Value, Value)> {
+    with_obj(v, |o| match o {
+        HeapObj::FloatRange { start, end } => Some((start.clone(), end.clone())),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// The stdlib class behind a floating-point range, told from an endpoint's
+/// width: `1.0f..3.0f` is a `ClosedFloatRange`, every other a
+/// `ClosedDoubleRange`.
+fn float_range_class(start: &Value) -> &'static str {
+    if f32_box(start).is_some() {
+        "ClosedFloatRange"
+    } else {
+        "ClosedDoubleRange"
+    }
+}
+
+/// The members a `ClosedFloatingPointRange` has: the two endpoints, the IEEE
+/// membership test (`lessThanOrEquals` is `<=`, so `NaN` is never in a range
+/// and `-0.0 in 0.0..1.0` holds), and `isEmpty()`, which is `!(start <= end)`.
+fn float_range_method(start: &Value, end: &Value, name: &str, args: &[Value]) -> Option<Value> {
+    let (lo, hi) = (num_f64(start), num_f64(end));
+    match (name, args) {
+        ("start", []) => Some(start.clone()),
+        ("endInclusive", []) => Some(end.clone()),
+        ("isEmpty", []) => Some(Value::Bool(!(lo <= hi))),
+        ("contains", [v]) => Some(Value::Bool(float_range_contains(lo, hi, v))),
+        _ => None,
+    }
+}
+
+/// `v in lo..hi` for a floating-point range. Only a `Double`/`Float` can reach
+/// it on the reference — `2 in 1.0..3.0` is a compile error there — so a
+/// non-number answers `false` rather than being coerced.
+fn float_range_contains(lo: f64, hi: f64, v: &Value) -> bool {
+    is_number(v) && {
+        let x = num_f64(v);
+        lo <= x && x <= hi
+    }
 }
 
 /// The first and last element of an integral range VALUE (`1..3`, `'a'..'f'`),

@@ -5980,8 +5980,15 @@ impl Compiler {
                         0,
                     );
                 }
-                self.compile_expr(sc, start)?;
-                self.compile_expr(sc, end)?;
+                // A `Float` endpoint is boxed so the range keeps its width:
+                // `1.0f..3.0f` is a `ClosedFloatRange` and renders and hashes
+                // its endpoints as `Float`s. An integral endpoint stays bare —
+                // an `IntRange` reads it as a plain number.
+                for bound in [start, end] {
+                    if self.compile_expr(sc, bound)? == Type::Float {
+                        self.b.emit(Op::Extended(KT_BOX_F32, 0), 0);
+                    }
+                }
                 self.b.emit(Op::Extended(KT_RANGE, range_form(*kind)), 0);
                 Ok(Type::Obj)
             }
@@ -12608,6 +12615,35 @@ impl Compiler {
                     self.compile_expr(sc, e)?;
                 }
             },
+            // A subject of no primitive static type (`when (x: Any?)`) is not
+            // compared numerically: `in 1..3` there is `contains` on the range
+            // VALUE, which a `Double`, a `String` or `null` is never a member
+            // of. The native comparisons below would read `2.0` as inside
+            // `1..3`. The range is built and handed to the `in` lowering.
+            WhenCond::InRange {
+                negated,
+                start,
+                end,
+                kind,
+            } if !matches!(
+                subj,
+                Some((
+                    _,
+                    Type::Int | Type::Long | Type::Float | Type::Double | Type::Char
+                ))
+            ) =>
+            {
+                let container = Expr::Range {
+                    start: Box::new(start.clone()),
+                    end: Box::new(end.clone()),
+                    kind: *kind,
+                };
+                let cond = WhenCond::In {
+                    negated: *negated,
+                    container,
+                };
+                return self.compile_when_cond(sc, subj, &cond);
+            }
             WhenCond::InRange {
                 negated,
                 start,

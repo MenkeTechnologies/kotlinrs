@@ -11,6 +11,40 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## `in` on an untyped subject, floating-point ranges, `codePointCount`
+
+Measured on `kotlinc` 2.4.21 / JDK 25.0.5, compiled and run on the same JVM.
+
+| program | before | reference |
+| --- | --- | --- |
+| `fun d(x: Any?) = when (x) { in 1..3 -> "small"; in 4..10 -> "mid"; !in 1..100 -> "out"; else -> "big" }`; `d(2.0)`, `d(5L)`, `d("2")`, `d(null)`, `d(2.5f)` | `small`, `mid`, `small`, `out`, `small` | `out` for every one |
+| `3.5 in 1.0..3.0` | `true` | `false` |
+| `println(1.0..3.0)`, `(1.0..3.0).start`, `.endInclusive`, `(3.0..1.0).isEmpty()` | `1..3`, `unresolved reference: start on IntRange` | `1.0..3.0`, `1.0`, `3.0`, `true` |
+| `Double.NaN in 1.0..3.0`, `-0.0 in 0.0..1.0`, `(0.0..1.0) == (-0.0..1.0)` | not measured | `false`, `true`, `true` |
+| `(1.0..3.0).hashCode()`, `(1.0f..3.0f).hashCode()`, `(3.0..1.0).hashCode()` | not measured | `-31981568`, `-255852544`, `-1` |
+| `(1.0..3.0)::class.simpleName`, `(1.0f..3.0f)::class.simpleName` | not measured | `ClosedDoubleRange`, `ClosedFloatRange` |
+| `"a😀b😀".codePointCount(0, 6)`, `.codePointCount(1, 2)`, `"abc".codePointCount(2, 5)` | `unresolved reference: codePointCount on String` | `4`, `1`, `IndexOutOfBoundsException: Range [2, 5) out of bounds for length 3` |
+
+`when (x) { in a..b -> }` lowered to two native comparisons whatever the
+subject's type, so any number between the bounds matched. It keeps that
+lowering only for a subject statically `Int`, `Long`, `Float`, `Double` or
+`Char`. Any other subject builds the range and tests `contains`, and an
+`IntRange` admits only an `Int` (or a `Char` for a `CharRange`): through an
+erased position the JVM's test is `equals` per element, which no `Double`,
+boxed `Long`, `String` or `null` passes.
+
+`a..b` with a floating-point endpoint used to truncate both into an `IntRange`.
+It now builds a `ClosedFloatingPointRange` that keeps its endpoints at their
+own width. A `Float` endpoint is boxed for this, so the class, the rendering
+and the hash follow it. The range has `start`, `endInclusive`, `contains`
+(IEEE `<=` at both ends) and `isEmpty()`, plus structural `equals`/`hashCode`.
+`until` and `downTo` over a `Double` are refused, as `kotlinc` refuses them.
+
+`codePointCount(begin, end)` counts over UTF-16 indices: a surrogate pair inside
+the window counts once, and a pair the window cuts counts per unit.
+
+Three records were added to the parity corpus, and its floor raised by the same three.
+
 ## Array content hashes; `replaceAfter`/`replaceBefore`; string sequences
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1. Each was `unresolved reference`.
