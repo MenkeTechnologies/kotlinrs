@@ -8323,6 +8323,44 @@ impl Compiler {
         // extension in Kotlin, so `Box(2).map { … }` on a class declaring
         // `fun <R> map(f: (T) -> R)` must reach that method, not the
         // collection HOF that answered `unresolved reference: map on Box`.
+        // `xs += x` / `xs -= x` spelled on a value (`m[k]!! += 2`): a mutable
+        // collection's `plusAssign`/`minusAssign` is `add`/`addAll`/`remove`/
+        // `removeAll`, by whether the operand is itself a collection.
+        if matches!(name, "plusAssign" | "minusAssign") && args.len() == 1 && !member_wins {
+            let many = matches!(
+                self.infer_class(sc, &args[0]).as_deref(),
+                Some(
+                    "List"
+                        | "MutableList"
+                        | "Set"
+                        | "MutableSet"
+                        | "Collection"
+                        | "Iterable"
+                        | "Sequence"
+                )
+            );
+            let member = match (name, many) {
+                ("plusAssign", false) => "add",
+                ("plusAssign", true) => "addAll",
+                (_, false) => "remove",
+                (_, true) => "removeAll",
+            };
+            self.compile_member(sc, recv, member, args, safe, line)?;
+            self.b.emit(Op::Pop, line);
+            self.b.emit(Op::Extended(KT_UNIT, 0), line);
+            return Ok(Type::Unit);
+        }
+        // `+x` on a number is the number itself.
+        if name == "unaryPlus"
+            && args.is_empty()
+            && !member_wins
+            && matches!(
+                self.infer(sc, recv),
+                Type::Int | Type::Long | Type::Double | Type::Float
+            )
+        {
+            return self.compile_expr(sc, recv);
+        }
         // `r.mapCatching(f)` / `r.recoverCatching(f)` are `fold`s whose
         // transforming half runs inside `runCatching`, so an exception the
         // transform throws becomes the failure:
@@ -14248,6 +14286,18 @@ impl Compiler {
     // ── Coarse type inference (no code emitted) ────────────────────
 
     fn infer(&self, sc: &Scope, e: &Expr) -> Type {
+        // `+x` on a number has the number's type.
+        if let Expr::MethodCall {
+            recv, name, args, ..
+        } = e
+        {
+            if name == "unaryPlus" && args.is_empty() {
+                let t = self.infer(sc, recv);
+                if matches!(t, Type::Int | Type::Long | Type::Double | Type::Float) {
+                    return t;
+                }
+            }
+        }
         if matches!(
             e,
             Expr::Call { .. } | Expr::MethodCall { .. } | Expr::Binary { .. } | Expr::Member { .. }

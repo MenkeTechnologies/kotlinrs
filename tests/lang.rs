@@ -10402,3 +10402,78 @@ fun main() {
         "Failure(java.lang.ArithmeticException: / by zero)\nSuccess(5)\nSuccess(9)\njava.lang.IllegalArgumentException: y\nSuccess(4)\n"
     );
 }
+
+/// Prefix `+x` (`unaryPlus`, the identity on a number), `a..<b` (`rangeUntil`)\nand `expr op= v` on an operand no assignment can rebind (`m[k]!! += 2`,\n`mk() += 4`, the `…Assign` convention) parse and run; each was a parse error\n(`unexpected token Plus`, `unexpected token Lt`, `invalid assignment\ntarget`). The rest pins a user `Comparable` through `sorted`/`max`/ranges/\n`when`.
+#[test]
+fn unary_plus_range_until_and_compound_assign_on_values() {
+    assert_eq!(
+        prog(
+            r##"data class Ver(val major: Int, val minor: Int) : Comparable<Ver> {
+    override fun compareTo(other: Ver) = compareValuesBy(this, other, { it.major }, { it.minor })
+    operator fun rangeTo(o: Ver) = VerRange(this, o)
+    operator fun unaryPlus() = Ver(major + 1, 0)
+}
+class VerRange(val lo: Ver, val hi: Ver) { operator fun contains(v: Ver) = v >= lo && v <= hi }
+class Counter { var n = 0; operator fun inc(): Counter { n++; return this } }
+class Holder { var c = 0 }
+fun main() {
+    val vs = listOf(Ver(1, 2), Ver(0, 9), Ver(1, 0))
+    println(vs.sorted()); println(vs.max()); println(vs.min())
+    println(Ver(1, 1) in Ver(1, 0)..Ver(2, 0)); println(Ver(3, 0) !in Ver(1, 0)..Ver(2, 0))
+    println(+Ver(1, 5))
+    for (i in 0..<3) print(i)
+    println()
+    val h = Holder(); h.c++; h.c += 5; println(h.c)
+    val m = mutableMapOf("a" to mutableListOf(1)); m["a"]!! += 2; m.getOrPut("b") { mutableListOf() } += 3; println(m)
+    val arr = intArrayOf(1, 2, 3); arr[1] *= 10; arr[2]++; println(arr.toList())
+    val v = Ver(2, 3)
+    println(when (v) { in Ver(0, 0)..Ver(1, 9) -> "old"; in Ver(2, 0)..Ver(2, 9) -> "two"; else -> "new" })
+    var cnt = Counter(); cnt++; cnt++; println(cnt.n)
+    println(Ver(1, 2) == Ver(1, 2)); println(Ver(1, 2) < Ver(1, 3)); println(maxOf(Ver(0, 1), Ver(0, 2)))
+    println(vs.sortedDescending().first()); println(vs.minOrNull()); println(vs.sortedWith(reverseOrder()))
+}"##
+        ),
+        "[Ver(major=0, minor=9), Ver(major=1, minor=0), Ver(major=1, minor=2)]\nVer(major=1, minor=2)\nVer(major=0, minor=9)\ntrue\ntrue\nVer(major=2, minor=0)\n012\n6\n{a=[1, 2], b=[3]}\n[1, 20, 4]\ntwo\n2\ntrue\ntrue\nVer(major=0, minor=2)\nVer(major=1, minor=2)\nVer(major=0, minor=9)\n[Ver(major=1, minor=2), Ver(major=1, minor=0), Ver(major=0, minor=9)]\n"
+    );
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    val x = 5
+    println(+x * 2)
+    println(+3)
+    println(-(+x))
+    println(+2.5)
+    println(+Int.MAX_VALUE + 1)
+}"##
+        ),
+        "10\n3\n-5\n2.5\n-2147483648\n"
+    );
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    for (i in 0..<3) print(i)
+    println()
+    println((1..<4).toList())
+    val n = 5
+    println(when (n) { in 0..<5 -> "lo"; else -> "hi" })
+    println((0..<0).toList())
+    println(2 in 0..<2)
+}"##
+        ),
+        "012\n[1, 2, 3]\nhi\n[]\nfalse\n"
+    );
+    assert_eq!(
+        prog(
+            r##"class Money(val c: Int) { operator fun plusAssign(o: Int) { println("pa $o") } }
+fun mk() = Money(1)
+fun main() {
+    mk() += 4
+    val m = mutableMapOf("k" to mutableSetOf(1))
+    m["k"]!! -= 1
+    m["k"]!! += setOf(7, 8)
+    println(m)
+}"##
+        ),
+        "pa 4\n{k=[7, 8]}\n"
+    );
+}

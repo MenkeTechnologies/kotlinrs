@@ -11,6 +11,16 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## `+x`, `a..<b`, and `op=` on a value
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | before | reference |
+| --- | --- | --- |
+| `operator fun unaryPlus() = …`; `+Ver(1, 5)`; `+x * 2`, `+Int.MAX_VALUE + 1` | `unexpected token Plus` | the convention; the identity on a number, at its width |
+| `for (i in 0..<3)`, `(1..<4).toList()`, `in 0..<5` in a `when` | `unexpected token Lt` | `0 1 2`, `[1, 2, 3]`, … |
+| `m["a"]!! += 2`, `m.getOrPut("b") { mutableListOf() } += 3`, `mk() += 4` (a user `plusAssign`) | `invalid assignment target` | the `…Assign` convention on the value |
+
 ## `Result.mapCatching` / `recoverCatching`
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.

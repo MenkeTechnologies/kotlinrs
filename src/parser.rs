@@ -875,6 +875,18 @@ fn is_modifier_word(w: &str) -> bool {
 /// is what a `reified` callee reads. Every generic call is wrapped, not just a
 /// call to a reified function: the parser cannot know which the callee is, and
 /// a binding nothing reads costs two ops and is correctly nested either way.
+/// The `…Assign` operator a compound assignment `op=` names.
+fn assign_operator(op: BinOp) -> Option<&'static str> {
+    Some(match op {
+        BinOp::Add => "plusAssign",
+        BinOp::Sub => "minusAssign",
+        BinOp::Mul => "timesAssign",
+        BinOp::Div => "divAssign",
+        BinOp::Mod => "remAssign",
+        _ => return None,
+    })
+}
+
 fn reify_wrap(targ: Option<String>, call: Expr, line: u32) -> Expr {
     match targ {
         Some(ty) => Expr::Call {
@@ -3766,7 +3778,22 @@ impl Parser {
                     line,
                 }))
             }
-            _ => Err(format!("invalid assignment target (line {})", self.line())),
+            // `m["a"]!! += 2`, `xs.getOrPut(k) { … } += 3` — an operand no
+            // assignment can rebind: the compound operator is its `…Assign`
+            // convention on the value (`plusAssign`, …).
+            other => match binop.and_then(assign_operator) {
+                Some(op) => {
+                    let line = self.line();
+                    Ok(StmtKind::Expr(Expr::MethodCall {
+                        recv: Box::new(other),
+                        name: op.to_string(),
+                        args: vec![value],
+                        safe: false,
+                        line,
+                    }))
+                }
+                None => Err(format!("invalid assignment target (line {})", self.line())),
+            },
         }
     }
 
@@ -4036,17 +4063,29 @@ impl Parser {
         Ok(l)
     }
 
+    /// After a `..`: the `<` of `a..<b` (`rangeUntil`, an `until` range) when
+    /// one follows, else the inclusive kind.
+    fn range_until_suffix(&mut self) -> RangeKind {
+        if self.at(&Tok::Lt) {
+            self.advance();
+            RangeKind::Until
+        } else {
+            RangeKind::Inclusive
+        }
+    }
+
     /// The range operator `a..b`, binding tighter than the named infix functions
     /// and looser than `+`/`-` — so `1..n-1` is `1..(n-1)`, matching Kotlin.
     fn range_expr(&mut self) -> Result<Expr, String> {
         let mut l = self.additive()?;
         while self.at(&Tok::DotDot) {
             self.advance();
+            let kind = self.range_until_suffix();
             let r = self.additive()?;
             l = Expr::Range {
                 start: Box::new(l),
                 end: Box::new(r),
-                kind: RangeKind::Inclusive,
+                kind,
             };
         }
         Ok(l)
@@ -4133,6 +4172,23 @@ impl Parser {
                 Ok(Expr::Unary {
                     op: UnOp::Not,
                     expr: Box::new(self.unary()?),
+                })
+            }
+            // Prefix `+x` — the `unaryPlus` convention, the identity on a
+            // number (and nothing at all on a numeric literal).
+            Tok::Plus => {
+                let line = self.line();
+                self.advance();
+                let e = self.unary()?;
+                Ok(match e {
+                    Expr::Int(_) | Expr::Long(_) | Expr::Float(_) | Expr::Float32(_) => e,
+                    other => Expr::MethodCall {
+                        recv: Box::new(other),
+                        name: "unaryPlus".to_string(),
+                        args: Vec::new(),
+                        safe: false,
+                        line,
+                    },
                 })
             }
             // Prefix `++x` / `--x` — the value is the target AFTER the update.
@@ -5313,7 +5369,7 @@ impl Parser {
         let (kind, end) = match self.peek() {
             Tok::DotDot => {
                 self.advance();
-                (RangeKind::Inclusive, self.range_bound()?)
+                (self.range_until_suffix(), self.range_bound()?)
             }
             Tok::Until => {
                 self.advance();
