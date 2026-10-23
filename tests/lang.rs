@@ -8421,3 +8421,75 @@ fun main() {
         "[small, out, out, out, out, big]\nin\nedge\n"
     );
 }
+
+#[test]
+fn the_to_destination_family_and_the_array_list_capacity_constructor() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. `filterTo`, `mapTo`,
+    // `associateTo`, `groupByTo` and the rest of the `…To(destination)`
+    // family, and `toCollection`, were `unresolved reference`;
+    // `ArrayList(10)` was read as a copy of the Int `10`.
+    assert_eq!(
+        stdout(
+            r##"fun t(name: String, f: () -> Any?) { try { println("$name: ${f()}") } catch (e: Throwable) { println("$name: EX $e") } }
+fun main() {
+    val xs = listOf(3, 1, 4, 1, 5, 9, 2, 6)
+    t("filterTo") { val d = mutableListOf(0); xs.filterTo(d) { it > 4 }; d }
+    t("mapTo") { xs.mapTo(mutableSetOf()) { it % 3 } }
+    t("toCollection") { xs.toCollection(sortedSetOf()) }
+    t("associateTo") { xs.associateTo(sortedMapOf()) { it to it * it } }
+    t("associateByTo") { listOf("a", "bb").associateByTo(mutableMapOf(0 to "z")) { it.length } }
+    t("groupByTo") { xs.groupByTo(sortedMapOf()) { it % 2 } }
+    t("flatMapTo") { listOf(1, 2).flatMapTo(mutableListOf(-1)) { listOf(it, it) } }
+    t("mapNotNullTo") { listOf("1", "x").mapNotNullTo(mutableListOf()) { it.toIntOrNull() } }
+    t("filterIndexedTo") { xs.filterIndexedTo(mutableListOf()) { i, _ -> i < 2 } }
+    t("mapIndexedNotNull") { xs.mapIndexedNotNull { i, v -> if (i % 3 == 0) v else null } }
+    t("filterNotTo") { xs.filterNotTo(hashSetOf()) { it < 5 } }
+    t("zipTransform") { listOf(1, 2).zip(listOf(10, 20)) { a, b -> a + b } }
+    t("foldRight") { listOf("a", "b").foldRight("!") { s, acc -> s + acc } }
+    t("foldIndexed") { xs.foldIndexed(0) { i, acc, v -> acc + i * v } }
+    t("scan") { listOf(1, 2, 3).scan(0) { a, b -> a + b } }
+    t("runningFoldIndexed") { listOf(1, 2).runningFoldIndexed(10) { i, a, b -> a + i + b } }
+    t("reduceRightIndexed") { listOf(1, 2, 3).reduceRightIndexed { i, v, acc -> acc - v * i } }
+    t("reduceOrNull") { listOf<Int>().reduceOrNull { a, b -> a + b } }
+    t("associateByKV") { listOf("a", "bb").associateBy({ it.length }, { it.uppercase() }) }
+    t("groupByKV") { listOf("a", "bb", "c").groupBy({ it.length }, { it.uppercase() }) }
+    t("mapKeys") { mapOf(1 to "a").mapKeys { it.key * 10 } }
+    t("mapValuesTo") { mapOf(1 to 2).mapValuesTo(mutableMapOf(0 to 0)) { it.value + 1 } }
+    t("mapKeysTo") { mapOf(1 to 2).mapKeysTo(sortedMapOf(5 to 5)) { -it.key } }
+    t("mapFilterMap") { mapOf(1 to 2, 3 to 4).filter { (k, v) -> k + v > 3 }.map { (k, v) -> k * v } }
+    t("mapMinBy") { mapOf("a" to 3, "b" to 1).minByOrNull { it.value }?.key }
+    t("mapForEachBi") { val sb = StringBuilder(); mapOf(1 to 2).forEach { k, v -> sb.append(k + v) }; sb }
+    t("mapToSorted") { mapOf(3 to "c", 1 to "a").toSortedMap(compareByDescending { it }) }
+    t("mapEntriesSorted") { mapOf("b" to 1, "a" to 2).entries.sortedBy { it.key }.map { it.value } }
+    t("mapFlatMap") { mapOf(1 to listOf("a", "b")).flatMap { (k, vs) -> vs.map { "$k$it" } } }
+    t("mapNotNullMap") { mapOf(1 to null, 2 to "b").mapNotNull { it.value } }
+    t("mapAll") { mapOf(1 to 2).all { it.value > it.key } }
+    t("mapAsIterable") { mapOf(1 to 2).asIterable().map { it.key } }
+    t("mapFilterNot") { mapOf(1 to 2, 3 to 4).filterNot { it.key == 1 } }
+    t("mapMaxOf") { mapOf(1 to 2, 3 to 4).maxOf { it.value } }
+    t("mapSumOf") { mapOf(1 to 2, 3 to 4).entries.sumOf { it.key * it.value } }
+    t("mapToMutable") { mapOf(1 to 2).toMutableMap().apply { put(3, 4) } }
+    t("mapPlusMap") { mapOf(1 to 2) + mapOf(1 to 3, 4 to 5) }
+    t("mapPlusList") { mapOf(1 to 2) + listOf(5 to 6) }
+    t("mapMinusList") { mapOf(1 to 2, 3 to 4, 5 to 6) - listOf(1, 5) }
+    t("listOfPairsToMap") { listOf(1 to "a", 1 to "b").toMap() }
+    t("zipToMap") { listOf("a", "b").zip(listOf(1, 2)).toMap() }
+    t("MutableListInit") { MutableList(3) { it * 2 }.apply { add(9) } }
+    t("ListInit") { List(3) { "x$it" } }
+    t("arrayListCap") { ArrayList<Int>(10).apply { add(1) } }
+    t("linkedListLike") { ArrayDeque<Int>().apply { addFirst(1); addFirst(2); addLast(3) }.toList() }
+    extra6()
+}
+fun extra6() {
+    t("arrayListNeg") { ArrayList<String>(-1) }
+    t("arrayListCopy") { ArrayList(listOf(1, 2)).apply { add(3) } }
+    t("toCollectionList") { listOf(2, 1, 2).toCollection(mutableListOf(9)) }
+    t("groupByToExisting") { val d = mutableMapOf(1 to mutableListOf(100)); listOf(1, 2, 3).groupByTo(d) { it % 2 }; d }
+    t("mapToSeq") { sequenceOf(1, 2).mapTo(mutableListOf()) { it * 3 } }
+    t("filterToStr") { "a1b2".filterTo(StringBuilder()) { it.isDigit() }.toString() }
+    t("associateWithTo") { listOf("x").associateWithTo(sortedMapOf("a" to 0)) { it.length } }
+}"##
+        ),
+        "filterTo: [0, 5, 9, 6]\nmapTo: [0, 1, 2]\ntoCollection: [1, 2, 3, 4, 5, 6, 9]\nassociateTo: {1=1, 2=4, 3=9, 4=16, 5=25, 6=36, 9=81}\nassociateByTo: {0=z, 1=a, 2=bb}\ngroupByTo: {0=[4, 2, 6], 1=[3, 1, 1, 5, 9]}\nflatMapTo: [-1, 1, 1, 2, 2]\nmapNotNullTo: [1]\nfilterIndexedTo: [3, 1]\nmapIndexedNotNull: [3, 1, 2]\nfilterNotTo: [5, 6, 9]\nzipTransform: [11, 22]\nfoldRight: ab!\nfoldIndexed: 131\nscan: [0, 1, 3, 6]\nrunningFoldIndexed: [10, 11, 14]\nreduceRightIndexed: 1\nreduceOrNull: null\nassociateByKV: {1=A, 2=BB}\ngroupByKV: {1=[A, C], 2=[BB]}\nmapKeys: {10=a}\nmapValuesTo: {0=0, 1=3}\nmapKeysTo: {-1=2, 5=5}\nmapFilterMap: [12]\nmapMinBy: b\nmapForEachBi: 3\nmapToSorted: {3=c, 1=a}\nmapEntriesSorted: [2, 1]\nmapFlatMap: [1a, 1b]\nmapNotNullMap: [b]\nmapAll: true\nmapAsIterable: [1]\nmapFilterNot: {3=4}\nmapMaxOf: 4\nmapSumOf: 14\nmapToMutable: {1=2, 3=4}\nmapPlusMap: {1=3, 4=5}\nmapPlusList: {1=2, 5=6}\nmapMinusList: {3=4}\nlistOfPairsToMap: {1=b}\nzipToMap: {a=1, b=2}\nMutableListInit: [0, 2, 4, 9]\nListInit: [x0, x1, x2]\narrayListCap: [1]\nlinkedListLike: [2, 1, 3]\narrayListNeg: EX java.lang.IllegalArgumentException: Illegal Capacity: -1\narrayListCopy: [1, 2, 3]\ntoCollectionList: [9, 2, 1, 2]\ngroupByToExisting: {1=[100, 1, 3], 0=[2]}\nmapToSeq: [3, 6]\nfilterToStr: 12\nassociateWithTo: {a=0, x=1}\n"
+    );
+}

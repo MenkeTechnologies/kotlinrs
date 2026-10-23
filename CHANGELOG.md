@@ -11,6 +11,23 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## The `…To(destination)` family; `ArrayList(initialCapacity)`
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1. Each `…To` member was
+`unresolved reference`.
+
+| program | reference |
+| --- | --- |
+| `val d = mutableListOf(0); xs.filterTo(d) { it > 4 }; d` | `[0, 5, 9, 6]` |
+| `xs.mapTo(mutableSetOf()) { it % 3 }`, `xs.toCollection(sortedSetOf())` | `[0, 1, 2]`, the sorted distinct elements |
+| `xs.associateTo(sortedMapOf()) { it to it * it }`, `listOf("x").associateWithTo(sortedMapOf("a" to 0)) { it.length }` | the destination's order: `{1=1, 2=4, …}`, `{a=0, x=1}` |
+| `listOf(1, 2, 3).groupByTo(mutableMapOf(1 to mutableListOf(100))) { it % 2 }` | `{1=[100, 1, 3], 0=[2]}` — an existing group is appended to |
+| `"a1b2".filterTo(StringBuilder()) { it.isDigit() }` | `12` |
+| `ArrayList<Int>(10).apply { add(1) }`, `ArrayList<String>(-1)` | `[1]`, `IllegalArgumentException: Illegal Capacity: -1` (was `unresolved reference: toMutableList on Int`) |
+
+Each `…To` form runs its base member and adds (puts) the result into the
+destination element by element, so a `Set` or a sorted destination applies
+its own rules.
 ## `in` on an untyped subject, floating-point ranges, `codePointCount`
 
 Measured on `kotlinc` 2.4.21 / JDK 25.0.5, compiled and run on the same JVM.

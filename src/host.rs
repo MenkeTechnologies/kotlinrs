@@ -6784,6 +6784,66 @@ fn gen_pull(vm: &mut VM, gen: &Value, want: Option<usize>) -> Result<Vec<Value>,
     gen_drive(vm, gen, want, &mut |_, _| Ok(true))
 }
 
+/// A `…To(destination)` higher-order member: the base member's result (the
+/// name without `To`), added to the destination element by element — or put
+/// entry by entry for the map-building ones, and for `groupByTo` appended to
+/// whatever list the destination already holds for the key, as Kotlin's
+/// `getOrPut(key) { ArrayList() }.add(e)` does. Answers the destination.
+fn hof_into(
+    vm: &mut VM,
+    name: &str,
+    recv: &Value,
+    extras: &[Value],
+    clo: &Value,
+    kind: SeqKind,
+) -> Result<Value, String> {
+    let base = name.strip_suffix("To").unwrap_or(name);
+    let Some((dest, rest)) = extras.split_first() else {
+        return Err(format!("{name}: a destination is required"));
+    };
+    let made = coll_hof(vm, base, recv, rest, clo, kind)?;
+    let entries = with_obj(&made, |o| match o {
+        HeapObj::Map(entries) => Some(entries.clone()),
+        _ => None,
+    })
+    .flatten();
+    match entries {
+        Some(entries) if base == "groupBy" => {
+            for (k, group) in entries {
+                let held = kt_method(vm, dest, "get", std::slice::from_ref(&k))?;
+                if matches!(held, Value::Undef) {
+                    let fresh = alloc(HeapObj::List(list_snapshot(&group).unwrap_or_default()));
+                    kt_method(vm, dest, "put", &[k, fresh])?;
+                } else {
+                    kt_method(vm, &held, "addAll", &[group])?;
+                }
+            }
+        }
+        Some(entries) => {
+            for (k, v) in entries {
+                kt_method(vm, dest, "put", &[k, v])?;
+            }
+        }
+        None => {
+            // A `CharSequence`'s `filterTo` takes an `Appendable` — a
+            // `StringBuilder` — and appends.
+            let add = if builder_len(dest).is_some() {
+                "append"
+            } else {
+                "add"
+            };
+            let made = match &made {
+                Value::Str(s) => s.encode_utf16().map(|u| char_of(u as i64)).collect(),
+                _ => list_snapshot(&made).unwrap_or_default(),
+            };
+            for it in made {
+                kt_method(vm, dest, add, &[it])?;
+            }
+        }
+    }
+    Ok(dest.clone())
+}
+
 /// Pull a lazy pipeline, handing every element that survives the stages to
 /// `on` — which answers `false` to stop the traversal there. [`gen_pull`] is
 /// this with a count budget and no early stop.
@@ -8330,6 +8390,14 @@ fn coll_hof(
     let items = list_snapshot(recv)
         .ok_or_else(|| format!("unresolved reference: {name} on {}", obj_label(recv)))?;
     match name {
+        // The `…To(destination)` forms — see [`hof_into`].
+        "filterTo" | "filterNotTo" => hof_into(vm, name, recv, extras, clo, kind),
+        "filterIndexedTo" | "flatMapTo" => hof_into(vm, name, recv, extras, clo, kind),
+        "mapTo" | "mapIndexedTo" => hof_into(vm, name, recv, extras, clo, kind),
+        "mapNotNullTo" | "mapIndexedNotNullTo" => hof_into(vm, name, recv, extras, clo, kind),
+        "associateTo" | "associateByTo" => hof_into(vm, name, recv, extras, clo, kind),
+        "associateWithTo" | "groupByTo" => hof_into(vm, name, recv, extras, clo, kind),
+        "mapKeysTo" | "mapValuesTo" => hof_into(vm, name, recv, extras, clo, kind),
         "map" => {
             let mut out = Vec::with_capacity(items.len());
             for it in items {
@@ -10782,6 +10850,16 @@ fn jdk_integral_static(recv: &Value, name: &str, args: &[Value]) -> Option<Resul
 fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     if let Some(r) = jdk_integral_static(recv, name, args) {
         return r;
+    }
+    // `ArrayList(initialCapacity)`, the capacity being the receiver.
+    if name == "#arrayListCapacity" {
+        let cap = num_i64(recv);
+        if cap < 0 {
+            return Err(format!(
+                "java.lang.IllegalArgumentException: Illegal Capacity: {cap}"
+            ));
+        }
+        return Ok(alloc(HeapObj::List(Vec::new())));
     }
     // The `content…` members are declared on the NULLABLE array receiver:
     // `null.contentHashCode()` is `0`, its `toString` forms are `null`.
@@ -14791,6 +14869,17 @@ fn sequence_member(
             return Some(Ok(set));
         }
         "toMutableSet" => return Some(Ok(alloc(HeapObj::Set(distinct(vm, items))))),
+        // `toCollection(destination)` adds each element to the destination —
+        // whose own kind decides what a repeat or the order does — and answers
+        // it.
+        "toCollection" if args.len() == 1 => {
+            for it in items {
+                if let Err(e) = kt_method(vm, &args[0], "add", std::slice::from_ref(it)) {
+                    return Some(Err(e));
+                }
+            }
+            return Some(Ok(args[0].clone()));
+        }
         // `toHashSet` is a `java.util.HashSet`, iterating in bucket order from
         // the capacity the stdlib asks for: `mapCapacity(size)` for a
         // collection or an array, `mapCapacity(12)` for any other `Iterable`

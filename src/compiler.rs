@@ -8889,7 +8889,15 @@ impl Compiler {
         // unannotated `it` picks up the receiver's element type instead of
         // staying `Unknown` (see [`Compiler::lambda_hint`]).
         let elem = self.infer_elem(sc, recv);
-        let hint = self.hof_param_types(sc, recv, name, elem, extras);
+        let hint = self.hof_param_types(sc, recv, into_base(name).unwrap_or(name), elem, {
+            // A `…To` form's first extra is the destination, which the base
+            // member's lambda knows nothing about.
+            if into_base(name).is_some() {
+                &extras[1.min(extras.len())..]
+            } else {
+                extras
+            }
+        });
         // `sumOf`'s overload — and so the width its total wraps at — is the
         // selector's result type: `sumOf { it }` over `Int`s is an `Int` sum.
         let sum_int = name == "sumOf" && self.infer_lambda_result(sc, closure, &hint) == Type::Int;
@@ -10605,6 +10613,16 @@ impl Compiler {
             // `ArrayList(other)` copies a collection, where `ArrayList()` builds
             // an empty one. A `List` iterates in position order however it was
             // built, so unlike its `Set`/`Map` siblings it needs no order spec.
+            // `ArrayList(initialCapacity)` — an `Int` argument is the capacity
+            // constructor: an EMPTY list, refused for a negative capacity.
+            "ArrayList"
+                if args.len() == 1
+                    && self.infer(sc, &args[0]) == Type::Int
+                    && !self.declares_fun(name) =>
+            {
+                self.compile_member(sc, &args[0], "#arrayListCapacity", &[], false, line)?;
+                Ok(Type::Obj)
+            }
             "ArrayList" if args.len() == 1 => {
                 self.compile_member(sc, &args[0], "toMutableList", &[], false, line)
             }
@@ -15240,6 +15258,21 @@ fn is_coll_hof(name: &str) -> bool {
     matches!(
         name,
         "map"
+            // The `…To(destination)` forms; see [`into_base`].
+            | "filterTo"
+            | "filterNotTo"
+            | "filterIndexedTo"
+            | "mapTo"
+            | "mapIndexedTo"
+            | "mapNotNullTo"
+            | "mapIndexedNotNullTo"
+            | "flatMapTo"
+            | "associateTo"
+            | "associateByTo"
+            | "associateWithTo"
+            | "groupByTo"
+            | "mapKeysTo"
+            | "mapValuesTo"
             | "mapIndexed"
             | "flatMap"
             | "filter"
@@ -15596,8 +15629,32 @@ fn is_lambda(e: &Expr) -> bool {
 /// Static result type of a higher-order collection method, for display/`==` op
 /// selection. Collection-returning methods yield a heap `Obj`; the rest are
 /// coarse (`Unknown` display routes through the generic Kotlin stringifier).
+/// The `…To(destination)` forms of the higher-order members, as the member
+/// whose result they add (or put) into the destination: `filterTo` is
+/// `filter`, `groupByTo` is `groupBy`. `None` for every other name.
+fn into_base(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "filterTo" => "filter",
+        "filterNotTo" => "filterNot",
+        "filterIndexedTo" => "filterIndexed",
+        "mapTo" => "map",
+        "mapIndexedTo" => "mapIndexed",
+        "mapNotNullTo" => "mapNotNull",
+        "mapIndexedNotNullTo" => "mapIndexedNotNull",
+        "flatMapTo" => "flatMap",
+        "associateTo" => "associate",
+        "associateByTo" => "associateBy",
+        "associateWithTo" => "associateWith",
+        "groupByTo" => "groupBy",
+        "mapKeysTo" => "mapKeys",
+        "mapValuesTo" => "mapValues",
+        _ => return None,
+    })
+}
+
 fn hof_ret_type(name: &str) -> Type {
     match name {
+        _ if into_base(name).is_some() => Type::Obj,
         "map" | "mapIndexed" | "flatMap" | "filter" | "filterNot" | "partition" | "takeWhile"
         | "dropWhile" | "takeLastWhile" | "dropLastWhile" | "sortedBy" | "sortedByDescending"
         | "associate" | "associateBy" | "associateWith" | "groupBy" | "groupingBy" => Type::Obj,
