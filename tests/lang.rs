@@ -9881,3 +9881,72 @@ fun main() { val l = listOf(C()); println(l[0](3)); val f = id { x: Int -> x * 1
         "2\n40\n2\n"
     );
 }
+
+/// A sorted set's or map's `headSet`/`tailMap`/`subSet`/`descendingSet`/… is a\nview: it is recomputed from its source after the source is written, and a\nwrite through it reaches the source, refusing a key outside the range with\n`key out of range` as `java.util.TreeMap` does. Each was a snapshot taken when\nthe member was called.
+#[test]
+fn sorted_collection_ranges_are_live_views() {
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    val t = sortedSetOf(1, 5, 9)
+    val h = t.headSet(6)
+    t.add(2)
+    println(h)
+    println(h.size)
+    println(3 in h)
+    t.add(3)
+    println(3 in h)
+    for (x in h) print("$x ")
+    println()
+    val d = t.descendingSet()
+    t.add(7)
+    println(d)
+    val m = sortedMapOf("b" to 2, "d" to 4)
+    val tm = m.tailMap("c")
+    m["e"] = 5
+    m["c"] = 3
+    println(tm)
+    println(tm.keys)
+    val byLen = sortedSetOf(compareBy<String> { it.length }, "aaa", "b")
+    val small = byLen.headSet("cc")
+    byLen.add("dd")
+    byLen.add("e")
+    println(small)
+    println(h.map { it * 10 })
+    val sub = t.subSet(2, 8)
+    t.remove(5)
+    println(sub)
+    println("$h")
+}"##
+        ),
+        "[1, 2, 5]\n3\nfalse\ntrue\n1 2 3 5 \n[9, 7, 5, 3, 2, 1]\n{c=3, d=4, e=5}\n[c, d, e]\n[b]\n[10, 20, 30, 50]\n[2, 3, 7]\n[1, 2, 3]\n"
+    );
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    val t = sortedSetOf(1, 5, 9)
+    val h = t.headSet(6)
+    h.add(2)
+    println(t)
+    try { h.add(7) } catch (e: IllegalArgumentException) { println(e.message) }
+    println(t)
+    println(h.remove(9))
+    println(h.remove(5))
+    println(t)
+    h.clear()
+    println(t)
+    val m = sortedMapOf(1 to "a", 4 to "d", 8 to "h")
+    val tail = m.tailMap(3)
+    tail[5] = "e"
+    println(m)
+    try { tail[2] = "b" } catch (e: IllegalArgumentException) { println(e.message) }
+    tail.remove(8)
+    println(m)
+    val d = t.descendingSet()
+    d.add(4)
+    println(t)
+}"##
+        ),
+        "[1, 2, 5, 9]\nkey out of range\n[1, 2, 5, 9]\nfalse\ntrue\n[1, 2, 9]\n[9]\n{1=a, 4=d, 5=e, 8=h}\nkey out of range\n{1=a, 4=d, 5=e}\n[4, 9]\n"
+    );
+}

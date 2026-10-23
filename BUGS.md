@@ -99,22 +99,24 @@ overflow) and succeeds for the second. Same category as the `%2147483647d` entry
   added to the stdlib surface without being added there loses the sequence
   wording for everything downstream of it.
 
-## Sorted-collection range VIEWS are snapshots
+## Collection views
 
-`subList()`, `asList()`, `asReversed()` and a map's `keys`/`values`/`entries`
-read their backing object live (see CHANGELOG, "Collection views read live").
-A sorted collection's `headMap`/`tailMap`/`subMap`/`headSet`/`tailSet`/`subSet`/
-`descending…` ranges are still copies taken when the member is called, so they
-stop tracking at that moment. Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1:
+`subList()`, `asList()`, `asReversed()`, a map's `keys`/`values`/`entries`
+(CHANGELOG, "Collection views read live") and a sorted collection's
+`headMap`/`tailMap`/`subMap`/`headSet`/`tailSet`/`subSet`/`descending…` ranges
+(CHANGELOG, "Sorted-collection ranges are live views") read their backing
+object live. One divergence remains, measured on `kotlinc` 2.4.21 /
+JRE 21.0.12.1:
 
 | program | kotlinrs | reference |
 | --- | --- | --- |
-| `val t = sortedSetOf(1, 5, 9); val h = t.headSet(6); t.add(2); println(h)` | `[1, 5]` | `[1, 2, 5]` |
 | `(listOf(1, 2).asReversed() as MutableList<Int>)[0] = 5` | succeeds | `ClassCastException: kotlin.collections.ReversedListReadOnly cannot be cast to kotlin.collections.MutableList` |
 
 A live view is a heap copy re-taken whenever its backing object was written
 since the last copy; reads that walk a view (`for`, indexing) read the backing
-directly, so a loop over a view stays linear while the backing is written.
+directly, so a loop over a view stays linear while the backing is written. A
+sorted range is recomputed at the next member call, render, `in` or `for`,
+since its comparator may be user code that needs the VM.
 
 ## Still missing, with the measurement
 
@@ -324,7 +326,7 @@ Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 | `mutableMapOf("a" to 1).withDefault { 0 }.getValue("zz")` | `unresolved reference: withDefault on Map` | `0` |
 
 `withDefault` is a VIEW over the receiver, and maps here have no view
-representation (see "Sorted-collection range VIEWS are snapshots").
+representation (see "Collection views").
 
 ## Round 19: `sum()` over an `Int` collection the frontend cannot type
 

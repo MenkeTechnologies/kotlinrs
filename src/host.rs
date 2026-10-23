@@ -2862,6 +2862,7 @@ fn reset_heap() {
     VIEW_SEEN.with(|t| t.borrow_mut().clear());
     REVERSED_VIEWS.with(|t| t.borrow_mut().clear());
     SUB_MOD.with(|t| t.borrow_mut().clear());
+    SORTED_VIEWS.with(|t| t.borrow_mut().clear());
     ONCE_TOKEN.with(|t| t.borrow_mut().clear());
     ONCE_CONSUMED.with(|t| t.borrow_mut().clear());
     ITER_END.with(|c| *c.borrow_mut() = None);
@@ -5556,6 +5557,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             if let Err(e) = comod_check_deep(&v, 0) {
                 fault(vm, e);
             }
+            refresh_sorted_view(vm, &v);
             RENDER_OVERFLOW.with(|f| f.set(false));
             let s = kotlin_string(&v);
             if RENDER_OVERFLOW.with(|f| f.replace(false)) {
@@ -7155,6 +7157,7 @@ fn rendering<T>(v: &Value, body: impl FnOnce() -> T) -> Option<T> {
 /// so they park the fact in `RENDER_OVERFLOW` and this — the one render entry
 /// point holding a `vm` — turns it into the exception.
 fn display_checked(vm: &mut VM, v: &Value) -> String {
+    refresh_sorted_view(vm, v);
     if let Err(e) = comod_check_deep(v, 0) {
         fault(vm, e);
         return String::new();
@@ -7362,6 +7365,7 @@ fn b_set_new(vm: &mut VM, argc: u8) -> Value {
 fn b_in(vm: &mut VM, _argc: u8) -> Value {
     let container = vm.pop();
     let value = vm.pop();
+    refresh_sorted_view(vm, &container);
     Value::Bool(contains_value(vm, &container, &value))
 }
 
@@ -7949,6 +7953,7 @@ fn b_coll_hof(vm: &mut VM, argc: u8) -> Value {
         fault(vm, e);
         return Value::Undef;
     }
+    refresh_sorted_view(vm, &recv);
     let before = mod_len(&recv);
     let out = b_coll_hof_inner(vm, &name, clo, extras, &recv);
     note_mod(&recv, &name, before);
@@ -8839,6 +8844,7 @@ fn b_iter_pull(vm: &mut VM, _argc: u8) -> Value {
 /// `KT_ITER_SRC` — see [`KT_ITER_SRC`].
 fn b_iter_src(vm: &mut VM, _argc: u8) -> Value {
     let v = vm.pop();
+    refresh_sorted_view(vm, &v);
     // `for (x in it)` over an ITERATOR (Kotlin's `Iterator<T>.iterator()` is
     // the iterator itself) walks what is left of it and leaves it exhausted —
     // pulled here at the head, as a `Sequence` is below.
@@ -11900,10 +11906,10 @@ fn double_stream_sum(items: &[Value]) -> f64 {
 /// other receiver or name.
 ///
 /// Ported from `java.util.TreeMap`/`TreeSet`. The range members (`headMap`,
-/// `tailSet`, `descendingMap`, …) answer SNAPSHOTS rather than the JDK's live
-/// views, the same limit every collection view here has: a range keeps the
-/// source's comparator and stays sorted, and a descending one iterates in
-/// reverse.
+/// `tailSet`, `descendingMap`, …) answer VIEWS: each keeps the source's
+/// comparator (a descending one iterates in reverse) and is recomputed from
+/// the source by [`refresh_sorted_view`] when the source has been written
+/// since, at the next use that can run a comparator.
 fn sorted_nav_method(
     vm: &mut VM,
     recv: &Value,
@@ -11941,7 +11947,140 @@ fn sorted_nav_method(
         return None;
     }
     ensure_ordered(vm, recv);
-    Some(sorted_nav(vm, recv, is_map, name, args))
+    let out = sorted_nav(vm, recv, is_map, name, args);
+    if let Ok(view @ Value::Obj(id)) = &out {
+        if sorted_range_member(name) {
+            track_view(view, recv);
+            SORTED_VIEWS.with(|t| {
+                t.borrow_mut()
+                    .insert(*id, (recv.clone(), name.to_string(), args.to_vec()))
+            });
+        }
+    }
+    Some(out)
+}
+
+/// The navigable members that answer a VIEW of their receiver.
+fn sorted_range_member(name: &str) -> bool {
+    matches!(
+        name,
+        "headMap"
+            | "tailMap"
+            | "subMap"
+            | "headSet"
+            | "tailSet"
+            | "subSet"
+            | "descendingMap"
+            | "descendingSet"
+            | "navigableKeySet"
+            | "descendingKeySet"
+    )
+}
+
+thread_local! {
+    /// A sorted-collection range view → `(source, member, arguments)`: what
+    /// [`refresh_sorted_view`] recomputes it from.
+    static SORTED_VIEWS: RefCell<std::collections::HashMap<u32, (Value, String, Vec<Value>)>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// A write through a sorted range view (`headSet`, `subMap`, `descendingSet`,
+/// …), applied to its source as the JDK's views apply it: `add`/`put` of a key
+/// outside the range is refused with `IllegalArgumentException: key out of
+/// range` and leaves the source as it was, `remove` of one outside it is a
+/// no-op, and `clear` removes the range. `None` for anything else.
+fn sorted_view_write(
+    vm: &mut VM,
+    view: &Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    let Value::Obj(id) = view else { return None };
+    let (source, member, _) = SORTED_VIEWS.with(|t| t.borrow().get(id).cloned())?;
+    if matches!(member.as_str(), "navigableKeySet" | "descendingKeySet") {
+        return None;
+    }
+    let out = match (name, args) {
+        ("add" | "put", [key, ..]) => {
+            let had = contains_value(vm, &source, key);
+            let r = match kt_method(vm, &source, name, args) {
+                Ok(r) => r,
+                Err(e) => return Some(Err(e)),
+            };
+            refresh_sorted_view(vm, view);
+            if !contains_value(vm, view, key) {
+                if !had {
+                    let _ = kt_method(vm, &source, "remove", std::slice::from_ref(key));
+                    refresh_sorted_view(vm, view);
+                }
+                return Some(Err(
+                    "java.lang.IllegalArgumentException: key out of range".to_string()
+                ));
+            }
+            Ok(r)
+        }
+        ("remove", [key]) => {
+            if contains_value(vm, view, key) {
+                kt_method(vm, &source, "remove", args)
+            } else if with_obj(view, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false) {
+                Ok(Value::Undef)
+            } else {
+                Ok(Value::Bool(false))
+            }
+        }
+        ("clear", []) => {
+            for key in list_snapshot(view).unwrap_or_default() {
+                let key = match with_obj(&key, |o| match o {
+                    HeapObj::Entry(k, _) => Some(k.clone()),
+                    _ => None,
+                })
+                .flatten()
+                {
+                    Some(k) => k,
+                    None => key,
+                };
+                if let Err(e) = kt_method(vm, &source, "remove", std::slice::from_ref(&key)) {
+                    return Some(Err(e));
+                }
+            }
+            Ok(unit_value())
+        }
+        _ => return None,
+    };
+    refresh_sorted_view(vm, view);
+    Some(out)
+}
+
+/// Recompute `v`, when it is a sorted-collection range view whose source was
+/// written since it was last computed. It needs the VM because a comparator
+/// can be user code, so it runs at the uses that hold one — a member call,
+/// rendering, `in`, a `for` — rather than in [`refresh_view`].
+fn refresh_sorted_view(vm: &mut VM, v: &Value) {
+    let Value::Obj(id) = v else { return };
+    let Some((source, name, args)) = SORTED_VIEWS.with(|t| t.borrow().get(id).cloned()) else {
+        return;
+    };
+    let Value::Obj(src) = source else { return };
+    refresh_sorted_view(vm, &source);
+    let now = backing_writes(src);
+    if VIEW_SEEN.with(|t| t.borrow().get(id).copied()) == Some(now) {
+        return;
+    }
+    ensure_ordered(vm, &source);
+    let is_map = with_obj(&source, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false);
+    if let Ok(fresh) = sorted_nav(vm, &source, is_map, &name, &args) {
+        let content = with_obj(&fresh, |o| match o {
+            HeapObj::Map(e) => Some(HeapObj::Map(e.clone())),
+            HeapObj::Set(items) => Some(HeapObj::Set(items.clone())),
+            _ => None,
+        })
+        .flatten();
+        if let Some(content) = content {
+            with_obj_mut(v, |o| *o = content);
+            invalidate_key_index(v);
+        }
+    }
+    VIEW_SEEN.with(|t| t.borrow_mut().insert(*id, now));
 }
 
 /// [`sorted_nav_method`] once the receiver is known to answer `name`.
@@ -12223,6 +12362,10 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
             | ("add", 2)
     );
     comod_check(recv)?;
+    refresh_sorted_view(vm, recv);
+    if let Some(r) = sorted_view_write(vm, recv, name, args) {
+        return r;
+    }
     let before = mod_len(recv);
     let out = kt_method_inner(vm, recv, name, args);
     note_mod(recv, name, before);
@@ -17227,6 +17370,11 @@ fn store_at(items: &mut [Value], i: i64, value: Value, kind: &str) -> Result<(),
 /// `recv[index] = value` — list set (bounds-checked) or map put.
 fn index_set(vm: &mut VM, recv: &Value, index: &Value, value: Value) -> Result<(), String> {
     comod_check(recv)?;
+    // `range[k] = v` on a sorted map's range view is its `put`.
+    refresh_sorted_view(vm, recv);
+    if let Some(r) = sorted_view_write(vm, recv, "put", &[index.clone(), value.clone()]) {
+        return r.map(|_| ());
+    }
     let before = mod_len(recv);
     let out = index_set_inner(vm, recv, index, value);
     // A new key appended to a `HashMap` belongs in its bucket, not at the end —

@@ -11,6 +11,17 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Sorted-collection ranges are live views
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | before | reference |
+| --- | --- | --- |
+| `val h = t.headSet(6); t.add(2); println(h)`, `3 in h`, `for (x in h)` | `[1, 5]` (snapshot) | `[1, 2, 5]` |
+| `m.tailMap("c")` after `m["e"] = 5; m["c"] = 3`; a comparator-ordered `headSet` | snapshot | the current range |
+| `h.add(2)` / `h.remove(5)` / `h.clear()` / `tail[5] = "e"` through a range | changed the copy only | reach the source |
+| `h.add(7)` / `tail[2] = "b"` outside the range | accepted into the copy | `IllegalArgumentException: key out of range` |
+
 ## Overloads of host-called members; references to overloaded members
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
