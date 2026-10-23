@@ -7952,23 +7952,22 @@ fn a_class_declaring_one_method_twice_resolves_the_call_by_its_argument() {
     // The second declaration used to answer for the first (`C().f(1)` ran
     // `f(a: String)`), and the set was then refused; member overloads now
     // resolve, and `C().f(1)` is the reference's `2` (kotlinc 2.4.21 / JRE
-    // 21.0.12.1). An overload set of a member the host calls by name stays
-    // refused rather than resolved wrongly.
-    assert_eq!(
-        stdout(
-            "class C { fun f(a: String) = 1; fun f(a: Int) = 2 }\nfun main() { println(C().f(1)) }"
-        ),
-        "2\n"
-    );
-    let out = eval(
-        "class C { fun next(a: String) = 1; fun next(a: Int) = 2 }\nfun main() { println(C().next(1)) }",
-    );
+    // 21.0.12.1), as is the same set on `next`, a member the runtime calls by
+    // name. Two declarations with the SAME parameters stay a compile error, as
+    // `kotlinc` reports conflicting overloads.
+    for name in ["f", "next"] {
+        assert_eq!(
+            stdout(&format!(
+                "class C {{ fun {name}(a: String) = 1; fun {name}(a: Int) = 2 }}\nfun main() {{ println(C().{name}(1)) }}"
+            )),
+            "2\n"
+        );
+    }
+    let out =
+        eval("class C { fun f(a: Int) = 1; fun f(a: Int) = 2 }\nfun main() { println(C().f(1)) }");
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("member overloads are not supported"),
-        "stderr was: {err}"
-    );
+    assert!(err.contains("conflicting overloads"), "stderr was: {err}");
 }
 
 #[test]
@@ -9076,7 +9075,11 @@ fn the_depth_guard_is_one_op_ahead_of_the_body() {
     );
 }
 
-/// `mutableListOf<Long>(1)`, `ArrayDeque<Long>()`, `mutableMapOf<Long, Long>()` and their\nannotated spellings (`val xs: MutableList<Long> = mutableListOf(1)`) type every\ninteger literal passed as an element, key or value as a `Long` — Kotlin types a\nliteral by its expected type. Each element below answered `is Long` false\nbefore, and a `Map<String, Int>`'s `m[k]!! + m[k]!!` skipped the 32-bit wrap.
+/// `mutableListOf<Long>(1)`, `ArrayDeque<Long>()`, `mutableMapOf<Long, Long>()` and their
+/// annotated spellings (`val xs: MutableList<Long> = mutableListOf(1)`) type every
+/// integer literal passed as an element, key or value as a `Long` — Kotlin types a
+/// literal by its expected type. Each element below answered `is Long` false
+/// before, and a `Map<String, Int>`'s `m[k]!! + m[k]!!` skipped the 32-bit wrap.
 #[test]
 fn explicit_and_annotated_element_types_make_literal_elements_long() {
     assert_eq!(
@@ -9190,7 +9193,12 @@ fun main() {
     );
 }
 
-/// `subList`, `asList` (object and primitive arrays), `asReversed` and a map's\n`keys`/`values`/`entries` read their backing object live, as the JDK's views\ndo, and a `subList` whose backing list changed structurally raises\n`ConcurrentModificationException` on every later use. Each was a snapshot\nbefore. The two loops pin linear cost: a write to the backing inside a loop\nover the view must not re-copy the view per step.
+/// `subList`, `asList` (object and primitive arrays), `asReversed` and a map's
+/// `keys`/`values`/`entries` read their backing object live, as the JDK's views
+/// do, and a `subList` whose backing list changed structurally raises
+/// `ConcurrentModificationException` on every later use. Each was a snapshot
+/// before. The two loops pin linear cost: a write to the backing inside a loop
+/// over the view must not re-copy the view per step.
 #[test]
 fn collection_views_read_their_backing_live() {
     assert_eq!(
@@ -9294,7 +9302,9 @@ fn collection_views_read_their_backing_live() {
     );
 }
 
-/// `MutableList.asReversed()` is a `MutableList` view: `set`, `add` and `removeAt`\nthrough it reach the backing list at the mirrored position. It was a\nread-only copy whose writes were dropped silently (`[1, 2, 3]` stayed).
+/// `MutableList.asReversed()` is a `MutableList` view: `set`, `add` and `removeAt`
+/// through it reach the backing list at the mirrored position. It was a
+/// read-only copy whose writes were dropped silently (`[1, 2, 3]` stayed).
 #[test]
 fn a_mutable_lists_reversed_view_writes_through() {
     assert_eq!(
@@ -9316,7 +9326,13 @@ fn a_mutable_lists_reversed_view_writes_through() {
     );
 }
 
-/// `Any()` is a bare `java.lang.Object` (equal only to itself), `synchronized(lock)`\nruns its block, and a throwable user code constructs carries the frames live\nat construction as its `stackTrace`: `Cls.method(file.kt:line)`, the facade\nclass `MainKt` for top-level functions, the throwable's own `<init>` frames\nleft out, inlined lambdas folded into their caller, and the bridge frame of a\nparameterless `main`. Each was `unresolved reference`. Expected output is the\nreference compiling the program as `main.kt`, the name a `-e` program takes.
+/// `Any()` is a bare `java.lang.Object` (equal only to itself), `synchronized(lock)`
+/// runs its block, and a throwable user code constructs carries the frames live
+/// at construction as its `stackTrace`: `Cls.method(file.kt:line)`, the facade
+/// class `MainKt` for top-level functions, the throwable's own `<init>` frames
+/// left out, inlined lambdas folded into their caller, and the bridge frame of a
+/// parameterless `main`. Each was `unresolved reference`. Expected output is the
+/// reference compiling the program as `main.kt`, the name a `-e` program takes.
 #[test]
 fn any_synchronized_and_user_stack_traces() {
     assert_eq!(
@@ -9373,7 +9389,11 @@ fun main() {
     );
 }
 
-/// `UByte`/`UShort`/`UInt`/`ULong`: `u`/`uL` literals, wrapping arithmetic at\nthe type's width, unsigned division, remainder and comparison, conversions to\nand from the signed types and `String`, companions' constants, bitwise members,\nranges, arrays, `sum`, and `is`/`equals`/`hashCode` by type. Every program here\nwas a parse error (`expected RParen, found Ident("u")`) before.
+/// `UByte`/`UShort`/`UInt`/`ULong`: `u`/`uL` literals, wrapping arithmetic at
+/// the type's width, unsigned division, remainder and comparison, conversions to
+/// and from the signed types and `String`, companions' constants, bitwise members,
+/// ranges, arrays, `sum`, and `is`/`equals`/`hashCode` by type. Every program here
+/// was a parse error (`expected RParen, found Ident("u")`) before.
 #[test]
 fn unsigned_integer_types() {
     assert_eq!(
@@ -9536,7 +9556,10 @@ fun main() {
     );
 }
 
-/// An unsigned value's `::class` and `javaClass` name `kotlin.UInt`/`kotlin.ULong`, `%d`\nrefuses one as `java.util.Formatter` does, and unsigned ranges are\n`UIntRange`/`ULongRange`/`UIntProgression` — a `UByte` range a `UIntRange` of\n`UInt`s.
+/// An unsigned value's `::class` and `javaClass` name `kotlin.UInt`/`kotlin.ULong`, `%d`
+/// refuses one as `java.util.Formatter` does, and unsigned ranges are
+/// `UIntRange`/`ULongRange`/`UIntProgression` — a `UByte` range a `UIntRange` of
+/// `UInt`s.
 #[test]
 fn unsigned_classes_formats_and_range_kinds() {
     assert_eq!(
@@ -9575,7 +9598,13 @@ fn unsigned_classes_formats_and_range_kinds() {
     );
 }
 
-/// A class may declare one method name several times: each declaration is\nrenamed by its parameter types, and a call picks one by its arguments the way\ntop-level overloads are picked — through a subclass override, an interface\ndefault, a named argument and a default, an implicit-`this` call, and a\nreceiver of no static class (where the value decides between the user overload\nand a stdlib member of the same name). Every program was refused with\n`member overloads are not supported`.
+/// A class may declare one method name several times: each declaration is
+/// renamed by its parameter types, and a call picks one by its arguments the way
+/// top-level overloads are picked — through a subclass override, an interface
+/// default, a named argument and a default, an implicit-`this` call, and a
+/// receiver of no static class (where the value decides between the user overload
+/// and a stdlib member of the same name). Every program was refused with
+/// `member overloads are not supported`.
 #[test]
 fn member_overloads_resolve_by_argument_types() {
     assert_eq!(
@@ -9669,7 +9698,10 @@ fun main() {
     );
 }
 
-/// `fun String.Companion.hello()`, `val String.Companion.x` and\n`fun Foo.Companion.f()` are called on the type name (`String.hello()`); a user\nclass's companion is `this` inside. They were a parse error\n(`expected LParen, found Dot`).
+/// `fun String.Companion.hello()`, `val String.Companion.x` and
+/// `fun Foo.Companion.f()` are called on the type name (`String.hello()`); a user
+/// class's companion is `this` inside. They were a parse error
+/// (`expected LParen, found Dot`).
 #[test]
 fn extensions_on_a_types_companion() {
     assert_eq!(
@@ -9704,7 +9736,11 @@ fun main() {
     );
 }
 
-/// An unsigned array prints as its value class does — `UIntArray(storage=[1, 2])`\n— with a `javaClass` of `kotlin.UIntArray`; it printed `[Ljava.lang.Object;@…`.\nA `ULongRange` above `Long.MAX_VALUE` iterates, tests membership, prints and\nreverses in unsigned order, and `x until 0u` is the type's `EMPTY` (`MAX..0`);\nboth answered in signed order before.
+/// An unsigned array prints as its value class does — `UIntArray(storage=[1, 2])`
+/// — with a `javaClass` of `kotlin.UIntArray`; it printed `[Ljava.lang.Object;@…`.
+/// A `ULongRange` above `Long.MAX_VALUE` iterates, tests membership, prints and
+/// reverses in unsigned order, and `x until 0u` is the type's `EMPTY` (`MAX..0`);
+/// both answered in signed order before.
 #[test]
 fn unsigned_arrays_print_their_storage_and_ulong_ranges_order_unsigned() {
     assert_eq!(
@@ -9766,7 +9802,11 @@ fn unsigned_arrays_print_their_storage_and_ulong_ranges_order_unsigned() {
     );
 }
 
-/// An overload set of a member the runtime calls by name — `toString`, `equals`,\n`compareTo`, an iterator's `next`, `invoke` — keeps the declaration it calls\nunder its plain name and resolves the rest by arguments; a callable reference\nto an overloaded member (`Printer::put`, `p::put`) takes the declaration its\nexpected function type selects. Each was refused or unresolved.
+/// An overload set of a member the runtime calls by name — `toString`, `equals`,
+/// `compareTo`, an iterator's `next`, `invoke` — keeps the declaration it calls
+/// under its plain name and resolves the rest by arguments; a callable reference
+/// to an overloaded member (`Printer::put`, `p::put`) takes the declaration its
+/// expected function type selects. Each was refused or unresolved.
 #[test]
 fn overloads_of_host_called_members_and_overloaded_references() {
     assert_eq!(
