@@ -11,6 +11,23 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Comparator builders over a comparator, `compareValues`, `minOfWith`
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1. Each was `unresolved reference`.
+
+| program | reference |
+| --- | --- |
+| `ps.sortedWith(compareBy(nullsFirst()) { it.age })`, `compareByDescending(nullsLast()) { it.age }` | the selector's results ordered by the comparator (descending swaps the operands) |
+| `compareValues(null, 1)`, `compareValues("b", "a")`, `compareValues<Int>(null, null)` | `-1`, `1`, `0` |
+| `compareValuesBy(P("a", 1), P("a", 2), { it.name }, { it.age })` | `-1` — the first non-zero selector decides |
+| `listOf("aa", "b", "ccc").minOfWith(compareBy<String> { it.length }) { it + "!" }` | `b!` |
+| `listOf<Int>().minOfWith(naturalOrder()) { it }`, `…minOfWithOrNull(…)` | `NoSuchElementException`, `null` |
+
+`compareBy(cmp) { sel }` is `Comparator { a, b -> cmp.compare(sel(a), sel(b)) }`
+with both evaluated once; `compareValues` is `nullsFirst()`'s comparator;
+`minOfWith(cmp) { sel }` and its siblings are `map(sel)` reduced by
+`minWith`/`maxWith`.
+
 ## Top-level function overloads
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, compiled and run on the same JVM.

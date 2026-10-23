@@ -6493,6 +6493,28 @@ impl Compiler {
             }
             return Ok(Type::Double);
         }
+        // `minOfWith(cmp) { sel }` and its three siblings are the selector's
+        // results reduced by the comparator: `map(sel).minWith(cmp)`, with the
+        // `…OrNull` forms answering `null` for an empty receiver.
+        if let ("minOfWith" | "maxOfWith" | "minOfWithOrNull" | "maxOfWithOrNull", 2, false) =
+            (name, args.len(), safe)
+        {
+            let declared = self
+                .infer_class(sc, recv)
+                .and_then(|c| self.classes.get(&c))
+                .is_some_and(|m| m.methods.contains_key(name));
+            if !declared {
+                let mapped = Expr::MethodCall {
+                    recv: Box::new(recv.clone()),
+                    name: "map".into(),
+                    args: vec![args[1].clone()],
+                    safe: false,
+                    line,
+                };
+                let reduce = name.replace("Of", "");
+                return self.compile_member(sc, &mapped, &reduce, &args[..1], false, line);
+            }
+        }
         // `s.lineSequence()` is `s.lines().asSequence()`: the same split, lazily.
         if name == "lineSequence" && args.is_empty() && !safe && self.infer(sc, recv).is_str() {
             let lines = Expr::MethodCall {
@@ -9968,6 +9990,116 @@ impl Compiler {
             // over one or more key selectors, for `sortedWith`. The selectors
             // are ordinary one-parameter lambdas, so each is compiled to a
             // closure value and the host holds the chain.
+            // `compareBy(comparator) { selector }` — the selector's results
+            // ordered by `comparator` (`compareByDescending` swaps the operands):
+            // `Comparator { a, b -> cmp.compare(sel(a), sel(b)) }`. Both are
+            // evaluated once, into hidden locals the comparator captures.
+            "compareBy" | "compareByDescending"
+                if args.len() == 2
+                    && !is_lambda(&args[0])
+                    && !self.declares_fun(name)
+                    && !self.local_sigs.contains_key(name) =>
+            {
+                let id = HOIST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let (cmp, sel) = (format!("#cmpby_cmp{id}"), format!("#cmpby_sel{id}"));
+                self.compile_expr(sc, &args[0])?;
+                let slot = sc.declare(&cmp, Type::Obj, false);
+                self.b.emit(Op::SetSlot(slot), line);
+                self.compile_expr(sc, &args[1])?;
+                let slot = sc.declare(&sel, Type::Obj, false);
+                self.b.emit(Op::SetSlot(slot), line);
+                let (a, b) = (format!("#cmpby_a{id}"), format!("#cmpby_b{id}"));
+                let (l, r) = if name == "compareBy" {
+                    (&a, &b)
+                } else {
+                    (&b, &a)
+                };
+                let key = |v: &str| Expr::Invoke {
+                    target: Box::new(Expr::Var(sel.clone())),
+                    args: vec![Expr::Var(v.to_string())],
+                    line,
+                };
+                let body = Expr::MethodCall {
+                    recv: Box::new(Expr::Var(cmp.clone())),
+                    name: "compare".into(),
+                    args: vec![key(l), key(r)],
+                    safe: false,
+                    line,
+                };
+                let lambda = Expr::Lambda {
+                    params: vec![(a.clone(), Type::Unknown), (b.clone(), Type::Unknown)],
+                    body: vec![Stmt::new(line, StmtKind::Expr(body))],
+                    catch_tag: None,
+                };
+                self.compile_expr(sc, &lambda)?;
+                Ok(Type::Obj)
+            }
+            // `compareValues(a, b)` — natural order with `null` first, which is
+            // exactly `nullsFirst()`'s comparator.
+            "compareValues"
+                if args.len() == 2
+                    && !self.declares_fun(name)
+                    && !self.local_sigs.contains_key(name) =>
+            {
+                let call = Expr::MethodCall {
+                    recv: Box::new(Expr::Call {
+                        name: "nullsFirst".into(),
+                        args: Vec::new(),
+                        line,
+                    }),
+                    name: "compare".into(),
+                    args: args.to_vec(),
+                    safe: false,
+                    line,
+                };
+                self.compile_expr(sc, &call)?;
+                Ok(Type::Int)
+            }
+            // `compareValuesBy(a, b, sel…)` — the first selector whose
+            // `compareValues` is non-zero decides; `0` when none is. `a` and `b`
+            // are evaluated once, and each selector at most twice, in order.
+            "compareValuesBy"
+                if args.len() >= 3
+                    && !self.declares_fun(name)
+                    && !self.local_sigs.contains_key(name) =>
+            {
+                let id = HOIST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let (a, b) = (format!("#cvb_a{id}"), format!("#cvb_b{id}"));
+                let var = |n: &str| Box::new(Expr::Var(n.to_string()));
+                let mut acc = Expr::Int(0);
+                for (i, sel) in args[2..].iter().enumerate().rev() {
+                    let key = |v: &str| Expr::Invoke {
+                        target: Box::new(sel.clone()),
+                        args: vec![Expr::Var(v.to_string())],
+                        line,
+                    };
+                    let c = format!("#cvb_c{id}_{i}");
+                    let cmp = Expr::Call {
+                        name: "compareValues".into(),
+                        args: vec![key(&a), key(&b)],
+                        line,
+                    };
+                    acc = Expr::Seq {
+                        binds: vec![(c.clone(), cmp)],
+                        value: Box::new(Expr::If(IfExpr {
+                            cond: Box::new(Expr::Binary {
+                                op: BinOp::Ne,
+                                l: var(&c),
+                                r: Box::new(Expr::Int(0)),
+                            }),
+                            then: vec![Stmt::new(line, StmtKind::Expr(Expr::Var(c.clone())))],
+                            els: Some(vec![Stmt::new(line, StmtKind::Expr(acc))]),
+                            line,
+                        })),
+                    };
+                }
+                let whole = Expr::Seq {
+                    binds: vec![(a, args[0].clone()), (b, args[1].clone())],
+                    value: Box::new(acc),
+                };
+                self.compile_expr(sc, &whole)?;
+                Ok(Type::Int)
+            }
             "compareBy" | "compareByDescending"
                 if !args.is_empty() && args.iter().all(is_lambda) =>
             {

@@ -7961,3 +7961,31 @@ fn a_class_declaring_one_method_twice_is_refused_rather_than_resolved_wrongly() 
         "stderr was: {err}"
     );
 }
+
+#[test]
+fn comparator_builders_over_a_comparator_and_compare_values() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. `compareBy(cmp) { sel }`,
+    // `compareValues`, `compareValuesBy` and `minOfWith`/`maxOfWith` were
+    // `unresolved reference`.
+    assert_eq!(
+        stdout(
+            r#"fun t(name: String, f: () -> Any?) { try { println("$name: ${f()}") } catch (e: Throwable) { println("$name: EX $e") } }
+data class P(val name: String, val age: Int?)
+fun main() {
+    val ps = listOf(P("b", 3), P("a", null), P("c", 3), P("d", 1))
+    t("nullsFirst") { ps.sortedWith(compareBy(nullsFirst()) { it.age }).map { it.name } }
+    t("nullsLast") { ps.sortedWith(compareBy(nullsLast()) { it.age }).map { it.name } }
+    t("byCmpDesc") { ps.sortedWith(compareByDescending(nullsLast()) { it.age }).map { it.name } }
+    t("byLen") { listOf("bb", "a", "ccc").sortedWith(compareBy(reverseOrder()) { it.length }) }
+    t("cmpValues") { listOf(compareValues(null, 1), compareValues("b", "a"), compareValues(2, 2), compareValues<Int>(null, null), compareValues(1.5, 0.5)) }
+    t("cmpBy") { listOf(compareValuesBy(P("a", 1), P("a", 2), { it.name }, { it.age }), compareValuesBy(P("b", 1), P("a", 2), { it.name }), compareValuesBy(P("a", null), P("a", 2)) { it.age }) }
+    t("minOfWith") { listOf("aa", "b", "ccc").minOfWith(compareBy<String> { it.length }) { it + "!" } }
+    t("maxOfWith") { listOf(3, 1, 2).maxOfWith(reverseOrder()) { it * 10 } }
+    t("minOfWithEmpty") { listOf<Int>().minOfWith(naturalOrder()) { it } }
+    t("minOfWithOrNull") { listOf<Int>().minOfWithOrNull(naturalOrder()) { it } }
+    t("maxOfWithOrNull") { listOf(4, 9).maxOfWithOrNull(naturalOrder()) { -it } }
+}"#
+        ),
+        "nullsFirst: [a, d, b, c]\nnullsLast: [d, b, c, a]\nbyCmpDesc: [a, b, c, d]\nbyLen: [ccc, bb, a]\ncmpValues: [-1, 1, 0, 0, 1]\ncmpBy: [-1, 1, -1]\nminOfWith: b!\nmaxOfWith: 10\nminOfWithEmpty: EX java.util.NoSuchElementException\nminOfWithOrNull: null\nmaxOfWithOrNull: -4\n"
+    );
+}
