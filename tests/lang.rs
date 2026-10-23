@@ -10197,3 +10197,52 @@ fn a_non_exhaustive_when_over_a_closed_type_is_refused() {
         );
     }
 }
+
+/// `class C private constructor(val c: Double)`, `class A constructor(…)` and\n`internal constructor` declare the primary constructor; they were a parse\nerror (`expected Class, found Ident("constructor")`). The visibility is not\nenforced.
+#[test]
+fn a_primary_constructor_spelled_with_its_keyword() {
+    assert_eq!(
+        prog(
+            r##"interface Named { val name: String; fun greet() = "Hi $name" }
+abstract class Animal(override val name: String) : Named { abstract fun sound(): String; open fun describe() = "$name says ${sound()}" }
+class Dog(name: String) : Animal(name) { override fun sound() = "woof"; override fun describe() = super.describe() + "!" }
+class Box<out T>(val v: T) { fun <R> map(f: (T) -> R) = Box(f(v)); override fun toString() = "Box($v)" }
+class Stack<T> { private val items = ArrayDeque<T>(); fun push(x: T) = items.addLast(x); fun pop(): T? = items.removeLastOrNull(); val size get() = items.size }
+object Registry { private val m = mutableMapOf<String, Int>(); fun add(k: String) { m[k] = (m[k] ?: 0) + 1 }; override fun toString() = m.toString() }
+class Temp private constructor(val c: Double) { companion object { fun ofF(f: Double) = Temp((f - 32) * 5 / 9) }; override fun toString() = "%.1f".format(c) }
+fun <T : Comparable<T>> maxOf3(a: T, b: T, c: T): T = maxOf(a, maxOf(b, c))
+fun main() {
+    val d = Dog("Rex"); println(d.describe()); println(d.greet())
+    println(Box(3).map { it * 2 }.map { "s$it" })
+    val s = Stack<String>(); s.push("a"); s.push("b"); println("${s.pop()} ${s.size} ${s.pop()} ${s.pop()}")
+    Registry.add("x"); Registry.add("x"); Registry.add("y"); println(Registry)
+    println(Temp.ofF(212.0))
+    println(maxOf3("pear", "apple", "zoo")); println(maxOf3(3, 9, 1))
+    val words = "the quick brown fox jumps over the lazy dog".split(" ")
+    println(words.groupingBy { it.length }.eachCount().toSortedMap())
+    println(words.associateWith { it.length }.filterValues { it > 4 })
+    println(words.windowed(3, 3).map { it.joinToString("-") })
+    println(words.zipWithNext { a, b -> a.first() == b.first() }.count { it })
+    println(words.sortedWith(compareBy({ it.length }, { it })).take(4))
+    println(words.fold(StringBuilder()) { acc, w -> acc.append(w[0]) })
+    val (short, long) = words.partition { it.length <= 3 }
+    println("$short | $long")
+    println(words.chunked(4).map { it.size })
+    println((1..10).toList().reduceRight { x, acc -> x - acc })
+    println(words.flatMap { it.toList() }.distinct().size)
+    println(buildString { repeat(3) { append(it) } })
+    println(buildList { add(1); addAll(listOf(2, 3)) })
+    println(buildMap { put("k", 1) })
+}"##
+        ),
+        "Rex says woof!\nHi Rex\nBox(s6)\nb 1 a null\n{x=2, y=1}\n100.0\nzoo\n9\n{3=4, 4=2, 5=3}\n{quick=5, brown=5, jumps=5}\n[the-quick-brown, fox-jumps-over, the-lazy-dog]\n0\n[dog, fox, the, the]\ntqbfjotld\n[the, fox, the, dog] | [quick, brown, jumps, over, lazy]\n[4, 4, 1]\n-5\n26\n012\n[1, 2, 3]\n{k=1}\n"
+    );
+    assert_eq!(
+        prog(
+            r##"class A constructor(val x: Int)
+class B internal constructor(val y: Int) { constructor() : this(7) }
+fun main() { println(A(1).x + B(2).y + B().y) }"##
+        ),
+        "10\n"
+    );
+}

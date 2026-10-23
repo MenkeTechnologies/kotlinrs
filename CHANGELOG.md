@@ -11,6 +11,17 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## A primary constructor spelled with its keyword
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | before | reference |
+| --- | --- | --- |
+| `class Temp private constructor(val c: Double) { companion object { fun ofF(f: Double) = … } }` | `expected Class, found Ident("constructor")` | runs |
+| `class A constructor(val x: Int)`, `class B internal constructor(val y: Int)` | parse error | runs |
+
+The visibility modifier is accepted and not enforced.
+
 ## A non-exhaustive `when` over a closed type is a compile error
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.

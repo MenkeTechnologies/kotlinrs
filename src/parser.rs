@@ -1077,7 +1077,8 @@ impl Parser {
     /// was there — the receiver is then that type's companion object.
     fn companion_qualifier(&mut self) -> bool {
         let named = matches!(self.peek(), Tok::Ident(n) if n == "Companion");
-        if named && matches!(self.peek_at(1), Tok::Dot) && matches!(self.peek_at(2), Tok::Ident(_)) {
+        if named && matches!(self.peek_at(1), Tok::Dot) && matches!(self.peek_at(2), Tok::Ident(_))
+        {
             self.advance();
             self.advance();
             return true;
@@ -1425,6 +1426,24 @@ impl Parser {
         let outer_ctps = std::mem::replace(&mut self.class_type_params, tps.clone());
         let outer_tps = std::mem::replace(&mut self.type_params, tps.clone());
 
+        // `class C private constructor(…)` — the primary constructor spelled
+        // with its keyword, which a visibility modifier needs. The visibility
+        // is not enforced here.
+        let ctor_at = match self.peek() {
+            Tok::Ident(v)
+                if matches!(v.as_str(), "private" | "protected" | "internal" | "public") =>
+            {
+                1
+            }
+            _ => 0,
+        };
+        if matches!(self.peek_at(ctor_at), Tok::Ident(w) if w == "constructor")
+            && matches!(self.peek_at(ctor_at + 1), Tok::LParen)
+        {
+            for _ in 0..=ctor_at {
+                self.advance();
+            }
+        }
         // Primary constructor (classes only). `object`s and `interface`s have
         // none.
         let mut params = Vec::new();
