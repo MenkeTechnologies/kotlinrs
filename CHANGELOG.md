@@ -11,6 +11,18 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## More JVM throwables; suppressed exceptions
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1. Each was `unresolved reference`.
+
+| program | reference |
+| --- | --- |
+| `throw AssertionError("ae")` caught as `Error`, `AssertionError(42).message`, not caught by `catch (e: Exception)` | `java.lang.AssertionError: ae`, `42`, the `Throwable` arm |
+| `OutOfMemoryError("oom")` caught as `VirtualMachineError` | `oom` |
+| `catch (e: ConcurrentModificationException)` around a `for` that resizes its list | caught, `message` `null` |
+| `InterruptedException`, `ArrayStoreException` | constructed, caught, printed |
+| `e.addSuppressed(x)`, `e.suppressed.size`, `e.suppressedExceptions`, `e.addSuppressed(e)` | in order; a self-suppression is ignored (Kotlin's extension skips it) |
+
 ## `Long` values keep their width once erased
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.

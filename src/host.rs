@@ -2606,6 +2606,7 @@ fn reset_heap() {
     MOD_COUNTS.with(|t| t.borrow_mut().clear());
     CHAR_CATEGORY_VALUES.with(|t| t.borrow_mut().clear());
     FAILED_INIT.with(|f| f.borrow_mut().clear());
+    SUPPRESSED.with(|s| s.borrow_mut().clear());
     INIT_DEPTH.with(|d| d.set(0));
     TYPES.with(|t| t.borrow_mut().clear());
     TOSTRING_SUBS.with(|t| t.borrow_mut().clear());
@@ -2643,6 +2644,12 @@ fn reset_heap() {
 // handler; the handler's [`KT_EXC_CUT`] then discards those stranded operands.
 // A program with no `try` pays nothing — no check is emitted and a fault halts
 // exactly as it did before.
+
+thread_local! {
+    /// Throwable handle → the exceptions `addSuppressed` attached to it.
+    static SUPPRESSED: RefCell<std::collections::HashMap<u32, Vec<Value>>> =
+        RefCell::new(std::collections::HashMap::new());
+}
 
 thread_local! {
     /// The `object`s whose initializer threw, with what it threw — see
@@ -2844,6 +2851,14 @@ pub const BUILTIN_THROWABLES: &[(&str, &str)] = &[
     ("VirtualMachineError", "java.lang.VirtualMachineError"),
     ("StackOverflowError", "java.lang.StackOverflowError"),
     ("LinkageError", "java.lang.LinkageError"),
+    ("AssertionError", "java.lang.AssertionError"),
+    ("OutOfMemoryError", "java.lang.OutOfMemoryError"),
+    (
+        "ConcurrentModificationException",
+        "java.util.ConcurrentModificationException",
+    ),
+    ("InterruptedException", "java.lang.InterruptedException"),
+    ("ArrayStoreException", "java.lang.ArrayStoreException"),
     (
         "ExceptionInInitializerError",
         "java.lang.ExceptionInInitializerError",
@@ -2908,6 +2923,11 @@ const THROWABLE_PARENTS: &[(&str, &str)] = &[
     ("VirtualMachineError", "Error"),
     ("StackOverflowError", "VirtualMachineError"),
     ("LinkageError", "Error"),
+    ("AssertionError", "Error"),
+    ("OutOfMemoryError", "VirtualMachineError"),
+    ("ConcurrentModificationException", "RuntimeException"),
+    ("InterruptedException", "Exception"),
+    ("ArrayStoreException", "RuntimeException"),
     ("ExceptionInInitializerError", "LinkageError"),
     ("NoClassDefFoundError", "LinkageError"),
     ("PatternSyntaxException", "IllegalArgumentException"),
@@ -13462,6 +13482,42 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             return Ok(CAUSES
                 .with(|c| c.borrow().get(id).cloned())
                 .unwrap_or(Value::Undef));
+        }
+    }
+    // `Throwable.addSuppressed(e)` / `.suppressed` (an array) /
+    // `.suppressedExceptions` (a list), in the order added.
+    if is_throwable(recv) {
+        if let Value::Obj(id) = recv {
+            match (name, args) {
+                ("addSuppressed", [other]) => {
+                    if matches!(other, Value::Undef) {
+                        return Err(
+                            "java.lang.NullPointerException: Cannot suppress a null exception."
+                                .to_string(),
+                        );
+                    }
+                    // Kotlin's `addSuppressed` is the stdlib extension, which skips
+                    // a self-suppression the JDK member would refuse.
+                    if identical(recv, other) {
+                        return Ok(unit_value());
+                    }
+                    SUPPRESSED.with(|s| s.borrow_mut().entry(*id).or_default().push(other.clone()));
+                    return Ok(unit_value());
+                }
+                ("suppressed" | "getSuppressed" | "suppressedExceptions", []) => {
+                    let items =
+                        SUPPRESSED.with(|s| s.borrow().get(id).cloned().unwrap_or_default());
+                    return Ok(if name == "suppressedExceptions" {
+                        alloc(HeapObj::List(items))
+                    } else {
+                        alloc(HeapObj::Array {
+                            items,
+                            desc: "[Ljava.lang.Throwable;".to_string(),
+                        })
+                    });
+                }
+                _ => {}
+            }
         }
     }
     // `Throwable.message` — the constructor message, or Kotlin `null`.

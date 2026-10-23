@@ -8968,3 +8968,66 @@ fun main() {
         "true\n[true, true, true]\n[2]\ntrue\n"
     );
 }
+
+#[test]
+fn more_jvm_throwables_and_suppressed_exceptions() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. `AssertionError`,
+    // `OutOfMemoryError`, `ConcurrentModificationException` (also as thrown by
+    // a `for` loop), `InterruptedException`, `ArrayStoreException`, and
+    // `addSuppressed`/`suppressed` were `unresolved reference`.
+    assert_eq!(
+        stdout(
+            r##"fun t(name: String, f: () -> Any?) { try { println("$name: ${f()}") } catch (e: Throwable) { println("$name: EX $e") } }
+fun main() {
+    t("ae") { try { throw AssertionError("ae") } catch (e: Error) { e.toString() } }
+    t("aeNull") { AssertionError().message }
+    t("aeAny") { AssertionError(42).message }
+    t("oom") { try { throw OutOfMemoryError("oom") } catch (e: VirtualMachineError) { e.message } }
+    t("cme") { try { val l = mutableListOf(1, 2); for (x in l) l.add(3) } catch (e: ConcurrentModificationException) { "caught ${e.message}" } }
+    t("cmeNew") { ConcurrentModificationException("x").toString() }
+    t("interrupted") { try { throw InterruptedException("i") } catch (e: Exception) { e.toString() } }
+    t("arrayStore") { ArrayStoreException("s").toString() }
+    t("aeCatchException") { try { throw AssertionError("x") } catch (e: Exception) { "exc" } catch (e: Throwable) { "thr" } }
+}"##
+        ),
+        "ae: java.lang.AssertionError: ae\naeNull: null\naeAny: 42\noom: oom\ncme: caught null\ncmeNew: java.util.ConcurrentModificationException: x\ninterrupted: java.lang.InterruptedException: i\narrayStore: java.lang.ArrayStoreException: s\naeCatchException: thr\n"
+    );
+    assert_eq!(
+        stdout(
+            r##"fun t(name: String, f: () -> Any?) { try { println("$name: ${f()}") } catch (e: Throwable) { println("$name: EX $e") } }
+fun main() {
+    t("size") { val e = RuntimeException("x"); e.addSuppressed(Exception("s")); e.addSuppressed(Error("t")); e.suppressed.size }
+    t("list") { val e = RuntimeException("x"); e.addSuppressed(Exception("s")); e.suppressedExceptions.map { it.message } }
+    t("first") { val e = RuntimeException("x"); e.addSuppressed(IllegalStateException("s")); e.suppressed[0].toString() }
+    t("none") { RuntimeException().suppressed.size }
+    t("self") { val e = RuntimeException("x"); e.addSuppressed(e) }
+    t("ret") { RuntimeException().addSuppressed(Exception()) }
+}"##
+        ),
+        "size: 2\nlist: [s]\nfirst: java.lang.IllegalStateException: s\nnone: 0\nself: kotlin.Unit\nret: kotlin.Unit\n"
+    );
+    assert_eq!(
+        stdout(
+            r##"fun t(name: String, f: () -> Any?) { try { println("$name: ${f()}") } catch (e: Throwable) { println("$name: EX $e") } }
+fun f1(): String { try { throw RuntimeException("a") } catch (e: Exception) { return "caught ${e.message}" } finally { println("fin1") } }
+@Suppress("RETURN_IN_FINALLY") fun f2(): Int { try { return 1 } finally { return 2 } }
+fun f3(): Int { var x = 0; try { x = 1; throw IllegalStateException() } catch (e: IllegalStateException) { x += 10 } finally { x += 100 }; return x }
+fun f4() { try { try { throw IllegalArgumentException("inner") } finally { println("inner fin") } } catch (e: IllegalArgumentException) { println("outer caught ${e.message}") } }
+fun f5(): String = try { "x".toInt().toString() } catch (e: NumberFormatException) { "nfe" } finally { println("fin5") }
+fun f6(xs: List<Int>): Int { xs.forEach { if (it > 2) return it }; return -1 }
+fun f7() { try { error("boom") } catch (e: Exception) { throw RuntimeException("wrapped", e) } }
+class Res(val n: String) : AutoCloseable { override fun close() { println("close $n") } }
+fun main() {
+    t("f1") { f1() }; t("f2") { f2() }; t("f3") { f3() }; f4(); t("f5") { f5() }; t("f6") { f6(listOf(1, 3, 5)) }
+    t("f7") { try { f7() } catch (e: RuntimeException) { "${e.message} <- ${e.cause?.message}" } }
+    t("use") { Res("a").use { r -> println("using ${r.n}"); 42 } }
+    t("useThrow") { Res("b").use { throw IllegalStateException("in use") } }
+    t("typed") { try { listOf(1)[3] } catch (e: IndexOutOfBoundsException) { e::class.simpleName } }
+    t("multiCatch") { try { "a".toInt() } catch (e: IllegalStateException) { "ise" } catch (e: IllegalArgumentException) { "iae:${e is NumberFormatException}" } }
+    t("rethrowFin") { var log = ""; try { try { throw Exception("q") } finally { log += "f" } } catch (e: Exception) { log += "c" }; log }
+    t("nothing") { val x: String? = null; x ?: throw IllegalArgumentException("null!") }
+}"##
+        ),
+        "fin1\nf1: caught a\nf2: 2\nf3: 111\ninner fin\nouter caught inner\nfin5\nf5: nfe\nf6: 3\nf7: wrapped <- boom\nusing a\nclose a\nuse: 42\nclose b\nuseThrow: EX java.lang.IllegalStateException: in use\ntyped: IndexOutOfBoundsException\nmultiCatch: iae:true\nrethrowFin: fc\nnothing: EX java.lang.IllegalArgumentException: null!\n"
+    );
+}
