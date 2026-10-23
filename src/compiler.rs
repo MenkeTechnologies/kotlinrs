@@ -8323,6 +8323,47 @@ impl Compiler {
         // extension in Kotlin, so `Box(2).map { … }` on a class declaring
         // `fun <R> map(f: (T) -> R)` must reach that method, not the
         // collection HOF that answered `unresolved reference: map on Box`.
+        // `r.mapCatching(f)` / `r.recoverCatching(f)` are `fold`s whose
+        // transforming half runs inside `runCatching`, so an exception the
+        // transform throws becomes the failure:
+        // `r.fold({ v -> runCatching { f(v) } }, { e -> Result.failure(e) })`.
+        if !member_wins && matches!(name, "mapCatching" | "recoverCatching") && args.len() == 1 {
+            let v = format!("$catching{}", self.b.current_pos());
+            let lam = |p: &str, body: Expr| Expr::Lambda {
+                params: vec![(p.to_string(), Type::Unknown)],
+                body: vec![Stmt::new(line, StmtKind::Expr(body))],
+                catch_tag: None,
+            };
+            let catching = Expr::Call {
+                name: "runCatching".to_string(),
+                args: vec![Expr::Lambda {
+                    params: Vec::new(),
+                    body: vec![Stmt::new(
+                        line,
+                        StmtKind::Expr(Expr::Invoke {
+                            target: Box::new(args[0].clone()),
+                            args: vec![Expr::Var(v.clone())],
+                            line,
+                        }),
+                    )],
+                    catch_tag: None,
+                }],
+                line,
+            };
+            let wrap = |kind: &str| Expr::MethodCall {
+                recv: Box::new(Expr::Var("Result".to_string())),
+                name: kind.to_string(),
+                args: vec![Expr::Var(v.clone())],
+                safe: false,
+                line,
+            };
+            let (on_success, on_failure) = if name == "mapCatching" {
+                (lam(&v, catching), lam(&v, wrap("failure")))
+            } else {
+                (lam(&v, wrap("success")), lam(&v, catching))
+            };
+            return self.compile_member(sc, recv, "fold", &[on_success, on_failure], safe, line);
+        }
         // The lambda-taking `Result` members. Routed before the collection HOFs
         // because `map`/`getOrElse` are spelled the same there and mean
         // something else — the receiver's static class is what tells them apart.

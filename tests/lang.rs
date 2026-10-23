@@ -10356,3 +10356,49 @@ fun main() {
         "[0, 1, 2, 3, 4]\n[0, 4, 16]\n11\n0123\n[0, 1]\ntrue\n"
     );
 }
+
+/// `Result.mapCatching` and `recoverCatching` run their transform inside\n`runCatching`, so an exception it throws becomes the failure; both were\n`unresolved reference`. The rest pins custom exception classes, `finally`\nordering, a `try` expression, causes and `runCatching` idioms.
+#[test]
+fn result_map_catching_and_recover_catching() {
+    assert_eq!(
+        prog(
+            r##"class AppError(msg: String, val code: Int) : Exception(msg)
+class NotFound(what: String) : RuntimeException("$what not found")
+fun find(k: String): Int = mapOf("a" to 1)[k] ?: throw NotFound(k)
+fun parse(s: String): Result<Int> = runCatching { s.toInt() }
+fun main() {
+    val r = try { find("b") } catch (e: NotFound) { println(e.message); -1 } finally { println("finally") }
+    println(r)
+    try { throw AppError("bad", 42) } catch (e: AppError) { println("${e.message} ${e.code} ${e is Exception}") }
+    try { try { error("inner") } finally { println("inner finally") } } catch (e: IllegalStateException) { println("caught ${e.message}") }
+    try { try { 1 / 0 } catch (e: ArithmeticException) { throw IllegalStateException("wrapped", e) } } catch (e: Exception) { println("${e.message} <- ${e.cause?.message}") }
+    println(listOf("1", "x", "3").map { parse(it) }.map { it.getOrElse { 0 } })
+    println(parse("7").mapCatching { it * 2 }.getOrThrow())
+    println(parse("q").exceptionOrNull()?.javaClass?.simpleName)
+    val results = listOf("4", "z").map(::parse)
+    println(results.filter { it.isSuccess }.map { it.getOrNull() })
+    println(runCatching { require(false) { "nope" } }.exceptionOrNull()?.message)
+    fun f(): Nothing = throw UnsupportedOperationException("never")
+    println(runCatching { f() }.isFailure)
+    val x = try { "5".toInt() } catch (e: Exception) { 0 }
+    println(x)
+    println(kotlin.runCatching { listOf<Int>().first() }.onFailure { println("fail: ${it.message}") }.getOrDefault(9))
+}"##
+        ),
+        "b not found\nfinally\n-1\nbad 42 true\ninner finally\ncaught inner\nwrapped <- / by zero\n[1, 0, 3]\n14\nNumberFormatException\n[4]\nnope\ntrue\n5\nfail: List is empty.\n9\n"
+    );
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    val r = runCatching { 4 }
+    println(r.mapCatching { it / 0 })
+    println(r.mapCatching { it + 1 })
+    val f = runCatching<Int> { error("x") }
+    println(f.recoverCatching { 9 })
+    println(f.recoverCatching { throw IllegalArgumentException("y") }.exceptionOrNull())
+    println(r.recoverCatching { 0 })
+}"##
+        ),
+        "Failure(java.lang.ArithmeticException: / by zero)\nSuccess(5)\nSuccess(9)\njava.lang.IllegalArgumentException: y\nSuccess(4)\n"
+    );
+}

@@ -11,6 +11,17 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## `Result.mapCatching` / `recoverCatching`
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | before | reference |
+| --- | --- | --- |
+| `runCatching { 4 }.mapCatching { it / 0 }` | `unresolved reference: mapCatching on Result` | `Failure(java.lang.ArithmeticException: / by zero)` |
+| `runCatching<Int> { error("x") }.recoverCatching { 9 }` | `unresolved reference` | `Success(9)` |
+
+Each is a `fold` whose transforming half runs inside `runCatching`.
+
 ## A user class implementing `Sequence`
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
