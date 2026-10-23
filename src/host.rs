@@ -8951,8 +8951,14 @@ fn coll_hof(
         "maxOf" | "minOf" | "maxOfOrNull" | "minOfOrNull" => {
             let want_max = name.starts_with("maxOf");
             let mut best: Option<Value> = None;
+            // The `Double`/`Float` selector overloads fold with `minOf(a, b)`,
+            // which is `Math.min` and PROPAGATES NaN; the total order below puts
+            // NaN on top, which `maxOf` agrees with and `minOf` does not.
+            let mut nan = false;
             for it in items {
                 let sel = invoke_closure(vm, clo, &[it])?;
+                nan |= matches!(sel, Value::Float(x) if x.is_nan())
+                    || f32_box(&sel).is_some_and(|x| x.is_nan());
                 let take = match &best {
                     None => true,
                     Some(b) => (value_cmp(&sel, b) == std::cmp::Ordering::Greater) == want_max,
@@ -8960,6 +8966,9 @@ fn coll_hof(
                 if take {
                     best = Some(sel);
                 }
+            }
+            if nan && !want_max {
+                best = Some(Value::Float(f64::NAN));
             }
             extremum_or(best, name)
         }
@@ -11521,8 +11530,30 @@ fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Va
                 desc: "[B".to_string(),
             }))
         }
+        // `toCharArray(startIndex, endIndex)` — the UTF-16 units of that range,
+        // bounds-checked as `AbstractList.checkBoundsIndexes` checks them.
         (Value::Str(s), "toCharArray") => {
-            let items: Vec<Value> = s.encode_utf16().map(|u| char_of(u as i64)).collect();
+            let units: Vec<u16> = s.encode_utf16().collect();
+            let n = units.len() as i64;
+            let bound = |i: usize, dflt: i64| match args.get(i) {
+                None | Some(Value::Undef) => dflt,
+                Some(v) => v.to_int(),
+            };
+            let (from, to) = (bound(0, 0), bound(1, n));
+            if from < 0 || to > n {
+                return Err(format!(
+                    "java.lang.IndexOutOfBoundsException: startIndex: {from}, endIndex: {to}, size: {n}"
+                ));
+            }
+            if from > to {
+                return Err(format!(
+                    "java.lang.IllegalArgumentException: startIndex: {from} > endIndex: {to}"
+                ));
+            }
+            let items: Vec<Value> = units[from as usize..to as usize]
+                .iter()
+                .map(|u| char_of(*u as i64))
+                .collect();
             Ok(alloc(HeapObj::Array {
                 items,
                 desc: "[C".to_string(),
@@ -12717,6 +12748,33 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         //
         // Membership runs through `key_position` — outside the heap borrow —
         // because a user `equals`/`hashCode` re-enters the VM.
+        // `addAll(index, elements)` INSERTS at the index, as `add(index, e)`
+        // does, with `ArrayList.rangeCheckForAdd`'s message; reading only the
+        // first argument appended the INDEX's collection — nothing — instead.
+        "addAll"
+            if args.len() == 2
+                && with_obj(recv, |o| matches!(o, HeapObj::List(_))).unwrap_or(false) =>
+        {
+            let at = args[0].to_int();
+            let other = sequence_items(&args[1]);
+            let out = with_obj_mut(recv, |o| match o {
+                HeapObj::List(items) => {
+                    match usize::try_from(at).ok().filter(|i| *i <= items.len()) {
+                        Some(i) => {
+                            let added = !other.is_empty();
+                            items.splice(i..i, other);
+                            Ok(Value::Bool(added))
+                        }
+                        None => Err(format!(
+                            "java.lang.IndexOutOfBoundsException: Index: {at}, Size: {}",
+                            items.len()
+                        )),
+                    }
+                }
+                _ => Ok(Value::Bool(false)),
+            });
+            return out.unwrap_or(Ok(Value::Bool(false)));
+        }
         "addAll" | "removeAll" | "retainAll" => {
             let other = args.first().map(sequence_items).unwrap_or_default();
             let keep: Vec<bool> = if name == "addAll" {
@@ -12808,9 +12866,48 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             })
             .flatten();
             if let Some(mut items) = taken {
+                // An ARRAY's `sort(fromIndex, toIndex)` / `sortDescending(…)` /
+                // `reverse(…)` act on that range only. The sorts are
+                // `java.util.Arrays.sort`, checked as it checks; `reverse` is
+                // Kotlin's own, checked by `AbstractList.checkRangeIndexes`.
+                let is_array =
+                    with_obj(recv, |o| matches!(o, HeapObj::Array { .. })).unwrap_or(false);
+                let len = items.len() as i64;
+                let (from, to) = match (args.first(), args.get(1)) {
+                    (Some(a), b) if is_array => (a.to_int(), b.map_or(len, |b| b.to_int())),
+                    _ => (0, len),
+                };
+                let bad = if name == "reverse" {
+                    if from < 0 || to > len {
+                        Some(format!(
+                            "java.lang.IndexOutOfBoundsException: fromIndex: {from}, toIndex: {to}, size: {len}"
+                        ))
+                    } else if from > to {
+                        Some(format!(
+                            "java.lang.IllegalArgumentException: fromIndex: {from} > toIndex: {to}"
+                        ))
+                    } else {
+                        None
+                    }
+                } else if from > to {
+                    Some(format!(
+                        "java.lang.IllegalArgumentException: fromIndex({from}) > toIndex({to})"
+                    ))
+                } else if from < 0 || to > len {
+                    let at = if from < 0 { from } else { to };
+                    Some(format!(
+                        "java.lang.ArrayIndexOutOfBoundsException: Array index out of range: {at}"
+                    ))
+                } else {
+                    None
+                };
+                if let Some(e) = bad {
+                    return Err(e);
+                }
+                let range = &mut items[from as usize..to as usize];
                 match name {
-                    "reverse" => items.reverse(),
-                    _ => sort_vm(vm, &mut items, name == "sortDescending"),
+                    "reverse" => range.reverse(),
+                    _ => sort_vm(vm, range, name == "sortDescending"),
                 }
                 with_obj_mut(recv, |o| {
                     if let HeapObj::List(dst) | HeapObj::Array { items: dst, .. } = o {
@@ -12968,6 +13065,82 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         }
         // `Array.fill(element, fromIndex = 0, toIndex = size)` — `Arrays.fill`,
         // whose `rangeCheck` words the faults — and `MutableList.fill(value)`.
+        // `src.copyInto(destination, destinationOffset, startIndex, endIndex)`
+        // is `System.arraycopy`, with HotSpot's own fault wording, and answers
+        // the destination. Overlapping ranges copy as if through a buffer.
+        "copyInto"
+            if (1..=4).contains(&args.len())
+                && with_obj(recv, |o| matches!(o, HeapObj::Array { .. })).unwrap_or(false) =>
+        {
+            let arr = |v: &Value| {
+                with_obj(v, |o| match o {
+                    HeapObj::Array { items, desc } => Some((items.clone(), desc.clone())),
+                    _ => None,
+                })
+                .flatten()
+            };
+            let (Some((src, sdesc)), Some((dst, ddesc))) = (arr(recv), arr(&args[0])) else {
+                return Err(format!(
+                    "unresolved reference: copyInto on {} with {}",
+                    obj_label(recv),
+                    obj_label(&args[0])
+                ));
+            };
+            let at = |i: usize, dflt: i64| match args.get(i) {
+                None | Some(Value::Undef) => dflt,
+                Some(v) => v.to_int(),
+            };
+            let (n, dn) = (src.len() as i64, dst.len() as i64);
+            let (off, start, end) = (at(1, 0), at(2, 0), at(3, n));
+            let len = end - start;
+            let elem = |desc: &str| match desc {
+                "[I" => "int",
+                "[J" => "long",
+                "[D" => "double",
+                "[F" => "float",
+                "[Z" => "boolean",
+                "[C" => "char",
+                "[S" => "short",
+                "[B" => "byte",
+                _ => "object array",
+            };
+            let (st, dt) = (elem(&sdesc), elem(&ddesc));
+            let aioobe = "java.lang.ArrayIndexOutOfBoundsException: arraycopy:";
+            if len < 0 {
+                return Err(format!("{aioobe} length {len} is negative"));
+            }
+            if start < 0 {
+                return Err(format!(
+                    "{aioobe} source index {start} out of bounds for {st}[{n}]"
+                ));
+            }
+            if off < 0 {
+                return Err(format!(
+                    "{aioobe} destination index {off} out of bounds for {dt}[{dn}]"
+                ));
+            }
+            if start + len > n {
+                return Err(format!(
+                    "{aioobe} last source index {} out of bounds for {st}[{n}]",
+                    start + len
+                ));
+            }
+            if off + len > dn {
+                return Err(format!(
+                    "{aioobe} last destination index {} out of bounds for {dt}[{dn}]",
+                    off + len
+                ));
+            }
+            let chunk: Vec<Value> = src[start as usize..end as usize].to_vec();
+            with_obj_mut(&args[0], |o| {
+                if let HeapObj::Array { items, .. } = o {
+                    for (k, v) in chunk.into_iter().enumerate() {
+                        items[off as usize + k] = v;
+                    }
+                }
+            });
+            return Ok(args[0].clone());
+        }
         "fill" if (1..=3).contains(&args.len()) => {
             let v = args[0].clone();
             let from = args.get(1).map(Value::to_int);
@@ -14209,8 +14382,48 @@ fn sequence_member(
             let Some(needle) = args.first().cloned() else {
                 return Some(Err("binarySearch: an element is required".to_string()));
             };
-            let mut lo: i64 = 0;
-            let mut hi: i64 = items.len() as i64 - 1;
+            // `binarySearch(element, fromIndex, toIndex)` searches that range,
+            // checked first — with the `List` wording of Kotlin's own
+            // `rangeCheck`, or `java.util.Arrays`'s for an array.
+            let int_arg = |i: usize| match args.get(i) {
+                Some(Value::Int(n)) => Some(*n),
+                _ => None,
+            };
+            let len = items.len() as i64;
+            let (from, to) = (int_arg(1).unwrap_or(0), int_arg(2).unwrap_or(len));
+            let fault = if kind == SeqKind::Array {
+                if from > to {
+                    Some(format!(
+                        "java.lang.IllegalArgumentException: fromIndex({from}) > toIndex({to})"
+                    ))
+                } else if from < 0 || to > len {
+                    let bad = if from < 0 { from } else { to };
+                    Some(format!(
+                        "java.lang.ArrayIndexOutOfBoundsException: Array index out of range: {bad}"
+                    ))
+                } else {
+                    None
+                }
+            } else if from > to {
+                Some(format!(
+                    "java.lang.IllegalArgumentException: fromIndex ({from}) is greater than toIndex ({to})."
+                ))
+            } else if from < 0 {
+                Some(format!(
+                    "java.lang.IndexOutOfBoundsException: fromIndex ({from}) is less than zero."
+                ))
+            } else if to > len {
+                Some(format!(
+                    "java.lang.IndexOutOfBoundsException: toIndex ({to}) is greater than size ({len})."
+                ))
+            } else {
+                None
+            };
+            if let Some(e) = fault {
+                return Some(Err(e));
+            }
+            let mut lo: i64 = from;
+            let mut hi: i64 = to - 1;
             let mut found: Option<i64> = None;
             while lo <= hi {
                 let mid = (lo + hi) / 2;

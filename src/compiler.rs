@@ -15346,6 +15346,18 @@ fn builtin_params(name: &str) -> Option<&'static [(&'static str, Dflt)]> {
             ("limit", Dflt::Int(-1)),
             ("truncated", Dflt::Str("...")),
         ],
+        "toCharArray" => &[("startIndex", Dflt::Int(0)), ("endIndex", Dflt::Absent)],
+        "binarySearch" => &[
+            ("element", Dflt::Required),
+            ("fromIndex", Dflt::Int(0)),
+            ("toIndex", Dflt::Absent),
+        ],
+        "copyInto" => &[
+            ("destination", Dflt::Required),
+            ("destinationOffset", Dflt::Int(0)),
+            ("startIndex", Dflt::Int(0)),
+            ("endIndex", Dflt::Absent),
+        ],
         "windowed" => &[
             ("size", Dflt::Required),
             ("step", Dflt::Int(1)),

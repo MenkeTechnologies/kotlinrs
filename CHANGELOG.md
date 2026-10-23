@@ -11,6 +11,20 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Arguments that were ignored: ranges, `addAll(index, …)`, `toCharArray(…)`
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, compiled and run on the same JVM.
+
+| program | before | reference |
+| --- | --- | --- |
+| `listOf(1, 3, 5, 7, 9).binarySearch(7, 0, 3)` | `3` | `-4` |
+| `listOf(…).binarySearch(7, 3, 1)` / an array's `(7, -1, 3)` | the whole list searched | `IllegalArgumentException: fromIndex (3) is greater than toIndex (1).` / `ArrayIndexOutOfBoundsException: Array index out of range: -1` |
+| `intArrayOf(5, 4, 3, 2, 1).also { it.sort(1, 4) }` | `[1, 2, 3, 4, 5]` | `[5, 2, 3, 4, 1]` |
+| `intArrayOf(1, 2, 3).copyInto(IntArray(5), 1, 1, 3)` | `unresolved reference: copyInto on Array` | `[0, 2, 3, 0, 0]`; a short destination is `arraycopy: last destination index 3 out of bounds for int[2]` |
+| `mutableListOf(1, 4).apply { addAll(1, listOf(2, 3)) }` | `[1, 4]` | `[1, 2, 3, 4]` |
+| `"hello".toCharArray(1, 3)` | all five characters | `[e, l]`; `(3, 1)` is `IllegalArgumentException: startIndex: 3 > endIndex: 1` |
+| `listOf(1.0, Double.NaN, 0.5).minOf { it }` | `0.5` | `NaN` — the `Double` selector folds with `Math.min` |
+
 ## Read-only `Set`/`Map` writes; casts to a collection interface
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1, compiled and run on the same JVM.

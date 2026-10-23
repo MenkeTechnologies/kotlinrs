@@ -8120,3 +8120,144 @@ fun main() {
         "class java.lang.Integer cannot be cast to class java.util.List (java.lang.Integer and java.util.List are in module java.base of loader 'bootstrap')\nclass java.lang.String cannot be cast to class java.util.List (java.lang.String and java.util.List are in module java.base of loader 'bootstrap')\nclass java.util.LinkedHashSet cannot be cast to class java.util.List (java.util.LinkedHashSet and java.util.List are in module java.base of loader 'bootstrap')\nclass java.util.LinkedHashMap cannot be cast to class java.util.List (java.util.LinkedHashMap and java.util.List are in module java.base of loader 'bootstrap')\nclass D cannot be cast to class java.util.List (D is in unnamed module of loader 'app'; java.util.List is in module java.base of loader 'bootstrap')\n[1, 2]\nclass java.lang.Double cannot be cast to class java.util.List (java.lang.Double and java.util.List are in module java.base of loader 'bootstrap')\n[1]\nclass java.util.Collections$SingletonSet cannot be cast to class java.util.List (java.util.Collections$SingletonSet and java.util.List are in module java.base of loader 'bootstrap')\nclass java.util.Collections$SingletonMap cannot be cast to class java.util.List (java.util.Collections$SingletonMap and java.util.List are in module java.base of loader 'bootstrap')\nclass kotlin.collections.EmptySet cannot be cast to class java.util.List (kotlin.collections.EmptySet is in unnamed module of loader 'app'; java.util.List is in module java.base of loader 'bootstrap')\nclass java.lang.Integer cannot be cast to class java.util.Map (java.lang.Integer and java.util.Map are in module java.base of loader 'bootstrap')\nclass java.lang.String cannot be cast to class java.util.Map (java.lang.String and java.util.Map are in module java.base of loader 'bootstrap')\nclass java.util.LinkedHashSet cannot be cast to class java.util.Map (java.util.LinkedHashSet and java.util.Map are in module java.base of loader 'bootstrap')\n{1=2, 3=4}\nclass D cannot be cast to class java.util.Map (D is in unnamed module of loader 'app'; java.util.Map is in module java.base of loader 'bootstrap')\nclass java.util.Arrays$ArrayList cannot be cast to class java.util.Map (java.util.Arrays$ArrayList and java.util.Map are in module java.base of loader 'bootstrap')\nclass java.lang.Double cannot be cast to class java.util.Map (java.lang.Double and java.util.Map are in module java.base of loader 'bootstrap')\nclass java.util.ArrayList cannot be cast to class java.util.Map (java.util.ArrayList and java.util.Map are in module java.base of loader 'bootstrap')\nclass java.util.Collections$SingletonSet cannot be cast to class java.util.Map (java.util.Collections$SingletonSet and java.util.Map are in module java.base of loader 'bootstrap')\n{1=1}\nclass kotlin.collections.EmptySet cannot be cast to class java.util.Map (kotlin.collections.EmptySet is in unnamed module of loader 'app'; java.util.Map is in module java.base of loader 'bootstrap')\nclass java.lang.Integer cannot be cast to class java.util.Set (java.lang.Integer and java.util.Set are in module java.base of loader 'bootstrap')\nclass java.lang.String cannot be cast to class java.util.Set (java.lang.String and java.util.Set are in module java.base of loader 'bootstrap')\n[1, 2]\nclass java.util.LinkedHashMap cannot be cast to class java.util.Set (java.util.LinkedHashMap and java.util.Set are in module java.base of loader 'bootstrap')\nclass D cannot be cast to class java.util.Set (D is in unnamed module of loader 'app'; java.util.Set is in module java.base of loader 'bootstrap')\nclass java.util.Arrays$ArrayList cannot be cast to class java.util.Set (java.util.Arrays$ArrayList and java.util.Set are in module java.base of loader 'bootstrap')\nclass java.lang.Double cannot be cast to class java.util.Set (java.lang.Double and java.util.Set are in module java.base of loader 'bootstrap')\nclass java.util.ArrayList cannot be cast to class java.util.Set (java.util.ArrayList and java.util.Set are in module java.base of loader 'bootstrap')\n[1]\nclass java.util.Collections$SingletonMap cannot be cast to class java.util.Set (java.util.Collections$SingletonMap and java.util.Set are in module java.base of loader 'bootstrap')\n[]\nclass java.lang.Integer cannot be cast to class java.util.Collection (java.lang.Integer and java.util.Collection are in module java.base of loader 'bootstrap')\nclass java.lang.String cannot be cast to class java.util.Collection (java.lang.String and java.util.Collection are in module java.base of loader 'bootstrap')\n[1, 2]\nclass java.util.LinkedHashMap cannot be cast to class java.util.Collection (java.util.LinkedHashMap and java.util.Collection are in module java.base of loader 'bootstrap')\nclass D cannot be cast to class java.util.Collection (D is in unnamed module of loader 'app'; java.util.Collection is in module java.base of loader 'bootstrap')\n[1, 2]\nclass java.lang.Double cannot be cast to class java.util.Collection (java.lang.Double and java.util.Collection are in module java.base of loader 'bootstrap')\n[1]\n[1]\nclass java.util.Collections$SingletonMap cannot be cast to class java.util.Collection (java.util.Collections$SingletonMap and java.util.Collection are in module java.base of loader 'bootstrap')\n[]\nclass java.lang.Integer cannot be cast to class java.lang.Iterable (java.lang.Integer and java.lang.Iterable are in module java.base of loader 'bootstrap')\nclass java.lang.String cannot be cast to class java.lang.Iterable (java.lang.String and java.lang.Iterable are in module java.base of loader 'bootstrap')\n[1, 2]\nclass java.util.LinkedHashMap cannot be cast to class java.lang.Iterable (java.util.LinkedHashMap and java.lang.Iterable are in module java.base of loader 'bootstrap')\nclass D cannot be cast to class java.lang.Iterable (D is in unnamed module of loader 'app'; java.lang.Iterable is in module java.base of loader 'bootstrap')\n[1, 2]\nclass java.lang.Double cannot be cast to class java.lang.Iterable (java.lang.Double and java.lang.Iterable are in module java.base of loader 'bootstrap')\n[1]\n[1]\nclass java.util.Collections$SingletonMap cannot be cast to class java.lang.Iterable (java.util.Collections$SingletonMap and java.lang.Iterable are in module java.base of loader 'bootstrap')\n[]\n"
     );
 }
+
+#[test]
+fn to_char_array_takes_its_range() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1: the range arguments were
+    // ignored, so `"hello".toCharArray(1, 3)` answered all five characters.
+    assert_eq!(
+        stdout(
+            r#"fun t(name: String, f: () -> Any?) { try { println("$name: ${f()}") } catch (e: Throwable) { println("$name: EX $e") } }
+fun main() {
+    t("a") { "hello".toCharArray(1, 3).joinToString() }
+    t("b") { "hello".toCharArray(2).joinToString() }
+    t("c") { "hello".toCharArray(endIndex = 2).joinToString() }
+    t("d") { "hello".toCharArray(1, 9).joinToString() }
+    t("e") { "hello".toCharArray(3, 1).joinToString() }
+    t("f") { "hello".toCharArray(-1, 2).joinToString() }
+    t("g") { "a😀".toCharArray(1, 3).size }
+}"#
+        ),
+        "a: e, l\nb: l, l, o\nc: h, e\nd: EX java.lang.IndexOutOfBoundsException: startIndex: 1, endIndex: 9, size: 5\ne: EX java.lang.IllegalArgumentException: startIndex: 3 > endIndex: 1\nf: EX java.lang.IndexOutOfBoundsException: startIndex: -1, endIndex: 2, size: 5\ng: 2\n"
+    );
+}
+
+#[test]
+fn range_arguments_of_binary_search_sort_and_copy_into_are_honoured() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. `binarySearch(x, from, to)`
+    // and an array's `sort(from, to)` ignored the range; `copyInto` was
+    // `unresolved reference`.
+    assert_eq!(
+        stdout(
+            r#"fun t(name: String, f: () -> Any?) { try { println("$name: ${f()}") } catch (e: Throwable) { println("$name: EX $e") } }
+fun main() {
+    val l = listOf(1, 3, 5, 7, 9)
+    t("a") { l.binarySearch(7, 0, 3) }
+    t("b") { l.binarySearch(7, 2) }
+    t("c") { l.binarySearch(1, 1, 4) }
+    t("d") { l.binarySearch(4, fromIndex = 1, toIndex = 4) }
+    t("e") { l.binarySearch(7, 3, 1) }
+    t("f") { l.binarySearch(7, -1, 3) }
+    t("g") { l.binarySearch(7, 0, 9) }
+    val a = intArrayOf(1, 3, 5, 7, 9)
+    t("aa") { a.binarySearch(7, 0, 3) }
+    t("ab") { a.binarySearch(9, 2) }
+    t("ae") { a.binarySearch(7, 3, 1) }
+    t("af") { a.binarySearch(7, -1, 3) }
+    t("ag") { a.binarySearch(7, 0, 9) }
+    t("s1") { intArrayOf(5, 4, 3, 2, 1).also { it.sort(1, 4) }.toList() }
+    t("s2") { intArrayOf(5, 4, 3, 2, 1).also { it.sort(2) }.toList() }
+    t("s3") { intArrayOf(5, 4, 3).also { it.sort(2, 1) }.toList() }
+    t("s4") { intArrayOf(5, 4, 3).also { it.sort(-1, 2) }.toList() }
+    t("s5") { intArrayOf(5, 4, 3).also { it.sort(0, 7) }.toList() }
+    t("s6") { arrayOf("c", "b", "a").also { it.sort(0, 2) }.toList() }
+    t("s7") { intArrayOf(1, 2, 3, 4).also { it.sortDescending(1, 3) }.toList() }
+    t("ci") { val d = IntArray(5); intArrayOf(1, 2, 3).copyInto(d, 1, 1, 3); d.toList() }
+    t("ci2") { val d = arrayOfNulls<String>(3); arrayOf("x", "y").copyInto(d); d.toList() }
+    t("ci3") { val d = IntArray(2); intArrayOf(1, 2, 3).copyInto(d).toList() }
+    t("ci4") { val d = intArrayOf(1, 2, 3, 4, 5); d.copyInto(d, 1, 0, 3); d.toList() }
+}"#
+        ),
+        "a: -4\nb: 3\nc: -2\nd: -3\ne: EX java.lang.IllegalArgumentException: fromIndex (3) is greater than toIndex (1).\nf: EX java.lang.IndexOutOfBoundsException: fromIndex (-1) is less than zero.\ng: EX java.lang.IndexOutOfBoundsException: toIndex (9) is greater than size (5).\naa: -4\nab: 4\nae: EX java.lang.IllegalArgumentException: fromIndex(3) > toIndex(1)\naf: EX java.lang.ArrayIndexOutOfBoundsException: Array index out of range: -1\nag: EX java.lang.ArrayIndexOutOfBoundsException: Array index out of range: 9\ns1: [5, 2, 3, 4, 1]\ns2: [5, 4, 1, 2, 3]\ns3: EX java.lang.IllegalArgumentException: fromIndex(2) > toIndex(1)\ns4: EX java.lang.ArrayIndexOutOfBoundsException: Array index out of range: -1\ns5: EX java.lang.ArrayIndexOutOfBoundsException: Array index out of range: 7\ns6: [b, c, a]\ns7: [1, 3, 2, 4]\nci: [0, 2, 3, 0, 0]\nci2: [x, y, null]\nci3: EX java.lang.ArrayIndexOutOfBoundsException: arraycopy: last destination index 3 out of bounds for int[2]\nci4: [1, 1, 2, 3, 5]\n"
+    );
+}
+
+#[test]
+fn add_all_at_an_index_and_min_of_over_nan() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1. `addAll(1, xs)` appended
+    // nothing (the index was read as the collection), and `minOf { }` over a
+    // NaN answered the smallest number where `Math.min` propagates NaN.
+    assert_eq!(
+        stdout(
+            r#"fun t(name: String, f: () -> Any?) { try { println("$name: ${f()}") } catch (e: Throwable) { println("$name: EX $e") } }
+fun main() {
+    t("minOfNaN") { listOf(1.0, Double.NaN, 0.5).minOf { it } }
+    t("maxOfNaN") { listOf(1.0, Double.NaN).maxOf { it } }
+    t("minOfOrNullNaN") { listOf(Double.NaN, 2.0).minOfOrNull { it } }
+    t("minOfFloat") { listOf(1f, Float.NaN).minOf { it } }
+    t("minOfInt") { listOf(3, 1, 2).minOf { it } }
+    t("minOfStr") { listOf("b", "a").minOf { it } }
+    t("addAllIdx") { mutableListOf(1, 4).apply { addAll(1, listOf(2, 3)) } }
+    t("addAllIdxRet") { mutableListOf(1).addAll(0, listOf()) }
+    t("addAllIdxEnd") { mutableListOf(1).apply { addAll(1, setOf(5, 6)) } }
+    t("addAllIdxBad") { mutableListOf(1).addAll(3, listOf(2)) }
+    t("addAllIdxNeg") { mutableListOf(1).addAll(-1, listOf(2)) }
+}"#
+        ),
+        "minOfNaN: NaN\nmaxOfNaN: NaN\nminOfOrNullNaN: NaN\nminOfFloat: NaN\nminOfInt: 1\nminOfStr: a\naddAllIdx: [1, 2, 3, 4]\naddAllIdxRet: false\naddAllIdxEnd: [1, 5, 6]\naddAllIdxBad: EX java.lang.IndexOutOfBoundsException: Index: 3, Size: 1\naddAllIdxNeg: EX java.lang.IndexOutOfBoundsException: Index: -1, Size: 1\n"
+    );
+    assert_eq!(
+        stdout(
+            r#"fun t(name: String, f: () -> Any?) { try { println("$name: ${f()}") } catch (e: Throwable) { println("$name: EX $e") } }
+fun main() {
+    t("lastIndexOfStart") { "abcabc".lastIndexOf('b', 3) to "abcabc".lastIndexOf("bc", 2) }
+    t("indexOfStart") { "abcabc".indexOf('a', 1) to "abcabc".indexOf("c", -5) }
+    t("startsWithIdx") { "hello".startsWith("ll", 2) to "hello".startsWith("ll", 3) }
+    t("endsWithCI") { "Hello".endsWith("LO", true) }
+    t("replaceCI") { "aAbB".replace("a", "x", ignoreCase = true) }
+    t("replaceChar") { "a-b-c".replace('-', '+') }
+    t("replaceCharCI") { "aAa".replace('a', 'b', true) }
+    t("containsChar") { "Hello".contains('h', ignoreCase = true) }
+    t("splitChar") { "a.b..c".split('.') }
+    t("splitCI") { "aXbxc".split("x", ignoreCase = true) }
+    t("splitLimitNeg") { "a,b".split(",", limit = 0) }
+    t("binSearchRange") { listOf(1, 3, 5, 7, 9).binarySearch(7, 0, 3) }
+    t("fillRange") { IntArray(5).also { it.fill(9, 1, 3) }.toList() }
+    t("copyOf") { intArrayOf(1, 2).copyOf(4).toList() }
+    t("copyOfRange") { intArrayOf(1, 2, 3, 4).copyOfRange(1, 3).toList() }
+    t("copyOfRangeBad") { intArrayOf(1, 2).copyOfRange(1, 5).toList() }
+    t("sortRange") { intArrayOf(5, 4, 3, 2, 1).also { it.sort(1, 4) }.toList() }
+    t("copyInto") { val d = IntArray(5); intArrayOf(1, 2, 3).copyInto(d, 1, 1, 3); d.toList() }
+    t("arrCopyOfStr") { arrayOf("a", "b").copyOf(3).toList() }
+    t("joinLimit") { (1..10).joinToString(limit = 3, truncated = "…") }
+    t("joinTransform") { listOf(1, 2).joinToString(" + ", "= ", ";") { "($it)" } }
+    t("chunkTransform") { (1..7).chunked(3) { it.sum() } }
+    t("windowedPartialTransform") { (1..5).windowed(2, 2, true) { it.joinToString("") } }
+    t("takeLast") { listOf(1, 2, 3).takeLast(5) }
+    t("dropLastWhile") { listOf(1, 2, 3, 4).dropLastWhile { it > 2 } }
+    t("elementAtOrElse") { listOf(1).elementAtOrElse(5) { it * 10 } }
+    t("getOrElseList") { listOf(1).getOrElse(-1) { 99 } }
+    t("indexOfLast") { listOf(1, 2, 1).indexOfLast { it == 1 } }
+    t("lastOrNullPred") { listOf(1, 2, 3).lastOrNull { it < 3 } }
+    t("findLast") { listOf(1, 2, 3).findLast { it % 2 == 1 } }
+    t("randomSeeded") { listOf(1, 2, 3, 4, 5).random(kotlin.random.Random(5)) }
+    t("toStringRadix") { (-255L).toString(16) to 255.toString(36) }
+    t("toLongRadix") { "-zz".toLong(36) }
+    t("toIntRadixBad") { "12".toInt(1) }
+    t("strSubSeq") { "hello".subSequence(1, 3) }
+    t("removeRange") { "hello".removeRange(1, 3) }
+    t("replaceRange") { "hello".replaceRange(1, 3, "XYZ") }
+    t("insertSB") { StringBuilder("ac").insert(1, 'b').insert(0, 12).toString() }
+    t("mutableAddAllIdx") { mutableListOf(1, 4).apply { addAll(1, listOf(2, 3)) } }
+    t("removeAtNeg") { mutableListOf(1).removeAt(-1) }
+    t("setNeg") { mutableListOf(1).set(3, 0) }
+    t("listOfNulls") { arrayOfNulls<String>(2).toList() }
+    t("sumOfLong") { listOf(1, 2).sumOf { it.toLong() * Int.MAX_VALUE } }
+    t("averageEmpty") { listOf<Int>().average() }
+    t("maxOrNullD") { listOf(1.5, Double.NaN, 2.0).maxOrNull() }
+    t("minOfNaN") { listOf(1.0, Double.NaN).minOf { it } }
+}"#
+        ),
+        "lastIndexOfStart: (1, 1)\nindexOfStart: (3, 2)\nstartsWithIdx: (true, false)\nendsWithCI: true\nreplaceCI: xxbB\nreplaceChar: a+b+c\nreplaceCharCI: bbb\ncontainsChar: true\nsplitChar: [a, b, , c]\nsplitCI: [a, b, c]\nsplitLimitNeg: [a, b]\nbinSearchRange: -4\nfillRange: [0, 9, 9, 0, 0]\ncopyOf: [1, 2, 0, 0]\ncopyOfRange: [2, 3]\ncopyOfRangeBad: EX java.lang.IndexOutOfBoundsException: toIndex (5) is greater than size (2).\nsortRange: [5, 2, 3, 4, 1]\ncopyInto: [0, 2, 3, 0, 0]\narrCopyOfStr: [a, b, null]\njoinLimit: 1, 2, 3, …\njoinTransform: = (1) + (2);\nchunkTransform: [6, 15, 7]\nwindowedPartialTransform: [12, 34, 5]\ntakeLast: [1, 2, 3]\ndropLastWhile: [1, 2]\nelementAtOrElse: 50\ngetOrElseList: 99\nindexOfLast: 2\nlastOrNullPred: 2\nfindLast: 3\nrandomSeeded: 2\ntoStringRadix: (-ff, 73)\ntoLongRadix: -1295\ntoIntRadixBad: EX java.lang.IllegalArgumentException: radix 1 was not in valid range 2..36\nstrSubSeq: el\nremoveRange: hlo\nreplaceRange: hXYZlo\ninsertSB: 12abc\nmutableAddAllIdx: [1, 2, 3, 4]\nremoveAtNeg: EX java.lang.IndexOutOfBoundsException: Index -1 out of bounds for length 1\nsetNeg: EX java.lang.IndexOutOfBoundsException: Index 3 out of bounds for length 1\nlistOfNulls: [null, null]\nsumOfLong: 6442450941\naverageEmpty: NaN\nmaxOrNullD: NaN\nminOfNaN: NaN\n"
+    );
+}

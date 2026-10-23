@@ -461,6 +461,9 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
 | `class C { fun f(a: String) = "s"; fun f(a: Int) = "i" }`; `C().f(1)` | `class C: method f is declared more than once — member overloads are not supported` | `i` |
 | `m(arrayOf(1, 2).asList()).add(3)`, `m(listOf(1, 2, 3).subList(0, 2)).add(3)` | the write happens | `UnsupportedOperationException` — both are views over an `Arrays$ArrayList` |
 | `val l = mutableListOf(1, 2, 3); for (x in l) l.remove(x)` | `[2]` | `ConcurrentModificationException` |
+| `object O { init { throw IllegalStateException("in init") }; val x = 1 }`; `O.x` | `IllegalStateException: in init` | `ExceptionInInitializerError` (its `cause` the `IllegalStateException`) |
+| `mutableListOf(1, 2, 3, 4).also { it.subList(1, 3).reverse() }` | `[1, 2, 3, 4]` | `[1, 3, 2, 4]` — the view writes through |
+| `"a😀b".codePointCount(0, 4)` | `unresolved reference: codePointCount on String` | `3` |
 
 The first is an untyped left operand against a PRIMITIVE right one: the native
 `Add` coerces a heap handle to a number. Routing every untyped arithmetic site
