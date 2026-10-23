@@ -11,6 +11,23 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## `ConcurrentModificationException` from a `for` loop
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
+
+| program | before | reference |
+| --- | --- | --- |
+| `val l = mutableListOf(1, 2, 3); for (x in l) l.remove(x)` | `[2]` | `ConcurrentModificationException` |
+| the same removing only `2` (the second-to-last) | `[1, 3]` | `[1, 3]` — the cursor sits at the end, so the loop ends |
+| removing the LAST element, or `add` on the last pass | the loop ends | `ConcurrentModificationException` |
+| `for ((k, _) in m) m[k + 10] = 0` over a `MutableMap` | the new entries iterated | `ConcurrentModificationException` |
+
+A `for` over a collection (anything but a string, an array or a range) tests
+with the new `KT_ITER_MORE` op, which reads the current size each pass and
+follows the JDK iterator: `hasNext` is `cursor != size`, and a size change
+under a cursor that is not at the end is what `next()` refuses. The test is
+one host op per pass where the native compare was.
+
 ## A write through `keys`/`values`/`entries` reaches the map
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.

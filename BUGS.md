@@ -470,7 +470,6 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
 | `open class M(val c: Int)`; `class N(c: Int) : M(c)`; `operator fun M.plus(o: M)` and `operator fun N.plus(o: M)`; `listOf<M>(N(1), M(2)).reduce { a, b -> a + b }` | `unresolved reference: plus on N` | `M.plus`, chosen by the static type `M` |
 | `class C { fun f(a: String) = "s"; fun f(a: Int) = "i" }`; `C().f(1)` | `class C: method f is declared more than once — member overloads are not supported` | `i` |
 | `m(arrayOf(1, 2).asList()).add(3)`, `m(listOf(1, 2, 3).subList(0, 2)).add(3)` | the write happens | `UnsupportedOperationException` — both are views over an `Arrays$ArrayList` |
-| `val l = mutableListOf(1, 2, 3); for (x in l) l.remove(x)` | `[2]` | `ConcurrentModificationException` |
 | `mutableListOf(1, 2, 3, 4).also { it.subList(1, 3).reverse() }` | `[1, 2, 3, 4]` | `[1, 3, 2, 4]` — the view writes through |
 | `'a'.category` | `unresolved reference: category on Char` | `LOWERCASE_LETTER` |
 | `class Bag(…) : Iterable<Int>`; `b.let { it.toList() }` — an `Iterable` user object reached through a receiver of no static class | `unresolved reference: toList on Bag` | the list — the extensions route only where the static class says `Iterable` |
@@ -487,9 +486,10 @@ extension on a class and on its subclass), the chain declines and the call
 fails loudly, because the runtime class does not say which the source meant.
 
 `asList`/`subList` are untagged views (see "Collection VIEWS are
-snapshots"). The `for` row needs a modification count on the list: the loop
-lowers to an index and a size, so a removal inside the body shifts the next
-element under the index instead of failing the next `next()`.
+snapshots"). A `for` loop over a collection raises `ConcurrentModificationException`
+from a SIZE change since round 21; a body that changes the collection
+without changing its size (an `add` and a `remove` in one pass, a `sort`)
+is not detected, which the JDK's modification count would.
 
 Member overloads were silently resolved to the FIRST declaration of the name;
 they are refused now, which is the measurement above. Resolving them needs a

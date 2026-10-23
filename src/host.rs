@@ -325,6 +325,14 @@ pub const KT_OBJ_INIT_ENTER: u16 = 154;
 /// `ExceptionInInitializerError` whose cause it is, and the object recorded
 /// as failed; an `Error` propagates as it is.
 pub const KT_OBJ_INIT_EXIT: u16 = 155;
+/// `KT_ITER_MORE`: the loop test of a `for` over a collection. Stack
+/// `[iterable, i, n0]`, `n0` the size at the loop's head; pushes whether to
+/// run another pass. It is the JDK iterator's protocol over a size check: a
+/// collection whose size the body changed ends the loop if the cursor now
+/// sits at its end (`hasNext` is `cursor != size`) and otherwise raises
+/// `ConcurrentModificationException`, which is what `next()`'s modification
+/// check raises there.
+pub const KT_ITER_MORE: u16 = 156;
 
 /// `KT_SEQ_NEW`: build the lazy `Sequence` a `sequence { … }` block denotes.
 /// Stack `[blockClosure]`; pushes a `Gen` whose source is a fresh coroutine.
@@ -1305,10 +1313,12 @@ fn map_view_write(
             let i = args[0].to_int();
             match usize::try_from(i).ok().filter(|i| *i < items.len()) {
                 Some(i) => vec![i],
-                None => return Some(Err(format!(
+                None => {
+                    return Some(Err(format!(
                     "java.lang.IndexOutOfBoundsException: Index {i} out of bounds for length {}",
                     items.len()
-                ))),
+                )))
+                }
             }
         }
         "removeAll" | "retainAll" if args.len() == 1 => {
@@ -4971,6 +4981,28 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
                 return;
             }
             vm.push(Value::Bool(false));
+        }
+        KT_ITER_MORE => {
+            let n0 = vm.pop().to_int();
+            let i = vm.pop().to_int();
+            let recv = vm.pop();
+            let resizable = with_obj(&recv, |o| {
+                matches!(o, HeapObj::List(_) | HeapObj::Set(_) | HeapObj::Map(_))
+            })
+            .unwrap_or(false);
+            let cur = if resizable {
+                iter_len(&recv).unwrap_or(n0)
+            } else {
+                n0
+            };
+            if cur == n0 {
+                vm.push(Value::Bool(i < n0));
+            } else if i == cur {
+                vm.push(Value::Bool(false));
+            } else {
+                fault(vm, "java.util.ConcurrentModificationException");
+                vm.push(Value::Bool(false));
+            }
         }
         KT_ITER_END => {
             let v = vm.pop();

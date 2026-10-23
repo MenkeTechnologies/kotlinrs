@@ -29,14 +29,14 @@ use crate::host::{
     KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND,
     KT_EXTREMUM_VM, KT_F32, KT_F32_ARITH, KT_F32_STR, KT_FFI_CALL, KT_FFI_COMPILE, KT_GENSEQ,
     KT_GETFIELD, KT_HASH_REG, KT_IDENTITY, KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM,
-    KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_END, KT_ITER_GET, KT_ITER_PULL, KT_ITER_SIZE, KT_ITER_SRC,
-    KT_ITER_SRC_LAZY, KT_JOIN, KT_LATEINIT, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO,
-    KT_LIST_TAG, KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW, KT_NLR_MATCH,
-    KT_NLR_RAISE, KT_NLR_TAKE, KT_NOTNULL, KT_OBJEQ_VM, KT_OBJ_INIT_ENTER, KT_OBJ_INIT_EXIT,
-    KT_OBSERVE, KT_OPER_REG, KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANDOM,
-    KT_RANGE, KT_RANGE_STEP, KT_REIFIED, KT_REIFY, KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN,
-    KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_STR_ORDER, KT_SYSTEM, KT_TOSTRING_REG, KT_TO_STRING,
-    KT_TYPE_REG, KT_YIELD,
+    KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_END, KT_ITER_GET, KT_ITER_MORE, KT_ITER_PULL, KT_ITER_SIZE,
+    KT_ITER_SRC, KT_ITER_SRC_LAZY, KT_JOIN, KT_LATEINIT, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST,
+    KT_LIST_RO, KT_LIST_TAG, KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_NEW,
+    KT_NLR_MATCH, KT_NLR_RAISE, KT_NLR_TAKE, KT_NOTNULL, KT_OBJEQ_VM, KT_OBJ_INIT_ENTER,
+    KT_OBJ_INIT_EXIT, KT_OBSERVE, KT_OPER_REG, KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT,
+    KT_PRINTLN, KT_RANDOM, KT_RANGE, KT_RANGE_STEP, KT_REIFIED, KT_REIFY, KT_RESULT_HOF,
+    KT_RUN_CATCHING, KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_STR_ORDER, KT_SYSTEM,
+    KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG, KT_YIELD,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
@@ -5536,10 +5536,15 @@ impl Compiler {
             },
         );
 
+        // A collection the body may resize is tested with `KT_ITER_MORE`,
+        // which raises `ConcurrentModificationException` as the JDK
+        // iterator does; a string, an array or a range cannot change size and
+        // keeps the native compare.
+        let checked = !self.fixed_size_header(sc, iter);
         // Rotated, like every other loop here: the index test guards the entry
         // and closes the loop as a conditional backward branch. See
         // the note on `while` in [`Compiler::compile_stmt_inner`].
-        self.emit_index_test(islot, nslot);
+        self.emit_loop_test(checked, cslot, islot, nslot);
         let jf = self.b.emit(Op::JumpIfFalse(0), 0);
         let top = self.b.current_pos();
         self.b.emit(Op::GetSlot(cslot), 0);
@@ -5593,7 +5598,7 @@ impl Compiler {
         self.b.emit(Op::LoadInt(1), 0);
         self.b.emit(Op::Add, 0);
         self.b.emit(Op::SetSlot(islot), 0);
-        self.emit_index_test(islot, nslot);
+        self.emit_loop_test(checked, cslot, islot, nslot);
         self.b.emit(Op::JumpIfTrue(top), 0);
         // A lazy source that ran dry left the end marker on the stack.
         if let Some(dry) = dry {
@@ -5663,6 +5668,39 @@ impl Compiler {
     /// `for (v in iterable)`'s bounds test — `index < length`, both read from
     /// their slots. Emitted twice per loop, for the reason
     /// [`Compiler::emit_range_test`] gives.
+    /// The `for`-in loop test: [`Compiler::emit_index_test`], or
+    /// `KT_ITER_MORE` over the iterable for a header that may be resized.
+    fn emit_loop_test(&mut self, checked: bool, cslot: u16, islot: u16, nslot: u16) {
+        if !checked {
+            return self.emit_index_test(islot, nslot);
+        }
+        self.b.emit(Op::GetSlot(cslot), 0);
+        self.b.emit(Op::GetSlot(islot), 0);
+        self.b.emit(Op::GetSlot(nslot), 0);
+        self.b.emit(Op::Extended(KT_ITER_MORE, 0), 0);
+    }
+
+    /// Whether a `for` header is statically a value whose size cannot change
+    /// while the loop runs: a `String`, an array or a range.
+    fn fixed_size_header(&self, sc: &Scope, iter: &Expr) -> bool {
+        if self.infer(sc, iter).is_str() || matches!(iter, Expr::Range { .. } | Expr::Step { .. }) {
+            return true;
+        }
+        self.infer_class(sc, iter).is_some_and(|c| {
+            is_array_class(&c)
+                || matches!(
+                    c.as_str(),
+                    "IntRange"
+                        | "LongRange"
+                        | "CharRange"
+                        | "IntProgression"
+                        | "LongProgression"
+                        | "CharProgression"
+                        | "String"
+                )
+        })
+    }
+
     fn emit_index_test(&mut self, islot: u16, nslot: u16) {
         self.b.emit(Op::GetSlot(islot), 0);
         self.b.emit(Op::GetSlot(nslot), 0);

@@ -8660,3 +8660,32 @@ fun main() {
         "true\nkeysRemove: {3=4}\nfalse\nkeysRemoveAbsent: {1=2}\ntrue\nvaluesRemove: {2=4, 3=5}\nentriesIter: {3=4}\nkeysIter: {a=1, c=3}\nvaluesIter: {2=y}\nkeysRemoveAll: {2=2}\nkeysRetainAll: {2=2}\nvaluesRemoveIf: {1=10}\nentriesRemoveIf: {2=20}\nkeysRemoveAllLambda: {1=1}\nkeysClear: {}\nvaluesClear: 0\nkeysAdd: EX java.lang.UnsupportedOperationException\nviewAfter: [3]\nhashMapKeys: {x=1, z=3}\nentriesRemove: {3=4}\n"
     );
 }
+
+#[test]
+fn a_for_loop_over_a_collection_the_body_resizes_follows_the_jdk_iterator() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.12.1: a size change raises
+    // `ConcurrentModificationException` at the next pass, unless the cursor
+    // now sits at the end — removing the second-to-last element ends the loop
+    // quietly. The indexed walk used to shift the next element under the
+    // index instead.
+    assert_eq!(
+        stdout(
+            r##"fun t(name: String, f: () -> Any?) { try { println("$name: ${f()}") } catch (e: Throwable) { println("$name: EX $e") } }
+fun main() {
+    t("removeFirst") { val l = mutableListOf(1, 2, 3); for (x in l) l.remove(x); l }
+    t("removeSecondToLast") { val l = mutableListOf(1, 2, 3); for (x in l) if (x == 2) l.remove(x); l }
+    t("removeLast") { val l = mutableListOf(1, 2, 3); for (x in l) if (x == 3) l.remove(x); l }
+    t("addDuring") { val l = mutableListOf(1, 2); for (x in l) if (x == 1) l.add(9); l }
+    t("addAtLast") { val l = mutableListOf(1, 2); for (x in l) if (x == 2) l.add(9); l }
+    t("setDuring") { val l = mutableListOf(1, 2); for (x in l) l[0] = 5; l }
+    t("mapPut") { val m = mutableMapOf(1 to 1, 2 to 2); for ((k, _) in m) m[k + 10] = 0; m }
+    t("setRemove") { val s = mutableSetOf(1, 2, 3); for (x in s) if (x == 1) s.remove(x); s }
+    t("indexLoop") { val l = mutableListOf(1, 2, 3); for (i in l.indices) if (i == 0) l.removeAt(0); l }
+    t("noChange") { var s = 0; for (x in mutableListOf(1, 2, 3)) s += x; s }
+    t("arr") { val a = intArrayOf(1, 2); var s = 0; for (x in a) { a[1] = 7; s += x }; s }
+    t("breakAfter") { val l = mutableListOf(1, 2, 3); for (x in l) { l.add(4); break }; l }
+}"##
+        ),
+        "removeFirst: EX java.util.ConcurrentModificationException\nremoveSecondToLast: [1, 3]\nremoveLast: EX java.util.ConcurrentModificationException\naddDuring: EX java.util.ConcurrentModificationException\naddAtLast: EX java.util.ConcurrentModificationException\nsetDuring: [5, 2]\nmapPut: EX java.util.ConcurrentModificationException\nsetRemove: EX java.util.ConcurrentModificationException\nindexLoop: [2, 3]\nnoChange: 6\narr: 8\nbreakAfter: [1, 2, 3, 4]\n"
+    );
+}
