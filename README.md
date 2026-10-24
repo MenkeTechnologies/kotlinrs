@@ -350,7 +350,10 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `.coerceIn()`/`.coerceAtLeast()`/`.coerceAtMost()`, `.pow()`,
   `.absoluteValue`, `.roundToInt()`, `.mod()`/`.floorDiv()` (which round toward negative
   infinity, narrowed to `Int` for an `Int` receiver; `Double.mod` takes the divisor's sign), the IEEE classifiers
-  `.isNaN()`/`.isInfinite()`/`.isFinite()`, and the unsigned 32-bit renderers
+  `.isNaN()`/`.isInfinite()`/`.isFinite()`, the `kotlin.math` IEEE neighbours
+  `.withSign()`/`.nextUp()`/`.nextDown()`/`.nextTowards()`/`.ulp` (stepping
+  through the receiver's own width, so `1f.nextUp()` is `1.0000001`), and the
+  unsigned 32-bit renderers
   `Integer.toBinaryString`/`toHexString`/`toOctalString` — which differ from
   `toString(radix)` only for a negative value (`Integer.toHexString(-1)` is
   `ffffffff` where `(-1).toString(2)` is `-1`); plus `Char.code`,
@@ -392,7 +395,9 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `NoClassDefFoundError: Could not initialize class …`, as on the JVM.
   A **`companion object`** (one per class, named or not) is hoisted to a
   singleton reached through the class name — `C.K`, `C.of(…)` — and, from inside
-  the class, with no qualifier at all. An extension on a companion —
+  the class, with no qualifier at all; a companion `var` is assigned through
+  the same spellings (`C.count = 5`, `count++` inside `init`). An extension on a
+  companion —
   `fun C.Companion.f()`, `val String.Companion.x`, `fun Int.Companion.g()` — is
   called on the type name (`C.f()`, `String.x`), with a user class's companion as
   `this`.
@@ -672,10 +677,14 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   parentheses. A receiver may be NULLABLE (`fun String?.orDash()`,
   `val String?.len get() = this?.length ?: 0`), callable on `null`, and an
   extension property may declare its own type variables (`val <T> List<T>.second:
-  T get() = this[1]`). Dispatch is by the receiver's
+  T get() = this[1]`). A `var` extension property with a setter (`var
+  Box.double: Int get() = n * 2; set(v) { n = v / 2 }`) lowers its setter to a
+  second extension function that `b.double = 10`, `b.double += 4` and
+  `b.double++` call. Dispatch is by the receiver's
   **static** type, which is what keeps an `Int` and a `Long` extension of one
   name apart (they share a runtime representation) and what makes the `Int` one's
-  arithmetic wrap at 32 bits. A member function of the same name and arity wins,
+  arithmetic wrap at 32 bits. A member function of the same name and arity — or
+  a member property of the same name — wins,
   as in Kotlin; inside the body `this` is the receiver, an unqualified name is a
   member of it, and a user-class receiver's properties are in scope. A receiver
   the frontend cannot type falls back to a sole program-wide extension of that
@@ -688,7 +697,8 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   the overridden declaration's defaults. Arguments are evaluated in the order
   they are WRITTEN, so a reordered named argument keeps its effect where it was
   written. A `vararg` binds an array of its declared
-  element type and is supported as the last parameter. The spread operator
+  element type and is supported as the last parameter, a secondary
+  constructor's included (`constructor(vararg v: Int) : this(v.toList())`). The spread operator
   passes an array's elements as that many arguments — `total(1, *xs, 9)`, and
   into the stdlib factories and `format` (`listOf(*xs, 3)`, `arrayOf(*a)`,
   `fmt.format(*args)`) — always as a COPY, so a callee writing its `vararg`
@@ -868,8 +878,8 @@ a name-based lookup falls into) would be silently wrong — so it is a compile
 error. A `reified` T does have an answer and is compiled: the call site binds
 the type argument and the body reads it back.
 
-Not yet (see roadmap): variance and bounds, `vararg` in a secondary
-constructor's parameter list, and the rest of the standard-library surface.
+Not yet (see roadmap): variance and bounds, and the rest of the
+standard-library surface.
 Each fails loudly rather than answering wrong.
 
 One limitation is a **representation** limit rather than a missing feature, and

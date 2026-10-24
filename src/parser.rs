@@ -90,6 +90,10 @@ pub struct Parser {
     /// A LOCAL class — one declared inside a function body — queues here too,
     /// for the same reason and through the same drain.
     pending_classes: Vec<ClassDecl>,
+    /// The setter of a top-level `var Recv.name` extension property, parsed
+    /// alongside its getter by [`Parser::accessor_prop_body`] (which returns
+    /// the getter alone) and drained by [`Parser::extension_prop`].
+    ext_setters: Vec<FunDecl>,
     /// The hoisted name an `object : T { … }` EXPRESSION is about to be
     /// declared under — set by [`Parser::primary`] and consumed by
     /// [`Parser::class_decl_mods`] in place of a written name.
@@ -417,6 +421,7 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
         reified_params: Vec::new(),
         no_trailing_lambda: false,
         pending_classes: Vec::new(),
+        ext_setters: Vec::new(),
         anon_object: None,
         nested_names: Vec::new(),
         in_subjectless_cond: false,
@@ -476,7 +481,7 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
                 prog.funs.push(f);
             }
             Tok::Val | Tok::Var => match p.extension_prop()? {
-                Some(f) => prog.funs.push(f),
+                Some(fs) => prog.funs.extend(fs),
                 None => prog.props.push(p.body_prop()?),
             },
             Tok::Class | Tok::Data | Tok::Object => prog.classes.push(p.class_decl()?),
@@ -1776,6 +1781,12 @@ impl Parser {
                         // what it lowers to. An interface may carry one too —
                         // it has a body, so it needs no storage.
                         if let Some(f) = self.accessor_prop(mods)? {
+                            if !self.ext_setters.is_empty() {
+                                return Err(format!(
+                                    "member extension property {} with a setter is not supported (line {})",
+                                    f.name, f.line
+                                ));
+                            }
                             methods.push(f);
                             continue;
                         }
@@ -2244,6 +2255,13 @@ impl Parser {
         self.eat(&Tok::LParen)?;
         let mut params = Vec::new();
         while !self.at(&Tok::RParen) {
+            // `constructor(vararg v: Int)` — as for a function, the parameter
+            // binds an array of the declared element type.
+            let is_vararg = matches!(self.peek(), Tok::Ident(w) if w == "vararg")
+                && matches!(self.peek_at(1), Tok::Ident(_));
+            if is_vararg {
+                self.advance();
+            }
             let pname = self.ident()?;
             self.eat(&Tok::Colon)?;
             let TypeArg {
@@ -2267,12 +2285,14 @@ impl Parser {
             };
             params.push(Param {
                 name: pname,
-                ty,
+                ty: if is_vararg { Type::Obj } else { ty },
                 class,
                 default,
-                vararg: None,
-                type_args,
-                type_param_of,
+                vararg: is_vararg.then_some(ty),
+                // An array binding is described by neither the annotation's
+                // arguments nor a class type variable.
+                type_args: if is_vararg { Vec::new() } else { type_args },
+                type_param_of: if is_vararg { None } else { type_param_of },
                 fn_recv: None,
             });
             if self.at(&Tok::Comma) {
@@ -2341,15 +2361,83 @@ impl Parser {
     /// A top-level `val Recv.name[: T] get() = …` — an extension property,
     /// parsed as the zero-parameter extension function it lowers to. `None`,
     /// with the position untouched, for any other top-level property.
-    fn extension_prop(&mut self) -> Result<Option<FunDecl>, String> {
+    /// A `var` one comes back as its getter followed by its setter.
+    fn extension_prop(&mut self) -> Result<Option<Vec<FunDecl>>, String> {
         let start = self.pos;
         match self.accessor_prop(Mods::default())? {
-            Some(f) if f.recv.is_some() => Ok(Some(f)),
+            Some(f) if f.recv.is_some() => {
+                let mut funs = vec![f];
+                funs.append(&mut self.ext_setters);
+                Ok(Some(funs))
+            }
             _ => {
                 self.pos = start;
                 Ok(None)
             }
         }
+    }
+
+    /// `set(v) = …` / `set(v) { … }` after an extension property's getter,
+    /// lowered to the extension function `Recv.<set-name>(v)` that a write
+    /// `recv.name = v` calls. The cursor is at the accessor (past any `;` or
+    /// visibility modifier); `annot` is the property's declared type, which
+    /// is the parameter's.
+    fn ext_setter(
+        &mut self,
+        name: &str,
+        recv: (String, Type, Option<String>),
+        annot: &TypeArg,
+        line: u32,
+    ) -> Result<FunDecl, String> {
+        while self.at(&Tok::Semi) {
+            self.advance();
+        }
+        while matches!(self.peek(), Tok::Ident(w) if matches!(w.as_str(), "private" | "protected" | "internal" | "public"))
+        {
+            self.advance();
+        }
+        self.advance(); // `set`
+        self.eat(&Tok::LParen)?;
+        let value = self.ident()?;
+        if self.at(&Tok::Colon) {
+            self.advance();
+            self.type_ref()?;
+        }
+        self.eat(&Tok::RParen)?;
+        let at = self.line();
+        let body = if self.at(&Tok::Assign) {
+            self.advance();
+            vec![Stmt::new(at, StmtKind::Expr(self.expr()?))]
+        } else {
+            self.block()?
+        };
+        Ok(FunDecl {
+            reified: Vec::new(),
+            name: format!("<set-{name}>"),
+            recv: Some(recv),
+            params: vec![Param {
+                name: value,
+                ty: annot.ty,
+                class: annot.class.clone(),
+                default: None,
+                vararg: None,
+                type_args: annot.args.clone(),
+                type_param_of: None,
+                fn_recv: None,
+            }],
+            ret: Type::Unit,
+            ret_class: None,
+            ret_type_param_of: None,
+            ret_class_type_param_of: None,
+            ret_type_args: Vec::new(),
+            body,
+            line,
+            is_abstract: false,
+            is_open: false,
+            is_override: false,
+            is_final: false,
+            is_inline: false,
+        })
     }
 
     fn accessor_prop(&mut self, mods: Mods) -> Result<Option<FunDecl>, String> {
@@ -2461,10 +2549,17 @@ impl Parser {
         };
         // A getter followed by a setter is a settable property: it goes through
         // [`Parser::body_prop`] and [`Parser::prop_accessors`], which give it a
-        // holder whether or not the accessors ever touch `field`.
+        // holder whether or not the accessors ever touch `field`. An EXTENSION
+        // property has no backing field to hold, so its setter is one more
+        // extension function — `<set-name>(value)` on the same receiver — and
+        // the getter below is returned as before.
         if self.accessor_follows(true) {
-            self.pos = start;
-            return Ok(None);
+            let Some(r) = recv.clone() else {
+                self.pos = start;
+                return Ok(None);
+            };
+            let setter = self.ext_setter(&name, r, &annot, line)?;
+            self.ext_setters.push(setter);
         }
         Ok(Some(FunDecl {
             reified: Vec::new(),
@@ -2665,6 +2760,7 @@ impl Parser {
             last_fn_recv: None,
             no_trailing_lambda: false,
             pending_classes: Vec::new(),
+            ext_setters: Vec::new(),
             anon_object: None,
             nested_names: Vec::new(),
             in_subjectless_cond: false,
@@ -5435,6 +5531,7 @@ impl Parser {
                         // A string template holds an expression, which can
                         // never declare a class.
                         pending_classes: Vec::new(),
+                        ext_setters: Vec::new(),
                         anon_object: None,
                         nested_names: Vec::new(),
                         in_subjectless_cond: false,

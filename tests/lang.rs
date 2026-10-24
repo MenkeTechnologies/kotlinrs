@@ -11306,3 +11306,144 @@ fun main() { println(top()); println(tg(1)); println(C().z()); println(C().w());
         "7\n2\nz\nw\n5\n8\n9\n"
     );
 }
+
+/// A boxed `Float` equals only a boxed `Float`: `Float.equals` checks the
+/// class before the value, so no `Double` of the same magnitude matches it —
+/// whether the `Double` is erased, a collection element or a `when` arm. The
+/// same-width comparisons through the same positions stay `true`, since every
+/// erased `Float` operand is boxed. Measured on kotlinc 2.4.21 / JDK 25.0.5.
+#[test]
+fn a_boxed_float_never_equals_a_double() {
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    val f: Any = 2.0f
+    val d: Any = 2.0
+    println(listOf(f == d, d == f, f.equals(d), d.equals(f)))
+    println(listOf(listOf(2.0).contains(f), listOf<Any>(2.0f).indexOf(2.0), setOf<Any>(1f, 1.0).size))
+    println(when (f) { 2.0 -> "double"; 2.0f -> "float"; else -> "none" })
+    val x = 2.0f
+    println(listOf(f == x, x == f, listOf(x).contains(2.0f), listOf(1f / 3f).contains(1f / 3f)))
+    println(when (f) { x -> "same"; else -> "diff" })
+}
+"##
+        ),
+        "[false, false, false, false]\n[false, -1, 2]\nfloat\n[true, true, true, true]\nsame\n"
+    );
+}
+
+/// `constructor(vararg v: T)` binds an array, so a call with any number of
+/// trailing arguments — none, or a spread — selects it, and a primitive
+/// argument never selects a primary whose parameter is a collection.
+/// Measured on kotlinc 2.4.21 / JDK 25.0.5.
+#[test]
+fn a_secondary_constructor_takes_a_vararg() {
+    assert_eq!(
+        prog(
+            r##"class P(val xs: List<Int>) { constructor(vararg v: Int) : this(v.toList()) }
+class N(val tag: String, val xs: List<String>) {
+    constructor(tag: String, vararg v: String) : this(tag, v.toList())
+}
+fun main() {
+    println(listOf(P(1, 2, 3).xs, P().xs, P(7).xs, P(listOf(9)).xs))
+    val arr = arrayOf("x", "y")
+    println(listOf(N("t", "a").xs, N("u").xs, N("w", *arr).xs, N("v", listOf("z")).xs))
+}
+"##
+        ),
+        "[[1, 2, 3], [], [7], [9]]\n[[a], [], [x, y], [z]]\n"
+    );
+}
+
+/// `withSign`, `nextUp`, `nextDown`, `nextTowards` and `ulp` step through the
+/// lattice of the RECEIVER's width: `1f.nextUp()` is the next `Float`, not the
+/// next `Double` narrowed back to `1.0`. `nextTowards` answers the direction
+/// when the two are equal, so `0.0` towards `-0.0` is `-0.0`. Measured on
+/// kotlinc 2.4.21 / JDK 25.0.5.
+#[test]
+fn ieee_neighbours_keep_the_receivers_width() {
+    assert_eq!(
+        prog(
+            r##"import kotlin.math.*
+fun main() {
+    println(listOf(1.5.withSign(-1), (-0.0).withSign(1), 1.0.nextUp(), 0.0.nextDown(), 0.0.nextTowards(-0.0)))
+    println(listOf(Double.MAX_VALUE.nextUp(), Double.MAX_VALUE.ulp, 0.0.ulp, 1.0.ulp))
+    println(listOf(1f.nextUp(), 1f.nextDown(), 0f.nextUp(), 1f.ulp, 2f.withSign(-0f)))
+    println(1f.nextUp() - 1f)
+}
+"##
+        ),
+        "[-1.5, 0.0, 1.0000000000000002, -4.9E-324, -0.0]\n\
+         [Infinity, 1.99584030953472E292, 4.9E-324, 2.220446049250313E-16]\n\
+         [1.0000001, 0.99999994, 1.4E-45, 1.1920929E-7, -2.0]\n\
+         1.1920929E-7\n"
+    );
+    // They are `kotlin.math` extensions, unresolved without the import.
+    let err = prog_err("fun main() { println(1.0.nextUp()) }");
+    assert!(err.contains("unresolved reference"), "{err}");
+}
+
+/// A companion `var` is written through the companion singleton, both
+/// qualified (`C.count = 5`, `C.Factory.made += 1`) and unqualified from the
+/// owning class's own members and `init`. It was `unresolved reference`.
+/// Measured on kotlinc 2.4.21 / JDK 25.0.5.
+#[test]
+fn a_companion_var_is_assignable() {
+    assert_eq!(
+        prog(
+            r##"class C {
+    companion object { var count = 0 }
+    init { count++ }
+    fun bump() { count += 10 }
+}
+class F { companion object Factory { var made = 0 } }
+fun main() {
+    C.count = 5
+    C(); C().bump()
+    C.count++
+    println(C.count)
+    F.made += 100
+    F.Factory.made -= 1
+    println(F.made)
+}
+"##
+        ),
+        "18\n99\n"
+    );
+}
+
+/// `var Recv.name` with a getter and a setter: the write calls the setter,
+/// compound and `++` writes read through the getter first, and a member
+/// property of the same name wins over the extension for both the read and
+/// the write. Measured on kotlinc 2.4.21 / JDK 25.0.5.
+#[test]
+fn an_extension_var_has_a_setter() {
+    assert_eq!(
+        prog(
+            r##"class Box(var n: Int)
+var Box.double: Int
+    get() = n * 2
+    set(value) { n = value / 2 }
+var MutableList<Int>.head: Int get() = this[0]; set(v) { this[0] = v }
+class Q(var v: Int)
+var Q.v: Int
+    get() = -1
+    set(x) { println("ext $x") }
+fun main() {
+    val b = Box(3)
+    b.double = 10
+    b.double += 4
+    println(listOf(b.n, b.double))
+    val l = mutableListOf(1, 2)
+    l.head = 9
+    l.head++
+    println(l)
+    val q = Q(1)
+    q.v = 5
+    println(q.v)
+}
+"##
+        ),
+        "[7, 14]\n[10, 2]\n5\n"
+    );
+}

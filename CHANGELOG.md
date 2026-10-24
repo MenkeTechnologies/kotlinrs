@@ -11,6 +11,30 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Boxed `Float` equality, secondary-constructor `vararg`, IEEE neighbours, companion and extension `var` writes
+
+Measured on `kotlinc` 2.4.21 / JDK 25.0.5.
+
+| program | before | reference |
+| --- | --- | --- |
+| `val f: Any = 2.0f; val d: Any = 2.0`; `f == d`, `f.equals(d)`, `listOf(2.0).contains(f)` | `true` | `false` |
+| `val a: Any = 3f`; `when (a) { 3.0 -> "d"; 3f -> "f"; else -> "?" }` | `d` | `f` |
+| `class P(val xs: List<Int>) { constructor(vararg v: Int) : this(v.toList()) }`; `P(1, 2, 3).xs`, `P(7).xs` | `expected Colon, found Ident("v")` | `[1, 2, 3]`, `[7]` |
+| `import kotlin.math.*`; `1.0.nextUp()`, `1f.nextUp()`, `1.5.withSign(-1)`, `0.0.nextTowards(-0.0)`, `Double.MAX_VALUE.ulp` | `unresolved reference: withSign on Double` | `1.0000000000000002`, `1.0000001`, `-1.5`, `-0.0`, `1.99584030953472E292` |
+| `class C { companion object { var count = 0 }; init { count++ } }`; `C.count = 5` | `unresolved reference: count` / `C` | assigns the companion's property |
+| `var Box.double: Int get() = n * 2; set(v) { n = v / 2 }`; `b.double = 10`, `b.double += 4` | `expected Assign, found Dot` | calls the setter |
+| `class Q(var v: Int)` beside `var Q.v: Int get() = -1 …`; `Q(1).v` after `q.v = 5` | `-1` | `5` — a member property wins over an extension |
+
+A boxed `Float` now equals only another boxed `Float`, as `Float.equals`
+checks the class first; the same-width comparisons stay `true` because every
+erased `Float` operand — `==` against `Any`, a collection element or argument,
+and now a `when` arm against an `Any` subject — is boxed before it reaches the
+comparison. `withSign`, `nextUp`, `nextDown`, `nextTowards` and `ulp` take a
+`Float` receiver's 32-bit lattice through `#f32` runtime names, since the bare
+value does not carry its width. A `vararg` secondary constructor is selected
+for any trailing count and for a spread, and a primitive argument no longer
+selects a primary whose parameter names a collection or user class.
+
 ## Numeric type checks, range members, typed arrays, iterator frames, `Pattern` messages, initialization order
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.13.0.2.

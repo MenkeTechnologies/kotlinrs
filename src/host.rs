@@ -7824,6 +7824,58 @@ fn array_desc(items: &[Value]) -> String {
     }
 }
 
+/// The IEEE neighbour operations behind `nextUp`/`nextDown`/`nextTowards`/`ulp`,
+/// ported from `java.lang.Math` at both widths. They step the bit pattern
+/// directly: adjacent finite values of one sign have adjacent patterns, and
+/// both zeros step to the smallest subnormal. (`f64::next_up` would do, but it
+/// is newer than this crate's `rust-version`.)
+macro_rules! ieee_neighbours {
+    ($t:ty, $next_up:ident, $next_after:ident, $ulp:ident) => {
+        /// `Math.nextUp`: NaN and `+∞` are their own successors.
+        fn $next_up(x: $t) -> $t {
+            if x.is_nan() || x == <$t>::INFINITY {
+                x
+            } else if x == 0.0 {
+                <$t>::from_bits(1)
+            } else if x > 0.0 {
+                <$t>::from_bits(x.to_bits() + 1)
+            } else {
+                <$t>::from_bits(x.to_bits() - 1)
+            }
+        }
+
+        /// `Math.nextAfter(start, direction)`: NaN if either is, and the
+        /// DIRECTION when the two compare equal — so `0.0` towards `-0.0` is
+        /// `-0.0`.
+        fn $next_after(start: $t, direction: $t) -> $t {
+            if start.is_nan() || direction.is_nan() {
+                <$t>::NAN
+            } else if start == direction {
+                direction
+            } else if direction > start {
+                $next_up(start)
+            } else {
+                -$next_up(-start)
+            }
+        }
+
+        /// `Math.ulp`: the gap from `|x|` to the next value up, with `MAX_VALUE`
+        /// measured downwards since the gap above it is infinite.
+        fn $ulp(x: $t) -> $t {
+            let a = x.abs();
+            if a.is_nan() || a.is_infinite() {
+                a
+            } else if a == <$t>::MAX {
+                a - (-$next_up(-a))
+            } else {
+                $next_up(a) - a
+            }
+        }
+    };
+}
+ieee_neighbours!(f64, next_up_f64, next_after_f64, ulp_f64);
+ieee_neighbours!(f32, next_up_f32, next_after_f32, ulp_f32);
+
 /// The `kotlin.math` / `java.lang.Math` functions the compiler routes here.
 ///
 /// Overload selection is by runtime value kind, mirroring Kotlin's static
@@ -15177,6 +15229,35 @@ fn kt_method_inner(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Res
         (Value::Float(x), "isNaN") => Ok(Value::Bool(x.is_nan())),
         (Value::Float(x), "isInfinite") => Ok(Value::Bool(x.is_infinite())),
         (Value::Float(x), "isFinite") => Ok(Value::Bool(x.is_finite())),
+        // The `kotlin.math` IEEE neighbours on a `Double`: `withSign` is
+        // `Math.copySign` (an `Int` sign is widened first), `nextUp`/`nextDown`
+        // are the `Math` methods of those names, `nextTowards` is
+        // `Math.nextAfter` and `ulp` is `Math.ulp`. The `#f32` spellings are the
+        // `Float` overloads, which step through the 32-bit lattice — the
+        // compiler selects them from the receiver's static type, since a bare
+        // `Value::Float` does not say which width it holds.
+        (Value::Float(x), "withSign") => {
+            let sign = args.first().map_or(1.0, Value::to_float);
+            Ok(Value::Float(x.copysign(sign)))
+        }
+        (Value::Float(x), "nextUp") => Ok(Value::Float(next_up_f64(*x))),
+        (Value::Float(x), "nextDown") => Ok(Value::Float(-next_up_f64(-x))),
+        (Value::Float(x), "nextTowards") => {
+            let to = args.first().map_or(f64::NAN, Value::to_float);
+            Ok(Value::Float(next_after_f64(*x, to)))
+        }
+        (Value::Float(x), "ulp") => Ok(Value::Float(ulp_f64(*x))),
+        (Value::Float(x), "#f32withSign") => {
+            let sign = args.first().map_or(1.0, Value::to_float) as f32;
+            Ok(Value::Float((*x as f32).copysign(sign) as f64))
+        }
+        (Value::Float(x), "#f32nextUp") => Ok(Value::Float(next_up_f32(*x as f32) as f64)),
+        (Value::Float(x), "#f32nextDown") => Ok(Value::Float(-next_up_f32(-x as f32) as f64)),
+        (Value::Float(x), "#f32nextTowards") => {
+            let to = args.first().map_or(f64::NAN, Value::to_float) as f32;
+            Ok(Value::Float(next_after_f32(*x as f32, to) as f64))
+        }
+        (Value::Float(x), "#f32ulp") => Ok(Value::Float(ulp_f32(*x as f32) as f64)),
         // `roundToInt`/`roundToLong` are `Math.round` (see [`java_math_round`])
         // behind two guards the JVM method does not have. `Math.round(NaN)` is
         // 0; Kotlin REFUSES it instead, and `roundToInt` additionally clamps to
@@ -18942,14 +19023,12 @@ pub fn value_eq(a: &Value, b: &Value) -> bool {
         _ if f32_box(a).is_some() || f32_box(b).is_some() => {
             match (f32_box(a), f32_box(b)) {
                 (Some(x), Some(y)) => (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits(),
-                // A box against a bare `Value::Float` compares by value: a
-                // `Float`-typed operand travels UNBOXED (see [`KT_F32_ARITH`]),
-                // so the bare value may be a `Float` of the same width. A bare
-                // `Value::Int` is an integral width, never a `Float`, and
-                // `Float.equals` checks the class first.
-                _ if matches!(a, Value::Float(_)) || matches!(b, Value::Float(_)) => {
-                    num_f64(a) == num_f64(b)
-                }
+                // A box against anything else is unequal: `Float.equals` checks
+                // the class first, so `(2.0f as Any) == (2.0 as Any)` is false.
+                // A bare `Value::Float` is a `Double` here — every erased
+                // position a `Float` can reach this function from boxes it
+                // (`compile_erased`, the `when` arm, collection elements and
+                // arguments), as the JVM boxes it to `java.lang.Float`.
                 _ => false,
             }
         }

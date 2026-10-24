@@ -5635,6 +5635,18 @@ impl Compiler {
                     if let Some(recv) = self.outer_receiver(sc, |m| m.prop(name).is_some()) {
                         return self.compile_set_member(sc, &recv, name, op, value);
                     }
+                    // A companion property named without a qualifier from inside
+                    // the owning class (`companion object { var count = 0 }` and
+                    // `init { count++ }`): the write goes to the companion
+                    // singleton, as the read of the same name does.
+                    if let Some(comp) = self
+                        .cur_class
+                        .clone()
+                        .and_then(|c| self.companion_of(&c))
+                        .filter(|c| self.classes[c].prop(name).is_some())
+                    {
+                        return self.compile_set_member(sc, &Expr::Var(comp), name, op, value);
+                    }
                 }
                 // A top-level `var`.
                 if sc.slot(name).is_none() {
@@ -7766,6 +7778,29 @@ impl Compiler {
                 None => return Err(format!("unresolved reference: {name}")),
             }
         };
+        // `withSign`/`nextUp`/`nextDown`/`nextTowards`/`ulp` exist on `Double`
+        // and `Float` only, and answer the receiver's width. A `Float` receiver
+        // selects the 32-bit overload by its `#f32` runtime name, since the
+        // value itself does not carry its width.
+        if is_ieee_neighbour(name) && !safe {
+            let rt = self.infer(sc, recv);
+            if !matches!(rt, Type::Double | Type::Float) {
+                return Err(format!("unresolved reference: {name}"));
+            }
+            self.compile_expr(sc, recv)?;
+            for a in args {
+                self.compile_expr(sc, a)?;
+            }
+            let rt_name = if rt == Type::Float {
+                format!("#f32{name}")
+            } else {
+                name.to_string()
+            };
+            let nidx = self.b.add_constant(Value::str(rt_name));
+            self.b.emit(Op::LoadConst(nidx), line);
+            self.b.emit(Op::CallBuiltin(KT_METHOD_VM, args.len() as u8), line);
+            return Ok(rt);
+        }
         // `Float.pow(…)` is the `Float` overload: `Math.pow` over the widened
         // operands, narrowed once to a `Float` — `2f.pow(0.5f)` is `1.4142135`.
         if name == "pow" && args.len() == 1 && !safe && self.infer(sc, recv) == Type::Float {
@@ -8704,11 +8739,13 @@ impl Compiler {
         // MEMBER of the same name first — an extension can never shadow one — so
         // a receiver whose static class declares the name at this arity skips
         // this arm and dispatches virtually below.
+        // A member PROPERTY wins over an extension property of the same name
+        // the same way (`class Q(val v: Int)` beside `val Q.v get() = -1`).
         let member_wins = self.infer_class(sc, recv).is_some_and(|c| {
-            self.classes
-                .get(&c)
-                .and_then(|m| m.methods.get(name))
-                .is_some_and(|s| s.accepts(args.len()))
+            self.classes.get(&c).is_some_and(|m| {
+                m.methods.get(name).is_some_and(|s| s.accepts(args.len()))
+                    || (args.is_empty() && m.prop(name).is_some())
+            })
         });
         let skip_ext = self.skip_ext_recv == Some(recv as *const Expr);
         if !member_wins {
@@ -10232,6 +10269,35 @@ impl Compiler {
         op: &Option<BinOp>,
         value: &Expr,
     ) -> Result<(), String> {
+        // `Owner.prop = …` where `Owner` names a class with a `companion
+        // object`: the companion singleton is the receiver, as it is for the
+        // read `Owner.prop` (see `compile_member`).
+        if let Some(comp) = self
+            .class_qualifier(recv)
+            .and_then(|cls| self.companion_of(&cls))
+        {
+            return self.compile_set_member(sc, &Expr::Var(comp), name, op, value);
+        }
+        // A `var Recv.name` extension property: the write calls its setter,
+        // the extension function `<set-name>`, unless the receiver's own class
+        // declares a member of the name (a member always wins).
+        let setter = format!("<set-{name}>");
+        let member = self
+            .infer_class(sc, recv)
+            .and_then(|c| self.classes.get(&c))
+            .is_some_and(|m| m.prop(name).is_some());
+        if !member && self.resolve_ext(sc, recv, &setter).is_some() {
+            let call = Expr::MethodCall {
+                recv: Box::new(recv.clone()),
+                name: setter,
+                args: vec![self.compound_value(recv, name, None, op, value)],
+                safe: false,
+                line: 0,
+            };
+            self.compile_expr(sc, &call)?;
+            self.b.emit(Op::Pop, 0);
+            return Ok(());
+        }
         // A `val` property cannot be reassigned (Kotlin compile-time error).
         if let Some(cls) = self.infer_class(sc, recv) {
             if let Some(p) = self.classes.get(&cls).and_then(|m| m.prop(name)) {
@@ -14261,10 +14327,14 @@ impl Compiler {
         let required = primary.iter().filter(|p| p.default.is_none()).count();
         let argc = args.len();
         let arg_types: Vec<Type> = args.iter().map(|a| self.infer(sc, a)).collect();
+        // A spread `*arr` can only go into a `vararg`.
+        let spread = args.iter().any(|a| matches!(a, Expr::Spread(_)));
+        let takes_spread = |params: &[Param]| !spread || params.iter().any(|p| p.vararg.is_some());
 
         let primary_fits = argc >= required
             && argc <= primary.len()
             && meta.has_primary
+            && takes_spread(&primary)
             && params_accept(&primary, &arg_types);
         if primary_fits {
             return (None, primary);
@@ -14274,11 +14344,14 @@ impl Compiler {
             .iter()
             .enumerate()
             .filter(|(i, n)| {
-                let required = meta.sec_params[*i]
+                let params = &meta.sec_params[*i];
+                let required = params
                     .iter()
                     .filter(|p| p.default.is_none() && p.vararg.is_none())
                     .count();
-                argc >= required && argc <= **n
+                // A `vararg` takes any number of trailing arguments.
+                let unbounded = params.iter().any(|p| p.vararg.is_some());
+                argc >= required && (unbounded || argc <= **n) && takes_spread(params)
             })
             .map(|(i, _)| i)
             // Prefer a secondary whose parameter types match; fall back to the
@@ -14752,12 +14825,22 @@ impl Compiler {
                 }
                 Some((slot, sty)) => {
                     self.b.emit(Op::GetSlot(slot), 0);
+                    // An erased comparison sees each side BOXED, as `==` does:
+                    // a `Float` subject is a `java.lang.Float`, which no
+                    // `Double` arm equals.
+                    if self.infer(sc, e) == Type::Obj {
+                        self.emit_width_box(sty);
+                    }
                     let et = self.compile_expr(sc, e)?;
                     // A `when` arm is an `==` against the subject, so an object
                     // subject takes the same object equality `==` does — the
                     // native op would compare two heap HANDLES numerically and
                     // pick whichever arm happened to sit at the lower one.
                     if sty == Type::Obj || et == Type::Obj {
+                        // `when (any) { 3f -> … }`: the `Float` arm is boxed.
+                        if sty == Type::Obj {
+                            self.emit_width_box(et);
+                        }
                         self.b.emit(Op::CallBuiltin(KT_OBJEQ_VM, 2), 0);
                     } else {
                         let str_eq = sty.is_str() || et.is_str();
@@ -14956,6 +15039,12 @@ impl Compiler {
                 if self.nests() && self.nested_class(recv, name).is_some_and(|m| m.is_object) =>
             {
                 Type::Obj
+            }
+            // `x.ulp` keeps the receiver's width.
+            Expr::Member { recv, name, .. }
+                if name == "ulp" && matches!(self.infer(sc, recv), Type::Double | Type::Float) =>
+            {
+                self.infer(sc, recv)
             }
             // `x.absoluteValue` keeps the receiver's width, `Long` included.
             Expr::Member { recv, name, .. }
@@ -15288,6 +15377,12 @@ impl Compiler {
                 if name == "pow" && args.len() == 1 && !*safe && self.infer(sc, recv) == Type::Float
                 {
                     return Type::Float;
+                }
+                // `withSign`/`nextUp`/… keep the receiver's width.
+                if is_ieee_neighbour(name)
+                    && matches!(self.infer(sc, recv), Type::Double | Type::Float)
+                {
+                    return self.infer(sc, recv);
                 }
                 // The bit counts answer an `Int` whatever the receiver's width.
                 if name.starts_with("count") && is_width_bit_member(name) && args.is_empty() {
@@ -16605,7 +16700,14 @@ fn is_math_ext(name: &str) -> bool {
     matches!(
         name,
         "roundToInt" | "roundToLong" | "pow" | "absoluteValue" | "sign"
-    )
+    ) || is_ieee_neighbour(name)
+}
+
+/// The `kotlin.math` extensions defined on `Double` and `Float` only, whose
+/// result has the receiver's width: `withSign`, `nextUp`, `nextDown`,
+/// `nextTowards` and the `ulp` property.
+fn is_ieee_neighbour(name: &str) -> bool {
+    matches!(name, "withSign" | "nextUp" | "nextDown" | "nextTowards" | "ulp")
 }
 
 /// The math functions Kotlin auto-imports (the `kotlin` package), usable with no
@@ -16989,8 +17091,23 @@ fn params_accept(params: &[Param], args: &[Type]) -> bool {
                 | Type::String
         )
     }
+    // The supertypes a primitive value has. Any other named class — a
+    // collection, a user class — can never hold one, so `P(7)` does not select
+    // `class P(val xs: List<Int>)` but a `constructor(vararg v: Int)`.
+    fn admits_primitive(class: &str) -> bool {
+        matches!(
+            class,
+            "Any" | "Comparable" | "Number" | "CharSequence" | "Serializable" | "java.io.Serializable"
+        )
+    }
     !params.iter().zip(args).any(|(p, a)| {
         let (want, got) = (p.ty, *a);
+        let named_class = want == Type::Obj
+            && p.vararg.is_none()
+            && p.class.as_deref().is_some_and(|c| !admits_primitive(c));
+        if named_class && primitive(got) {
+            return true;
+        }
         primitive(want)
             && primitive(got)
             && want != got

@@ -472,22 +472,24 @@ by (`val f = C::f`) stays unresolved, as `kotlinc` reports it ambiguous.
 
 Measured on `kotlinc` 2.4.21 / JDK 25.0.5, compiled and run on the same JVM.
 
+Both rows this section recorded — a boxed `Float` equal to a `Double`, and
+`vararg` in a secondary constructor — are closed (CHANGELOG, "Boxed `Float`
+equality, secondary-constructor `vararg`, IEEE neighbours, companion and
+extension `var` writes").
+
+## Round 23: measured and not closed
+
+Measured on `kotlinc` 2.4.21 / JDK 25.0.5, compiled and run on the same JVM.
+
 | program | kotlinrs | reference |
 | --- | --- | --- |
-| `val f: Any = 2.0f; val d: Any = 2.0`; `f == d`, `listOf(2.0).contains(f)` | `true`, `true` | `false`, `false` — `Float.equals(Double)` checks the class first |
-| `class P(val xs: List<Int>) { constructor(vararg v: Int) : this(v.toList()) }` | `expected Colon, found Ident("v")` | `P(1, 2, 3).xs` is `[1, 2, 3]` |
+| `data class V(val x: Int) { operator fun times(k: Int) = V(x * k) }`, `operator fun Int.times(v: V) = v * this`; `V(2) * 3` | `unresolved reference: x` | `V(x=6)` — the member operator, not the `Int` extension |
+| `mapOf("x" to 1).withDefault { it.length * 10 }.getValue("yyy")` | `unresolved reference: withDefault on Map` | `30` |
+| `class K { val y = 1; var Int.ext: Int get() = this + y; set(v) { println("set $v") }; fun go() { 5.ext = 3; println(5.ext) } }` — a MEMBER extension `var` with a setter | `member extension property ext with a setter is not supported (line 3)` | `set 3`, `6` |
 
-The erased `Int`/`Double`, `Long`/`Double` and `LongRange` rows this section
-recorded are closed (CHANGELOG, "Erased numbers compare by class; `LongRange`
-keeps its width"). The first row left is what remains of them: a boxed `Float`
-against a bare `Value::Float` still compares by value, because a `Float`-typed
-operand travels UNBOXED (`KT_F32_ARITH` pushes a bare `Value::Float`), so the
-bare value may be a `Float` of the same width or a `Double`, and nothing on it
-says which. Making that arm class-strict is only sound once every `Float` that
-can reach `value_eq` is boxed first, and those paths have not been audited.
-
-The `vararg` row is the secondary-constructor parser, which still refuses the
-modifier rather than mis-binding it.
+Without the `Int.times` extension the member call answers `V(x=6)`; the cause
+inside the operator lowering has not been traced. The member extension row
+fails loudly by design: only the top-level form lowers its setter.
 
 ## Parity fan-out rounds 6–7: measured and not closed
 
