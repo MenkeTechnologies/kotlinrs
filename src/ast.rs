@@ -10,6 +10,14 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
     Int,
+    /// `Byte` and `Short` — narrower STORAGE widths. Kotlin promotes both to
+    /// `Int` before every operator (`b + b` on two `Byte`s is an `Int`), so
+    /// [`Type::promoted`] maps them to `Int` wherever an operator is selected.
+    /// The types themselves are what overload resolution, `is`/`as`, the
+    /// erased-position box (`KT_BOX_NARROW`) and `javaClass` read: on the JVM a
+    /// `Byte` boxes to `java.lang.Byte`, which equals no `Integer`.
+    Byte,
+    Short,
     Long,
     /// `Float` — 32-bit. fusevm has one floating representation, so a `Float`
     /// is carried in the same `Value::Float` an `f64` uses, holding a value
@@ -43,7 +51,18 @@ impl Type {
     /// by an integer code unit at runtime, so `==`/comparisons on it use the
     /// numeric ops; only its *display* and add/sub result type differ.
     pub fn is_int(self) -> bool {
-        matches!(self, Type::Int | Type::Long | Type::Char)
+        matches!(
+            self,
+            Type::Int | Type::Byte | Type::Short | Type::Long | Type::Char
+        )
+    }
+    /// The type an operand of this type takes part in arithmetic at: `Byte`
+    /// and `Short` are promoted to `Int`, every other type is itself.
+    pub fn promoted(self) -> Type {
+        match self {
+            Type::Byte | Type::Short => Type::Int,
+            other => other,
+        }
     }
     /// The `String` kinds — both drive `+`-as-concatenation and the string
     /// comparison ops; only their display coercion differs.
@@ -53,7 +72,14 @@ impl Type {
     pub fn is_num(self) -> bool {
         matches!(
             self,
-            Type::Int | Type::Long | Type::Float | Type::Double | Type::Char | Type::Unknown
+            Type::Int
+                | Type::Byte
+                | Type::Short
+                | Type::Long
+                | Type::Float
+                | Type::Double
+                | Type::Char
+                | Type::Unknown
         )
     }
     /// The floating kinds. Both are `Value::Float` at run time; they differ in
@@ -64,13 +90,9 @@ impl Type {
     /// Parse a type annotation name (`Int`, `Double`, `String`, …).
     pub fn from_name(s: &str) -> Type {
         match s {
-            // `Byte` and `Short` are narrower storage types, but Kotlin promotes
-            // both to `Int` before every arithmetic operation (`b + b` on two
-            // `Byte`s is an `Int`), and a literal that does not fit the declared
-            // width is a compile error — so `Int` is their exact arithmetic
-            // width here. Their `MIN_VALUE`/`MAX_VALUE` constants and the
-            // `toByte()`/`toShort()` conversions carry the narrower behaviour.
-            "Int" | "Byte" | "Short" => Type::Int,
+            "Int" => Type::Int,
+            "Byte" => Type::Byte,
+            "Short" => Type::Short,
             "Long" => Type::Long,
             "Double" => Type::Double,
             "Float" => Type::Float,
@@ -286,6 +308,10 @@ pub struct FunDecl {
     /// where finality changes a result: a `data class` keeps a supertype's
     /// `final` `toString`/`equals`/`hashCode` instead of generating its own.
     pub is_final: bool,
+    /// `inline fun` — the JVM back end copies its body, and the bodies of the
+    /// lambda literals passed to it, into each caller, so none of them owns a
+    /// stack-trace frame. Read only for the trace.
+    pub is_inline: bool,
 }
 
 /// Whether a primary-constructor parameter also declares a stored property.

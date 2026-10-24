@@ -112,6 +112,12 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `Float.toString`), `Boolean`,
   `Char` (a distinct runtime type — see below), `String`, `Unit`; annotations
   optional (including nullable `T?`), coarsely inferred otherwise.
+- **`Byte` / `Short`** — static types of their own that box to their own class
+  in an erased position (a collection element, an `Any` binding, a lambda
+  result), so `x is Byte` and `x is Int` differ, `1.toByte() as Any` equals no
+  `1`, and overloads, extensions and `javaClass` see the type. Every operator
+  promotes both to `Int`; `toByte()`/`toShort()`, `inc()`/`dec()` and `b++`
+  narrow back, and an integer literal initializes one only when it fits.
 - **Unsigned integers** — `UByte`/`UShort`/`UInt`/`ULong`, each a runtime type
   of its own (a heap box holding the value's bits), so `x is UInt` and `x is
   Int` differ and `1u != 1`. `u`/`U` literals with an optional `L` (`7uL`;
@@ -788,8 +794,15 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   runtime faults kotlinrs already reported are the *same* catchable exceptions:
   `1 / 0` is an `ArithmeticException`, `!!` on null a `NullPointerException`, an
   out-of-range index an `IndexOutOfBoundsException`. An uncaught exception
-  reports `Exception in thread "main" <class>: <message>` on stderr and exits
-  non-zero.
+  reports `Exception in thread "main" <class>: <message>` and its stack trace
+  on stderr and exits non-zero. The trace has the frames the JVM back end
+  gives: none for a user `inline fun` or a lambda passed to one, a
+  `main$lambda$N` frame for a lambda held in a `val`, and the stdlib or
+  `java.util` frames in front of a measured set of runtime faults.
+- **`when`** — a `when` whose value is used must be exhaustive (`else`, or
+  every case of a `Boolean`, enum or sealed subject); in statement position,
+  including the tail of a lambda, it need not be, and a lambda ending in one
+  answers `Unit`.
 - **Functions** — user calls, recursion, `return`, `Unit` functions.
 - **Increment / decrement** — `x++`, `x--`, `++x`, `--x` on a variable, a
   property, or an indexed element, in statement **and** expression position
@@ -952,7 +965,8 @@ loop traceable by the JIT, and it is a no-op for a value already in range.
 It covers `+ - * / %`, unary minus, `++`/`--`, compound assignment, and
 `abs(Int.MIN_VALUE)`. `Byte` and `Short` follow Kotlin in promoting to `Int`
 before every operator, while `toByte()`/`toShort()`/`toInt()` truncate to their
-own width and `Double.toInt()` saturates. The shifts take the receiver's width
+own width (on an `Int` receiver as a `Shl`/`Shr` pair, so `b++` on a `Byte`
+stays in the JIT) and `Double.toInt()` saturates. The shifts take the receiver's width
 too: `shl`/`shr`/`ushr` mask the count at 31 and truncate to 32 bits on an `Int`
 receiver, at 63 and 64 bits on a `Long` one (`1 shl 32` is 1, `1L shl 32` is
 4294967296), and `inv()` complements the matching width.

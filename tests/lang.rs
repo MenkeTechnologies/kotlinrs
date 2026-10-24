@@ -10536,3 +10536,333 @@ fn long_ranges_keep_their_width() {
         "[true, true, false, true, true, false]\n[true, true]\n[true, false, true, true]\ntrue\ntrue\n[false, true, true]\ntrue\n[false, true]\n[34, 1274, 705032829]\nkotlin.ranges.LongProgression\nout\n[1, 9, 9]\n"
     );
 }
+
+/// `Byte` and `Short` are types of their own: a value of either boxes to
+/// `java.lang.Byte`/`Short` in an erased position, so `is Byte` is false for an
+/// `Int`, `is Int` false for a `Byte`, and `1.toByte() as Any` equals no `1`.
+/// Arithmetic promotes both to `Int`; `toByte`/`toShort`/`inc`/`++` narrow
+/// back. Overloads, extensions and `javaClass` see the type. Measured on kotlinc 2.4.21 / JRE 21.0.13.
+#[test]
+fn byte_and_short_are_their_own_runtime_types() {
+    assert_eq!(
+        prog(
+            r##"fun f(x: Any) = when (x) { is Byte -> "B$x"; is Short -> "S$x"; is Int -> "I$x"; is Long -> "L$x"; else -> "?" }
+fun g(b: Byte) = "byte"
+fun g(s: Short) = "short"
+fun g(i: Int) = "int"
+fun main() {
+    println((listOf(1) as List<Any>)[0] is Byte)
+    val b: Byte = 10
+    val s: Short = 300
+    println(f(b)); println(f(s)); println(f(1)); println(f(1L))
+    println(b + b); println(f(b + b)); println(f(-b)); println(f(b.inc()))
+    val xs = listOf<Byte>(1, 2, 3)
+    println(xs); println(xs.map { f(it) })
+    println(xs[0] + 1)
+    println(f(xs[0])); println(xs.sum()); println(f(xs.sum()))
+    println(200.toByte()); println(f(200.toByte())); println(70000.toShort()); println(f(70000.toShort()))
+    println((1.toByte() as Any) == (1 as Any))
+    println(listOf<Any>(1.toByte(), 1, 1.toShort(), 1L).distinct())
+    println(b.hashCode()); println(b.javaClass); println(b::class)
+    println(g(b)); println(g(s)); println(g(1))
+    var c: Byte = 127; c++; println(c); println(f(c))
+    val ba = ByteArray(3) { (it * 100).toByte() }
+    println(ba.toList()); println(f(ba[1])); println(ba.contentToString())
+    val sa = shortArrayOf(1, 2, 40000.toShort())
+    println(sa.toList()); println(f(sa[2]))
+    println(b.toString() + s); println("$b $s")
+    println(b.compareTo(s)); println(b < s)
+    println(b == 10.toByte())
+    val m = mapOf<Any, String>(1.toByte() to "b", 1 to "i")
+    println(m.size); println(m[1.toByte()]); println(m[1])
+    println(Byte.MAX_VALUE); println(f(Byte.MAX_VALUE)); println(f(Short.MIN_VALUE))
+    println((b * 20).toByte())
+    println(b / 3); println(b % 3); println(f(b / 3))
+    val any: Any = b
+    println((any as Byte) + 1)
+    println(any as? Int)
+    println(b.toInt() + b.toLong())
+}
+"##
+        ),
+        "false\nB10\nS300\nI1\nL1\n20\nI20\nI-10\nB11\n[1, 2, 3]\n[B1, B2, B3]\n2\nB1\n6\nI6\n-56\nB-56\n4464\nS4464\nfalse\n[1, 1, 1, 1]\n10\nbyte\nclass kotlin.Byte\nbyte\nshort\nint\n-128\nB-128\n[0, 100, -56]\nB100\n[0, 100, -56]\n[1, 2, -25536]\nS-25536\n10300\n10 300\n-1\ntrue\ntrue\n2\nb\ni\n127\nB127\nS-32768\n-56\n3\n1\nI3\n11\nnull\n20\n"
+    );
+}
+
+/// `Byte`/`Short` through the positions that keep no type: `%x` at the
+/// value's own width, a `data class` property, a generic `id`, a `List<Byte>`
+/// literal, `Map<Byte, _>` keys, `when` over a `Byte`, `ByteArray` members,
+/// and `setOf<Any>(1.toByte(), 1.toShort(), 1, 1L)` holding four. Measured on kotlinc 2.4.21 / JRE 21.0.13.
+#[test]
+fn byte_and_short_in_collections_formats_and_data_classes() {
+    assert_eq!(
+        prog(
+            r##"data class D(val b: Byte, val s: Short)
+fun <T> id(x: T) = x
+fun r(): Any = 5.toByte()
+fun main() {
+    val b: Byte = -1
+    val s: Short = -1
+    println("%x %x %d %d".format(b, s, b, s))
+    println(D(1, 2)); println(D(1, 2) == D(1, 2)); println(D(1, 2).hashCode())
+    println(id(b) is Byte); println(id(s) is Short); println(r() is Byte); println(r())
+    val xs = mutableListOf<Byte>(3, 1, 2)
+    xs.add(9); xs.sort(); println(xs); println(xs.contains(9)); println(xs.indexOf(2))
+    println(xs.max()); println(xs.maxOf { it }); println(xs.map { it * 2 })
+    println(xs.filter { it > 1 }); println(xs.sumOf { it.toInt() })
+    val m = mutableMapOf<Byte, String>()
+    m[1] = "a"; m[2] = "b"; println(m); println(m[1]); println(m.containsKey(2))
+    val t: Byte = 5
+    when (t) { 5.toByte() -> println("five") else -> println("other") }
+    when (t) { in 1..10 -> println("in") else -> println("out") }
+    println(b.equals(s)); println(b.equals(-1)); println(b.equals((-1).toByte()))
+    println(b.hashCode()); println(s.hashCode()); println(b.toString())
+    println(b.compareTo(1)); println(maxOf(b, 3.toByte()))
+    val ba = byteArrayOf(1, 2, 127)
+    println(ba.sum()); println(ba.map { it + 1 }); println(ba.toList().map { it is Byte })
+    println(ba.joinToString()); println(ba.reversed()); println(ba.size)
+    var acc: Short = 0
+    for (x in ba) acc = (acc + x).toShort()
+    println(acc)
+    println(Byte.MAX_VALUE + 1); println((Byte.MAX_VALUE + 1).toByte())
+    println(300.toShort().toByte()); println((-129).toByte()); println(65535.toShort())
+    println(1.5.toInt().toByte()); println(b.toInt() and 0xFF); println(b.toLong()); println(b.toDouble()); println(b.toFloat())
+    println(listOf<Any>(1.toByte(), 1.toShort(), 1).map { it.javaClass.simpleName })
+    println(listOf(1.toByte(), 2.toByte()) + 3.toByte())
+    val anyS: Any = s
+    println(anyS == (-1).toShort()); println(anyS == -1)
+    println(setOf<Any>(1.toByte(), 1.toShort(), 1, 1L).size)
+}
+"##
+        ),
+        "ff ffff -1 -1\nD(b=1, s=2)\ntrue\n33\ntrue\ntrue\ntrue\n5\n[1, 2, 3, 9]\ntrue\n1\n9\n9\n[2, 4, 6, 18]\n[2, 3, 9]\n15\n{1=a, 2=b}\na\ntrue\nfive\nin\nfalse\nfalse\ntrue\n-1\n-1\n-1\n-1\n3\n130\n[2, 3, 128]\n[true, true, true]\n1, 2, 127\n[127, 2, 1]\n3\n130\n128\n-128\n44\n127\n-1\n1\n255\n-1\n-1.0\n-1.0\n[Byte, Short, Integer]\n[1, 2, 3]\ntrue\nfalse\n4\n"
+    );
+}
+
+/// Overload and extension choice by `Byte`/`Short`, the `Int` a `Byte`
+/// operator answers, `--` wrapping at `Short.MIN_VALUE`, and `List<Short>`
+/// folds and reductions. Measured on kotlinc 2.4.21 / JRE 21.0.13.
+#[test]
+fn byte_and_short_overloads_extensions_and_steps() {
+    assert_eq!(
+        prog(
+            r##"fun Byte.twice() = this * 2
+fun Short.name() = "short"
+fun Int.name() = "int"
+fun h(x: Byte) = "byte $x"
+fun h(x: Long) = "long $x"
+fun k(x: Short): Short = (x * 2).toShort()
+fun main() {
+    val b: Byte = -128
+    println(b.twice()); println(5.toShort().name()); println(5.name())
+    println(h(b)); println(k(20000)); println(k(20000) is Short)
+    println(-b); println((-b).toByte())
+    val z: Byte = 0
+    try { println(b / z) } catch (e: ArithmeticException) { println(e.message) }
+    val xs = listOf<Short>(100, 200)
+    println(xs[0] + xs[1]); println(xs[0] * xs[1]); println((xs[0] * xs[1]).toShort())
+    println(xs.reduce { a, c -> (a + c).toShort() })
+    println(xs.fold(0) { a, c -> a + c })
+    val sa = ShortArray(2); sa[0] = 7; sa[1] = (sa[0] * 3).toShort(); println(sa.toList())
+    println(sa.sorted()); println(sa.average())
+    var c: Short = Short.MIN_VALUE; c--; println(c)
+    var d: Byte = 0; d = d.dec(); println(d); println(++d); println(d--); println(d)
+    println(b.toString(16)); println(b.toUByte())
+    println("${xs[0]}-${b}")
+    println(b.coerceIn(-5, 5))
+    println(xs.sorted().reversed()); println(xs.groupBy { it > 150 })
+}
+"##
+        ),
+        "-256\nshort\nint\nbyte -128\n-25536\ntrue\n128\n-128\n/ by zero\n300\n20000\n20000\n300\n300\n[7, 21]\n[7, 21]\n14.0\n32767\n-1\n0\n0\n-1\n-80\n128\n100--128\n-5\n[200, 100]\n{false=[100], true=[200]}\n"
+    );
+}
+
+/// An integer literal takes a `Byte`/`Short` declaration's type only when it
+/// fits; one that does not is an `Int`, which the declaration refuses — as
+/// `kotlinc` does (`initializer type mismatch: expected 'Byte', actual 'Int'.`).
+/// Measured on kotlinc 2.4.21 / JRE 21.0.13.
+#[test]
+fn an_out_of_range_literal_does_not_initialize_a_byte() {
+    for (src, want) in [
+        (
+            "val b: Byte = 200; println(b)",
+            "expected 'Byte', actual 'Int'.",
+        ),
+        (
+            "val s: Short = -32769; println(s)",
+            "expected 'Short', actual 'Int'.",
+        ),
+    ] {
+        let err = prog_err(src);
+        assert!(
+            err.contains(&format!("initializer type mismatch: {want}")),
+            "{src}: {err}"
+        );
+    }
+    assert_eq!(
+        stdout("val b: Byte = -128; val s: Short = 32767; println(\"$b $s\")"),
+        "-128 32767\n"
+    );
+}
+
+/// A `when` with no `else` over an open type is a STATEMENT in the tail of a
+/// lambda (and of an `if`/`try` statement), so the lambda answers `Unit`
+/// whichever arm ran; only where its value is used must it be exhaustive.
+/// Measured on kotlinc 2.4.21 / JRE 21.0.13.
+#[test]
+fn a_non_exhaustive_when_in_a_lambda_tail_is_a_statement() {
+    assert_eq!(
+        prog(
+            r##"fun f(x: Int) { println("f"); when (x) { 1 -> println("a") } }
+fun main() {
+    val x = 3
+    val a = { y: Int -> when (y) { 1 -> 2 } }
+    println(a(1))
+    println(run { when (x) { 1 -> "a" } })
+    println(listOf(1, 2).map { when (it) { 1 -> "a" } })
+    println({ try { when (x) { 1 -> "a" } } finally { } }())
+    println({ when (x) { 1 -> when (x) { 2 -> "q" } } }())
+    println({ when (x) { 3 -> "three"; else -> "z" } }())
+    val t: () -> Any = { when (x) { 1 -> "a" } }
+    println(t())
+    println(x.let { when (it) { 1 -> 9 } })
+    f(2)
+    if (x > 0) { when (x) { 1 -> println("a") } }
+    try { when (x) { 1 -> println("a") } } finally { println("fin") }
+    when (x) { 1 -> println("a") }
+    println(when (x) { 3 -> "three"; else -> "z" })
+}
+"##
+        ),
+        "kotlin.Unit\nkotlin.Unit\n[kotlin.Unit, kotlin.Unit]\nkotlin.Unit\nkotlin.Unit\nthree\nkotlin.Unit\nkotlin.Unit\nf\nfin\nthree\n"
+    );
+}
+
+/// A `when` with no `else` over an open type whose VALUE is used — a function
+/// expression body, a `return`, an initializer, an argument, an `if`
+/// expression's branch, a compound assignment, an explicitly `Unit` body — is
+/// refused, as `kotlinc` refuses it. Each program below is a compile error on
+/// kotlinc 2.4.21 / JRE 21.0.13.
+#[test]
+fn a_used_non_exhaustive_when_is_refused() {
+    for src in [
+        "fun g(x: Int) = when (x) { 1 -> 2 }\nfun main() { println(g(1)) }",
+        "fun k(x: Int) { return when (x) { 1 -> println(\"a\") } }\nfun main() { k(1) }",
+        "fun h(x: Int): Unit = when (x) { 1 -> println(\"a\") }\nfun main() { h(1) }",
+        "fun main() { val x = 3; val y = when (x) { 1 -> \"a\" }; println(y) }",
+        "fun main() { val x = 3; println(when (x) { 1 -> \"a\" }) }",
+        "fun main() { val x = 1; val y = when { x > 0 -> \"p\" }; println(y) }",
+        "fun main() { val x = 5; var s = \"\"; s += when (x) { 1 -> \"a\" }; println(s) }",
+        "fun main() { val x = 3; val c = true; val y = if (c) { when (x) { 1 -> \"a\" } } else \"b\"; println(y) }",
+        "fun main() { val x: Any = 3; val y = if (x is Int) when (x) { 1 -> \"a\" } else \"b\"; println(y) }",
+    ] {
+        let err = prog_err(src);
+        assert!(
+            err.contains("'when' expression must be exhaustive. Add an 'else' branch."),
+            "{src}: {err}"
+        );
+    }
+}
+
+/// Which lambdas own a stack-trace frame is decided by how `kotlinc` compiles
+/// them: one passed to a user `inline fun` is copied into the caller with the
+/// function, so neither appears; a lambda held in a `val` and called keeps its
+/// `main$lambda$N` frame even when its own body calls it; an unannotated
+/// `val k = { throw … }` is `() -> Nothing`, compiled to a class whose
+/// bridge and typed `invoke` both appear and which takes no `$lambda$N`
+/// index. Measured on kotlinc 2.4.21 / JRE 21.0.13.
+#[test]
+fn lambda_frames_follow_the_jvm_back_end() {
+    assert_eq!(
+        prog(
+            r##"inline fun twice(f: () -> Unit) { f(); f() }
+fun h(f: () -> Unit) = f()
+fun tr(e: Throwable) = println(e.stackTrace.joinToString(" | "))
+class C { fun m() { val q = { throw Exception("c") }; try { q() } catch (e: Exception) { tr(e) } } }
+fun main() {
+    try { twice { throw IllegalStateException("x") } } catch (e: Exception) { tr(e) }
+    try { run { twice { error("r") } } } catch (e: Exception) { tr(e) }
+    try { h { throw Exception("a") } } catch (e: Exception) { tr(e) }
+    val g = { x: Int -> if (x > 0) throw Exception("b") else x }
+    try { g(1) } catch (e: Exception) { tr(e) }
+    val k = { throw Exception("k") }
+    try { k() } catch (e: Exception) { tr(e) }
+    C().m()
+    val n: () -> Int = { throw Exception("n") }
+    try { n() } catch (e: Exception) { tr(e) }
+    try { listOf(1).map { throw Exception("m") } } catch (e: Exception) { tr(e) }
+}
+"##
+        ),
+        "MainKt.main(main.kt:6) | MainKt.main(main.kt)\nMainKt.main(main.kt:7) | MainKt.main(main.kt)\nMainKt.main$lambda$2(main.kt:8) | MainKt.h(main.kt:2) | MainKt.main(main.kt:8) | MainKt.main(main.kt)\nMainKt.main$lambda$3(main.kt:9) | MainKt.main(main.kt:10) | MainKt.main(main.kt)\nMainKt$main$k$1.invoke(main.kt:11) | MainKt$main$k$1.invoke(main.kt:11) | MainKt.main(main.kt:12) | MainKt.main(main.kt)\nC$m$q$1.invoke(main.kt:4) | C$m$q$1.invoke(main.kt:4) | C.m(main.kt:4) | MainKt.main(main.kt:13) | MainKt.main(main.kt)\nMainKt.main$lambda$4(main.kt:14) | MainKt.main(main.kt:15) | MainKt.main(main.kt)\nMainKt.main(main.kt:16) | MainKt.main(main.kt)\n"
+    );
+}
+
+/// A `throw` that reaches the top of `main` prints its trace after the
+/// `Exception in thread "main"` line, as a runtime-raised fault's already
+/// did; it printed the line alone. Measured on kotlinc 2.4.21 / JRE 21.0.13.
+#[test]
+fn an_uncaught_throw_prints_its_stack_trace() {
+    let src = r##"fun twice(f: () -> Unit) { f(); f() }
+fun main() {
+    println("start")
+    twice { throw IllegalStateException("x") }
+}
+"##;
+    assert_eq!(eval(src).status.code(), Some(1));
+    assert_eq!(prog_err(src), "Exception in thread \"main\" java.lang.IllegalStateException: x\n\tat MainKt.main$lambda$0(main.kt:4)\n\tat MainKt.twice(main.kt:1)\n\tat MainKt.main(main.kt:4)\n\tat MainKt.main(main.kt)\n");
+}
+
+/// A fault raised by a stdlib member's own argument or emptiness check has
+/// that member's frames (and the `java.util` class behind a list) in front of
+/// the user's, as on the JVM. `listIterator(5)` reports the size as well.
+/// Measured on kotlinc 2.4.21 / JRE 21.0.13.
+#[test]
+fn stdlib_argument_checks_have_their_stdlib_frames() {
+    assert_eq!(
+        prog(
+            r##"fun t(f: () -> Any?) = try { f(); "ok" } catch (e: Exception) { e.stackTrace.dropLast(2).joinToString(" | ") }
+fun main() {
+    println(t { ArrayDeque<Int>().removeFirst() })
+    println(t { ArrayDeque<Int>().removeLast() })
+    println(t { ArrayDeque<Int>().first() })
+    println(t { ArrayDeque<Int>().last() })
+    println(t { setOf<Int>().first() })
+    println(t { setOf<Int>().last() })
+    println(t { setOf<Int>().single() })
+    println(t { setOf(1, 2).single() })
+    println(t { listOf<Int>().single() })
+    println(t { emptyList<Int>().random() })
+    println(t { sequenceOf<Int>().first() })
+    println(t { sequenceOf<Int>().last() })
+    println(t { "".last() })
+    println(t { "abc".take(-1) })
+    println(t { "abc".takeLast(-1) })
+    println(t { "abc".drop(-1) })
+    println(t { listOf(1).take(-1) })
+    println(t { listOf(1).takeLast(-1) })
+    println(t { listOf(1).drop(-1) })
+    println(t { listOf(1).dropLast(-1) })
+    println(t { "ab".padStart(-1) })
+    println(t { "ab".padStart(-1, 'x') })
+    println(t { "ab".padEnd(-1) })
+    println(t { listOf(1, 2).chunked(0) })
+    println(t { listOf(1, 2).windowed(0) })
+    println(t { "abc".chunked(0) })
+    println(t { 'x'.digitToInt() })
+    println(t { 'a'.digitToInt(37) })
+    println(t { "x".toInt(1) })
+    println(t { mutableListOf(1).add(5, 1) })
+    println(t { listOf(1).elementAt(4) })
+    println(t { listOf(1, 2).subList(0, 5) })
+    println(t { mutableListOf(1, 2).subList(0, 5) })
+    println(t { listOf(1).listIterator(5) })
+    println(t { mutableListOf(1).listIterator(5) })
+    try { mutableListOf(1).listIterator(5) } catch (e: Exception) { println(e.message) }
+}
+"##
+        ),
+        "kotlin.collections.ArrayDeque.removeFirst(ArrayDeque.kt:147) | MainKt.main$lambda$0(main.kt:3) | MainKt.t(main.kt:1)\nkotlin.collections.ArrayDeque.removeLast(ArrayDeque.kt:168) | MainKt.main$lambda$1(main.kt:4) | MainKt.t(main.kt:1)\nkotlin.collections.ArrayDeque.first(ArrayDeque.kt:102) | MainKt.main$lambda$2(main.kt:5) | MainKt.t(main.kt:1)\nkotlin.collections.ArrayDeque.last(ArrayDeque.kt:112) | MainKt.main$lambda$3(main.kt:6) | MainKt.t(main.kt:1)\nkotlin.collections.CollectionsKt___CollectionsKt.first(_Collections.kt:209) | MainKt.main$lambda$4(main.kt:7) | MainKt.t(main.kt:1)\nkotlin.collections.CollectionsKt___CollectionsKt.last(_Collections.kt:413) | MainKt.main$lambda$5(main.kt:8) | MainKt.t(main.kt:1)\nkotlin.collections.CollectionsKt___CollectionsKt.single(_Collections.kt:605) | MainKt.main$lambda$6(main.kt:9) | MainKt.t(main.kt:1)\nkotlin.collections.CollectionsKt___CollectionsKt.single(_Collections.kt:608) | MainKt.main$lambda$7(main.kt:10) | MainKt.t(main.kt:1)\nkotlin.collections.CollectionsKt___CollectionsKt.single(_Collections.kt:619) | MainKt.main$lambda$8(main.kt:11) | MainKt.t(main.kt:1)\nkotlin.collections.CollectionsKt___CollectionsKt.random(_Collections.kt:573) | MainKt.main$lambda$9(main.kt:12) | MainKt.t(main.kt:1)\nkotlin.sequences.SequencesKt___SequencesKt.first(_Sequences.kt:117) | MainKt.main$lambda$10(main.kt:13) | MainKt.t(main.kt:1)\nkotlin.sequences.SequencesKt___SequencesKt.last(_Sequences.kt:249) | MainKt.main$lambda$11(main.kt:14) | MainKt.t(main.kt:1)\nkotlin.text.StringsKt___StringsKt.last(_Strings.kt:194) | MainKt.main$lambda$12(main.kt:15) | MainKt.t(main.kt:1)\nkotlin.text.StringsKt___StringsKt.take(_Strings.kt:581) | MainKt.main$lambda$13(main.kt:16) | MainKt.t(main.kt:1)\nkotlin.text.StringsKt___StringsKt.takeLast(_Strings.kt:606) | MainKt.main$lambda$14(main.kt:17) | MainKt.t(main.kt:1)\nkotlin.text.StringsKt___StringsKt.drop(_Strings.kt:350) | MainKt.main$lambda$15(main.kt:18) | MainKt.t(main.kt:1)\nkotlin.collections.CollectionsKt___CollectionsKt.take(_Collections.kt:906) | MainKt.main$lambda$16(main.kt:19) | MainKt.t(main.kt:1)\nkotlin.collections.CollectionsKt___CollectionsKt.takeLast(_Collections.kt:930) | MainKt.main$lambda$17(main.kt:20) | MainKt.t(main.kt:1)\nkotlin.collections.CollectionsKt___CollectionsKt.drop(_Collections.kt:693) | MainKt.main$lambda$18(main.kt:21) | MainKt.t(main.kt:1)\nkotlin.collections.CollectionsKt___CollectionsKt.dropLast(_Collections.kt:732) | MainKt.main$lambda$19(main.kt:22) | MainKt.t(main.kt:1)\nkotlin.text.StringsKt__StringsKt.padStart(Strings.kt:217) | kotlin.text.StringsKt__StringsKt.padStart(Strings.kt:238) | kotlin.text.StringsKt__StringsKt.padStart$default(Strings.kt:237) | MainKt.main$lambda$20(main.kt:23) | MainKt.t(main.kt:1)\nkotlin.text.StringsKt__StringsKt.padStart(Strings.kt:217) | kotlin.text.StringsKt__StringsKt.padStart(Strings.kt:238) | MainKt.main$lambda$21(main.kt:24) | MainKt.t(main.kt:1)\nkotlin.text.StringsKt__StringsKt.padEnd(Strings.kt:252) | kotlin.text.StringsKt__StringsKt.padEnd(Strings.kt:273) | kotlin.text.StringsKt__StringsKt.padEnd$default(Strings.kt:272) | MainKt.main$lambda$22(main.kt:25) | MainKt.t(main.kt:1)\nkotlin.collections.SlidingWindowKt.checkWindowSizeStep(SlidingWindow.kt:9) | kotlin.collections.CollectionsKt___CollectionsKt.windowed(_Collections.kt:3765) | kotlin.collections.CollectionsKt___CollectionsKt.chunked(_Collections.kt:3556) | MainKt.main$lambda$23(main.kt:26) | MainKt.t(main.kt:1)\nkotlin.collections.SlidingWindowKt.checkWindowSizeStep(SlidingWindow.kt:9) | kotlin.collections.CollectionsKt___CollectionsKt.windowed(_Collections.kt:3765) | kotlin.collections.CollectionsKt___CollectionsKt.windowed$default(_Collections.kt:3764) | MainKt.main$lambda$24(main.kt:27) | MainKt.t(main.kt:1)\nkotlin.collections.SlidingWindowKt.checkWindowSizeStep(SlidingWindow.kt:9) | kotlin.text.StringsKt___StringsKt.windowed(_Strings.kt:2453) | kotlin.text.StringsKt___StringsKt.windowed(_Strings.kt:2431) | kotlin.text.StringsKt___StringsKt.chunked(_Strings.kt:2319) | MainKt.main$lambda$25(main.kt:28) | MainKt.t(main.kt:1)\nkotlin.text.CharsKt__CharKt.digitToInt(Char.kt:23) | MainKt.main$lambda$26(main.kt:29) | MainKt.t(main.kt:1)\nkotlin.text.CharsKt__CharJVMKt.checkRadix(CharJVM.kt:312) | kotlin.text.CharsKt__CharKt.digitToIntOrNull(Char.kt:74) | kotlin.text.CharsKt__CharKt.digitToInt(Char.kt:42) | MainKt.main$lambda$27(main.kt:30) | MainKt.t(main.kt:1)\nkotlin.text.CharsKt__CharJVMKt.checkRadix(CharJVM.kt:312) | MainKt.main$lambda$28(main.kt:31) | MainKt.t(main.kt:1)\njava.base/java.util.ArrayList.rangeCheckForAdd(ArrayList.java:838) | java.base/java.util.ArrayList.add(ArrayList.java:510) | MainKt.main$lambda$29(main.kt:32) | MainKt.t(main.kt:1)\njava.base/java.util.Collections$SingletonList.get(Collections.java:5180) | MainKt.main$lambda$30(main.kt:33) | MainKt.t(main.kt:1)\njava.base/java.util.AbstractList.subListRangeCheck(AbstractList.java:509) | java.base/java.util.AbstractList.subList(AbstractList.java:499) | MainKt.main$lambda$31(main.kt:34) | MainKt.t(main.kt:1)\njava.base/java.util.AbstractList.subListRangeCheck(AbstractList.java:509) | java.base/java.util.ArrayList.subList(ArrayList.java:1190) | MainKt.main$lambda$32(main.kt:35) | MainKt.t(main.kt:1)\njava.base/java.util.AbstractList.rangeCheckForAdd(AbstractList.java:634) | java.base/java.util.AbstractList.listIterator(AbstractList.java:340) | MainKt.main$lambda$33(main.kt:36) | MainKt.t(main.kt:1)\njava.base/java.util.ArrayList.rangeCheckForAdd(ArrayList.java:838) | java.base/java.util.ArrayList.listIterator(ArrayList.java:1005) | MainKt.main$lambda$34(main.kt:37) | MainKt.t(main.kt:1)\nIndex: 5, Size: 1\n"
+    );
+}

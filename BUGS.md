@@ -422,17 +422,15 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
 
 | program | kotlinrs | reference |
 | --- | --- | --- |
-| `(listOf(1) as List<Any>)[0] is Byte` | `true` | `false` |
-| `stackTrace` inside a user `inline fun`'s lambda (`twice { throw … }`) | `main$lambda$0`, `twice` and `main` frames | `main` only: both are inlined |
-| `val g = { throw Exception() }; g()` | `MainKt.main(…)` only | `MainKt$main$g$1.invoke(…)` twice, then `main` |
 | a runtime-raised throwable from an operation not in `jdk_prefix`'s table (e.g. `mutableListOf(1).iterator()` past its end through a view) | the user frames only | the JDK frames in front |
 | `import java.util.*` then `kotlin.collections.ArrayDeque` `.push(0)` | `unresolved reference: push` | `java.util.ArrayDeque` wins the star import |
 | `java.util.LinkedList`, `java.util.BitSet`, `java.util.Optional`, `System.getProperty` | `unresolved reference` | the JDK member |
 
 The typed-builder row this table opened with (`mutableListOf<Long>(1)[0] is
 Long`) is closed: a written or annotated element, key or value type now types
-the literal arguments. The first row is its mirror for `Byte`/`Short`: they have
-no box of their own, so `is Byte` accepts any `Int` that fits.
+the literal arguments. Its `Byte`/`Short` mirror, the `inline fun` and
+held-lambda frame rows, and much of the `jdk_prefix` row are closed by the
+parity fan-out's sixth round (CHANGELOG); what remains of them is listed there.
 
 ## Round 21: measured and not closed
 
@@ -441,7 +439,6 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
 | program | kotlinrs | reference |
 | --- | --- | --- |
 | `fun <T> id(x: T) = x`; `println(id(listOf(1)) + 5)` | `5.0` | `[1, 5]` |
-| `fun g(x: Int) = when (x) { 1 -> 2 }` (no `else`, not a closed type) | compiles, `null` for other values | `'when' expression must be exhaustive. Add an 'else' branch.` — refused only in expression position, which this frontend does not tell apart from a value-discarding lambda body |
 | `open class M(val c: Int)`; `class N(c: Int) : M(c)`; `operator fun M.plus(o: M)` and `operator fun N.plus(o: M)`; `listOf<M>(N(1), M(2)).reduce { a, b -> a + b }` | `unresolved reference: plus on N` | `M.plus`, chosen by the static type `M` |
 | `val a = arrayOf(1, 2); val l = a.asList(); a[0] = 7; println(l)` | `[1, 2]` | `[7, 2]` — a write to the ARRAY shows through the view; writes through the view reach the array since round 21 |
 
@@ -488,3 +485,29 @@ can reach `value_eq` is boxed first, and those paths have not been audited.
 
 The `vararg` row is the secondary-constructor parser, which still refuses the
 modifier rather than mis-binding it.
+
+## Parity fan-out round 6: measured and not closed
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.13.0.2, compiled and run on the same
+JVM.
+
+| program | kotlinrs | reference |
+| --- | --- | --- |
+| `var b: Byte = 1; b += 1` | `2` | `assignment type mismatch: actual type is 'Int', but 'Byte' was expected.` |
+| `val x = 5; val b: Byte = x` | `5` | `initializer type mismatch: expected 'Byte', actual 'Int'.` |
+| `val l: List<Any> = byteArrayOf(1, 2).toList()`; `l.contains(1)`, `l[0] is Byte` | `true`, `false` | `false`, `true` |
+| `inline fun boom(): Int { throw … }`; `boom()` caught in `main` | `MainKt.main(main.kt:<boom's line>)` | `MainKt.main(main.kt:<a line past the end of the file>)` |
+| `val lz = { y: Int -> y / 0 }` on line 15, `listOf(1).map(lz)` on line 16 | `main$lambda$N(…:16)`, `main(…:16)` | `main$lambda$N(…:15)`, `main(…:25)` |
+| `emptyList<Int>().reduce { a, b -> a + b }`, `listOf(1, 2).first { it > 5 }`, `last { it > 5 }` on line 2 | `main(main.kt:2)` | `main(main.kt:6)`, `6`, `10` |
+| `mutableMapOf<Int, Int>().iterator().next()`, a `mutableSetOf` or `keys` iterator past its end | the user frames only | `LinkedHashMap$LinkedHashIterator.nextNode` and the `next` of the entry or key iterator in front |
+
+The first two are a declaration type check this frontend does not make for any
+integral width (`val l: Long = x` is accepted the same way); only an
+out-of-range LITERAL is refused. The third is the erased-position box: a
+primitive array holds bare integers, so a member that copies one into a
+collection (`toList`, `asList`) hands back `Int`s — `LongArray` has the same
+gap. The three line rows are the JVM's inline-function line mapping: a body
+copied into its caller is numbered past the end of the file (the SMAP
+section), and a stack trace prints those numbers as they are. The lambda row's
+first frame is a line attribution miss of its own: the faulting op in the
+lambda body carries no line, so the frame takes the literal's following one.

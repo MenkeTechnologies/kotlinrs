@@ -11,6 +11,57 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## `Byte` and `Short` are types of their own
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.13.0.2.
+
+| program | before | reference |
+| --- | --- | --- |
+| `(listOf(1) as List<Any>)[0] is Byte` | `true` | `false` |
+| `fun f(x: Any) = when (x) { is Byte -> …; is Short -> …; is Int -> … }`; `f(300.toShort())`, `f(b + b)` | the `Byte` arm for both | `S300`, `I20` |
+| `(1.toByte() as Any) == (1 as Any)`; `listOf<Any>(1.toByte(), 1, 1.toShort(), 1L).distinct()` | `true`; `[1, 1]` | `false`; `[1, 1, 1, 1]` |
+| `fun g(b: Byte)` / `g(s: Short)` / `g(i: Int)`; `g(s)`, `g(1)` | `byte`, `byte` | `short`, `int` |
+| `var c: Byte = 127; c++` | `128` | `-128` |
+| `b.javaClass`; `mapOf<Any, String>(1.toByte() to "b", 1 to "i")[1.toByte()]` | `class kotlin.Int`; `i` | `class kotlin.Byte`; `b` |
+| `"%x".format((-1).toByte())`; `listOf<Byte>(1, 2).sum()` boxed into `Any` | `ffffffff`; a `Byte` | `ff`; an `Int` |
+| `val b: Byte = 200` | `200` | `initializer type mismatch: expected 'Byte', actual 'Int'.` |
+
+`Type::Byte`/`Type::Short` are static types that promote to `Int` at every
+operator, and box to a `Byte`/`Short` heap value (`KT_BOX_NARROW`) at the
+erased positions a `Long` and a `Float` already box at. `toByte()`/`toShort()`
+on an `Int` is a native `Shl`/`Shr` pair, so a loop stepping a `Byte` stays in
+the JIT: 3 000 000 iterations of `s += b * 3; b++` retire 0.19 G instructions
+(debug build), and an `Int` loop's bytecode is unchanged (one through the host's `%` retires 0.6% more).
+
+## A `when` whose value is used must be exhaustive
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.13.0.2.
+
+| program | before | reference |
+| --- | --- | --- |
+| `fun g(x: Int) = when (x) { 1 -> 2 }`, `val y = when (x) { 1 -> "a" }`, `println(when (x) { 1 -> "a" })`, `when { x > 0 -> "p" }` as a value | `null` for an unmatched value | `'when' expression must be exhaustive. Add an 'else' branch.` |
+| `val f = { x: Int -> when (x) { 1 -> 2 } }; f(1)`; `listOf(1, 2).map { when (it) { 1 -> "a" } }` | `2`; `[a, null]` | `kotlin.Unit`; `[kotlin.Unit, kotlin.Unit]` |
+
+The tail of a lambda — and of an `if`/`try` statement — is statement position:
+a non-exhaustive `when` there runs for effect and the lambda answers `Unit`.
+
+## Stack-trace frames the JVM back end gives
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.13.0.2.
+
+| program | before | reference |
+| --- | --- | --- |
+| `inline fun twice(f: () -> Unit)`; `twice { throw … }` | `main$lambda$0`, `twice`, `main` | `main` only |
+| `val g = { x: Int -> … throw … }; g(1)` | `main` only | `main$lambda$1`, then `main` |
+| `val k = { throw Exception("k") }; k()` | `main` only | `MainKt$main$k$1.invoke` twice, then `main` |
+| an uncaught `throw` in a program | the `Exception in thread "main"` line alone | the line and the trace |
+| `ArrayDeque().removeFirst()`, `setOf<Int>().first()`, `"abc".take(-1)`, `"ab".padStart(-1)`, `listOf(1, 2).chunked(0)`, `'x'.digitToInt()`, `mutableListOf(1).add(5, 1)`, `listOf(1, 2).subList(0, 5)`, `sequenceOf<Int>().last()`, … | the user frames only | the stdlib / `java.util` frames in front |
+| `listOf(1).listIterator(5)` | `Index: 5` | `Index: 5, Size: 1` |
+
+A lambda's sub name carries how `kotlinc` compiles it: a value held in a `val`
+(its own frame), an argument of a user `inline fun` (none), or a `() ->
+Nothing` class lambda (two). An `inline fun` is marked in the chunk's names.
+
 ## Erased numbers compare by class; `LongRange` keeps its width
 
 Measured on `kotlinc` 2.4.21 / JDK 25.0.5.

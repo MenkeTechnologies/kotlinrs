@@ -22,21 +22,22 @@
 use crate::ast::*;
 use crate::host::{
     COLL_COPY, COLL_DEFAULT_CAP, COLL_HASH, COLL_LITERAL, COLL_SORTED, KT_ARRAY, KT_ARRAY_INIT,
-    KT_ARRAY_NEW, KT_AS, KT_BOX_F32, KT_BOX_I64, KT_BUILDER, KT_CHR_STRING, KT_CLASSOF,
-    KT_CLASS_REF, KT_CLOSURE_CALL, KT_COLL_HOF, KT_COMPARATOR, KT_COMPARE_REG, KT_COMPARE_VM,
-    KT_DBG_LINE, KT_DDIV, KT_DELEG_GET, KT_DELEG_SET, KT_DEPTH_GUARD, KT_DISPLAY, KT_ENUM_REG,
-    KT_EQUALS_REG, KT_EXC_ABORT, KT_EXC_CAUSE_SET, KT_EXC_CUT, KT_EXC_DEPTH, KT_EXC_MATCH,
-    KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW, KT_EXC_UNSTASH, KT_EXTEND,
-    KT_EXTREMUM_VM, KT_F32, KT_F32_ARITH, KT_F32_STR, KT_FFI_CALL, KT_FFI_COMPILE, KT_GENSEQ,
-    KT_GETFIELD, KT_HASH_REG, KT_IDENTITY, KT_IDIV, KT_IMOD, KT_INDEX_GET_VM, KT_INDEX_SET_VM,
-    KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_END, KT_ITER_GET, KT_ITER_MORE, KT_ITER_PULL, KT_ITER_SIZE,
-    KT_ITER_SRC, KT_ITER_SRC_LAZY, KT_JOIN, KT_LATEINIT, KT_LAZY_GET, KT_LAZY_NEW, KT_LIST,
-    KT_LIST_RO, KT_LIST_TAG, KT_MAKE_CLOSURE, KT_MAP_VM, KT_MATH, KT_METHOD_VM, KT_MODCOUNT,
-    KT_NEW, KT_NLR_MATCH, KT_NLR_RAISE, KT_NLR_TAKE, KT_NOTNULL, KT_OBJEQ_VM, KT_OBJ_INIT_ENTER,
-    KT_OBJ_INIT_EXIT, KT_OBSERVE, KT_OPER_REG, KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT,
-    KT_PRINTLN, KT_RANDOM, KT_RANGE, KT_RANGE_STEP, KT_REIFIED, KT_REIFY, KT_RESULT_HOF,
-    KT_RUN_CATCHING, KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD, KT_SET_VM, KT_STR_ORDER, KT_SYSTEM,
-    KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG, KT_UNIT, KT_UNSIGNED, KT_YIELD,
+    KT_ARRAY_NEW, KT_AS, KT_BOX_F32, KT_BOX_I64, KT_BOX_NARROW, KT_BUILDER, KT_CHR_STRING,
+    KT_CLASSOF, KT_CLASS_REF, KT_CLOSURE_CALL, KT_COLL_HOF, KT_COMPARATOR, KT_COMPARE_REG,
+    KT_COMPARE_VM, KT_DBG_LINE, KT_DDIV, KT_DELEG_GET, KT_DELEG_SET, KT_DEPTH_GUARD, KT_DISPLAY,
+    KT_ENUM_REG, KT_EQUALS_REG, KT_EXC_ABORT, KT_EXC_CAUSE_SET, KT_EXC_CUT, KT_EXC_DEPTH,
+    KT_EXC_MATCH, KT_EXC_NEW, KT_EXC_PENDING, KT_EXC_STASH, KT_EXC_TAKE, KT_EXC_THROW,
+    KT_EXC_UNSTASH, KT_EXTEND, KT_EXTREMUM_VM, KT_F32, KT_F32_ARITH, KT_F32_STR, KT_FFI_CALL,
+    KT_FFI_COMPILE, KT_GENSEQ, KT_GETFIELD, KT_HASH_REG, KT_IDENTITY, KT_IDIV, KT_IMOD,
+    KT_INDEX_GET_VM, KT_INDEX_SET_VM, KT_IN_VM, KT_IS, KT_ISNULL, KT_ITER_END, KT_ITER_GET,
+    KT_ITER_MORE, KT_ITER_PULL, KT_ITER_SIZE, KT_ITER_SRC, KT_ITER_SRC_LAZY, KT_JOIN, KT_LATEINIT,
+    KT_LAZY_GET, KT_LAZY_NEW, KT_LIST, KT_LIST_RO, KT_LIST_TAG, KT_MAKE_CLOSURE, KT_MAP_VM,
+    KT_MATH, KT_METHOD_VM, KT_MODCOUNT, KT_NEW, KT_NLR_MATCH, KT_NLR_RAISE, KT_NLR_TAKE,
+    KT_NOTNULL, KT_OBJEQ_VM, KT_OBJ_INIT_ENTER, KT_OBJ_INIT_EXIT, KT_OBSERVE, KT_OPER_REG,
+    KT_OPER_VM, KT_PAIR, KT_PRECOND, KT_PRINT, KT_PRINTLN, KT_RANDOM, KT_RANGE, KT_RANGE_STEP,
+    KT_REIFIED, KT_REIFY, KT_RESULT_HOF, KT_RUN_CATCHING, KT_SCOPE_FN, KT_SEQ_NEW, KT_SETFIELD,
+    KT_SET_VM, KT_STR_ORDER, KT_SYSTEM, KT_TOSTRING_REG, KT_TO_STRING, KT_TYPE_REG, KT_UNIT,
+    KT_UNSIGNED, KT_YIELD,
 };
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::cell::RefCell;
@@ -763,6 +764,8 @@ struct FnSig {
     /// (`f(count = 3)`) binds against; the defaults and the `vararg` marker are
     /// what [`Compiler::expand_args`] fills an under-supplied call from.
     params: Vec<Param>,
+    /// `inline fun` — see [`crate::ast::FunDecl::is_inline`].
+    inline: bool,
 }
 
 impl FnSig {
@@ -788,6 +791,7 @@ impl FnSig {
             arity: f.params.len(),
             owner: f.recv.as_ref().map(|(r, _, _)| r.clone()),
             params: f.params.clone(),
+            inline: f.is_inline,
         }
     }
 }
@@ -2258,6 +2262,9 @@ pub struct Compiler {
     /// enclosing lambda's. Identified by the body slice's address, which is
     /// the literal's own and unique while it is being lowered.
     zero_arity_body: Option<*const Stmt>,
+    /// How the JVM back end compiles a lambda literal, by its body's address,
+    /// where that is not the default (see [`LambdaFrame`]).
+    lambda_frame: HashMap<usize, LambdaFrame>,
     /// The receiver expression of the member call that is the FALLBACK half of
     /// an extension's runtime receiver check (see [`Compiler::compile_member`]),
     /// which must not pick the same extension again. Identified by address.
@@ -2304,6 +2311,13 @@ pub struct Compiler {
     /// non-local `return` (in some lambda), so its own frame boundary claims
     /// one aimed at it. `None` in a lambda body, which never claims one.
     nlr_catch: Option<String>,
+    /// The `when`s (by address) that sit in the TAIL of the lambda body being
+    /// lowered — its last statement, and recursively the tails of that
+    /// statement's `if`/`try`/`when` branches. A lambda's last statement is
+    /// its result, but `kotlinc` does not hold a non-exhaustive `when` there
+    /// to the exhaustiveness rule: it is a statement and the lambda answers
+    /// `Unit`. Everywhere else a `when` whose value is used must be exhaustive.
+    tail_whens: Vec<usize>,
     /// The `reified` type-parameter names of the function whose body is being
     /// lowered. A `T::class`, `x is T` or `x as T` naming one of these reads
     /// the type the CALL bound rather than a constant. Empty everywhere else.
@@ -2420,6 +2434,25 @@ struct LambdaCtx {
     token: String,
     /// Literals seen in this body so far.
     next: usize,
+}
+
+/// The stack-trace frame a lambda literal runs in on the JVM, where the
+/// default — a frame of its own unless the body it was written in runs it,
+/// which is an inlined stdlib call — is not the answer.
+#[derive(Clone)]
+enum LambdaFrame {
+    /// A value — a `val` initializer — called later: always its own
+    /// `method$lambda$N` frame, even when invoked from the body it sits in.
+    Own,
+    /// Passed straight to a user `inline fun`: copied into the caller, with
+    /// no frame of its own.
+    Inlined,
+    /// An unannotated `val name = { … throw … }`: its type is `() -> Nothing`,
+    /// which `kotlinc` compiles to a class `Outer$method$name$1` rather than
+    /// an `invokedynamic` lambda. It runs as that class's `invoke`, under the
+    /// generic bridge `invoke`, so it has two frames, and it takes no
+    /// `$lambda$N` index.
+    Class(String),
 }
 
 struct PendingLambda {
@@ -3397,6 +3430,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         lambda_recv: None,
         lambda_recv_it: false,
         zero_arity_body: None,
+        lambda_frame: HashMap::new(),
         skip_ext_recv: None,
         skip_overload: false,
         math_scope: HashMap::new(),
@@ -3408,6 +3442,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         cur_ret: None,
         nlr_target: None,
         nlr_catch: None,
+        tail_whens: Vec::new(),
         cur_reified: Vec::new(),
         unwind: Vec::new(),
         finally_returns: Vec::new(),
@@ -3559,6 +3594,15 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
     let end_jump = c.b.emit(Op::Jump(0), main.line);
 
     for f in &program.funs {
+        // An `inline fun` owns no frame on the JVM; the marker name tells the
+        // stack-trace builder which sub it is.
+        if f.is_inline {
+            let sub = match &f.recv {
+                Some((recv, _, _)) => ext_sub_name(recv, &f.name),
+                None => f.name.clone(),
+            };
+            c.b.add_name(&format!("{}{sub}", crate::host::INLINE_MARK));
+        }
         c.compile_fun(f, None)?;
     }
     // Class/object methods lower as subs named `Class#method`, with `this`
@@ -5100,6 +5144,23 @@ impl Compiler {
                 lazy,
                 delegated,
             } => {
+                // A lambda held in a local is a value: it keeps its own frame
+                // wherever it is called from.
+                if let Expr::Lambda { body, .. } = init {
+                    let nothing = ty.is_none()
+                        && fn_ret.is_none()
+                        && annotated_class.is_none()
+                        && matches!(
+                            body.last().map(|s| &s.kind),
+                            Some(StmtKind::Expr(Expr::Throw(_)))
+                        );
+                    let frame = if nothing {
+                        LambdaFrame::Class(name.clone())
+                    } else {
+                        LambdaFrame::Own
+                    };
+                    self.lambda_frame.insert(body.as_ptr() as usize, frame);
+                }
                 // `val xs: List<Long> = listOf(1)` is `listOf<Long>(1)`: the
                 // annotation is the expected type the literal elements take.
                 let written_elem = annotated_elem(annotated_class.as_deref(), annotated);
@@ -5126,11 +5187,16 @@ impl Compiler {
                         &typed_init
                     }
                     Expr::Call { name: b, .. }
-                        if written_elem == Type::Long && element_builder(b) =>
+                        if int_literal_conv(written_elem).is_some() && element_builder(b) =>
                     {
+                        let elem = match written_elem {
+                            Type::Byte => "Byte",
+                            Type::Short => "Short",
+                            _ => "Long",
+                        };
                         typed_init = Expr::Call {
                             name: REIFY_CALL.to_string(),
-                            args: vec![Expr::Str(vec![StrExpr::Text("Long".into())]), init.clone()],
+                            args: vec![Expr::Str(vec![StrExpr::Text(elem.into())]), init.clone()],
                             line: 0,
                         };
                         &typed_init
@@ -5183,10 +5249,24 @@ impl Compiler {
                 // unannotated one keeps the static type and needs no box — and
                 // must not get one: a BOXED `Long` in a `Long`-typed slot reached
                 // the integer division as a handle, and `x / 2` answered `0.0`.
-                let it = match ty {
-                    Some(t) if !matches!(t, Type::Float | Type::Long) => {
-                        self.compile_erased(sc, init)?
+                // An integer literal adopts a `Byte`/`Short` declaration's type
+                // only when it fits; one that does not stays an `Int`, which
+                // the declaration then refuses.
+                if let (Some(t @ (Type::Byte | Type::Short)), Some(n)) = (ty, int_literal_of(init))
+                {
+                    let fits = match t {
+                        Type::Byte => i8::try_from(n).is_ok(),
+                        _ => i16::try_from(n).is_ok(),
+                    };
+                    if !fits {
+                        let want = if *t == Type::Byte { "Byte" } else { "Short" };
+                        return Err(format!(
+                            "initializer type mismatch: expected '{want}', actual 'Int'."
+                        ));
                     }
+                }
+                let it = match ty {
+                    Some(t) if !boxes_width(*t) => self.compile_erased(sc, init)?,
                     _ => self.compile_expr(sc, init)?,
                 };
                 let mut vty = ty.unwrap_or(it);
@@ -5643,7 +5723,13 @@ impl Compiler {
                 self.compile_when_stmt(sc, w)?;
             }
             StmtKind::Expr(e) => {
-                self.compile_expr(sc, e)?;
+                // An `if`/`try` statement's value is discarded, so a `when` in
+                // the tail of one of its branches is a statement too.
+                let outer = self.tail_whens.len();
+                tail_whens(std::slice::from_ref(s), &mut self.tail_whens);
+                let res = self.compile_expr(sc, e);
+                self.tail_whens.truncate(outer);
+                res?;
                 self.b.emit(Op::Pop, 0);
             }
         }
@@ -6886,8 +6972,21 @@ impl Compiler {
         };
         // With an `inc`/`dec` convention the update is a plain `=` of the
         // method's result; without one it is the `+= 1` the primitive types use.
+        // A `Byte`/`Short` steps through `inc()`/`dec()`, which narrow the sum
+        // back to the type's width (`127` steps to `-128`).
         let (upd_op, upd_value) = match conv {
             Some(call) => (None, call),
+            None if matches!(ty, Type::Byte | Type::Short) => (
+                None,
+                narrow_to(
+                    Expr::Binary {
+                        op,
+                        l: Box::new(target.clone()),
+                        r: Box::new(Expr::Int(1)),
+                    },
+                    ty,
+                ),
+            ),
             None => (Some(op), Expr::Int(1)),
         };
         let update = match target {
@@ -7257,8 +7356,12 @@ impl Compiler {
         // representation for `Int` and `Long` and one for `Float` and `Double`,
         // so only the static types can say.
         if name == "equals" && args.len() == 1 && !safe {
-            let numeric =
-                |t: Type| matches!(t, Type::Int | Type::Long | Type::Double | Type::Float);
+            let numeric = |t: Type| {
+                matches!(
+                    t,
+                    Type::Int | Type::Byte | Type::Short | Type::Long | Type::Double | Type::Float
+                )
+            };
             let (rt, at) = (self.infer(sc, recv), self.infer(sc, &args[0]));
             if numeric(rt) && numeric(at) && rt != at {
                 self.compile_expr(sc, recv)?;
@@ -7541,31 +7644,51 @@ impl Compiler {
             let rty = self.infer(sc, recv);
             let numeric = matches!(
                 rty,
-                Type::Int | Type::Long | Type::Double | Type::Float | Type::Char
+                Type::Int
+                    | Type::Byte
+                    | Type::Short
+                    | Type::Long
+                    | Type::Double
+                    | Type::Float
+                    | Type::Char
             );
             let one = || Box::new(Expr::Int(1));
+            // `Byte.inc()` answers a `Byte` — the sum narrowed back to 8 bits —
+            // while `Byte.unaryPlus()` answers the promoted `Int`.
             let rewritten = match (name, args.len()) {
-                ("inc", 0) if numeric => Some(Expr::Binary {
-                    op: BinOp::Add,
-                    l: Box::new(recv.clone()),
-                    r: one(),
-                }),
-                ("dec", 0) if numeric => Some(Expr::Binary {
-                    op: BinOp::Sub,
-                    l: Box::new(recv.clone()),
-                    r: one(),
-                }),
+                ("inc", 0) if numeric => Some(narrow_to(
+                    Expr::Binary {
+                        op: BinOp::Add,
+                        l: Box::new(recv.clone()),
+                        r: one(),
+                    },
+                    rty,
+                )),
+                ("dec", 0) if numeric => Some(narrow_to(
+                    Expr::Binary {
+                        op: BinOp::Sub,
+                        l: Box::new(recv.clone()),
+                        r: one(),
+                    },
+                    rty,
+                )),
                 ("unaryMinus", 0) if numeric && rty != Type::Char => Some(Expr::Unary {
                     op: UnOp::Neg,
                     expr: Box::new(recv.clone()),
                 }),
+                ("unaryPlus", 0) if matches!(rty, Type::Byte | Type::Short) => {
+                    Some(narrow_to(recv.clone(), Type::Int))
+                }
                 ("unaryPlus", 0) if numeric && rty != Type::Char => Some(recv.clone()),
                 ("not", 0) if rty == Type::Boolean => Some(Expr::Unary {
                     op: UnOp::Not,
                     expr: Box::new(recv.clone()),
                 }),
                 ("rangeTo" | "rangeUntil", 1)
-                    if matches!(rty, Type::Int | Type::Long | Type::Char) =>
+                    if matches!(
+                        rty,
+                        Type::Int | Type::Byte | Type::Short | Type::Long | Type::Char
+                    ) =>
                 {
                     Some(Expr::Range {
                         start: Box::new(recv.clone()),
@@ -7739,10 +7862,8 @@ impl Compiler {
         // `java.lang.Double`'s, so an unboxed query misses a boxed element.
         // `format`'s `vararg args: Any?` is the same position by another name.
         if width_erasing_member(name)
-            && (args
-                .iter()
-                .any(|a| matches!(self.infer(sc, a), Type::Float | Type::Long))
-                || (name == "equals" && matches!(self.infer(sc, recv), Type::Float | Type::Long)))
+            && (args.iter().any(|a| boxes_width(self.infer(sc, a)))
+                || (name == "equals" && boxes_width(self.infer(sc, recv))))
         {
             return self.compile_member_boxed(sc, recv, name, args, line);
         }
@@ -8325,6 +8446,7 @@ impl Compiler {
             });
             if let Some((sub, sig)) = resolved {
                 let full = self.expand_args(name, sig.owner.as_deref(), &sig.params, args)?;
+                self.mark_inlined_lambdas(&sig, &full);
                 self.compile_expr(sc, recv)?;
                 self.compile_call_args(sc, &sig.params, &full)?;
                 let idx = self.b.add_name(&sub);
@@ -8699,6 +8821,27 @@ impl Compiler {
         // is -1, `(-1L).hashCode()` is 0) and the two share one runtime
         // representation, so the receiver's static width rides along exactly as
         // it does for the shifts below.
+        // `n.toByte()` / `n.toShort()` on an `Int` — which is never boxed, so
+        // the value is a bare integer — truncate with the native shifts, as
+        // `emit_wrap32` does at 32 bits: `b++` on a `Byte` lowers to one, and a
+        // host call there would take the loop out of the JIT.
+        if matches!(name, "toByte" | "toShort")
+            && args.is_empty()
+            && !safe
+            && self.infer(sc, recv) == Type::Int
+        {
+            self.compile_expr(sc, recv)?;
+            let shift = if name == "toByte" { 56 } else { 48 };
+            self.b.emit(Op::LoadInt(shift), line);
+            self.b.emit(Op::Shl, line);
+            self.b.emit(Op::LoadInt(shift), line);
+            self.b.emit(Op::Shr, line);
+            return Ok(if name == "toByte" {
+                Type::Byte
+            } else {
+                Type::Short
+            });
+        }
         if name == "hashCode" && args.is_empty() {
             let rt = self.infer(sc, recv);
             self.compile_expr(sc, recv)?;
@@ -8743,7 +8886,11 @@ impl Compiler {
         // `Int.MIN_VALUE`). Every integer is one `i64` at run time and an
         // `IntArray` and a `LongArray` hold the same values, so the host sums at
         // 64 bits and the width is applied here, from the static element type.
-        if name == "sum" && args.is_empty() && !safe && self.index_elem_ty(sc, recv) == Type::Int {
+        if name == "sum"
+            && args.is_empty()
+            && !safe
+            && self.index_elem_ty(sc, recv).promoted() == Type::Int
+        {
             self.emit_kt_method(sc, recv, name, args, line)?;
             self.emit_wrap32();
             return Ok(Type::Int);
@@ -9187,6 +9334,7 @@ impl Compiler {
         let recv = self.lambda_recv.take();
         let recv_it = std::mem::take(&mut self.lambda_recv_it);
         let zero_arity = self.zero_arity_body.take() == Some(body.as_ptr());
+        let frame = self.lambda_frame.remove(&(body.as_ptr() as usize));
         // An unparameterized lambda has the single implicit parameter `it` —
         // unless the function type it is passed as takes none.
         let declared: Vec<(String, Type)> =
@@ -9235,18 +9383,30 @@ impl Compiler {
         // left out where the literal was invoked by its own enclosing body
         // (an inlined stdlib call), as the JVM leaves it out.
         let jvm = self.lambda_ctx.last_mut().map(|c| {
-            let i = c.next;
-            c.next += 1;
-            let method = if c.token.starts_with("lam:") {
-                format!("{}${i}", c.method)
-            } else {
-                format!("{}$lambda${i}", c.method)
+            let method = match &frame {
+                // A class lambda's method field is its class's suffix.
+                Some(LambdaFrame::Class(var)) => format!("${}${var}$1", c.method),
+                _ => {
+                    let i = c.next;
+                    c.next += 1;
+                    if c.token.starts_with("lam:") {
+                        format!("{}${i}", c.method)
+                    } else {
+                        format!("{}$lambda${i}", c.method)
+                    }
+                }
             };
             (c.class.clone(), method, c.token.clone())
         });
+        let mode = match frame {
+            None => "",
+            Some(LambdaFrame::Own) => "own",
+            Some(LambdaFrame::Inlined) => "inl",
+            Some(LambdaFrame::Class(_)) => "cls",
+        };
         let sub = match &jvm {
             Some((class, method, parent)) => {
-                format!("$lambda${id}\x1f{class}\x1f{method}\x1f{parent}")
+                format!("$lambda${id}\x1f{class}\x1f{method}\x1f{parent}\x1f{mode}")
             }
             None => format!("$lambda${id}"),
         };
@@ -9584,7 +9744,11 @@ impl Compiler {
         self.push_unwind(UnwindKind::Frame);
         let outer_returns = std::mem::take(&mut self.finally_returns);
         let outer_exits = std::mem::take(&mut self.finally_exits);
+        let mut tails = Vec::new();
+        tail_whens(&pl.body, &mut tails);
+        let outer_tails = std::mem::replace(&mut self.tail_whens, tails);
         let res = self.compile_block_value(&mut sc, &pl.body);
+        self.tail_whens = outer_tails;
         // `run outer@{ xs.forEach { return@outer 1 } }` — the RESULT
         // expression may itself be the call a nested lambda returned through,
         // and the parked value, not the half-computed one, is the answer.
@@ -9615,18 +9779,13 @@ impl Compiler {
         // position's does: unboxed, `{ -1L }()` reached `"%x".format(…)` as an
         // `Int` and printed `ffffffff`.
         match res.as_ref() {
-            Ok(Type::Float) => {
-                self.b.emit(Op::Extended(KT_BOX_F32, 0), 0);
-            }
             // A lambda whose body ends in a `Unit` expression answers
             // `kotlin.Unit`, not `null`: `{ x: Int -> println(x) }(1)` prints it.
             Ok(Type::Unit) => {
                 self.b.emit(Op::Pop, 0);
                 self.b.emit(Op::Extended(KT_UNIT, 0), 0);
             }
-            Ok(Type::Long) => {
-                self.b.emit(Op::Extended(KT_BOX_I64, 0), 0);
-            }
+            Ok(t) => self.emit_width_box(*t),
             _ => {}
         }
         res?;
@@ -10064,8 +10223,10 @@ impl Compiler {
             return Ok(Type::Boolean);
         }
 
-        let lt = self.infer(sc, l);
-        let rt = self.infer(sc, r);
+        // `Byte` and `Short` operands are promoted to `Int` before every
+        // operator, so the operator is selected on the promoted types.
+        let lt = self.infer(sc, l).promoted();
+        let rt = self.infer(sc, r).promoted();
 
         // `x == null` / `x != null` is a null test, not a value comparison: the
         // native numeric/string ops would compare an absent value's coerced form
@@ -10642,13 +10803,14 @@ impl Compiler {
                 },
             ) = (reify_arg_name(&args[0]), &args[1])
             {
-                if ty == "Long"
+                let want = Type::from_name(&ty);
+                if int_literal_conv(want).is_some()
                     && element_builder(inner)
                     && elems.iter().any(|a| self.infer(sc, a) == Type::Int)
                 {
                     let call = Expr::Call {
                         name: inner.clone(),
-                        args: self.widen_to_long(sc, elems),
+                        args: self.retype_ints(sc, elems, want),
                         line: *l,
                     };
                     let wrapped = [args[0].clone(), call];
@@ -11504,7 +11666,7 @@ impl Compiler {
             // the way any `Long` parameter widens one.
             "IntRange" | "LongRange" if args.len() == 2 => {
                 let ends = match name {
-                    "LongRange" => self.widen_to_long(sc, args),
+                    "LongRange" => self.retype_ints(sc, args, Type::Long),
                     _ => args.to_vec(),
                 };
                 self.compile_expr(
@@ -12024,6 +12186,25 @@ impl Compiler {
     /// unset marker and the callee's prologue replaces it (see
     /// [`Compiler::needs_callee_frame`], [`Compiler::emit_callee_defaults`]).
     /// `owner` is the class whose members such a default may name.
+    /// A lambda literal handed straight to a user `inline fun` is copied into
+    /// the caller along with the function, so neither owns a stack-trace
+    /// frame: mark each literal argument of a call to `sig` when it is inline.
+    fn mark_inlined_lambdas(&mut self, sig: &FnSig, args: &[Expr]) {
+        if !sig.inline {
+            return;
+        }
+        for a in args {
+            let a = match a {
+                Expr::Named { value, .. } => &**value,
+                other => other,
+            };
+            if let Expr::Lambda { body, .. } = a {
+                self.lambda_frame
+                    .insert(body.as_ptr() as usize, LambdaFrame::Inlined);
+            }
+        }
+    }
+
     fn expand_args(
         &self,
         callee: &str,
@@ -12642,7 +12823,7 @@ impl Compiler {
         let boxed: Vec<Expr> = args
             .iter()
             .map(|a| match self.infer(sc, a) {
-                Type::Float | Type::Long => Expr::Call {
+                t if boxes_width(t) => Expr::Call {
                     name: BOX_WIDTH.to_string(),
                     args: vec![a.clone()],
                     line,
@@ -12652,7 +12833,7 @@ impl Compiler {
             .collect();
         // `equals` sees BOTH operands boxed: `5L.equals(5L)` is `Long.equals(Object)`.
         let boxed_recv;
-        let recv = if name == "equals" && matches!(self.infer(sc, recv), Type::Float | Type::Long) {
+        let recv = if name == "equals" && boxes_width(self.infer(sc, recv)) {
             boxed_recv = Expr::Call {
                 name: BOX_WIDTH.to_string(),
                 args: vec![recv.clone()],
@@ -12687,6 +12868,7 @@ impl Compiler {
             &sig.params,
             args,
         )?;
+        self.mark_inlined_lambdas(&sig, &full);
         self.compile_call_args(sc, &sig.params, &full)?;
         // A local `fun` shadows a top-level one of the same name and
         // lives under its mangled sub. Its captures follow the real
@@ -12923,6 +13105,8 @@ impl Compiler {
             matches!(
                 t,
                 Type::Int
+                    | Type::Byte
+                    | Type::Short
                     | Type::Long
                     | Type::Float
                     | Type::Double
@@ -12934,6 +13118,8 @@ impl Compiler {
         };
         match p.ty {
             Type::Int
+            | Type::Byte
+            | Type::Short
             | Type::Long
             | Type::Float
             | Type::Double
@@ -12942,7 +13128,7 @@ impl Compiler {
             | Type::String => {
                 if at == p.ty {
                     Some(3)
-                } else if p.ty == Type::Long && at == Type::Int && int_literal {
+                } else if int_literal_conv(p.ty).is_some() && at == Type::Int && int_literal {
                     Some(2)
                 } else if matches!(a, Expr::Null) {
                     // Only a `T?` parameter takes `null`, and nullability is not
@@ -13055,31 +13241,30 @@ impl Compiler {
         Ok(Type::Obj)
     }
 
-    /// `args` with every `Int`-typed one converted to `Long` — the arguments
-    /// passed where a `Long` element is expected. Kotlin accepts only an
-    /// integer LITERAL there (an `Int` expression is a type error), and types
-    /// it `Long`; the conversion is what makes the stored element a `Long`.
-    fn widen_to_long(&self, sc: &Scope, args: &[Expr]) -> Vec<Expr> {
+    /// `args` with every `Int`-typed one converted to `want` when `want` is an
+    /// integral width an integer literal takes (`Long`, `Short`, `Byte`) — the
+    /// arguments passed where an element of that width is expected. Kotlin
+    /// accepts only an integer LITERAL there (an `Int` expression is a type
+    /// error), and types it by the element; the conversion is what makes the
+    /// stored element one.
+    fn retype_ints(&self, sc: &Scope, args: &[Expr], want: Type) -> Vec<Expr> {
         args.iter()
-            .map(|a| {
-                if self.infer(sc, a) == Type::Int {
-                    Expr::MethodCall {
-                        recv: Box::new(a.clone()),
-                        name: "toLong".to_string(),
-                        args: Vec::new(),
-                        safe: false,
-                        line: 0,
-                    }
-                } else {
-                    a.clone()
-                }
+            .map(|a| match int_literal_conv(want) {
+                Some(conv) if self.infer(sc, a) == Type::Int => Expr::MethodCall {
+                    recv: Box::new(a.clone()),
+                    name: conv.to_string(),
+                    args: Vec::new(),
+                    safe: false,
+                    line: 0,
+                },
+                _ => a.clone(),
             })
             .collect()
     }
 
     /// `xs.add(1)` on a receiver whose elements are `Long`, or `m.put(1, 2)`
     /// on a `Map<Long, Long>`: the arguments with each one that takes a `Long`
-    /// element, key or value widened (see [`Compiler::widen_to_long`]), or
+    /// element, key or value widened (see [`Compiler::retype_ints`]), or
     /// `None` when nothing changes. Of a list member only the LAST argument is
     /// an element — the first of `add(i, x)` and `set(i, x)` is an `Int` index.
     fn long_element_args(
@@ -13106,8 +13291,9 @@ impl Compiler {
         } else {
             return None;
         };
+        let want = |i: usize| wanted.get(i).copied().unwrap_or(Type::Unknown);
         let widen = |i: usize, a: &Expr| {
-            wanted.get(i) == Some(&Type::Long) && self.infer(sc, a) == Type::Int
+            int_literal_conv(want(i)).is_some() && self.infer(sc, a) == Type::Int
         };
         if !args.iter().enumerate().any(|(i, a)| widen(i, a)) {
             return None;
@@ -13115,10 +13301,7 @@ impl Compiler {
         Some(
             args.iter()
                 .enumerate()
-                .map(|(i, a)| match widen(i, a) {
-                    true => self.widen_to_long(sc, std::slice::from_ref(a)).remove(0),
-                    false => a.clone(),
-                })
+                .map(|(i, a)| self.as_long_if(sc, a, want(i)))
                 .collect(),
         )
     }
@@ -13134,13 +13317,11 @@ impl Compiler {
         }
     }
 
-    /// `e` as a `Long` when it is an `Int` passed where `want` is `Long`.
+    /// `e` as a `Long` (`Short`, `Byte`) when it is an `Int` passed where
+    /// `want` is that width.
     fn as_long_if(&self, sc: &Scope, e: &Expr, want: Type) -> Expr {
-        if want == Type::Long && self.infer(sc, e) == Type::Int {
-            self.widen_to_long(sc, std::slice::from_ref(e)).remove(0)
-        } else {
-            e.clone()
-        }
+        self.retype_ints(sc, std::slice::from_ref(e), want)
+            .remove(0)
     }
 
     fn compile_erased(&mut self, sc: &mut Scope, e: &Expr) -> Result<Type, String> {
@@ -13149,15 +13330,27 @@ impl Compiler {
         // `List<Long>` element) may still be one `infer` knows is a `Long`,
         // and the box is what `is Long` and `equals` read.
         let t = match t {
-            Type::Unknown if self.infer(sc, e) == Type::Long => Type::Long,
+            Type::Unknown => match self.infer(sc, e) {
+                t @ (Type::Long | Type::Byte | Type::Short) => t,
+                _ => Type::Unknown,
+            },
             other => other,
         };
-        match t {
-            Type::Float => self.b.emit(Op::Extended(KT_BOX_F32, 0), 0),
-            Type::Long => self.b.emit(Op::Extended(KT_BOX_I64, 0), 0),
-            _ => return Ok(t),
-        };
+        self.emit_width_box(t);
         Ok(t)
+    }
+
+    /// Box the value on the stack when its static type `t` is one whose width
+    /// the runtime value cannot carry (see [`boxes_width`]); otherwise nothing.
+    fn emit_width_box(&mut self, t: Type) {
+        let op = match t {
+            Type::Float => Op::Extended(KT_BOX_F32, 0),
+            Type::Long => Op::Extended(KT_BOX_I64, 0),
+            Type::Byte => Op::Extended(KT_BOX_NARROW, 8),
+            Type::Short => Op::Extended(KT_BOX_NARROW, 16),
+            _ => return,
+        };
+        self.b.emit(op, 0);
     }
 
     /// The empty value `x.orEmpty()` falls back to for a receiver of `recv`'s
@@ -13190,6 +13383,8 @@ impl Compiler {
         match self.infer(sc, recv) {
             Type::Int => Some("Int".into()),
             Type::Long => Some("Long".into()),
+            Type::Byte => Some("Byte".into()),
+            Type::Short => Some("Short".into()),
             Type::Float => Some("Float".into()),
             Type::Double => Some("Double".into()),
             Type::Boolean => Some("Boolean".into()),
@@ -13831,13 +14026,18 @@ impl Compiler {
     /// A `when` over a `sealed` type, an enum or a `Boolean` must cover every
     /// case or say `else` — in statement position as well, since Kotlin 1.7.
     /// The error names what is missing, as `kotlinc`'s does.
-    fn check_exhaustive(&self, sc: &Scope, w: &WhenExpr) -> Result<(), String> {
-        let Some(subject) = &w.subject else {
-            return Ok(());
-        };
+    ///
+    /// `Ok(true)` when the arms are exhaustive — an `else`, or every case of
+    /// one of those types covered — and `Ok(false)` for a `when` over any
+    /// other subject (or none) without an `else`, which is only legal where its
+    /// value is not used.
+    fn check_exhaustive(&self, sc: &Scope, w: &WhenExpr) -> Result<bool, String> {
         if w.arms.iter().any(|a| matches!(a.guard, WhenGuard::Else)) {
-            return Ok(());
+            return Ok(true);
         }
+        let Some(subject) = &w.subject else {
+            return Ok(false);
+        };
         let conds: Vec<&WhenCond> = w
             .arms
             .iter()
@@ -13870,7 +14070,19 @@ impl Compiler {
                 _ => None,
             };
             let Some(class) = declared.or_else(|| self.infer_class(sc, subject)) else {
-                return Ok(());
+                // A subject this frontend cannot type may be a sealed or enum
+                // value it cannot see (a `for` variable over a `List<S>`), so
+                // only a known primitive type is open for certain.
+                return Ok(!matches!(
+                    self.infer(sc, subject).promoted(),
+                    Type::Int
+                        | Type::Long
+                        | Type::Float
+                        | Type::Double
+                        | Type::Char
+                        | Type::String
+                        | Type::NullableString
+                ));
             };
             if let Some(constants) = self.enum_constants.get(&class) {
                 constants
@@ -13897,11 +14109,11 @@ impl Compiler {
                 self.uncovered_subclasses(&class, &tested, &objects, &mut out);
                 out
             } else {
-                return Ok(());
+                return Ok(false);
             }
         };
         if missing.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
         let what = missing
             .iter()
@@ -13981,7 +14193,20 @@ impl Compiler {
         w: &WhenExpr,
         want_value: bool,
     ) -> Result<Type, String> {
-        self.check_exhaustive(sc, w)?;
+        let exhaustive = self.check_exhaustive(sc, w)?;
+        if want_value && !exhaustive {
+            // A lambda's tail statement: not an expression to `kotlinc`, so the
+            // `when` runs as a statement and the lambda answers `Unit`.
+            if self.tail_whens.contains(&(w as *const WhenExpr as usize)) {
+                self.compile_when_inner(sc, w, false)?;
+                self.b.emit(Op::Extended(KT_UNIT, 0), w.line);
+                return Ok(Type::Unit);
+            }
+            return Err(format!(
+                "'when' expression must be exhaustive. Add an 'else' branch. (line {})",
+                w.line
+            ));
+        }
         let mark = sc.enter();
         // Evaluate the subject once; remember its static type for `==` op choice.
         let subj = if let Some(subject) = &w.subject {
@@ -14234,15 +14459,7 @@ impl Compiler {
                 // Boxed for the test exactly as an `is` expression's operand is
                 // (see `compile_erased`): `is Float` / `is Long` answer for a
                 // box, which is the only form that tells them apart.
-                match sty {
-                    Type::Float => {
-                        self.b.emit(Op::Extended(KT_BOX_F32, 0), 0);
-                    }
-                    Type::Long => {
-                        self.b.emit(Op::Extended(KT_BOX_I64, 0), 0);
-                    }
-                    _ => {}
-                }
+                self.emit_width_box(sty);
                 let nidx = self.b.add_constant(Value::str(self.canon_class(ty)));
                 self.b.emit(Op::LoadConst(nidx), 0);
                 // The operand says whether the tested type was written `T?`,
@@ -14724,6 +14941,8 @@ impl Compiler {
                         | "minBy"
                 ) {
                     let elem = self.infer_elem(sc, recv);
+                    // A `Byte`/`Short` total is an `Int`.
+                    let elem = if name == "sum" { elem.promoted() } else { elem };
                     if elem != Type::Unknown {
                         return nullable_if_safe(elem, *safe);
                     }
@@ -14838,9 +15057,9 @@ impl Compiler {
             return Type::Char;
         }
         match self.infer_class(sc, recv).as_deref() {
-            // `Short`/`Byte` arithmetic promotes to `Int`, so their elements
-            // take part at `Int` width.
-            Some("IntArray" | "ShortArray" | "ByteArray") => Type::Int,
+            Some("IntArray") => Type::Int,
+            Some("ShortArray") => Type::Short,
+            Some("ByteArray") => Type::Byte,
             Some("LongArray") => Type::Long,
             Some("DoubleArray") => Type::Double,
             Some("FloatArray") => Type::Float,
@@ -14976,7 +15195,9 @@ impl Compiler {
                     t @ (Type::Int | Type::Long | Type::Double | Type::Float | Type::Char) => t,
                     _ => Type::Unknown,
                 },
-                "intArrayOf" | "shortArrayOf" | "byteArrayOf" => Type::Int,
+                "intArrayOf" => Type::Int,
+                "shortArrayOf" => Type::Short,
+                "byteArrayOf" => Type::Byte,
                 "longArrayOf" => Type::Long,
                 // `LongRange(a, b)` / `IntRange(a, b)` — the constructor spellings.
                 "LongRange" if args.len() == 2 => Type::Long,
@@ -16085,6 +16306,8 @@ fn native_compare(t: Type) -> bool {
     matches!(
         t,
         Type::Int
+            | Type::Byte
+            | Type::Short
             | Type::Long
             | Type::Float
             | Type::Double
@@ -16480,6 +16703,8 @@ fn spread_factory(name: &str) -> Option<(Type, Option<&'static str>)> {
 fn vararg_array(elem: Type, items: &[Expr]) -> Expr {
     let name = match elem {
         Type::Int | Type::Long => "intArrayOf",
+        Type::Byte => "byteArrayOf",
+        Type::Short => "shortArrayOf",
         Type::Double => "doubleArrayOf",
         Type::Float => "floatArrayOf",
         Type::Boolean => "booleanArrayOf",
@@ -16701,6 +16926,8 @@ fn smart_cast_of(sc: &Scope, name: &str, ty: &str) -> Option<(String, Type)> {
     let tracked = matches!(
         t,
         Type::Int
+            | Type::Byte
+            | Type::Short
             | Type::Long
             | Type::Double
             | Type::Float
@@ -16741,10 +16968,10 @@ fn zero_arity_member(name: &str) -> bool {
 
 fn primitive_const(ty: &str, name: &str) -> Option<(Value, Type)> {
     let v = match (ty, name) {
-        ("Byte", "MAX_VALUE") => (Value::Int(i8::MAX as i64), Type::Int),
-        ("Byte", "MIN_VALUE") => (Value::Int(i8::MIN as i64), Type::Int),
-        ("Short", "MAX_VALUE") => (Value::Int(i16::MAX as i64), Type::Int),
-        ("Short", "MIN_VALUE") => (Value::Int(i16::MIN as i64), Type::Int),
+        ("Byte", "MAX_VALUE") => (Value::Int(i8::MAX as i64), Type::Byte),
+        ("Byte", "MIN_VALUE") => (Value::Int(i8::MIN as i64), Type::Byte),
+        ("Short", "MAX_VALUE") => (Value::Int(i16::MAX as i64), Type::Short),
+        ("Short", "MIN_VALUE") => (Value::Int(i16::MIN as i64), Type::Short),
         ("Int", "MAX_VALUE") => (Value::Int(i32::MAX as i64), Type::Int),
         ("Int", "MIN_VALUE") => (Value::Int(i32::MIN as i64), Type::Int),
         ("Long", "MAX_VALUE") => (Value::Int(i64::MAX), Type::Long),
@@ -16888,6 +17115,8 @@ fn is_primitive_recv(t: Type) -> bool {
     matches!(
         t,
         Type::Int
+            | Type::Byte
+            | Type::Short
             | Type::Long
             | Type::Float
             | Type::Double
@@ -16910,8 +17139,93 @@ fn nonempty(v: Vec<TypeArg>) -> Option<Vec<TypeArg>> {
     (!v.is_empty()).then_some(v)
 }
 
+/// Collect into `out` the address of every `when` in the tail of `body` (see
+/// `Compiler::tail_whens`): its last statement, and recursively the tails of
+/// that statement's `if` branches, `try` body and handlers, and `when` arms.
+fn tail_whens(body: &[Stmt], out: &mut Vec<usize>) {
+    let Some(last) = body.last() else {
+        return;
+    };
+    let (w, ie, t) = match &last.kind {
+        StmtKind::When(w) | StmtKind::Expr(Expr::When(w)) => (Some(w), None, None),
+        StmtKind::If(ie) | StmtKind::Expr(Expr::If(ie)) => (None, Some(ie), None),
+        StmtKind::Expr(Expr::Try(t)) => (None, None, Some(t)),
+        _ => return,
+    };
+    if let Some(w) = w {
+        out.push(w as *const WhenExpr as usize);
+        for arm in &w.arms {
+            tail_whens(&arm.body, out);
+        }
+    }
+    if let Some(ie) = ie {
+        tail_whens(&ie.then, out);
+        if let Some(els) = &ie.els {
+            tail_whens(els, out);
+        }
+    }
+    if let Some(t) = t {
+        tail_whens(&t.body, out);
+        for c in &t.catches {
+            tail_whens(&c.body, out);
+        }
+    }
+}
+
+/// The value of `e` when it is an integer literal, negated or not.
+fn int_literal_of(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::Int(n) => Some(*n),
+        Expr::Unary {
+            op: UnOp::Neg,
+            expr,
+        } => match **expr {
+            Expr::Int(n) => Some(-n),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The conversion an `Int`-typed integer literal takes in a position typed
+/// `want`, when `want` is one of the other integral widths a literal adopts.
+fn int_literal_conv(want: Type) -> Option<&'static str> {
+    match want {
+        Type::Long => Some("toLong"),
+        Type::Short => Some("toShort"),
+        Type::Byte => Some("toByte"),
+        _ => None,
+    }
+}
+
+/// Whether a value of static type `t` needs a box in an erased position: the
+/// types that share a runtime form with another one — `Float` with `Double`,
+/// and `Long`, `Short` and `Byte` with `Int` — so only a box can say which.
+fn boxes_width(t: Type) -> bool {
+    matches!(t, Type::Float | Type::Long | Type::Byte | Type::Short)
+}
+
+/// `e` converted to `ty` when `ty` is a width `Int` arithmetic is narrowed
+/// back into (`Byte`/`Short`), or `Int` itself, which `toInt()` reads a boxed
+/// narrow value out of; any other `ty` leaves `e` as it is.
+fn narrow_to(e: Expr, ty: Type) -> Expr {
+    let name = match ty {
+        Type::Byte => "toByte",
+        Type::Short => "toShort",
+        Type::Int => "toInt",
+        _ => return e,
+    };
+    Expr::MethodCall {
+        recv: Box::new(e),
+        name: name.to_string(),
+        args: Vec::new(),
+        safe: false,
+        line: 0,
+    }
+}
+
 fn is_int_width(t: Type) -> bool {
-    matches!(t, Type::Int | Type::Char)
+    matches!(t, Type::Int | Type::Byte | Type::Short | Type::Char)
 }
 
 /// True when an operation on operands of these types produces a value that must
@@ -16949,10 +17263,11 @@ fn nullable_if_safe(t: Type, safe: bool) -> Type {
 fn method_ret_type(name: &str) -> Type {
     match name {
         "length" | "code" | "lastIndex" => Type::Int,
-        // The width conversions. `toByte`/`toShort` narrow the VALUE, but their
-        // result still takes part in arithmetic at `Int` width (Kotlin promotes
-        // both before every operator), so `Int` is their arithmetic type here.
-        "toInt" | "toByte" | "toShort" => Type::Int,
+        // The width conversions. A `Byte`/`Short` result is promoted back to
+        // `Int` by any operator it meets (see `Type::promoted`).
+        "toInt" => Type::Int,
+        "toByte" => Type::Byte,
+        "toShort" => Type::Short,
         "toLong" => Type::Long,
         "toDouble" => Type::Double,
         "toFloat" => Type::Float,

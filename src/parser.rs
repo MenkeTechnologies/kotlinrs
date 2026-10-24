@@ -222,6 +222,8 @@ struct Mods {
     /// `lateinit var` — a class property with no initializer, whose read
     /// before its first write is `UninitializedPropertyAccessException`.
     lateinit: bool,
+    /// `inline fun` — see [`FunDecl::is_inline`].
+    inline: bool,
 }
 
 /// A `typealias` declaration: its type-parameter names and the tokens of the
@@ -747,6 +749,7 @@ fn expand_interface_delegation(prog: &mut Program) -> Result<(), String> {
                     is_open: true,
                     is_override: true,
                     is_final: false,
+                    is_inline: false,
                 });
             }
         }
@@ -1036,9 +1039,10 @@ impl Parser {
                 "sealed" => m.sealed = true,
                 "inner" => m.inner = true,
                 "lateinit" => m.lateinit = true,
+                "inline" => m.inline = true,
                 "final" => m.final_ = true,
-                "public" | "private" | "internal" | "protected" | "inline" | "noinline"
-                | "crossinline" | "tailrec" | "operator" | "infix" | "const" => {}
+                "public" | "private" | "internal" | "protected" | "noinline" | "crossinline"
+                | "tailrec" | "operator" | "infix" | "const" => {}
                 _ => break,
             }
             self.advance();
@@ -1354,6 +1358,7 @@ impl Parser {
             is_open: mods.open,
             is_override: mods.override_,
             is_final: mods.final_,
+            is_inline: mods.inline,
         })
     }
 
@@ -1856,6 +1861,7 @@ impl Parser {
                 is_open: false,
                 is_override: true,
                 is_final: false,
+                is_inline: false,
             });
         }
         Ok(ClassDecl {
@@ -2152,6 +2158,7 @@ impl Parser {
             is_open: false,
             is_override: false,
             is_final: false,
+            is_inline: false,
         });
 
         // `fun valueOf(value: String) = when (value) { "RED" -> E.RED; …
@@ -2220,6 +2227,7 @@ impl Parser {
             is_open: false,
             is_override: false,
             is_final: false,
+            is_inline: false,
         });
 
         Ok(comp)
@@ -2479,6 +2487,7 @@ impl Parser {
             is_open: mods.open,
             is_override: mods.override_,
             is_final: mods.final_,
+            is_inline: false,
         }))
     }
 
@@ -2803,6 +2812,7 @@ impl Parser {
             is_open: false,
             is_override: false,
             is_final: false,
+            is_inline: false,
         };
         let (get_name, set_name) = (format!("<get-{}>", p.name), format!("<set-{}>", p.name));
         let get_body = match getter {

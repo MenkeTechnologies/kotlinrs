@@ -18,7 +18,7 @@
 //! `ArithmeticException`).
 
 use fusevm::{Frame, NumOp, VMResult, Value, VM};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::regex::{next_search, KRegex, Match};
@@ -252,6 +252,15 @@ pub const KT_REIFIED: u16 = 53;
 /// container, a `Map` key, an `Any` binding, a parameter or return that is not
 /// declared `Long`, or a lambda's result — the same list [`KT_BOX_F32`] has.
 pub const KT_BOX_I64: u16 = 51;
+
+/// `KT_BOX_NARROW`: box the `Byte` (`arg == 8`) or `Short` (`arg == 16`) on
+/// top of the stack, for the reason [`KT_BOX_I64`] boxes a `Long`: all three
+/// share `Value::Int` with `Int`, and on the JVM each boxes to its own class —
+/// `java.lang.Byte` equals no `Integer`, so `(listOf(1) as List<Any>)[0] is
+/// Byte` is false and `listOf<Any>(1.toByte(), 1).distinct()` keeps both.
+/// The same erased positions box; arithmetic on a box reads its value and
+/// answers an `Int`, as Kotlin's promotion does.
+pub const KT_BOX_NARROW: u16 = 55;
 
 /// `KT_YIELD`: suspend the running `sequence { … }` block, handing its argument
 /// to whoever is pulling from it. Stack `[value]`; leaves the `Unit` the call
@@ -2462,6 +2471,12 @@ enum HeapObj {
     /// A boxed `Long` — see [`KT_BOX_I64`]. The value is the same `i64` a bare
     /// `Value::Int` would hold; what the box carries is that it is a `Long`.
     I64(i64),
+    /// A boxed `Byte` (`bits == 8`) or `Short` (`bits == 16`) — see
+    /// [`KT_BOX_NARROW`]. The value is already inside the type's range.
+    Narrow {
+        bits: u8,
+        v: i16,
+    },
     /// An unsigned integer: `UByte`/`UShort`/`UInt`/`ULong` by `bits`, its
     /// value masked to that width. See [`KT_UNSIGNED`].
     Unsigned {
@@ -2999,6 +3014,11 @@ pub fn set_source_file(path: &str) {
     let _ = SOURCE_FILE.set(name);
 }
 
+/// The prefix of the chunk name the compiler adds for each `inline fun`'s
+/// sub (`$inline$twice`): the JVM copies an inline function into its caller,
+/// so its sub owns no stack-trace frame.
+pub const INLINE_MARK: &str = "$inline$";
+
 /// The facade class Kotlin compiles a file's top-level functions into:
 /// `lv.kt` → `LvKt`, with each character no Java identifier takes as `_`.
 fn facade_class() -> String {
@@ -3034,6 +3054,11 @@ fn jvm_frame(sub: &str) -> Option<(String, String)> {
         } else {
             class.to_string()
         };
+        // A class-compiled lambda runs as `invoke` on the class whose name
+        // suffix the method field carries (see the compiler's `LambdaFrame`).
+        if lambda_mode(sub) == Some("cls") {
+            return Some((class + method, "invoke".to_string()));
+        }
         return Some((class, method.to_string()));
     }
     let base = sub.split_once("$ov").map_or(sub, |(b, _)| b);
@@ -3133,6 +3158,9 @@ thread_local! {
     /// came out of.
     static LAST_OP: RefCell<(String, ReceiverKind, usize)> =
         const { RefCell::new((String::new(), ReceiverKind::Other, 0)) };
+    /// The read-only class behind [`LAST_OP`]'s receiver when it is a `List`
+    /// (see [`ro_list`]); `None` for an `ArrayList`, and for any other kind.
+    static LAST_RO: Cell<Option<RoList>> = const { Cell::new(None) };
     /// Runtime-raised throwable → the JDK/stdlib frames in front of its user
     /// frames.
     static STACK_PREFIX: RefCell<std::collections::HashMap<u32, Vec<JdkFrame>>> =
@@ -3148,6 +3176,12 @@ enum ReceiverKind {
     EmptyIter,
     /// An iterator over a `MutableList` — `ArrayList$Itr`.
     ArrayListIter,
+    /// `kotlin.collections.ArrayDeque`.
+    Deque,
+    /// A `Set` — every stdlib member on it is the `Iterable` overload.
+    Set,
+    /// A `Sequence`.
+    Seq,
     Other,
 }
 
@@ -3168,9 +3202,13 @@ fn note_op(name: &str, recv: &Value, arity: usize) {
                 _ => ReceiverKind::Other,
             }
         }
+        _ if is_deque(Some(recv)) => ReceiverKind::Deque,
+        _ if is_sequence_view(recv) => ReceiverKind::Seq,
         _ => with_obj(recv, |o| match o {
             HeapObj::List(_) => ReceiverKind::List,
             HeapObj::Map(_) => ReceiverKind::Map,
+            HeapObj::Set(_) => ReceiverKind::Set,
+            HeapObj::Gen { .. } | HeapObj::Coro { .. } => ReceiverKind::Seq,
             _ => ReceiverKind::Other,
         })
         .unwrap_or(ReceiverKind::Other),
@@ -3181,6 +3219,13 @@ fn note_op(name: &str, recv: &Value, arity: usize) {
         o.0.push_str(name);
         o.1 = kind;
         o.2 = arity;
+    });
+    LAST_RO.with(|r| {
+        r.set(if kind == ReceiverKind::List {
+            ro_list(recv)
+        } else {
+            None
+        })
     });
 }
 
@@ -3225,7 +3270,9 @@ fn jdk_prefix(class: &str, msg: &str) -> Vec<JdkFrame> {
                 470,
             )],
         ),
-        ("java.lang.IndexOutOfBoundsException", "get") if list && msg.starts_with("Index: ") => {
+        ("java.lang.IndexOutOfBoundsException", "get" | "elementAt")
+            if list && msg.starts_with("Index: ") =>
+        {
             vec![(
                 "java.base",
                 "java.util.Collections$SingletonList",
@@ -3561,6 +3608,290 @@ fn jdk_prefix(class: &str, msg: &str) -> Vec<JdkFrame> {
                 ),
             ]
         }
+        _ => stdlib_prefix(class, msg, &op, kind, arity),
+    }
+}
+
+/// A `kotlin` stdlib frame — `(class, method, file, line)` with no module.
+const fn kt(class: &'static str, method: &'static str, file: &'static str, line: u32) -> JdkFrame {
+    ("", class, method, file, line)
+}
+
+/// A `java.base` frame — `(class, method, file, line)`.
+const fn jb(class: &'static str, method: &'static str, file: &'static str, line: u32) -> JdkFrame {
+    ("java.base", class, method, file, line)
+}
+
+const COLLECTIONS: &str = "kotlin.collections.CollectionsKt___CollectionsKt";
+const COLLECTIONS_FILE: &str = "_Collections.kt";
+const STRINGS: &str = "kotlin.text.StringsKt___StringsKt";
+const STRINGS_FILE: &str = "_Strings.kt";
+const CHECK_WINDOW: JdkFrame = kt(
+    "kotlin.collections.SlidingWindowKt",
+    "checkWindowSizeStep",
+    "SlidingWindow.kt",
+    9,
+);
+const CHECK_RADIX: JdkFrame = kt(
+    "kotlin.text.CharsKt__CharJVMKt",
+    "checkRadix",
+    "CharJVM.kt",
+    312,
+);
+
+/// [`jdk_prefix`] for the stdlib members whose argument checks and empty
+/// receivers fault inside `kotlin-stdlib` (or the `java.util` class behind a
+/// list). Measured on `kotlinc` 2.4.21 / JRE 21.0.13.
+fn stdlib_prefix(
+    class: &str,
+    msg: &str,
+    op: &str,
+    kind: ReceiverKind,
+    arity: usize,
+) -> Vec<JdkFrame> {
+    use ReceiverKind as K;
+    let neg_count = msg.ends_with(" is less than zero.");
+    let empty = msg.ends_with(" is empty.");
+    let one = |f: JdkFrame| vec![f];
+    match (class, op, kind) {
+        ("java.util.NoSuchElementException", "removeFirst", K::Deque) if empty => one(kt(
+            "kotlin.collections.ArrayDeque",
+            "removeFirst",
+            "ArrayDeque.kt",
+            147,
+        )),
+        ("java.util.NoSuchElementException", "removeLast", K::Deque) if empty => one(kt(
+            "kotlin.collections.ArrayDeque",
+            "removeLast",
+            "ArrayDeque.kt",
+            168,
+        )),
+        ("java.util.NoSuchElementException", "first", K::Deque) if empty => one(kt(
+            "kotlin.collections.ArrayDeque",
+            "first",
+            "ArrayDeque.kt",
+            102,
+        )),
+        ("java.util.NoSuchElementException", "last", K::Deque) if empty => one(kt(
+            "kotlin.collections.ArrayDeque",
+            "last",
+            "ArrayDeque.kt",
+            112,
+        )),
+        // `Iterable<T>` (not `List<T>`) overloads, for a `Set` receiver.
+        ("java.util.NoSuchElementException", "first", K::Set) if empty => {
+            one(kt(COLLECTIONS, "first", COLLECTIONS_FILE, 209))
+        }
+        ("java.util.NoSuchElementException", "last", K::Set) if empty => {
+            one(kt(COLLECTIONS, "last", COLLECTIONS_FILE, 413))
+        }
+        ("java.util.NoSuchElementException", "single", K::Set) if empty => {
+            one(kt(COLLECTIONS, "single", COLLECTIONS_FILE, 605))
+        }
+        ("java.lang.IllegalArgumentException", "single", K::Set)
+            if msg == "Collection has more than one element." =>
+        {
+            one(kt(COLLECTIONS, "single", COLLECTIONS_FILE, 608))
+        }
+        ("java.util.NoSuchElementException", "single", K::List) if msg == "List is empty." => {
+            one(kt(COLLECTIONS, "single", COLLECTIONS_FILE, 619))
+        }
+        ("java.util.NoSuchElementException", "random", K::List | K::Set) if empty => {
+            one(kt(COLLECTIONS, "random", COLLECTIONS_FILE, 573))
+        }
+        ("java.util.NoSuchElementException", "first", K::Seq) if empty => one(kt(
+            "kotlin.sequences.SequencesKt___SequencesKt",
+            "first",
+            "_Sequences.kt",
+            117,
+        )),
+        ("java.util.NoSuchElementException", "last", K::Seq) if empty => one(kt(
+            "kotlin.sequences.SequencesKt___SequencesKt",
+            "last",
+            "_Sequences.kt",
+            249,
+        )),
+        ("java.util.NoSuchElementException", "last", K::Str) if empty => {
+            one(kt(STRINGS, "last", STRINGS_FILE, 194))
+        }
+        // A negative count, checked by the member itself.
+        ("java.lang.IllegalArgumentException", "take", K::Str) if neg_count => {
+            one(kt(STRINGS, "take", STRINGS_FILE, 581))
+        }
+        ("java.lang.IllegalArgumentException", "takeLast", K::Str) if neg_count => {
+            one(kt(STRINGS, "takeLast", STRINGS_FILE, 606))
+        }
+        ("java.lang.IllegalArgumentException", "drop", K::Str) if neg_count => {
+            one(kt(STRINGS, "drop", STRINGS_FILE, 350))
+        }
+        ("java.lang.IllegalArgumentException", "take", K::List) if neg_count => {
+            one(kt(COLLECTIONS, "take", COLLECTIONS_FILE, 906))
+        }
+        ("java.lang.IllegalArgumentException", "takeLast", K::List) if neg_count => {
+            one(kt(COLLECTIONS, "takeLast", COLLECTIONS_FILE, 930))
+        }
+        ("java.lang.IllegalArgumentException", "drop", K::List) if neg_count => {
+            one(kt(COLLECTIONS, "drop", COLLECTIONS_FILE, 693))
+        }
+        ("java.lang.IllegalArgumentException", "dropLast", K::List) if neg_count => {
+            one(kt(COLLECTIONS, "dropLast", COLLECTIONS_FILE, 732))
+        }
+        // `padStart(n)` reaches the checking overload through its `$default`
+        // bridge and the `String` overload; `padStart(n, c)` skips the bridge.
+        ("java.lang.IllegalArgumentException", "padStart" | "padEnd", K::Str) if neg_count => {
+            let (name, bridge, check, wrap) = if op == "padStart" {
+                ("padStart", "padStart$default", 217, 238)
+            } else {
+                ("padEnd", "padEnd$default", 252, 273)
+            };
+            let p = "kotlin.text.StringsKt__StringsKt";
+            let mut v = vec![
+                kt(p, name, "Strings.kt", check),
+                kt(p, name, "Strings.kt", wrap),
+            ];
+            if arity == 1 {
+                v.push(kt(p, bridge, "Strings.kt", wrap - 1));
+            }
+            v
+        }
+        ("java.lang.IllegalArgumentException", "chunked", K::List)
+            if msg.ends_with("must be greater than zero.") =>
+        {
+            vec![
+                CHECK_WINDOW,
+                kt(COLLECTIONS, "windowed", COLLECTIONS_FILE, 3765),
+                kt(COLLECTIONS, "chunked", COLLECTIONS_FILE, 3556),
+            ]
+        }
+        ("java.lang.IllegalArgumentException", "windowed", K::List)
+            if arity == 1 && msg.ends_with("must be greater than zero.") =>
+        {
+            vec![
+                CHECK_WINDOW,
+                kt(COLLECTIONS, "windowed", COLLECTIONS_FILE, 3765),
+                kt(COLLECTIONS, "windowed$default", COLLECTIONS_FILE, 3764),
+            ]
+        }
+        ("java.lang.IllegalArgumentException", "chunked", K::Str)
+            if msg.ends_with("must be greater than zero.") =>
+        {
+            vec![
+                CHECK_WINDOW,
+                kt(STRINGS, "windowed", STRINGS_FILE, 2453),
+                kt(STRINGS, "windowed", STRINGS_FILE, 2431),
+                kt(STRINGS, "chunked", STRINGS_FILE, 2319),
+            ]
+        }
+        ("java.lang.IllegalArgumentException", "digitToInt", _)
+            if arity == 0 && msg.ends_with("is not a decimal digit") =>
+        {
+            one(kt(
+                "kotlin.text.CharsKt__CharKt",
+                "digitToInt",
+                "Char.kt",
+                23,
+            ))
+        }
+        ("java.lang.IllegalArgumentException", "digitToInt", _)
+            if arity == 1 && msg.contains("was not in valid range") =>
+        {
+            vec![
+                CHECK_RADIX,
+                kt(
+                    "kotlin.text.CharsKt__CharKt",
+                    "digitToIntOrNull",
+                    "Char.kt",
+                    74,
+                ),
+                kt("kotlin.text.CharsKt__CharKt", "digitToInt", "Char.kt", 42),
+            ]
+        }
+        ("java.lang.IllegalArgumentException", "toInt" | "toLong", K::Str)
+            if arity == 1 && msg.contains("was not in valid range") =>
+        {
+            one(CHECK_RADIX)
+        }
+        // `subList`/`listIterator` range checks: `AbstractList`'s for the
+        // read-only `Arrays$ArrayList`/`SingletonList`, `ArrayList`'s own
+        // `subList`/`listIterator` around them for a mutable list.
+        ("java.lang.IndexOutOfBoundsException", "subList", K::List)
+            if msg.starts_with("toIndex = ") || msg.starts_with("fromIndex = ") =>
+        {
+            let ro = LAST_RO.with(Cell::get);
+            let check = jb(
+                "java.util.AbstractList",
+                "subListRangeCheck",
+                "AbstractList.java",
+                509,
+            );
+            match ro {
+                Some(RoList::Arrays | RoList::Singleton) => {
+                    vec![
+                        check,
+                        jb(
+                            "java.util.AbstractList",
+                            "subList",
+                            "AbstractList.java",
+                            499,
+                        ),
+                    ]
+                }
+                None => vec![
+                    check,
+                    jb("java.util.ArrayList", "subList", "ArrayList.java", 1190),
+                ],
+                _ => Vec::new(),
+            }
+        }
+        ("java.lang.IndexOutOfBoundsException", "listIterator", K::List)
+            if msg.contains(", Size: ") =>
+        {
+            match LAST_RO.with(Cell::get) {
+                Some(RoList::Arrays | RoList::Singleton) => vec![
+                    jb(
+                        "java.util.AbstractList",
+                        "rangeCheckForAdd",
+                        "AbstractList.java",
+                        634,
+                    ),
+                    jb(
+                        "java.util.AbstractList",
+                        "listIterator",
+                        "AbstractList.java",
+                        340,
+                    ),
+                ],
+                None => vec![
+                    jb(
+                        "java.util.ArrayList",
+                        "rangeCheckForAdd",
+                        "ArrayList.java",
+                        838,
+                    ),
+                    jb(
+                        "java.util.ArrayList",
+                        "listIterator",
+                        "ArrayList.java",
+                        1005,
+                    ),
+                ],
+                _ => Vec::new(),
+            }
+        }
+        // `ArrayList`'s own range checks, on a list every write works on.
+        ("java.lang.IndexOutOfBoundsException", "add", K::List)
+            if arity == 2 && msg.starts_with("Index: ") =>
+        {
+            vec![
+                jb(
+                    "java.util.ArrayList",
+                    "rangeCheckForAdd",
+                    "ArrayList.java",
+                    838,
+                ),
+                jb("java.util.ArrayList", "add", "ArrayList.java", 510),
+            ]
+        }
         _ => Vec::new(),
     }
 }
@@ -3577,6 +3908,13 @@ fn frame_token(sub: &str) -> String {
 /// The body a lambda's literal was written in, as a [`frame_token`].
 fn lambda_parent(sub: &str) -> Option<&str> {
     sub.strip_prefix("$lambda$")?.split('\x1f').nth(3)
+}
+
+/// How the compiler said a lambda is compiled on the JVM: `own` (a value,
+/// always its own frame), `inl` (inlined by a user `inline fun`), `cls` (a
+/// class lambda, two frames) or empty for the default rule.
+fn lambda_mode(sub: &str) -> Option<&str> {
+    sub.strip_prefix("$lambda$")?.split('\x1f').nth(4)
 }
 
 /// Record the frames live now as `exc`'s stack trace. The throwable's own
@@ -3618,6 +3956,12 @@ fn capture_stack_trace(vm: &VM, exc: &Value) {
         .iter()
         .map(|(n, ip)| (*ip, *n))
         .collect();
+    let inline_subs: std::collections::HashSet<&str> = vm
+        .chunk
+        .names
+        .iter()
+        .filter_map(|n| n.strip_prefix(INLINE_MARK))
+        .collect();
     for (k, frame) in vm.frames.iter().enumerate().rev() {
         // The JVM records at most `MaxJavaStackTraceDepth` (1024) frames.
         if frames.len() >= 1024 {
@@ -3631,14 +3975,27 @@ fn capture_stack_trace(vm: &VM, exc: &Value) {
             // A lambda run by the body it was written in was run by an
             // inlined stdlib call there (`map`, `run`, `forEach`), so the JVM
             // has no frame for it.
-            let inlined = lambda_parent(name).is_some_and(|parent| {
-                k.checked_sub(1)
-                    .and_then(sub_of)
-                    .is_some_and(|outer| frame_token(outer) == parent)
-            });
+            let inlined = match lambda_mode(name) {
+                Some("inl") => true,
+                Some("own" | "cls") => false,
+                _ => {
+                    inline_subs.contains(name)
+                        || lambda_parent(name).is_some_and(|parent| {
+                            k.checked_sub(1)
+                                .and_then(sub_of)
+                                .is_some_and(|outer| frame_token(outer) == parent)
+                        })
+                }
+            };
             match jvm_frame(name).filter(|_| !inlined) {
                 Some((class, method)) => {
-                    frames.push((class, method, inlined_line.take().or(line)));
+                    let line = inlined_line.take().or(line);
+                    // A class lambda's bridge `invoke` calls the typed one,
+                    // both on the literal's line.
+                    if lambda_mode(name) == Some("cls") {
+                        frames.push((class.clone(), method.clone(), line));
+                    }
+                    frames.push((class, method, line));
                 }
                 None => {
                     inlined_line = inlined_line.or(line);
@@ -4546,12 +4903,8 @@ fn b_exc_abort(vm: &mut VM, _argc: u8) -> Value {
     let exc = PENDING
         .with(|p| p.borrow_mut().take())
         .unwrap_or(Value::Undef);
-    KT_ERROR.with(|e| {
-        *e.borrow_mut() = Some(format!(
-            "Exception in thread \"main\" {}",
-            throwable_str(&exc)
-        ))
-    });
+    // The same report an uncatchable raise prints: the line, then the trace.
+    KT_ERROR.with(|e| *e.borrow_mut() = Some(uncaught_report(&exc)));
     vm.request_halt();
     Value::Undef
 }
@@ -5469,6 +5822,37 @@ fn i64_box(v: &Value) -> Option<i64> {
     .flatten()
 }
 
+/// `Some((bits, value))` when `v` is a boxed `Byte` (8) or `Short` (16).
+fn narrow_box(v: &Value) -> Option<(u8, i64)> {
+    with_obj(v, |o| match o {
+        HeapObj::Narrow { bits, v } => Some((*bits, i64::from(*v))),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// `v` with a boxed `Byte`/`Short` replaced by the bare `Int` it promotes to —
+/// what every operator sees, since Kotlin promotes both before operating.
+fn unbox_narrow(v: &Value) -> Value {
+    narrow_box(v).map_or_else(|| v.clone(), |(_, n)| Value::Int(n))
+}
+
+/// [`unbox_narrow`] taking the value, with no lookup for a non-heap one —
+/// the shape the arithmetic ops pop their operands in.
+fn unbox_narrow_obj(v: Value) -> Value {
+    match v {
+        Value::Obj(_) => unbox_narrow(&v),
+        other => other,
+    }
+}
+
+/// Box `n` as a `Byte` (`bits == 8`) or `Short` (`bits == 16`), truncating it
+/// to that width first. See [`KT_BOX_NARROW`].
+fn box_narrow(bits: u8, n: i64) -> Value {
+    let v = if bits == 8 { n as i8 as i16 } else { n as i16 };
+    alloc(HeapObj::Narrow { bits, v })
+}
+
 /// Box `n` so its `Long` width survives an erased position. See [`KT_BOX_I64`].
 fn box_i64(n: i64) -> Value {
     alloc(HeapObj::I64(n))
@@ -5714,6 +6098,7 @@ fn num_f64(v: &Value) -> f64 {
     match (f32_box(v), i64_box(v)) {
         (Some(f), _) => f as f64,
         (_, Some(n)) => n as f64,
+        _ if narrow_box(v).is_some() => unbox_narrow(v).to_float(),
         _ => v.to_float(),
     }
 }
@@ -5724,7 +6109,7 @@ fn num_f64(v: &Value) -> f64 {
 fn num_i64(v: &Value) -> i64 {
     match i64_box(v) {
         Some(n) => n,
-        None => v.to_int(),
+        None => unbox_narrow(v).to_int(),
     }
 }
 
@@ -5766,6 +6151,32 @@ fn char_string(code: i64) -> String {
 ///   nothing but `Char`.
 fn num_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     use NumOp::*;
+    // A boxed `Byte`/`Short` takes part as the `Int` it promotes to.
+    if narrow_box(a).is_some() || narrow_box(b).is_some() {
+        let (a, b) = (unbox_narrow(a), unbox_narrow(b));
+        if let (Value::Int(x), Value::Int(y)) = (&a, &b) {
+            let (x, y) = (*x, *y);
+            return Ok(match op {
+                Add => Value::Int(x.wrapping_add(y)),
+                Sub => Value::Int(x.wrapping_sub(y)),
+                Mul => Value::Int(x.wrapping_mul(y)),
+                Neg => Value::Int(x.wrapping_neg()),
+                Div | Mod if y == 0 => {
+                    return Err("java.lang.ArithmeticException: / by zero".to_string())
+                }
+                Div => Value::Int(x.wrapping_div(y)),
+                Mod => Value::Int(x.wrapping_rem(y)),
+                Pow => Value::Float((x as f64).powf(y as f64)),
+                Lt => Value::Bool(x < y),
+                Gt => Value::Bool(x > y),
+                Le => Value::Bool(x <= y),
+                Ge => Value::Bool(x >= y),
+                Eq => Value::Bool(x == y),
+                Ne => Value::Bool(x != y),
+            });
+        }
+        return num_hook(op, &a, &b);
+    }
     // Kotlin's `String.plus(Any?)`: `+` with a String operand concatenates, in
     // every position. The compiler emits `Op::Concat` where it can see a String
     // statically; this is the case where it cannot — `xs.fold("") { acc, c ->
@@ -6858,6 +7269,13 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let ty = REIFIED.with(|r| r.borrow().last().cloned().unwrap_or_default());
             vm.push(Value::str(ty));
         }
+        KT_BOX_NARROW => {
+            let v = vm.pop();
+            vm.push(match v {
+                Value::Int(n) => box_narrow(arg, n),
+                other => other,
+            });
+        }
         KT_BOX_I64 => {
             let v = vm.pop();
             vm.push(match v {
@@ -6884,8 +7302,9 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             vm.push(Value::str(format_float(num_f64(&v) as f32)));
         }
         KT_IDIV => {
-            let b = vm.pop();
-            let a = vm.pop();
+            // A boxed `Byte`/`Short` operand divides as the `Int` it promotes to.
+            let b = unbox_narrow_obj(vm.pop());
+            let a = unbox_narrow_obj(vm.pop());
             // A boxed `Float` operand resolves before the integral test: it is
             // not an `Int`, and dividing it through `to_float` would read its
             // HANDLE. This is the `xs.map { it / 3.0f }` shape, where `it`
@@ -6916,8 +7335,9 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             }
         }
         KT_IMOD => {
-            let b = vm.pop();
-            let a = vm.pop();
+            // A boxed `Byte`/`Short` operand divides as the `Int` it promotes to.
+            let b = unbox_narrow_obj(vm.pop());
+            let a = unbox_narrow_obj(vm.pop());
             if let Some(v) = float32_mod(&a, &b) {
                 vm.push(v);
             } else if i64_box(&a).is_some() || i64_box(&b).is_some() {
@@ -7049,7 +7469,10 @@ fn is_int(v: &Value) -> bool {
 /// Whether a `maxOf`/`minOf` argument selects the numeric overloads: a number,
 /// or the box a `Float`/`Long` travels in through an erased position.
 fn is_numeric_arg(v: &Value) -> bool {
-    matches!(v, Value::Int(_) | Value::Float(_)) || f32_box(v).is_some() || i64_box(v).is_some()
+    matches!(v, Value::Int(_) | Value::Float(_))
+        || f32_box(v).is_some()
+        || i64_box(v).is_some()
+        || narrow_box(v).is_some()
 }
 
 // ── Ranges, arrays, iteration, and kotlin.math ──────────────────────────────
@@ -7274,7 +7697,7 @@ fn math_call(name: &str, args: &[Value]) -> Result<Value, String> {
     // A `Long` read out of a collection is boxed; the math below reads plain numbers.
     let unboxed: Vec<Value> = args
         .iter()
-        .map(|v| i64_box(v).map_or_else(|| v.clone(), Value::Int))
+        .map(|v| i64_box(v).map_or_else(|| unbox_narrow(v), Value::Int))
         .collect();
     let args = unboxed.as_slice();
     let a = args.first().cloned().unwrap_or(Value::Int(0));
@@ -7663,6 +8086,7 @@ fn untyped_arith(name: &str, a: &Value, b: &Value) -> Option<Result<Value, Strin
         matches!(v, Value::Int(_) | Value::Float(_) | Value::Str(_))
             || is_char(v)
             || f32_box(v).is_some()
+            || narrow_box(v).is_some()
             || i64_box(v).is_some()
     };
     if !scalar(a) || !scalar(b) {
@@ -8578,7 +9002,7 @@ fn b_extremum(vm: &mut VM, argc: u8) -> Value {
             .map(|v| match (i64_box(v), f32_box(v)) {
                 (Some(i), _) => Value::Int(i),
                 (_, Some(f)) => Value::Float(f64::from(f)),
-                _ => v.clone(),
+                _ => unbox_narrow(v),
             })
             .collect();
         return math_call(if want_max { "max" } else { "min" }, &plain).unwrap_or(Value::Undef);
@@ -10193,6 +10617,10 @@ fn double_compare(x: f64, y: f64) -> std::cmp::Ordering {
 
 /// [`value_cmp`] for everything that is not an enum constant.
 fn value_cmp_scalar(a: &Value, b: &Value) -> std::cmp::Ordering {
+    // A boxed `Byte`/`Short` orders by its value.
+    if narrow_box(a).is_some() || narrow_box(b).is_some() {
+        return value_cmp_scalar(&unbox_narrow(a), &unbox_narrow(b));
+    }
     match (a, b) {
         // `Char` is `Comparable<Char>` by code unit, so a `List<Char>` sorts and
         // reduces (`max`/`min`) like any other comparable element.
@@ -11977,7 +12405,9 @@ fn conversion_accepts(conv: char, arg: &Value) -> bool {
     match conv {
         // Integral only. A `Char` is a `Character`, not an integral box.
         'd' | 'x' | 'X' | 'o' => {
-            (matches!(arg, Value::Int(_)) && !is_char) || i64_box(arg).is_some()
+            (matches!(arg, Value::Int(_)) && !is_char)
+                || i64_box(arg).is_some()
+                || narrow_box(arg).is_some()
         }
         // A boxed `Float` is a `java.lang.Float`, which the floating
         // conversions take exactly as they take a `Double`.
@@ -12162,6 +12592,8 @@ fn format_string(
                 let n = num_i64(&arg);
                 let bits = if i64_box(&arg).is_some() {
                     n as u64
+                } else if let Some((w, _)) = narrow_box(&arg) {
+                    (n as u64) & ((1u64 << w) - 1)
                 } else {
                     u64::from(n as i32 as u32)
                 };
@@ -13455,6 +13887,18 @@ fn kt_method_inner(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Res
     // folds the two halves, which the `Int` arm below would not do at 64-bit
     // width. The compiler already appends the width for a statically-`Long`
     // receiver; this is the case where only the value knows.
+    // A boxed `Byte`/`Short`'s members are its own: the conversion to its own
+    // width keeps the box, `equals` compares boxes, and every other member is
+    // the promoted `Int`'s.
+    if let Some((bits, n)) = narrow_box(recv) {
+        if name == "equals" && args.len() == 1 {
+            return Ok(Value::Bool(value_eq(recv, &args[0])));
+        }
+        if args.is_empty() && name == if bits == 8 { "toByte" } else { "toShort" } {
+            return Ok(recv.clone());
+        }
+        return kt_method(vm, &Value::Int(n), name, args);
+    }
     if let Some(n) = i64_box(recv) {
         if name == "hashCode" && args.is_empty() {
             return Ok(Value::Int(int_hash(n, true) as i64));
@@ -15156,7 +15600,9 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         if let Some(len) = iter_len(recv) {
             let at = args.first().map_or(0, Value::to_int);
             if at < 0 || at > len {
-                return Err(format!("java.lang.IndexOutOfBoundsException: Index: {at}"));
+                return Err(format!(
+                    "java.lang.IndexOutOfBoundsException: Index: {at}, Size: {len}"
+                ));
             }
             return Ok(alloc(HeapObj::Iter {
                 src: recv.clone(),
@@ -17854,6 +18300,7 @@ fn component(recv: &Value, n: usize) -> Result<Value, String> {
         | HeapObj::Observed { .. }
         | HeapObj::F32(_)
         | HeapObj::I64(_)
+        | HeapObj::Narrow { .. }
         | HeapObj::Unsigned { .. }
         | HeapObj::Gen { .. }
         | HeapObj::Grouping { .. }
@@ -17909,6 +18356,14 @@ fn sum_values(items: &[Value], int32: bool) -> Value {
     // caller, `int`) addition does — `longArrayOf(Long.MAX_VALUE, 1).sum()` is
     // `Long.MIN_VALUE`, not an overflow.
     let wrapping = |items: &[Value]| items.iter().map(num_i64).fold(0i64, i64::wrapping_add);
+    // `Iterable<Byte>.sum()` / `Iterable<Short>.sum()` are `Int` totals.
+    if items.iter().any(|v| narrow_box(v).is_some())
+        && items
+            .iter()
+            .all(|v| narrow_box(v).is_some() || matches!(v, Value::Int(_)))
+    {
+        return Value::Int(i64::from(wrapping(items) as i32));
+    }
     if items.iter().all(|v| matches!(v, Value::Int(_))) {
         let total = wrapping(items);
         return Value::Int(if int32 {
@@ -18326,6 +18781,11 @@ pub fn value_eq(a: &Value, b: &Value) -> bool {
                 _ => false,
             }
         }
+        // A boxed `Byte`/`Short` equals only a box of its own class and value:
+        // `java.lang.Byte.equals` checks the class first, like `Long`'s.
+        _ if narrow_box(a).is_some() || narrow_box(b).is_some() => {
+            narrow_box(a).is_some() && narrow_box(a) == narrow_box(b)
+        }
         // A boxed `Long` compares by VALUE against another boxed `Long`, and is
         // NOT equal to a bare `Int` of the same magnitude — `Long.equals` checks
         // the class first, so `(1 as Any) == (1L as Any)` is false on the JVM.
@@ -18673,6 +19133,8 @@ fn obj_hash(recv: &Value) -> Option<i32> {
         // boxed `Long` and an `Int` of the same small magnitude land in the same
         // bucket and are separated by `equals`, exactly as on the JVM.
         HeapObj::I64(n) => Some(int_hash(*n, true)),
+        // `Byte.hashCode()`/`Short.hashCode()` are the value itself.
+        HeapObj::Narrow { v, .. } => Some(i32::from(*v)),
         HeapObj::Unsigned { bits, v } => Some(unsigned_hash(*bits, *v)),
         // `Map.Entry.hashCode()` is `key ^ value`; a `Pair` is a `data class`,
         // so it folds like one.
@@ -18775,6 +19237,7 @@ fn obj_label(recv: &Value) -> String {
         HeapObj::MatchGroup { .. } => "MatchGroup".to_string(),
         HeapObj::F32(_) => "Float".to_string(),
         HeapObj::I64(_) => "Long".to_string(),
+        HeapObj::Narrow { bits, .. } => if *bits == 8 { "Byte" } else { "Short" }.to_string(),
         HeapObj::Unsigned { bits, .. } => unsigned_name(*bits).to_string(),
         HeapObj::Klass { java, .. } => if *java { "Class" } else { "KClass" }.to_string(),
         HeapObj::Iter { .. } => "Iterator".to_string(),
@@ -18983,6 +19446,7 @@ fn display_obj(id: u32) -> String {
             // A `Long` renders exactly as an `Int` of the same value does; the
             // box exists for identity and equality, not for display.
             HeapObj::I64(n) => n.to_string(),
+            HeapObj::Narrow { v, .. } => v.to_string(),
             HeapObj::Unsigned { v, .. } => v.to_string(),
             // `Class.toString` is `class <name>` — except for a PRIMITIVE
             // class, which prints its bare name. `KClass.toString` is
@@ -19210,6 +19674,8 @@ fn class_ref(v: &Value, hint: &str, java: bool, reified: bool) -> Value {
         match v {
             _ if f32_box(v).is_some() => "Float",
             _ if i64_box(v).is_some() => "Long",
+            _ if narrow_box(v).is_some_and(|(b, _)| b == 8) => "Byte",
+            _ if narrow_box(v).is_some() => "Short",
             _ if char_code(v).is_some() => "Char",
             Value::Int(_) => "Int",
             Value::Float(_) => "Double",
@@ -19493,7 +19959,10 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         // which is the whole distinction, and it cannot be made from the value
         // alone because both are one `Value::Int`.
         "Long" => i64_box(v).is_some(),
-        "Int" | "Byte" | "Short" => matches!(v, Value::Int(_)),
+        // A `Byte`/`Short` answers only through its box, as a `Long` does.
+        "Int" => matches!(v, Value::Int(_)),
+        "Byte" => matches!(narrow_box(v), Some((8, _))),
+        "Short" => matches!(narrow_box(v), Some((16, _))),
         // A boxed `Float` answers `is Float` and NOT `is Double`, which is the
         // one place the two runtime forms of a floating value are told apart.
         // A bare `Value::Float` is a `Double`: an `is` operand whose static
@@ -20483,7 +20952,10 @@ fn deep_to_string(a: &Value, seen: &mut Vec<u32>, out: &mut String) {
 /// Whether `v` is a `kotlin.Number`: an `Int`/`Short`/`Byte`, a `Double`, or a
 /// boxed `Long`/`Float`.
 fn is_number(v: &Value) -> bool {
-    matches!(v, Value::Int(_) | Value::Float(_)) || i64_box(v).is_some() || f32_box(v).is_some()
+    matches!(v, Value::Int(_) | Value::Float(_))
+        || i64_box(v).is_some()
+        || f32_box(v).is_some()
+        || narrow_box(v).is_some()
 }
 
 /// Whether `v` is a floating-point number: a `Double` or a boxed `Float`.
