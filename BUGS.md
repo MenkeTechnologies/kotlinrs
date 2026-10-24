@@ -504,8 +504,6 @@ JVM.
 | a lambda `{ x: Int ->` on line 3, `println("in")` on 4, `10 / x` on 5 | `main$lambda$0(main.kt:4)` | `main$lambda$0(main.kt:5)` |
 | `mutableMapOf<Int, Int>().values.iterator().next()` | `ArrayList$Itr.next` in front | `LinkedHashMap$LinkedValueIterator.next` and `nextNode` |
 | `class L { lateinit var s: String }`; `L().s` read from outside `L` | `MainKt.main(…)` | `L.getS(main.kt:1)` in front: the read goes through the getter |
-| `class Box<out T>(var v: T)`; `class Sink<in T> { fun get(): T? = null }` | compiles | `type parameter 'T' is declared as 'out' but occurs in 'invariant' position …` / `… 'in' but occurs in 'out' position …` |
-| `val b: Box<Any> = Box<String>("s")`; `val xs: MutableList<Any> = mutableListOf<String>("a")` | compiles | `initializer type mismatch: expected 'Box<Any>', actual 'Box<String>'.` |
 | `Regex("(?x) a b # c")`, `Regex("\\0101")`, `Regex("\\cA")` | `PatternSyntaxException` (the engine's) | compiles |
 | `UByteArray(3).also { it[1] = 200u }.toString()`; `byteArrayOf(-1).toUByteArray()` | `UByteArray(storage=[0, 200, 0])`; `unresolved reference` | `UByteArray(storage=[0, -56, 0])`; `[255]` |
 | `(O.a)()` — a parenthesized callee | `expected RParen, found LParen` | invokes it |
@@ -515,11 +513,30 @@ The numeric declaration checks apply where the frontend can tell a type for
 certain — a literal, a numeric local, arithmetic of those, a conversion — and
 stay silent elsewhere, so a mismatch hidden behind an untyped call is still
 accepted. The `lateinit` row needs a frame the VM never runs: the getter is not
-a sub here. The variance and invariance rows are checks this frontend does not
-make — variance annotations are parsed and dropped. The three inline line rows
+a sub here. Variance is checked since round 8 (CHANGELOG); what it
+does not reach is listed under "Variance — what is not checked". The three inline line rows
 are the JVM's inline-function line mapping: a body copied into its caller is
 numbered past the end of the file (the SMAP section), and a stack trace prints
 those numbers as they are. The multi-line lambda row is a line attribution
 miss: the body's tail expression carries no line of its own, so the frame takes
 the nearest earlier one. The `(?x)` row is the engine's anchored second
 compilation, whose closing group the trailing comment swallows.
+
+## Variance — what is not checked
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.13.0.2. Declaration-site and use-site
+variance are checked since round 8, each only where the answer is certain, so
+every gap below is a program ACCEPTED that `kotlinc` refuses — none refuses a
+valid one.
+
+| program | kotlinrs | reference |
+| --- | --- | --- |
+| `class J<out T> { inner class K { fun f(x: T) {} } }` | compiles | `type parameter 'T' is declared as 'out' but occurs in 'in' position …` — an inner class's members are checked against the outer parameters |
+| `class D<out T> : Comparable<T>` | compiles | `… occurs in 'in' position in type 'Comparable<T (of class D<out T>)>'` — supertypes are not checked |
+| `fun f(b: Box<String>) { val x: Box<Any> = b }` | compiles | `initializer type mismatch …` — only a LOCAL's written type (its annotation, or an explicit `Box<String>(…)` construction) is tracked, not a parameter's |
+| `val b: Box<Number> = Box(1)` then `val c: Box<Int> = b.also { }` | compiles | refused — a projection or mismatch is seen only through a bare local name or an explicit construction |
+
+The use-site checks name standard-library members only for the receivers
+measured: `add`, `set` and `put` on `MutableList`/`MutableSet`/
+`MutableCollection`/`MutableMap`, their `java.util` aliases and `Array`, and the
+indexed read of a list or array.

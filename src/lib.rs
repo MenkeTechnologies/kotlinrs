@@ -26,6 +26,7 @@ pub mod rust_ffi;
 pub mod tiers;
 pub mod token;
 pub mod unicode_jdk;
+pub mod variance;
 
 use lexer::Lexer;
 use token::Tok;

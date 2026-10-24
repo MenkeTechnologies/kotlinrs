@@ -72,6 +72,11 @@ pub struct Parser {
     /// positional against the CLASS's list, so `class Box<T> { fun <U> f(): T }`
     /// has to record `0` for `T` whichever position the union put it in.
     class_type_params: Vec<String>,
+    /// The written signature of the `fun` parsed last, set when its whole
+    /// declaration (body included) has been read, so a local `fun` in the body
+    /// cannot leave its own behind. A class body turns it into a
+    /// [`MemberType`] for the variance checks.
+    last_fun_sig: Option<MemberKind>,
     /// The `reified` type-parameter names of the `fun` whose body is being
     /// parsed. A runtime test against one of these is legal — that is what
     /// `reified` means — where a test against a plain type parameter is not.
@@ -228,6 +233,8 @@ struct Mods {
     lateinit: bool,
     /// `inline fun` — see [`FunDecl::is_inline`].
     inline: bool,
+    /// `private` — exempts a member from declaration-site variance.
+    private_: bool,
 }
 
 /// A `typealias` declaration: its type-parameter names and the tokens of the
@@ -418,6 +425,7 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
         last_fn_recv: None,
         type_params: Vec::new(),
         class_type_params: Vec::new(),
+        last_fun_sig: None,
         reified_params: Vec::new(),
         no_trailing_lambda: false,
         pending_classes: Vec::new(),
@@ -1046,8 +1054,9 @@ impl Parser {
                 "lateinit" => m.lateinit = true,
                 "inline" => m.inline = true,
                 "final" => m.final_ = true,
-                "public" | "private" | "internal" | "protected" | "noinline" | "crossinline"
-                | "tailrec" | "operator" | "infix" | "const" => {}
+                "private" => m.private_ = true,
+                "public" | "internal" | "protected" | "noinline" | "crossinline" | "tailrec"
+                | "operator" | "infix" | "const" => {}
                 _ => break,
             }
             self.advance();
@@ -1140,6 +1149,9 @@ impl Parser {
         // `T` and `U` are type variables.
         let mut tps = self.type_params.clone();
         let (declared, reified) = self.type_params_decl_reified();
+        let own_tps = declared.clone();
+        let mut sig_recv: Option<TypeExpr> = None;
+        let mut sig_params: Vec<(String, Option<TypeExpr>, bool)> = Vec::new();
         tps.extend(declared);
         let outer_tps = std::mem::replace(&mut self.type_params, tps);
         let outer_reified = std::mem::replace(&mut self.reified_params, reified.clone());
@@ -1172,6 +1184,7 @@ impl Parser {
         } else {
             // `fun Recv.name(…)` — an extension. The first identifier is
             // the receiver type only when a `.` follows it.
+            let recv_at = self.pos;
             let first = self.ident()?;
             // A NULLABLE receiver (`fun String?.orBlank()`) is the same
             // extension, callable on `null` as well.
@@ -1180,6 +1193,11 @@ impl Parser {
                 self.advance();
             }
             if self.at(&Tok::Dot) {
+                sig_recv = Some(TypeExpr::Named {
+                    name: first.clone(),
+                    args: Vec::new(),
+                    nullable: nullable_dot,
+                });
                 self.advance();
                 // `fun String.Companion.f()` — an extension on a type's
                 // companion object, called as `String.f()`.
@@ -1201,6 +1219,7 @@ impl Parser {
                 self.ident()?
             } else if self.at(&Tok::Lt) {
                 // `fun List<Int>.sum2()` — a generic receiver keeps its head name.
+                sig_recv = self.written_type_at(recv_at).map(|(t, _)| t);
                 self.skip_type_args();
                 if self.at(&Tok::Question) {
                     self.advance();
@@ -1239,6 +1258,13 @@ impl Parser {
             self.last_fn_recv = None;
             let ann = if self.at(&Tok::Colon) {
                 self.advance();
+                sig_params.push((
+                    pname.clone(),
+                    self.written_type_at(self.pos)
+                        .filter(|_| !is_vararg)
+                        .map(|(t, _)| t),
+                    false,
+                ));
                 self.type_ref()?
             } else {
                 self.last_type_param = None;
@@ -1264,6 +1290,11 @@ impl Parser {
             } else {
                 None
             };
+            if default.is_some() {
+                if let Some(last) = sig_params.last_mut() {
+                    last.2 = true;
+                }
+            }
             params.push(Param {
                 name: pname,
                 // A `vararg` parameter arrives as an array of the declared
@@ -1289,6 +1320,10 @@ impl Parser {
             }
         }
         self.eat(&Tok::RParen)?;
+        let sig_ret_written = self
+            .at(&Tok::Colon)
+            .then(|| self.written_type_at(self.pos + 1).map(|(t, _)| t))
+            .flatten();
         let (ret_annot, ret_class, ret_type_args, ret_tp) = if self.at(&Tok::Colon) {
             self.advance();
             let t = self.type_ref()?;
@@ -1345,6 +1380,23 @@ impl Parser {
             None if is_expr_body => Type::Unknown,
             None => Type::Unit,
         };
+        // The written signature, published only now that the body (and any
+        // local `fun` in it) has been read.
+        let sig_ret = match ret_annot {
+            Some(_) => sig_ret_written,
+            None if is_expr_body => None,
+            None => Some(TypeExpr::Named {
+                name: "Unit".to_string(),
+                args: Vec::new(),
+                nullable: false,
+            }),
+        };
+        self.last_fun_sig = Some(MemberKind::Fun {
+            own_tps,
+            recv: sig_recv,
+            params: sig_params,
+            ret: sig_ret,
+        });
         self.type_params = outer_tps;
         self.reified_params = outer_reified;
         Ok(FunDecl {
@@ -1464,7 +1516,14 @@ impl Parser {
         // carries no type variables. The parameter NAMES are still recorded, so
         // an annotation that mentions one (`val v: T`) resolves to the unknown
         // type rather than to a heap class called `T` — see [`Parser::type_ref`].
+        let tp_from = self.pos;
         let tps = self.type_params_decl();
+        let (variance, tp_list) = if tps.is_empty() {
+            (Vec::new(), None)
+        } else {
+            self.type_param_header(tp_from, self.pos - 1)
+        };
+        let mut member_types: Vec<MemberType> = Vec::new();
         let outer_ctps = std::mem::replace(&mut self.class_type_params, tps.clone());
         let outer_tps = std::mem::replace(&mut self.type_params, tps.clone());
 
@@ -1497,7 +1556,7 @@ impl Parser {
                 // `class Base(override val name: String)` is how a class
                 // satisfies an interface's declared property with storage, and
                 // `private val` is just as legal.
-                self.modifiers();
+                let pmods = self.modifiers();
                 let kind = match self.peek() {
                     Tok::Val => {
                         self.advance();
@@ -1511,6 +1570,16 @@ impl Parser {
                 };
                 let pname = self.ident()?;
                 self.eat(&Tok::Colon)?;
+                if kind != PropKind::None {
+                    member_types.push(MemberType {
+                        name: pname.clone(),
+                        private: pmods.private_,
+                        kind: MemberKind::Prop {
+                            mutable: kind == PropKind::Var,
+                            ty: self.written_type_at(self.pos).map(|(t, _)| t),
+                        },
+                    });
+                }
                 let TypeArg {
                     ty,
                     class,
@@ -1635,6 +1704,7 @@ impl Parser {
             }
         }
 
+        let has_where = matches!(self.peek(), Tok::Ident(w) if w == "where");
         // `class C<T> where T : Bound { … }` — bounds the typing does not keep.
         self.skip_where_clause()?;
         // Body: methods, plus (for `object`) property initializers.
@@ -1766,6 +1836,35 @@ impl Parser {
                     self.pending_classes.push(nested);
                     continue;
                 }
+                if matches!(self.peek(), Tok::Val | Tok::Var) {
+                    let at = self.pos;
+                    let typed = matches!(self.toks[at + 1].tok, Tok::Ident(_))
+                        && matches!(self.toks[at + 2].tok, Tok::Colon);
+                    if let Tok::Ident(n) = &self.toks[at + 1].tok {
+                        member_types.push(MemberType {
+                            name: n.clone(),
+                            private: mods.private_,
+                            kind: MemberKind::Prop {
+                                mutable: self.at(&Tok::Var),
+                                ty: typed
+                                    .then(|| self.written_type_at(at + 3).map(|(t, _)| t))
+                                    .flatten(),
+                            },
+                        });
+                    }
+                }
+                if self.at(&Tok::Fun) {
+                    let f = self.fun_decl_mods(mods)?;
+                    if let Some(kind) = self.last_fun_sig.take() {
+                        member_types.push(MemberType {
+                            name: f.name.clone(),
+                            private: mods.private_,
+                            kind,
+                        });
+                    }
+                    methods.push(f);
+                    continue;
+                }
                 match self.peek() {
                     Tok::Fun => methods.push(self.fun_decl_mods(mods)?),
                     // A body property: `val n = expr` / `var c: Int = expr`, in a
@@ -1875,10 +1974,18 @@ impl Parser {
                 is_inline: false,
             });
         }
+        let simple = name.rsplit('$').next().unwrap_or(&name).to_string();
+        let kind_word = if is_interface { "interface" } else { "class" };
+        let variance_header = tp_list
+            .filter(|_| !has_where)
+            .map(|l| format!("{kind_word} {simple}<{l}>"));
         Ok(ClassDecl {
             name,
             companion_alias,
             type_params: tps,
+            variance,
+            variance_header,
+            member_types,
             params,
             obj_props,
             methods,
@@ -2001,6 +2108,9 @@ impl Parser {
             Some(c) => *c,
             None => ClassDecl {
                 name: companion_name(cls),
+                variance: Vec::new(),
+                variance_header: None,
+                member_types: Vec::new(),
                 companion_alias: None,
                 inner_of: None,
                 captures: Vec::new(),
@@ -2059,6 +2169,9 @@ impl Parser {
                     let sub = entry_class_name(cls, &e.name);
                     self.pending_classes.push(ClassDecl {
                         name: sub.clone(),
+                        variance: Vec::new(),
+                        variance_header: None,
+                        member_types: Vec::new(),
                         companion_alias: None,
                         inner_of: None,
                         captures: Vec::new(),
@@ -2673,6 +2786,8 @@ impl Parser {
             mutable: true,
             lazy: false,
             delegated: false,
+            written: None,
+            init_written: None,
         })
     }
 
@@ -2752,6 +2867,7 @@ impl Parser {
             reified_params: Vec::new(),
             type_params: Vec::new(),
             class_type_params: Vec::new(),
+            last_fun_sig: None,
             toks: Lexer::new(src).tokenize()?,
             pos: 0,
             fn_param_types: Vec::new(),
@@ -3087,6 +3203,8 @@ impl Parser {
                     want = true;
                     saw_reified = false;
                 }
+                // `in` lexes as the keyword, and is a modifier here.
+                Tok::In if want && depth == 1 => {}
                 // A modifier or a bound is not the parameter's own name.
                 Tok::Ident(w) if want && depth == 1 => {
                     if w == "reified" {
@@ -3168,6 +3286,220 @@ impl Parser {
     /// A type reference — `Int`, `String`, `Array<String>`, `Int?`, … A trailing
     /// `?` (nullable) is accepted and discarded — nullability is tracked at the
     /// value/flow level, not in the coarse static type.
+    /// The type annotation starting at token `at`, as WRITTEN (see
+    /// [`TypeExpr`]), and the index just past it — read without moving the
+    /// cursor, so it can run beside [`Parser::type_ref`] without disturbing
+    /// that rule's side channels. `None` for anything the grammar below does
+    /// not model; an annotation (`@UnsafeVariance T`) is one of those, which is
+    /// exactly what makes the variance check skip it.
+    fn written_type_at(&self, at: usize) -> Option<(TypeExpr, usize)> {
+        let tok = |i: usize| self.toks.get(i).map(|s| &s.tok).unwrap_or(&Tok::Eof);
+        // `(A, B) -> R`, or a parenthesized type `(T)` / `((A) -> R)?`.
+        let func = |i: usize, recv: Option<TypeExpr>| -> Option<(TypeExpr, usize)> {
+            let mut i = i + 1; // `(`
+            let mut params = Vec::new();
+            while !matches!(tok(i), Tok::RParen) {
+                // A named parameter `(x: Int) -> Unit` names it and moves on.
+                if matches!(tok(i), Tok::Ident(_)) && matches!(tok(i + 1), Tok::Colon) {
+                    i += 2;
+                }
+                let (t, next) = self.written_type_at(i)?;
+                params.push(t);
+                i = next;
+                match tok(i) {
+                    Tok::Comma => i += 1,
+                    Tok::RParen => {}
+                    _ => return None,
+                }
+            }
+            i += 1; // `)`
+            if !matches!(tok(i), Tok::Arrow) {
+                // Grouping parentheses: exactly one type inside.
+                if recv.is_some() || params.len() != 1 {
+                    return None;
+                }
+                let mut t = params.pop()?;
+                if matches!(tok(i), Tok::Question) {
+                    i += 1;
+                    match &mut t {
+                        TypeExpr::Named { nullable, .. } | TypeExpr::Func { nullable, .. } => {
+                            *nullable = true
+                        }
+                    }
+                }
+                return Some((t, i));
+            }
+            let (ret, i) = self.written_type_at(i + 1)?;
+            Some((
+                TypeExpr::Func {
+                    recv: recv.map(Box::new),
+                    params,
+                    ret: Box::new(ret),
+                    nullable: false,
+                },
+                i,
+            ))
+        };
+        if matches!(tok(at), Tok::LParen) {
+            return func(at, None);
+        }
+        let Tok::Ident(first) = tok(at) else {
+            return None;
+        };
+        if matches!(first.as_str(), "suspend" | "dynamic") {
+            return None;
+        }
+        let mut name = first.clone();
+        let mut i = at + 1;
+        while matches!(tok(i), Tok::Dot) && matches!(tok(i + 1), Tok::Ident(_)) {
+            if let Tok::Ident(n) = tok(i + 1) {
+                name.push('.');
+                name.push_str(n);
+            }
+            i += 2;
+        }
+        let mut args = Vec::new();
+        if matches!(tok(i), Tok::Lt) {
+            i += 1;
+            loop {
+                if matches!(tok(i), Tok::Star) {
+                    args.push(TypeProj::Star);
+                    i += 1;
+                } else {
+                    let v = match tok(i) {
+                        Tok::Ident(w) if w == "out" => Variance::Out,
+                        Tok::Ident(w) if w == "in" => Variance::In,
+                        Tok::In => Variance::In,
+                        _ => Variance::Invariant,
+                    };
+                    if v != Variance::Invariant {
+                        i += 1;
+                    }
+                    let (t, next) = self.written_type_at(i)?;
+                    args.push(TypeProj::Arg(v, t));
+                    i = next;
+                }
+                match tok(i) {
+                    Tok::Comma => i += 1,
+                    Tok::Gt => {
+                        i += 1;
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        let nullable = matches!(tok(i), Tok::Question);
+        if nullable {
+            i += 1;
+        }
+        let named = TypeExpr::Named {
+            name,
+            args,
+            nullable,
+        };
+        // `Recv.(A) -> R` — a function type with a receiver.
+        if matches!(tok(i), Tok::Dot) && matches!(tok(i + 1), Tok::LParen) {
+            return func(i + 1, Some(named));
+        }
+        Some((named, i))
+    }
+
+    /// When the expression just parsed from token `at` is EXACTLY a call with
+    /// explicit type arguments — `Box<String>("s")`, `mutableListOf<Int>()` —
+    /// that callee and its arguments as a written type. Anything after the
+    /// closing `)` (a member call, a trailing lambda, an operator) makes the
+    /// expression's type something else, and answers `None`.
+    fn explicit_construction(&self, at: usize) -> Option<TypeExpr> {
+        let (t, end) = self.written_type_at(at)?;
+        match &t {
+            TypeExpr::Named { args, nullable, .. } if !args.is_empty() && !nullable => {}
+            _ => return None,
+        }
+        if !matches!(self.toks.get(end).map(|s| &s.tok), Some(Tok::LParen)) {
+            return None;
+        }
+        let mut depth = 0i32;
+        let mut i = end;
+        loop {
+            match &self.toks.get(i)?.tok {
+                Tok::LParen => depth += 1,
+                Tok::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Tok::Eof => return None,
+                _ => {}
+            }
+            i += 1;
+        }
+        (self.pos == i + 1).then_some(t)
+    }
+
+    /// A class's type-parameter list `<out T : Number, in U>` between token
+    /// indices `from` and `to`: each parameter's declared variance, and the
+    /// list as `kotlinc` renders it in a class header (`None` where a
+    /// parameter carries something this rendering does not model).
+    fn type_param_header(&self, from: usize, to: usize) -> (Vec<Variance>, Option<String>) {
+        let mut vs = Vec::new();
+        let mut parts = Vec::new();
+        let mut ok = true;
+        let mut i = from + 1;
+        while i < to {
+            let mut v = Variance::Invariant;
+            match &self.toks[i].tok {
+                Tok::Ident(w) if w == "out" => {
+                    v = Variance::Out;
+                    i += 1;
+                }
+                Tok::Ident(w) if w == "in" => {
+                    v = Variance::In;
+                    i += 1;
+                }
+                Tok::In => {
+                    v = Variance::In;
+                    i += 1;
+                }
+                _ => {}
+            }
+            let Tok::Ident(n) = &self.toks[i].tok else {
+                ok = false;
+                break;
+            };
+            let mut part = match v {
+                Variance::Invariant => n.clone(),
+                _ => format!("{} {n}", v.word()),
+            };
+            i += 1;
+            if matches!(self.toks[i].tok, Tok::Colon) {
+                match self.written_type_at(i + 1) {
+                    Some((b, next)) => {
+                        part.push_str(" : ");
+                        part.push_str(&b.render());
+                        i = next;
+                    }
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            vs.push(v);
+            parts.push(part);
+            match &self.toks[i].tok {
+                Tok::Comma => i += 1,
+                Tok::Gt => break,
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        (vs, ok.then(|| parts.join(", ")))
+    }
+
     fn type_name(&mut self) -> Result<Type, String> {
         Ok(self.type_ref()?.ty)
     }
@@ -3242,6 +3574,10 @@ impl Parser {
     /// — `Person`, `List`, `Map`, …), and the type ARGUMENTS the annotation
     /// wrote.
     fn type_ref(&mut self) -> Result<TypeArg, String> {
+        // A type annotation (`@UnsafeVariance T`) qualifies the type for the
+        // checker and changes nothing it denotes. The written form keeps no
+        // record of it, which is what turns the variance check off for it.
+        self.skip_annotations();
         // A function type `(T1, …) -> R` (chainable: `(Int) -> (Int) -> Int`).
         // The coarse type can't carry a signature, so the parameter/return types
         // are consumed and discarded; the annotation only needs to mark the
@@ -3605,6 +3941,10 @@ impl Parser {
             return Ok(StmtKind::Destructure { names, init });
         }
         let name = self.ident()?;
+        let written = self
+            .at(&Tok::Colon)
+            .then(|| self.written_type_at(self.pos + 1).map(|(t, _)| t))
+            .flatten();
         let (ty, class, type_args, fn_params, fn_ret, fn_recv) = if self.at(&Tok::Colon) {
             self.advance();
             let before = self.fn_param_types.len();
@@ -3649,6 +3989,8 @@ impl Parser {
                     mutable,
                     lazy: false,
                     delegated: true,
+                    written: None,
+                    init_written: None,
                 });
             }
             self.advance();
@@ -3668,10 +4010,14 @@ impl Parser {
                 mutable,
                 lazy: true,
                 delegated: false,
+                written: None,
+                init_written: None,
             });
         }
         self.eat(&Tok::Assign)?;
+        let init_at = self.pos;
         let init = self.expr()?;
+        let init_written = self.explicit_construction(init_at);
         Ok(StmtKind::Let {
             name,
             ty,
@@ -3684,6 +4030,8 @@ impl Parser {
             mutable,
             lazy: false,
             delegated: false,
+            written,
+            init_written,
         })
     }
 
@@ -5521,6 +5869,7 @@ impl Parser {
                         reified_params: Vec::new(),
                         type_params: Vec::new(),
                         class_type_params: Vec::new(),
+                        last_fun_sig: None,
                         toks,
                         pos: 0,
                         fn_param_types: Vec::new(),

@@ -878,8 +878,11 @@ a name-based lookup falls into) would be silently wrong — so it is a compile
 error. A `reified` T does have an answer and is compiled: the call site binds
 the type argument and the body reads it back.
 
-Not yet (see roadmap): variance and bounds, and the rest of the
-standard-library surface.
+Variance is checked at the declaration site (`out`/`in` positions in member
+types) and at the use site (invariant initializers, `out`/`*` projections that
+prohibit a member, `in`/`*` reads), each only where the answer is certain; see
+BUGS.md for what it does not reach. Not yet (see roadmap): type-parameter
+bounds, and the rest of the standard-library surface.
 Each fails loudly rather than answering wrong.
 
 One limitation is a **representation** limit rather than a missing feature, and
@@ -1860,7 +1863,7 @@ it. A secondary that says `super(…)` beside a primary constructor is rejected
 with Kotlin's own diagnostic (`primary constructor call expected`); the four
 corpus records that pin the rest were captured from the reference toolchain.
 
-Next: variance and bounds, and a growing standard-library surface —
+Next: type-parameter bounds, and a growing standard-library surface —
 alongside the sibling parity tooling (LSP/DAP, reference generator, differential
 harness). Open divergences are tracked in [BUGS.md](BUGS.md); the round-by-round
 record continues in [CHANGELOG.md](CHANGELOG.md).

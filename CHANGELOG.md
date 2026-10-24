@@ -11,6 +11,39 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Variance: declaration-site positions, use-site projections, invariant initializers
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.13.0.2.
+
+| program | before | reference |
+| --- | --- | --- |
+| `class Box<out T>(var v: T)` | compiles | `type parameter 'T' is declared as 'out' but occurs in 'invariant' position in type 'T (of class Box<out T>)'.` |
+| `class Sink<in T> { fun get(): T? = null }` | compiles | `… declared as 'in' but occurs in 'out' position in type 'T? (of class Sink<in T>)'.` |
+| `class H<out T> { fun g(): Pair<ArrayList<T>, Int> = TODO() }` | compiles | `… 'invariant' position in abbreviated type 'Pair<ArrayList<T (of class H<out T>)>, Int>'.` |
+| `val b: Box<Any> = Box<String>("s")` (invariant `Box`) | compiles | `initializer type mismatch: expected 'Box<Any>', actual 'Box<String>'.` |
+| `val ys: MutableList<out Number> = …; ys.add(3)` | compiles | `receiver type 'MutableList<out Number>' contains out projection which prohibits the use of 'fun add(element: E): Boolean'.` |
+| `val c: Box<in Int> = Box<Number>(1); val x: Int = c.get()` | compiles | `initializer type mismatch: expected 'Int', actual 'CapturedType(in Int)'.` |
+| `val b: Box<out Number> = Box(1); b.v = 3` | compiles | `assignment type mismatch: actual type is 'Int', but 'Nothing' was expected.` |
+| `fun contains(x: @UnsafeVariance T)` | `expected identifier, found At` | compiles |
+
+The parser keeps every annotation AS WRITTEN beside the coarse type — names,
+projections, nullability, function types (`TypeExpr`) — together with each
+class's declared variances and its members' written signatures. The
+declaration check walks every non-`private` member type with the position
+composition `kotlinc` uses (a function parameter flips, an invariant argument
+pins) against the declared variance of user classes and of the measured
+standard-library generics; an unknown generic contributes nothing. The use-site
+checks read the written type of a local — its annotation, or the explicit type
+arguments of the construction that initialized it — and decide only where the
+answer is certain: equal heads with known variances, and the final builtins.
+`<in T>` also records `T` as a type parameter now: `in` lexes as the keyword,
+and the parameter-list scan had skipped the name after it, leaving a `T`
+annotation to name a heap class `T` rather than the type variable. A type annotation (`@UnsafeVariance T`) is accepted and
+turns the variance check off for that type, as it does on the reference.
+
+What these checks do not reach is listed in BUGS.md, "Variance — what is not
+checked".
+
 ## Boxed `Float` equality, secondary-constructor `vararg`, IEEE neighbours, companion and extension `var` writes
 
 Measured on `kotlinc` 2.4.21 / JDK 25.0.5.

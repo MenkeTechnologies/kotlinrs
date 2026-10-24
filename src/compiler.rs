@@ -318,6 +318,10 @@ const RUST_COMPILE: &str = "__rust_compile";
 #[derive(Clone)]
 struct Binding {
     slot: u16,
+    /// The static type AS WRITTEN — the annotation, or the explicit type
+    /// arguments of the construction that initialized it — for the variance
+    /// checks (see [`crate::variance`]). A smart cast clears it.
+    written: Option<TypeExpr>,
     ty: Type,
     mutable: bool,
     /// The class/container name when `ty == Type::Obj` (e.g. `Person`, `List`),
@@ -463,6 +467,7 @@ impl Scope {
             Binding {
                 slot,
                 ty,
+                written: None,
                 mutable,
                 class,
                 elem,
@@ -524,6 +529,7 @@ impl Scope {
             let narrowed = Binding {
                 ty,
                 class: None,
+                written: None,
                 declared: None,
                 ..b.clone()
             };
@@ -548,6 +554,7 @@ impl Scope {
         if let Some(b) = self.map.get(name).cloned() {
             let narrowed = Binding {
                 declared: Some(class),
+                written: None,
                 ..b.clone()
             };
             self.map.insert(name.to_string(), narrowed);
@@ -587,6 +594,16 @@ impl Scope {
     }
     /// The type arguments recorded for `name`, empty when it holds no instance
     /// of a generic class or the arguments could not be resolved.
+    /// Record the written static type of `name` — see [`Binding::written`].
+    fn set_written(&mut self, name: &str, written: Option<TypeExpr>) {
+        if let Some(b) = self.map.get_mut(name) {
+            b.written = written;
+        }
+    }
+    /// The written static type of `name`, when one was recorded.
+    fn written_of(&self, name: &str) -> Option<TypeExpr> {
+        self.map.get(name).and_then(|b| b.written.clone())
+    }
     fn type_args_of(&self, name: &str) -> Vec<TypeArg> {
         self.map
             .get(name)
@@ -2123,6 +2140,9 @@ fn linearize(name: &str, parents: &HashMap<String, Vec<String>>) -> Vec<String> 
 
 pub struct Compiler {
     b: ChunkBuilder,
+    /// Declared variance and written member signatures of every generic
+    /// class, for the use-site variance checks (see [`crate::variance`]).
+    variance: crate::variance::VarianceTable,
     /// name → signature for user functions, filled before lowering.
     fun_sig: HashMap<String, FnSig>,
     /// A top-level function name declared more than once → the mangled names
@@ -3548,6 +3568,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         }
     }
 
+    crate::variance::check_declaration_variance(program)?;
     let classes = build_class_meta(program)?;
     let method_index = build_method_index(program, &classes);
     let class_alias = if program.nested.is_empty() {
@@ -3567,6 +3588,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
 
     let mut c = Compiler {
         b: ChunkBuilder::new(),
+        variance: crate::variance::VarianceTable::new(program),
         fun_sig,
         overloads,
         member_overloads,
@@ -5342,6 +5364,8 @@ impl Compiler {
                 mutable,
                 lazy,
                 delegated,
+                written,
+                init_written,
             } => {
                 // A lambda held in a local is a value: it keeps its own frame
                 // wherever it is called from.
@@ -5451,6 +5475,12 @@ impl Compiler {
                 // Kotlin converts no number implicitly: a numeric declaration
                 // takes only its own type (an integer literal adopting it where
                 // it fits).
+                let static_written = self.check_written_initializer(
+                    sc,
+                    written.as_ref(),
+                    init_written.as_ref(),
+                    init,
+                )?;
                 if let Some(t) = ty {
                     if let Some(actual) = self.num_mismatch(sc, *t, init) {
                         return Err(format!(
@@ -5524,6 +5554,7 @@ impl Compiler {
                     class
                 };
                 let slot = sc.declare_full(name, vty, *mutable, class, elem);
+                sc.set_written(name, static_written);
                 if let Some(ann) = annotated_class
                     .clone()
                     .filter(|c| self.classes.contains_key(c))
@@ -5737,16 +5768,26 @@ impl Compiler {
                 name,
                 op,
                 value,
-            } => self.compile_set_member(sc, recv, name, op, value)?,
+            } => {
+                if op.is_none() {
+                    self.check_projected_assign(sc, recv, name, value)?;
+                }
+                self.compile_set_member(sc, recv, name, op, value)?
+            }
             StmtKind::SetIndex {
                 recv,
                 index,
                 op,
                 value,
-            } => match self.collection_delegate(sc, recv, "set") {
-                Some(field) => self.compile_set_index(sc, &field, index, op, value)?,
-                None => self.compile_set_index(sc, recv, index, op, value)?,
-            },
+            } => {
+                if op.is_none() {
+                    self.check_projected_call(sc, recv, "set", 2, true)?;
+                }
+                match self.collection_delegate(sc, recv, "set") {
+                    Some(field) => self.compile_set_index(sc, &field, index, op, value)?,
+                    None => self.compile_set_index(sc, recv, index, op, value)?,
+                }
+            }
             StmtKind::Destructure { names, init } => self.compile_destructure(sc, names, init)?,
             StmtKind::Return(e) => {
                 match e {
@@ -6387,6 +6428,12 @@ impl Compiler {
     // ── Expressions (leave exactly one value) ──────────────────────
 
     fn compile_expr(&mut self, sc: &mut Scope, e: &Expr) -> Result<Type, String> {
+        if let Expr::MethodCall {
+            recv, name, args, ..
+        } = e
+        {
+            self.check_projected_call(sc, recv, name, args.len(), false)?;
+        }
         match e {
             // `super` is a receiver, never a value — `compile_member` takes it
             // before it can be compiled on its own, so reaching here means the
@@ -7798,7 +7845,8 @@ impl Compiler {
             };
             let nidx = self.b.add_constant(Value::str(rt_name));
             self.b.emit(Op::LoadConst(nidx), line);
-            self.b.emit(Op::CallBuiltin(KT_METHOD_VM, args.len() as u8), line);
+            self.b
+                .emit(Op::CallBuiltin(KT_METHOD_VM, args.len() as u8), line);
             return Ok(rt);
         }
         // `Float.pow(…)` is the `Float` overload: `Math.pow` over the widened
@@ -12813,6 +12861,8 @@ impl Compiler {
                     mutable: false,
                     lazy: false,
                     delegated: false,
+                    written: None,
+                    init_written: None,
                 },
             )
         };
@@ -14160,6 +14210,8 @@ impl Compiler {
                     mutable: false,
                     lazy: false,
                     delegated: false,
+                    written: None,
+                    init_written: None,
                 },
             )
         } else {
@@ -14187,6 +14239,8 @@ impl Compiler {
                     mutable: false,
                     lazy: false,
                     delegated: false,
+                    written: None,
+                    init_written: None,
                 },
             ),
             Stmt::new(
@@ -16707,7 +16761,10 @@ fn is_math_ext(name: &str) -> bool {
 /// result has the receiver's width: `withSign`, `nextUp`, `nextDown`,
 /// `nextTowards` and the `ulp` property.
 fn is_ieee_neighbour(name: &str) -> bool {
-    matches!(name, "withSign" | "nextUp" | "nextDown" | "nextTowards" | "ulp")
+    matches!(
+        name,
+        "withSign" | "nextUp" | "nextDown" | "nextTowards" | "ulp"
+    )
 }
 
 /// The math functions Kotlin auto-imports (the `kotlin` package), usable with no
@@ -17097,7 +17154,12 @@ fn params_accept(params: &[Param], args: &[Type]) -> bool {
     fn admits_primitive(class: &str) -> bool {
         matches!(
             class,
-            "Any" | "Comparable" | "Number" | "CharSequence" | "Serializable" | "java.io.Serializable"
+            "Any"
+                | "Comparable"
+                | "Number"
+                | "CharSequence"
+                | "Serializable"
+                | "java.io.Serializable"
         )
     }
     !params.iter().zip(args).any(|(p, a)| {
@@ -19079,4 +19141,131 @@ fn recursive_names(program: &Program) -> HashSet<String> {
         }
     }
     out
+}
+
+/// The type name of a literal whose type is certain from its spelling alone.
+fn literal_type_name(e: &Expr) -> Option<&'static str> {
+    Some(match e {
+        Expr::Int(_) => "Int",
+        Expr::Long(_) => "Long",
+        Expr::Float(_) => "Double",
+        Expr::Float32(_) => "Float",
+        Expr::Bool(_) => "Boolean",
+        Expr::Char(_) => "Char",
+        Expr::Str(_) => "String",
+        _ => return None,
+    })
+}
+
+impl Compiler {
+    /// The written static type of a local read by name.
+    fn written_recv(sc: &Scope, recv: &Expr) -> Option<TypeExpr> {
+        match recv {
+            Expr::Var(n) => sc.written_of(n),
+            _ => None,
+        }
+    }
+
+    /// Refuse a call through an `out`- or star-projected receiver to a member
+    /// that takes the projected type parameter, as `kotlinc` does.
+    fn check_projected_call(
+        &self,
+        sc: &Scope,
+        recv: &Expr,
+        name: &str,
+        argc: usize,
+        indexed: bool,
+    ) -> Result<(), String> {
+        match Self::written_recv(sc, recv)
+            .and_then(|w| self.variance.projected_call(&w, name, argc, indexed))
+        {
+            Some(msg) => Err(msg),
+            None => Ok(()),
+        }
+    }
+
+    /// The captured type a read through an `in`- or star-projected receiver
+    /// produces — `CapturedType(in Int)` — when `e` is such a read.
+    fn projected_read_of(&self, sc: &Scope, e: &Expr) -> Option<String> {
+        match e {
+            Expr::Member {
+                recv,
+                name,
+                safe: false,
+                ..
+            } => self
+                .variance
+                .projected_read(&Self::written_recv(sc, recv)?, name, false, false),
+            Expr::MethodCall {
+                recv,
+                name,
+                args,
+                safe: false,
+                ..
+            } if args.is_empty() || name == "get" => {
+                self.variance
+                    .projected_read(&Self::written_recv(sc, recv)?, name, true, false)
+            }
+            Expr::Index { recv, .. } => {
+                self.variance
+                    .projected_read(&Self::written_recv(sc, recv)?, "get", false, true)
+            }
+            _ => None,
+        }
+    }
+
+    /// `val x: <written> = <init>` — refuse an initializer whose generic type
+    /// is certainly not a subtype of the declaration, and a read through an
+    /// `in`/star projection into anything but `Any?`. Answers the static type
+    /// the binding takes, as written, for later checks through it.
+    fn check_written_initializer(
+        &self,
+        sc: &Scope,
+        written: Option<&TypeExpr>,
+        init_written: Option<&TypeExpr>,
+        init: &Expr,
+    ) -> Result<Option<TypeExpr>, String> {
+        let built = init_written.and_then(|t| self.variance.construction_type(t));
+        let Some(declared) = written else {
+            return Ok(built);
+        };
+        let actual = built.or_else(|| Self::written_recv(sc, init));
+        if let Some(msg) = actual
+            .as_ref()
+            .and_then(|a| self.variance.initializer_mismatch(declared, a))
+        {
+            return Err(msg);
+        }
+        let any_q = matches!(declared, TypeExpr::Named { name, args, nullable: true } if name == "Any" && args.is_empty());
+        if !any_q {
+            if let Some(cap) = self.projected_read_of(sc, init) {
+                return Err(format!(
+                    "initializer type mismatch: expected '{}', actual '{cap}'.",
+                    declared.render()
+                ));
+            }
+        }
+        Ok(Some(declared.clone()))
+    }
+
+    /// `b.v = <literal>` through an `out`- or star-projected receiver, where
+    /// `v` is a `var` of the projected type parameter: its setter takes
+    /// `Nothing`.
+    fn check_projected_assign(
+        &self,
+        sc: &Scope,
+        recv: &Expr,
+        name: &str,
+        value: &Expr,
+    ) -> Result<(), String> {
+        let (Some(w), Some(lit)) = (Self::written_recv(sc, recv), literal_type_name(value)) else {
+            return Ok(());
+        };
+        if self.variance.projected_write(&w, name) {
+            return Err(format!(
+                "assignment type mismatch: actual type is '{lit}', but 'Nothing' was expected."
+            ));
+        }
+        Ok(())
+    }
 }

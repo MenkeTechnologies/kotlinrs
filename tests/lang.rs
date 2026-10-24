@@ -11447,3 +11447,131 @@ fun main() {
         "[7, 14]\n[10, 2]\n5\n"
     );
 }
+
+/// Declaration-site variance: a class member whose written type puts an
+/// `out` type parameter in an `in` or invariant position, or an `in` one in an
+/// `out` or invariant position, is refused with `kotlinc`'s message. `private`
+/// members are exempt. Each message measured on kotlinc 2.4.21 / JRE 21.0.13.0.2.
+#[test]
+fn declaration_site_variance_violations_are_refused() {
+    for (src, msg) in [
+        ("class Box<out T>(var v: T)", "type parameter 'T' is declared as 'out' but occurs in 'invariant' position in type 'T (of class Box<out T>)'."),
+        ("class Sink<in T> { fun get(): T? = null }", "type parameter 'T' is declared as 'in' but occurs in 'out' position in type 'T? (of class Sink<in T>)'."),
+        ("class P<out T> { fun put(x: T) {} }", "type parameter 'T' is declared as 'out' but occurs in 'in' position in type 'T (of class P<out T>)'."),
+        ("class Q<in T>(val t: T)", "type parameter 'T' is declared as 'in' but occurs in 'out' position in type 'T (of class Q<in T>)'."),
+        ("class R<out T> { fun f(g: (T) -> Unit) {} ; fun h(): List<T> = listOf(); fun k(x: MutableList<T>) {} }", "type parameter 'T' is declared as 'out' but occurs in 'invariant' position in type 'MutableList<T (of class R<out T>)>'."),
+        ("class S<in T> { fun f(g: (T) -> Unit) {} }", "type parameter 'T' is declared as 'in' but occurs in 'out' position in type '(T (of class S<in T>)) -> Unit'."),
+        ("class A<out T>(private var v: T, x: T) { private fun f(y: T) {}; protected fun g(y: T) {} }", "type parameter 'T' is declared as 'out' but occurs in 'in' position in type 'T (of class A<out T>)'."),
+        ("class B<out T : Number, in U>(val u: U)", "type parameter 'U' is declared as 'in' but occurs in 'out' position in type 'U (of class B<out T : Number, in U>)'."),
+        ("class C<out T> { fun <T> f(x: T) {} ; internal fun h(x: T) {} }", "type parameter 'T' is declared as 'out' but occurs in 'in' position in type 'T (of class C<out T>)'."),
+        ("interface I<out T> { fun f(x: T) }", "type parameter 'T' is declared as 'out' but occurs in 'in' position in type 'T (of interface I<out T>)'."),
+        ("sealed interface Si<in T> { val x: T }", "type parameter 'T' is declared as 'in' but occurs in 'out' position in type 'T (of interface Si<in T>)'."),
+        ("class E<out T> { fun T.ext() {} }", "type parameter 'T' is declared as 'out' but occurs in 'in' position in type 'T (of class E<out T>)'."),
+        ("class E<out T> { val p: T get() = TODO(); var q: T get() = TODO(); set(v) {} }", "type parameter 'T' is declared as 'out' but occurs in 'invariant' position in type 'T (of class E<out T>)'."),
+        ("class F<in T> { private val p: T? = null; fun f(x: (T) -> T) {} }", "type parameter 'T' is declared as 'in' but occurs in 'out' position in type '(T (of class F<in T>)) -> T (of class F<in T>)'."),
+        ("abstract class G<out T> { abstract var x: T }", "type parameter 'T' is declared as 'out' but occurs in 'invariant' position in type 'T (of class G<out T>)'."),
+        ("class H<out T> { fun f(): ArrayList<List<T>> = TODO() }", "type parameter 'T' is declared as 'out' but occurs in 'invariant' position in type 'ArrayList<List<T (of class H<out T>)>>'."),
+        ("class H<out T> { fun g(): Pair<ArrayList<T>, Int> = TODO() }", "type parameter 'T' is declared as 'out' but occurs in 'invariant' position in abbreviated type 'Pair<ArrayList<T (of class H<out T>)>, Int>'."),
+        ("class X<out T> { fun r(): Comparable<T> = TODO() }", "type parameter 'T' is declared as 'out' but occurs in 'in' position in type 'Comparable<T (of class X<out T>)>'."),
+        ("class X<out T> { fun r(): Array<in T> = TODO() }", "type parameter 'T' is declared as 'out' but occurs in 'in' position in type 'Array<in T (of class X<out T>)>'."),
+        ("class X<out T> { fun p(x: Map<String, T>) {} }", "type parameter 'T' is declared as 'out' but occurs in 'in' position in type 'Map<String, T (of class X<out T>)>'."),
+        ("data class Dc<out T>(var x: T)", "type parameter 'T' is declared as 'out' but occurs in 'invariant' position in type 'T (of class Dc<out T>)'."),
+    ] {
+        let err = prog_err(&format!("{src}\nfun main() {{}}"));
+        assert_eq!(err, format!("kotlin: {msg}\n"), "{src}");
+    }
+}
+
+/// The valid side of variance: covariant producers, contravariant consumers,
+/// `@UnsafeVariance`, `private` members, a method's own type parameter
+/// shadowing the class's, use-site projections read and written where Kotlin
+/// allows it, and subtyping through declared variance. Output measured on
+/// kotlinc 2.4.21 / JRE 21.0.13.0.2.
+#[test]
+fn valid_variance_programs_compile_and_run() {
+    assert_eq!(
+        prog(
+            r##"class Box<T>(var v: T) { fun put(x: T) { v = x }; fun get(): T = v }
+class Producer<out T>(private val items: List<T>) {
+    fun first(): T = items[0]
+    fun all(): List<T> = items
+    fun each(f: (T) -> Unit) { items.forEach(f) }
+    fun <R> map(f: (T) -> R): Producer<R> = Producer(items.map(f))
+    fun contains(x: @UnsafeVariance T): Boolean = x in items
+    private var cache: T? = null
+}
+class Consumer<in T> {
+    fun take(x: T) { println("took $x") }
+    fun takeAll(xs: List<T>) { xs.forEach { take(it) } }
+    fun sink(f: () -> T) { take(f()) }
+}
+interface Source<out T> { fun next(): T }
+fun copy(from: Array<out Any>, to: Array<Any>) { for (i in from.indices) to[i] = from[i] }
+fun fill(dest: Array<in String>, v: String) { dest[0] = v }
+fun main() {
+    val p: Producer<Any> = Producer(listOf("a", "b"))
+    println(p.first()); println(p.contains("b")); p.each { print("$it ") }; println()
+    println(p.map { it.toString().length }.all())
+    val c: Consumer<String> = Consumer<Any>()
+    c.take("x"); c.takeAll(listOf("y")); c.sink { "s" }
+    val b: Box<out Number> = Box<Int>(1)
+    println(b.get()); println(b.v)
+    val bi: Box<in Int> = Box<Number>(2.5)
+    bi.put(3); val a: Any? = bi.get(); println(a)
+    val star: Box<*> = Box("q"); println(star.get())
+    val xs: MutableList<out Number> = mutableListOf(1, 2)
+    println(xs[0]); println(xs.contains(1))
+    val ys: MutableList<in Int> = mutableListOf<Number>(1.5)
+    ys.add(3); println(ys)
+    val l: List<Any> = listOf<String>("a")
+    val m: Map<String, Any> = mapOf<String, Int>("k" to 1)
+    val bo: Box<Any> = Box("inferred")
+    val bb = Box<String>("s"); val b4: Box<out Any> = bb
+    val arr = arrayOf<Any>(1, 2); copy(arrayOf(3, 4), arr); println(arr.toList())
+    val sa = arrayOfNulls<String>(1); fill(sa, "f"); println(sa.toList())
+    val src = object : Source<String> { override fun next() = "n" }; val s2: Source<Any> = src
+    println(s2.next()); println(l); println(m); println(bo.get()); println(b4.get())
+}
+"##
+        ),
+        "a\ntrue\na b \n[1, 1]\ntook x\ntook y\ntook s\n1\n1\n3\nq\n1\ntrue\n[1.5, 3]\n[3, 4]\n[f]\nn\n[a]\n{k=1}\ninferred\ns\n"
+    );
+}
+
+/// Use-site variance: an initializer whose generic type is certainly not a
+/// subtype of the declaration, a call through an `out`/star projection to a
+/// member taking the projected parameter, a read through an `in`/star
+/// projection into anything but `Any?`, and a write of a projected `var`.
+/// Each message measured on kotlinc 2.4.21 / JRE 21.0.13.0.2.
+#[test]
+fn use_site_variance_violations_are_refused() {
+    let class = "class Box<T>(var v: T) { fun put(x: T) { v = x }; fun get(): T = v; fun d(x: T, y: Int = 2): Int = 1; fun n(): T? = null }";
+    for (body, msg) in [
+        (r#"val b: Box<Any> = Box<String>("s")"#, "initializer type mismatch: expected 'Box<Any>', actual 'Box<String>'."),
+        (r#"val xs: MutableList<Any> = mutableListOf<String>("a")"#, "initializer type mismatch: expected 'MutableList<Any>', actual 'MutableList<String>'."),
+        (r#"val bb: Box<String> = Box("s"); val b2: Box<Any> = bb"#, "initializer type mismatch: expected 'Box<Any>', actual 'Box<String>'."),
+        ("val b: Box<Int?> = Box<Int>(1)", "initializer type mismatch: expected 'Box<Int?>', actual 'Box<Int>'."),
+        ("val b: List<String> = listOf<Int>(1)", "initializer type mismatch: expected 'List<String>', actual 'List<Int>'."),
+        ("val b: Pair<Int, String> = Pair<Int, Int>(1, 2)", "initializer type mismatch: expected 'Pair<Int, String>', actual 'Pair<Int, Int>'."),
+        ("val ys: MutableList<out Number> = mutableListOf(1, 2); ys.add(3)", "receiver type 'MutableList<out Number>' contains out projection which prohibits the use of 'fun add(element: E): Boolean'."),
+        ("val ys: MutableList<out Number> = mutableListOf(1, 2); ys[0] = 5", "receiver type 'MutableList<out Number>' contains out projection which prohibits the use of 'fun set(index: Int, element: E): E'."),
+        ("val ys: MutableList<out Number> = mutableListOf(1, 2); ys.add(0, 3)", "receiver type 'MutableList<out Number>' contains out projection which prohibits the use of 'fun add(index: Int, element: E): Unit'."),
+        ("val st: MutableList<*> = mutableListOf(1); st.add(1)", "receiver type 'MutableList<*>' contains star projection which prohibits the use of 'fun add(element: E): Boolean'."),
+        ("val s: ArrayList<out Int> = arrayListOf(1); s.add(0, 1)", "receiver type 'ArrayList<out Int>' contains out projection which prohibits the use of 'fun add(p0: Int, p1: E): Unit'."),
+        ("val c: Array<out Int> = arrayOf(1); c[0] = 2", "receiver type 'Array<out Int>' contains out projection which prohibits the use of 'fun set(index: Int, value: T): Unit'."),
+        (r#"val m: MutableMap<String, out Number> = mutableMapOf("a" to 1); m["b"] = 2"#, "receiver type 'MutableMap<String, out Number>' contains out projection which prohibits the use of 'fun <K, V> MutableMap<K, V>.set(key: K, value: V): Unit'."),
+        (r#"val m: HashMap<String, out Int> = hashMapOf("a" to 1); m.put("x", 1)"#, "receiver type 'HashMap<String, out Int>' contains out projection which prohibits the use of 'fun put(p0: K, p1: V): V?'."),
+        ("val b: Box<out Number> = Box(1); b.put(2)", "receiver type 'Box<out Number>' contains out projection which prohibits the use of 'fun put(x: T): Unit'."),
+        ("val b: Box<*> = Box(1); b.d(2)", "receiver type 'Box<*>' contains star projection which prohibits the use of 'fun d(x: T, y: Int = ...): Int'."),
+        ("val c: Box<in Int> = Box<Number>(1); val x: Int = c.get()", "initializer type mismatch: expected 'Int', actual 'CapturedType(in Int)'."),
+        ("val c: Box<in Int> = Box<Number>(1); val x: Number = c.v", "initializer type mismatch: expected 'Number', actual 'CapturedType(in Int)'."),
+        ("val c: Box<in Int> = Box<Number>(1); val x: Int = c.n()", "initializer type mismatch: expected 'Int', actual 'CapturedType(in Int)?'."),
+        ("val zs: MutableList<in Int> = mutableListOf<Number>(1, 2.0); val n: Int = zs[0]", "initializer type mismatch: expected 'Int', actual 'CapturedType(in Int)'."),
+        ("val s: MutableList<*> = mutableListOf(1); val n: Int = s[0]", "initializer type mismatch: expected 'Int', actual 'CapturedType(*)'."),
+        ("val b: Box<out Number> = Box(1); b.v = 3", "assignment type mismatch: actual type is 'Int', but 'Nothing' was expected."),
+        (r#"val b: Box<*> = Box(1); b.v = "s""#, "assignment type mismatch: actual type is 'String', but 'Nothing' was expected."),
+    ] {
+        let err = prog_err(&format!("{class}\nfun main() {{ {body} }}"));
+        assert_eq!(err, format!("kotlin: {msg}\n"), "{body}");
+    }
+}

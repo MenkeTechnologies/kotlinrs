@@ -152,6 +152,162 @@ impl TypeArg {
     }
 }
 
+/// A variance: a type parameter's declared one (`class Box<out T>`), a type
+/// argument's use-site projection (`MutableList<out Number>`), and the
+/// position a type occurrence sits in. All three are the same lattice, which
+/// is why one enum serves them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Variance {
+    Invariant,
+    Out,
+    In,
+}
+
+impl Variance {
+    /// The word `kotlinc` uses for it in a diagnostic.
+    pub fn word(self) -> &'static str {
+        match self {
+            Variance::Invariant => "invariant",
+            Variance::Out => "out",
+            Variance::In => "in",
+        }
+    }
+    /// The position an occurrence takes when it sits under a type argument of
+    /// variance `arg` in a type that is itself in position `self`: `out`
+    /// keeps the position, `in` flips it, and invariance pins it.
+    pub fn compose(self, arg: Variance) -> Variance {
+        match (self, arg) {
+            (_, Variance::Out) => self,
+            (Variance::Out, Variance::In) => Variance::In,
+            (Variance::In, Variance::In) => Variance::Out,
+            _ => Variance::Invariant,
+        }
+    }
+}
+
+/// A type annotation AS WRITTEN — names, arguments with their projections,
+/// nullability and function types — kept beside the coarse [`TypeArg`] for the
+/// checks that read the source's own spelling: declaration-site variance and
+/// use-site projections. Anything this grammar does not model (an annotated
+/// type, an intersection, `suspend`, `dynamic`) is not represented at all, and
+/// the checks treat its absence as "nothing known".
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeExpr {
+    Named {
+        /// The name as written, qualified (`Map.Entry`) when it was.
+        name: String,
+        args: Vec<TypeProj>,
+        nullable: bool,
+    },
+    Func {
+        recv: Option<Box<TypeExpr>>,
+        params: Vec<TypeExpr>,
+        ret: Box<TypeExpr>,
+        nullable: bool,
+    },
+}
+
+/// One type argument: a star projection, or a type with its use-site variance.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeProj {
+    Star,
+    Arg(Variance, TypeExpr),
+}
+
+impl TypeExpr {
+    /// The name's last segment for a named type (`Entry` for `Map.Entry`).
+    pub fn head(&self) -> Option<&str> {
+        match self {
+            TypeExpr::Named { name, .. } => Some(name.rsplit('.').next().unwrap_or(name)),
+            TypeExpr::Func { .. } => None,
+        }
+    }
+    /// Render as `kotlinc` prints a type in a diagnostic, with `label`
+    /// supplying the text that replaces a type-parameter name (it answers
+    /// `None` for a name it does not own).
+    pub fn render_with(&self, label: &dyn Fn(&str) -> Option<String>) -> String {
+        match self {
+            TypeExpr::Named {
+                name,
+                args,
+                nullable,
+            } => {
+                let q = if *nullable { "?" } else { "" };
+                if args.is_empty() {
+                    if let Some(l) = label(name) {
+                        // `T? (of class Sink<in T>)` — the mark sits on the name.
+                        return match l.split_once(' ') {
+                            Some((n, rest)) => format!("{n}{q} {rest}"),
+                            None => format!("{l}{q}"),
+                        };
+                    }
+                    return format!("{name}{q}");
+                }
+                let inner: Vec<String> = args
+                    .iter()
+                    .map(|a| match a {
+                        TypeProj::Star => "*".to_string(),
+                        TypeProj::Arg(Variance::Invariant, t) => t.render_with(label),
+                        TypeProj::Arg(v, t) => format!("{} {}", v.word(), t.render_with(label)),
+                    })
+                    .collect();
+                format!("{name}<{}>{q}", inner.join(", "))
+            }
+            TypeExpr::Func {
+                recv,
+                params,
+                ret,
+                nullable,
+            } => {
+                let ps: Vec<String> = params.iter().map(|p| p.render_with(label)).collect();
+                let r = match recv {
+                    Some(r) => format!("{}.", r.render_with(label)),
+                    None => String::new(),
+                };
+                let body = format!("{r}({}) -> {}", ps.join(", "), ret.render_with(label));
+                if *nullable {
+                    format!("({body})?")
+                } else {
+                    body
+                }
+            }
+        }
+    }
+    /// Render with no type parameters labelled.
+    pub fn render(&self) -> String {
+        self.render_with(&|_| None)
+    }
+}
+
+/// A class member's written signature, for the variance checks: a property's
+/// type and mutability, or a function's parameter and result types.
+#[derive(Debug, Clone)]
+pub struct MemberType {
+    pub name: String,
+    /// `private` members are exempt from declaration-site variance.
+    pub private: bool,
+    pub kind: MemberKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum MemberKind {
+    Prop {
+        mutable: bool,
+        ty: Option<TypeExpr>,
+    },
+    Fun {
+        /// The function's OWN type parameters, which shadow the class's.
+        own_tps: Vec<String>,
+        recv: Option<TypeExpr>,
+        /// Each parameter's name, written type (`None` where the type is not
+        /// modelled or the parameter is a `vararg`) and whether it has a default.
+        params: Vec<(String, Option<TypeExpr>, bool)>,
+        /// The result type: written, `Unit` for a block body without one, and
+        /// `None` for an `= expr` body whose type is inferred.
+        ret: Option<TypeExpr>,
+    },
+}
+
 /// A whole compilation unit: the top-level `class`/`object` declarations and
 /// free `fun`s. Execution still enters `fun main`.
 #[derive(Debug, Clone, Default)]
@@ -343,6 +499,15 @@ pub struct ClassDecl {
     /// and a construction site resolves that index to the concrete type its
     /// argument supplied.
     pub type_params: Vec<String>,
+    /// The declared variance of each of `type_params`, parallel to it.
+    pub variance: Vec<Variance>,
+    /// The header `kotlinc` names the class by in a variance diagnostic —
+    /// `class B<out T : Number, in U>` — or `None` where it cannot be
+    /// rendered exactly (a `where` clause), which turns the check off.
+    pub variance_header: Option<String>,
+    /// The members' written signatures, in source order, for the variance
+    /// checks. See [`MemberType`].
+    pub member_types: Vec<MemberType>,
     /// Primary-constructor parameters (empty for an `object`).
     pub params: Vec<CtorProp>,
     /// Properties declared in the class BODY rather than the primary
@@ -694,6 +859,12 @@ pub enum StmtKind {
         /// every write a `setValue` — the general property-delegate protocol,
         /// of which `lazy` is one instance with a lowering of its own.
         delegated: bool,
+        /// The annotation AS WRITTEN, projections included (see [`TypeExpr`]).
+        written: Option<TypeExpr>,
+        /// The initializer's type when it is certain from the source alone:
+        /// a construction with explicit type arguments, `Box<String>("s")` or
+        /// `mutableListOf<String>()`, written as the type the CALLEE names.
+        init_written: Option<TypeExpr>,
     },
     /// `name (op)= value`, where `op` is `None` for a plain `=`.
     Assign {
