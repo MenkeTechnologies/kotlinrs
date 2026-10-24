@@ -260,8 +260,10 @@ fn when_subjectless_and_statement_and_fallthrough() {
         stdout(r#"println(when (1) { 1 -> { val y = 10; y + 5 }; else -> 0 })"#),
         "15\n"
     );
-    // Non-exhaustive `when` with no matching arm and no `else` yields null.
-    assert_eq!(stdout(r#"println(when (9) { 1 -> "a" })"#), "null\n");
+    // A non-exhaustive `when` whose value is used is refused: kotlinc 2.4.21
+    // reports `'when' expression must be exhaustive. Add an 'else' branch.`
+    assert!(prog_err(r#"println(when (9) { 1 -> "a" })"#)
+        .contains("'when' expression must be exhaustive. Add an 'else' branch."));
 }
 
 #[test]
