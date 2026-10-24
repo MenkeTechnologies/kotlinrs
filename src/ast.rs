@@ -306,6 +306,8 @@ pub enum MemberKind {
         /// `None` for an `= expr` body whose type is inferred.
         ret: Option<TypeExpr>,
     },
+    /// A supertype as written, which is an `out` position.
+    Super(TypeExpr),
 }
 
 /// A whole compilation unit: the top-level `class`/`object` declarations and
@@ -365,6 +367,8 @@ impl ImportDecl {
 #[derive(Debug, Clone)]
 pub struct Param {
     pub name: String,
+    /// The annotation AS WRITTEN (see [`TypeExpr`]); `None` for a `vararg`.
+    pub written: Option<TypeExpr>,
     pub ty: Type,
     /// The class name when `ty == Type::Obj` and the annotation named a user
     /// class (e.g. `p: Person`).
@@ -407,6 +411,9 @@ pub struct FnRecv {
 
 #[derive(Debug, Clone)]
 pub struct FunDecl {
+    /// The written result type, for a function with no type parameters of
+    /// its own or of its class — a concrete type a call certainly has.
+    pub ret_written: Option<TypeExpr>,
     pub name: String,
     /// The `reified` type-parameter names this function declares. A call to it
     /// binds the type argument at run time and the body reads it back — see
@@ -755,6 +762,9 @@ pub struct BodyProp {
     /// a read of it before the first write goes through its getter, whose
     /// frame (`L.getS(main.kt:<line>)`) heads the JVM trace.
     pub lateinit_getter: Option<u32>,
+    /// The line the property is declared on (0 for a synthesized one): its
+    /// initializer's ops are attributed to it.
+    pub line: u32,
 }
 
 /// A primary-constructor parameter with its property kind.
@@ -797,6 +807,7 @@ impl CtorProp {
             type_args: self.type_args.clone(),
             type_param_of: self.type_param_of,
             fn_recv: None,
+            written: None,
         }
     }
 }

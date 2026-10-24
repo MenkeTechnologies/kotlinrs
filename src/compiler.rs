@@ -4005,6 +4005,7 @@ impl Compiler {
             for (i, p) in cd.obj_props.iter().enumerate() {
                 self.emit_init_blocks(&mut sc, cd, i)?;
                 self.mark_value_lambda(p);
+                self.mark_stmt_line(p.line);
                 self.compile_expr(&mut sc, &p.init)?;
                 if p.lazy {
                     self.b.emit(Op::Extended(KT_LAZY_NEW, 0), cd.line);
@@ -4327,6 +4328,7 @@ impl Compiler {
                 for (i, p) in cd.obj_props.iter().enumerate() {
                     self.emit_init_blocks(&mut sc, cd, i)?;
                     self.mark_value_lambda(p);
+                    self.mark_stmt_line(p.line);
                     self.compile_expr(&mut sc, &p.init)?;
                     if p.lazy {
                         self.b.emit(Op::Extended(KT_LAZY_NEW, 0), cd.line);
@@ -4560,6 +4562,7 @@ impl Compiler {
             for (i, p) in cd.obj_props.iter().enumerate() {
                 self.emit_init_blocks(&mut sc, cd, i)?;
                 self.mark_value_lambda(p);
+                self.mark_stmt_line(p.line);
                 let t = self.compile_expr(&mut sc, &p.init)?;
                 if p.lazy {
                     self.b.emit(Op::Extended(KT_LAZY_NEW, 0), cd.line);
@@ -5152,6 +5155,7 @@ impl Compiler {
         // function parameters are read-only (`val`), so declared immutable.
         for p in &f.params {
             sc.declare_obj(&p.name, p.ty, false, p.class.clone());
+            sc.set_written(&p.name, p.written.clone());
             // `fun f(b: Box<Int>)` — the annotation is the only place the width
             // of a read through `b` is written down; the caller's construction
             // site is on the other side of the call.
@@ -5373,9 +5377,7 @@ impl Compiler {
     }
 
     fn compile_stmt_inner(&mut self, sc: &mut Scope, s: &Stmt) -> Result<(), String> {
-        if s.line != 0 {
-            self.stmt_lines.push((self.b.current_pos(), s.line));
-        }
+        self.mark_stmt_line(s.line);
         // In debug mode, a stack-neutral marker carrying this statement's source
         // line precedes the statement — the `--dap` hook reads it to decide
         // whether to stop here. `Op::Extended(KT_DBG_LINE, 0)` pushes nothing (the
@@ -19307,7 +19309,22 @@ impl Compiler {
         let Some(declared) = written else {
             return Ok(built);
         };
-        let actual = built.or_else(|| Self::written_recv(sc, init));
+        let called = match init {
+            Expr::Call { name, .. }
+                if sc.slot(name).is_none() && !self.local_funs.contains_key(name) =>
+            {
+                self.variance.fun_ret(name).cloned()
+            }
+            // `also`/`apply` answer their receiver, whose written type it keeps.
+            Expr::MethodCall {
+                recv,
+                name,
+                safe: false,
+                ..
+            } if matches!(name.as_str(), "also" | "apply") => Self::written_recv(sc, recv),
+            _ => None,
+        };
+        let actual = built.or_else(|| Self::written_recv(sc, init)).or(called);
         if let Some(msg) = actual
             .as_ref()
             .and_then(|a| self.variance.initializer_mismatch(declared, a))
@@ -19345,5 +19362,15 @@ impl Compiler {
             ));
         }
         Ok(())
+    }
+}
+
+impl Compiler {
+    /// Record that the op about to be emitted starts a statement (or a
+    /// property initializer) on `line` — see `stmt_lines`.
+    fn mark_stmt_line(&mut self, line: u32) {
+        if line != 0 {
+            self.stmt_lines.push((self.b.current_pos(), line));
+        }
     }
 }

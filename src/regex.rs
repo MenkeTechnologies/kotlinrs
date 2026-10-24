@@ -286,11 +286,18 @@ fn java_syntax_error(p: &str) -> Stop {
 fn scan(c: &[char]) -> Result<(), Stop> {
     let n = c.len();
     let at = |i: usize| c.get(i).copied().ok_or(None);
+    // Comments mode, scoped by group as the flag is (see `translate`).
+    let mut x = false;
+    let mut saved: Vec<bool> = Vec::new();
     let mut names: Vec<String> = Vec::new();
     let mut open = 0usize;
     let mut prev = Prev::Start;
     let mut i = 0;
     while i < n {
+        if x && (c[i].is_whitespace() || c[i] == '#') {
+            i = skip_comments(c, i, x);
+            continue;
+        }
         match c[i] {
             '\\' => {
                 let Ok(e) = at(i + 1) else {
@@ -326,16 +333,22 @@ fn scan(c: &[char]) -> Result<(), Stop> {
                 prev = Prev::Atom;
             }
             '[' => {
-                i = class_end(c, i)?;
+                i = class_end(c, i, x)?;
                 prev = Prev::Atom;
             }
             '(' => {
-                if c.get(i + 1) == Some(&'?') {
-                    match at(i + 2)? {
-                        ':' | '=' | '!' | '>' => i += 3,
-                        '<' if matches!(c.get(i + 3), Some('=' | '!')) => i += 4,
+                // In comments mode `(` and `?` may have whitespace between them.
+                let q = skip_comments(c, i + 1, x);
+                if c.get(q) == Some(&'?') {
+                    saved.push(x);
+                    if q + 1 >= n {
+                        return stop("Unknown inline modifier", n);
+                    }
+                    match at(q + 1)? {
+                        ':' | '=' | '!' | '>' => i = q + 2,
+                        '<' if matches!(c.get(q + 2), Some('=' | '!')) => i = q + 3,
                         '<' => {
-                            let first = i + 3;
+                            let first = q + 2;
                             if !at(first)?.is_ascii_alphabetic() {
                                 return stop(
                                     "capturing group name does not start with a Latin letter",
@@ -361,22 +374,35 @@ fn scan(c: &[char]) -> Result<(), Stop> {
                         }
                         _ => {
                             // Inline flags: `(?imsx-u)` or `(?i:…)`.
-                            let mut j = i + 2;
-                            while c.get(j).is_some_and(|f| "idmsuxUc-".contains(*f)) {
+                            let mut j = q + 1;
+                            let (mut on, mut next) = (true, x);
+                            while let Some(f) = c.get(j).filter(|f| "idmsuxUc-".contains(**f)) {
+                                match f {
+                                    '-' => on = false,
+                                    'x' => next = on,
+                                    _ => {}
+                                }
                                 j += 1;
                             }
                             match at(j)? {
                                 ')' => {
+                                    // The flag holds to the end of the ENCLOSING group.
+                                    saved.pop();
+                                    x = next;
                                     i = j + 1;
-                                    prev = Prev::Unsure;
+                                    prev = Prev::Start;
                                     continue;
                                 }
-                                ':' => i = j + 1,
+                                ':' => {
+                                    x = next;
+                                    i = j + 1;
+                                }
                                 _ => return stop("Unknown inline modifier", j),
                             }
                         }
                     }
                 } else {
+                    saved.push(x);
                     i += 1;
                 }
                 open += 1;
@@ -390,6 +416,7 @@ fn scan(c: &[char]) -> Result<(), Stop> {
                     return stop("Unmatched closing ')'", i - 1);
                 }
                 open -= 1;
+                x = saved.pop().unwrap_or(x);
                 i += 1;
                 prev = Prev::Atom;
             }
@@ -399,11 +426,17 @@ fn scan(c: &[char]) -> Result<(), Stop> {
             }
             q @ ('*' | '+' | '?') => {
                 match prev {
-                    Prev::Start => return stop(format!("Dangling meta character '{q}'"), i),
+                    Prev::Start => {
+                        return stop(
+                            format!("Dangling meta character '{q}'"),
+                            skip_comments(c, i + 1, x) - 1,
+                        )
+                    }
                     Prev::Unsure => return Err(None),
                     Prev::Atom => {}
                 }
                 i += 1;
+                i = skip_comments(c, i, x);
                 if matches!(c.get(i), Some('?' | '+')) {
                     i += 1;
                 }
@@ -434,6 +467,7 @@ fn scan(c: &[char]) -> Result<(), Stop> {
                     return stop("Illegal repetition range", j);
                 }
                 i = j + 1;
+                i = skip_comments(c, i, x);
                 if matches!(c.get(i), Some('?' | '+')) {
                     i += 1;
                 }
@@ -470,23 +504,44 @@ fn bound(c: &[char], j: &mut usize) -> Result<i32, Stop> {
     Ok(v)
 }
 
+/// The index past whitespace and `#` comments from `i`, in comments mode `x`;
+/// `i` itself outside it.
+fn skip_comments(c: &[char], mut i: usize, x: bool) -> usize {
+    while x && i < c.len() && (c[i].is_whitespace() || c[i] == '#') {
+        if c[i] == '#' {
+            while i < c.len() && !line_end(c[i]) {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    i
+}
+
 /// The index just past the character class opening at `c[start]`.
-fn class_end(c: &[char], start: usize) -> Result<usize, Stop> {
+/// In comments mode `x` whitespace and `#` comments inside it are skipped.
+fn class_end(c: &[char], start: usize, x: bool) -> Result<usize, Stop> {
     let n = c.len();
     let mut j = start + 1;
     if c.get(j) == Some(&'^') {
         j += 1;
     }
+    j = skip_comments(c, j, x);
     // A `]` first in the class is a literal.
     if c.get(j) == Some(&']') {
         j += 1;
     }
     let mut last: Option<char> = None;
     while j < n {
+        if x && (c[j].is_whitespace() || c[j] == '#') {
+            j = skip_comments(c, j, x);
+            continue;
+        }
         match c[j] {
             ']' => return Ok(j + 1),
             '[' => {
-                j = class_end(c, j)?;
+                j = class_end(c, j, x)?;
                 last = None;
             }
             '\\' => {
@@ -616,7 +671,12 @@ fn translate(pattern: &str) -> String {
                 // A `]` first in the class (after an optional `^`) is a literal.
                 out.push('[');
                 i += 1;
+                // `^` must follow `[` directly; in comments mode a `]` after
+                // whitespace is still the leading literal, as in `Pattern`.
                 for lead in ['^', ']'] {
+                    if lead == ']' {
+                        i = skip_comments(&c, i, x);
+                    }
                     if c.get(i) == Some(&lead) {
                         out.push(lead);
                         i += 1;
@@ -660,6 +720,10 @@ fn translate(pattern: &str) -> String {
         }
         if ch.is_whitespace() {
             literal(&mut out, ch);
+        } else if ch == '^' && class > 0 {
+            // Not the leading `^` (taken above): a literal, which comments
+            // mode may have moved next to the `[`.
+            out.push_str("\\^");
         } else {
             out.push(ch);
         }

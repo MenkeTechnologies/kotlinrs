@@ -203,6 +203,7 @@ fn deferred_prop(p: CtorProp, nullable: bool) -> BodyProp {
         type_param_of: p.type_param_of,
         deferred: true,
         lateinit_getter: None,
+        line: 0,
     }
 }
 
@@ -713,6 +714,7 @@ fn expand_interface_delegation(prog: &mut Program) -> Result<(), String> {
                     type_param_of: None,
                     deferred: false,
                     lateinit_getter: None,
+                    line: 0,
                 },
             );
             if builtin {
@@ -765,6 +767,7 @@ fn expand_interface_delegation(prog: &mut Program) -> Result<(), String> {
                     is_override: true,
                     is_final: false,
                     is_inline: false,
+                    ret_written: None,
                 });
             }
         }
@@ -1297,6 +1300,10 @@ impl Parser {
                     last.2 = true;
                 }
             }
+            let p_written = sig_params
+                .last()
+                .filter(|s| s.0 == pname)
+                .and_then(|s| s.1.clone());
             params.push(Param {
                 name: pname,
                 // A `vararg` parameter arrives as an array of the declared
@@ -1314,6 +1321,7 @@ impl Parser {
                 // elsewhere.
                 fn_recv,
                 type_param_of: None,
+                written: p_written,
             });
             if self.at(&Tok::Comma) {
                 self.advance();
@@ -1384,6 +1392,9 @@ impl Parser {
         };
         // The written signature, published only now that the body (and any
         // local `fun` in it) has been read.
+        let ret_written = sig_ret_written
+            .clone()
+            .filter(|_| own_tps.is_empty() && self.class_type_params.is_empty());
         let sig_ret = match ret_annot {
             Some(_) => sig_ret_written,
             None if is_expr_body => None,
@@ -1418,6 +1429,7 @@ impl Parser {
             is_override: mods.override_,
             is_final: mods.final_,
             is_inline: mods.inline,
+            ret_written,
         })
     }
 
@@ -1661,6 +1673,13 @@ impl Parser {
         if self.at(&Tok::Colon) {
             self.advance();
             loop {
+                if let Some((t, _)) = self.written_type_at(self.pos) {
+                    member_types.push(MemberType {
+                        name: String::new(),
+                        private: false,
+                        kind: MemberKind::Super(t),
+                    });
+                }
                 let pname = self.qualified_ident()?;
                 // A generic supertype (`Box<Int>`) keeps its head name AND its
                 // written arguments: a subclass declares no type parameters of
@@ -1833,6 +1852,11 @@ impl Parser {
                         );
                         nested.has_primary = true;
                         nested.inner_of = Some(name.clone());
+                        // An inner class's members see the outer type parameters, so
+                        // the outer class's variance applies to them too.
+                        if nested.type_params.is_empty() {
+                            member_types.extend(nested.member_types.iter().cloned());
+                        }
                     }
                     self.nested_names.push(nested.name.clone());
                     self.pending_classes.push(nested);
@@ -1974,6 +1998,7 @@ impl Parser {
                 is_override: true,
                 is_final: false,
                 is_inline: false,
+                ret_written: None,
             });
         }
         let simple = name.rsplit('$').next().unwrap_or(&name).to_string();
@@ -2224,6 +2249,7 @@ impl Parser {
                 type_param_of: None,
                 deferred: false,
                 lateinit_getter: None,
+                line: 0,
             });
         }
 
@@ -2255,6 +2281,7 @@ impl Parser {
             type_param_of: None,
             deferred: false,
             lateinit_getter: None,
+            line: 0,
         });
         props.append(&mut comp.obj_props);
         comp.obj_props = props;
@@ -2287,6 +2314,7 @@ impl Parser {
             is_override: false,
             is_final: false,
             is_inline: false,
+            ret_written: None,
         });
 
         // `fun valueOf(value: String) = when (value) { "RED" -> E.RED; …
@@ -2333,6 +2361,7 @@ impl Parser {
                 vararg: None,
                 type_args: Vec::new(),
                 type_param_of: None,
+                written: None,
                 fn_recv: None,
             }],
             ret: Type::Obj,
@@ -2356,6 +2385,7 @@ impl Parser {
             is_override: false,
             is_final: false,
             is_inline: false,
+            ret_written: None,
         });
 
         Ok(comp)
@@ -2410,6 +2440,7 @@ impl Parser {
                 // arguments nor a class type variable.
                 type_args: if is_vararg { Vec::new() } else { type_args },
                 type_param_of: if is_vararg { None } else { type_param_of },
+                written: None,
                 fn_recv: None,
             });
             if self.at(&Tok::Comma) {
@@ -2540,6 +2571,7 @@ impl Parser {
                 vararg: None,
                 type_args: annot.args.clone(),
                 type_param_of: None,
+                written: None,
                 fn_recv: None,
             }],
             ret: Type::Unit,
@@ -2554,6 +2586,7 @@ impl Parser {
             is_override: false,
             is_final: false,
             is_inline: false,
+            ret_written: None,
         })
     }
 
@@ -2700,6 +2733,7 @@ impl Parser {
             is_override: mods.override_,
             is_final: mods.final_,
             is_inline: false,
+            ret_written: None,
         }))
     }
 
@@ -2772,6 +2806,7 @@ impl Parser {
             type_param_of: None,
             deferred: false,
             lateinit_getter: (!private).then_some(line),
+            line,
         })
     }
 
@@ -3012,6 +3047,7 @@ impl Parser {
             vararg: None,
             type_args: p.type_args.clone(),
             type_param_of: None,
+            written: None,
             fn_recv: None,
         };
         let method = |name: String, params: Vec<Param>, body: Vec<Stmt>| FunDecl {
@@ -3031,6 +3067,7 @@ impl Parser {
             is_override: false,
             is_final: false,
             is_inline: false,
+            ret_written: None,
         };
         let (get_name, set_name) = (format!("<get-{}>", p.name), format!("<set-{}>", p.name));
         let get_body = match getter {
@@ -3086,6 +3123,7 @@ impl Parser {
     }
 
     fn body_prop(&mut self) -> Result<BodyProp, String> {
+        let decl_line = self.line();
         let mutable = matches!(self.bump(), Tok::Var);
         let name = self.ident()?;
         let TypeArg {
@@ -3138,6 +3176,7 @@ impl Parser {
                     type_param_of,
                     deferred: false,
                     lateinit_getter: None,
+                    line: decl_line,
                 });
             }
             let init = self.expr()?;
@@ -3153,6 +3192,7 @@ impl Parser {
                 type_param_of,
                 deferred: false,
                 lateinit_getter: None,
+                line: decl_line,
             });
         }
         // `var f: Double get() = … set(v) { … }` with no initializer: accessors
@@ -3177,6 +3217,7 @@ impl Parser {
             type_param_of,
             deferred: false,
             lateinit_getter: None,
+            line: decl_line,
         })
     }
 

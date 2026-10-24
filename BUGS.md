@@ -501,8 +501,6 @@ JVM.
 | `inline fun boom(): Int { throw … }`; `boom()` caught in `main` | `MainKt.main(main.kt:<boom's line>)` | `MainKt.main(main.kt:<a line past the end of the file>)` |
 | `val lz = { y: Int -> y / 0 }` on line 15, `listOf(1).map(lz)` on line 16 | `main(…:16)` for the caller | `main(…:25)` |
 | `emptyList<Int>().reduce { a, b -> a + b }`, `listOf(1, 2).first { it > 5 }`, `last { it > 5 }` on line 2 | `main(main.kt:2)` | `main(main.kt:6)`, `6`, `10` |
-| `Regex("(?x)[#a]")` | `PatternSyntaxException` with the engine's description | `Unclosed character class near index 7` — in comments mode `#` opens a comment inside a class too |
-| `class Z(val d: Int) { val q = 10 / d }`; `Z(0)` caught, `stackTrace[0]` | `MainKt.main(main.kt:<call line>)` | `Z.<init>(main.kt:2)` |
 
 The numeric declaration checks apply where the frontend can tell a type for
 certain — a literal, a numeric local, arithmetic of those, a conversion — and
@@ -518,11 +516,7 @@ first to last line with code. A STANDARD-LIBRARY inline function (`map`,
 `first`, `reduce`; not the `@InlineOnly` ones such as `println`) takes a range
 too, sized by its own source, so every user inline call after one in the same
 class file shifts by an amount that needs a table of the stdlib's ranges. That
-table is the missing piece. The `(?x)[#a]` row is the syntax checker, which
-runs before comments are stripped and does not track the flag. The `<init>`
-row is a constructor's frame: the constructor is lowered as more than one
-subroutine, and the leading `<init>` frames are dropped to hide a throwable's
-OWN constructor, which takes the raising class's with them.
+table is the missing piece.
 
 ## Variance — what is not checked
 
@@ -533,10 +527,7 @@ valid one.
 
 | program | kotlinrs | reference |
 | --- | --- | --- |
-| `class J<out T> { inner class K { fun f(x: T) {} } }` | compiles | `type parameter 'T' is declared as 'out' but occurs in 'in' position …` — an inner class's members are checked against the outer parameters |
-| `class D<out T> : Comparable<T>` | compiles | `… occurs in 'in' position in type 'Comparable<T (of class D<out T>)>'` — supertypes are not checked |
-| `fun f(b: Box<String>) { val x: Box<Any> = b }` | compiles | `initializer type mismatch …` — only a LOCAL's written type (its annotation, or an explicit `Box<String>(…)` construction) is tracked, not a parameter's |
-| `val b: Box<Number> = Box(1)` then `val c: Box<Int> = b.also { }` | compiles | refused — a projection or mismatch is seen only through a bare local name or an explicit construction |
+| `val b: Box<Number> = Box(1)` then `val c: Box<Int> = b.let { it }` | compiles | `return type mismatch: expected 'Box<Int>', actual 'Box<Number>'.` — a written type is seen through a local, a parameter, an explicit construction, a call to a top-level function with a concrete written result, and `also`/`apply`; through no other expression |
 
 The use-site checks name standard-library members only for the receivers
 measured: `add`, `set` and `put` on `MutableList`/`MutableSet`/

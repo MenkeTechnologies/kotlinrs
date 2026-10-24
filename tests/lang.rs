@@ -11829,3 +11829,237 @@ fun main() {
         "evals: java.util.NoSuchElementException @ kotlin.collections.EmptyIterator.next(Collections.kt:21) | kotlin.collections.EmptyIterator.next(Collections.kt:16) | MainKt.main$lambda$0(main.kt:3) | MainKt.t(main.kt:1)\nekeys: java.util.NoSuchElementException @ kotlin.collections.EmptyIterator.next(Collections.kt:21) | kotlin.collections.EmptyIterator.next(Collections.kt:16) | MainKt.main$lambda$1(main.kt:4) | MainKt.t(main.kt:1)\neents: java.util.NoSuchElementException @ kotlin.collections.EmptyIterator.next(Collections.kt:21) | kotlin.collections.EmptyIterator.next(Collections.kt:16) | MainKt.main$lambda$2(main.kt:5) | MainKt.t(main.kt:1)\nsvals: java.util.NoSuchElementException @ java.base/java.util.TreeMap$PrivateEntryIterator.nextEntry(TreeMap.java:1519) | java.base/java.util.TreeMap$ValueIterator.next(TreeMap.java:1566) | MainKt.main$lambda$3(main.kt:6) | MainKt.t(main.kt:1)\nskeys: java.util.NoSuchElementException @ java.base/java.util.TreeMap$PrivateEntryIterator.nextEntry(TreeMap.java:1519) | java.base/java.util.TreeMap$KeyIterator.next(TreeMap.java:1575) | MainKt.main$lambda$4(main.kt:7) | MainKt.t(main.kt:1)\n"
     );
 }
+
+/// A fault in a constructor keeps the constructor's ONE `<init>` frame, on
+/// the line of the initializer that raised — a property initializer, an
+/// `init` block, a superclass's initializer, a recursive construction, a
+/// secondary constructor — and only a throwable's OWN constructors are left
+/// out. An `object`'s initializer is `<clinit>`. Measured on kotlinc 2.4.21 /
+/// JRE 21.0.13.0.2.
+#[test]
+fn constructor_faults_keep_one_init_frame() {
+    assert_eq!(
+        prog(
+            r##"class Z(val d: Int) {
+    val q = 10 / d
+}
+class Y(val d: Int) {
+    init { check(d > 0) }
+}
+class E2(m: String) : Exception(m)
+class W(val d: Int) {
+    init { if (d == 0) throw RuntimeException("x") else throw E2("y") }
+}
+open class Base(val d: Int) { val r = 5 / d }
+class Sub(d: Int) : Base(d)
+class N(val d: Int) {
+    val c: Int = if (d > 0) N(d - 1).c else 1 / d
+}
+class S2(val d: Int) {
+    constructor() : this(0) { println(1 / d) }
+}
+fun t(b: () -> Unit) = try { b() } catch (e: Exception) { println(e.stackTrace.take(4).joinToString(" | ")) }
+fun main() {
+    t { Z(0) }
+    t { Y(0) }
+    t { W(0) }
+    t { W(1) }
+    t { Sub(0) }
+    t { N(2) }
+    t { S2() }
+    t { throw E2("z") }
+}
+"##
+        ),
+        "Z.<init>(main.kt:2) | MainKt.main$lambda$0(main.kt:21) | MainKt.t(main.kt:19) | MainKt.main(main.kt:21)\nY.<init>(main.kt:5) | MainKt.main$lambda$1(main.kt:22) | MainKt.t(main.kt:19) | MainKt.main(main.kt:22)\nW.<init>(main.kt:9) | MainKt.main$lambda$2(main.kt:23) | MainKt.t(main.kt:19) | MainKt.main(main.kt:23)\nW.<init>(main.kt:9) | MainKt.main$lambda$3(main.kt:24) | MainKt.t(main.kt:19) | MainKt.main(main.kt:24)\nBase.<init>(main.kt:11) | Sub.<init>(main.kt:12) | MainKt.main$lambda$4(main.kt:25) | MainKt.t(main.kt:19)\nN.<init>(main.kt:14) | N.<init>(main.kt:14) | N.<init>(main.kt:14) | MainKt.main$lambda$5(main.kt:26)\nS2.<init>(main.kt:17) | MainKt.main$lambda$6(main.kt:27) | MainKt.t(main.kt:19) | MainKt.main(main.kt:27)\nMainKt.main$lambda$7(main.kt:28) | MainKt.t(main.kt:19) | MainKt.main(main.kt:28) | MainKt.main(main.kt)\n"
+    );
+    let out = eval(
+        r##"open class E2(m: String) : Exception(m) { val tag = 1 }
+class E3(m: String) : E2(m) { init { println("e3") } }
+class L {
+    lateinit var s: String
+    init { try { println(s) } catch (e: Exception) { println(e.stackTrace.take(2).joinToString(" | ")) } }
+}
+class Q(val d: Int) {
+    val q = 10 / d
+}
+object Ob { val v = 1 / zero() }
+fun zero() = 0
+fun main() {
+    try { throw E3("z") } catch (e: Exception) { println(e.stackTrace.take(2).joinToString(" | ")) }
+    L()
+    try { Ob.v } catch (e: Throwable) { println(e.toString() + " " + e.cause?.stackTrace?.take(2)?.joinToString(" | ")) }
+    Q(0)
+}
+"##,
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "e3\nMainKt.main(main.kt:13) | MainKt.main(main.kt)\nL.getS(main.kt:4) | L.<init>(main.kt:5)\njava.lang.ExceptionInInitializerError Ob.<clinit>(main.kt:10) | MainKt.main(main.kt:15)\n");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "Exception in thread \"main\" java.lang.ArithmeticException: / by zero\n\tat Q.<init>(main.kt:8)\n\tat MainKt.main(main.kt:16)\n\tat MainKt.main(main.kt)\n");
+    assert_eq!(out.status.code(), Some(1));
+}
+
+/// The syntax check reads comments mode as `Pattern` does: a `#` comment and
+/// whitespace are skipped everywhere — inside a class, between `(` and `?`,
+/// between a quantifier and its `+`/`?` — so a `(` or `[` in a comment opens
+/// nothing, `(?x)[#a]` is an unclosed class, and an inline-flag group is the
+/// start of a sequence for a dangling quantifier. Measured on kotlinc 2.4.21 /
+/// JRE 21.0.13.0.2.
+#[test]
+fn regex_syntax_check_in_comments_mode() {
+    assert_eq!(
+        prog(
+            r##"fun t(p: String, s: String) = try { val r = Regex(p); "" + r.containsMatchIn(s) + " " + r.find(s)?.value + " " + r.matches(s) } catch (e: Exception) { e.javaClass.simpleName + ": " + e.message!!.replace("\n", "|") }
+fun main() {
+    println(t("(?x)[#a]", "#"))
+    println(t("(?x)a # (", "a"))
+    println(t("(?x)a # )", "a"))
+    println(t("(?x)[a # ]\n]", "a"))
+    println(t("(?x)a\\ b", "a b"))
+    println(t("(?x)( a ) # [", "a"))
+    println(t("(?x)a #c\n)", "a"))
+    println(t("(?x:a #(\n)b", "ab"))
+    println(t("(?x)a{2 }", "aa"))
+    println(t("(?x) * a", "a"))
+    println(t("(?x)[ ]", " "))
+}
+"##
+        ),
+        "PatternSyntaxException: Unclosed character class near index 7|(?x)[#a]|       ^\ntrue a true\ntrue a true\ntrue a true\ntrue a b true\ntrue a true\nPatternSyntaxException: Unmatched closing ')' near index 8|(?x)a #c|)|        ^\ntrue ab true\ntrue aa true\nPatternSyntaxException: Dangling meta character '*' near index 6|(?x) * a|      ^\nPatternSyntaxException: Unclosed character class near index 6|(?x)[ ]|      ^\n"
+    );
+    assert_eq!(
+        prog(
+            r##"fun t(p: String) = try { Regex(p); "ok" } catch (e: Exception) { e.message!!.replace("\n", "|") }
+fun main() {
+    for (p in listOf("(?x)*a", "(?x) *a", "(?x)  *a", "(?x)a|  *", "(?x)a| *", "(?x)(  ?", "(?x)[  ", "(?x)[a", "(?x)a{2,1}", "(?x)a{ 2}", "(?x) ( ", "(?x)a)", "(?x)a )", "(?x)  )", "(?x)\\k<q>", "(?x)a{", "(?x)[b-a]"))
+        println(p + " => " + t(p))
+}
+"##
+        ),
+        "(?x)*a => Dangling meta character '*' near index 4|(?x)*a|    ^\n(?x) *a => Dangling meta character '*' near index 5|(?x) *a|     ^\n(?x)  *a => Dangling meta character '*' near index 6|(?x)  *a|      ^\n(?x)a|  * => Dangling meta character '*' near index 8|(?x)a|  *|        ^\n(?x)a| * => Dangling meta character '*' near index 7|(?x)a| *|       ^\n(?x)(  ? => Unknown inline modifier near index 8|(?x)(  ?\n(?x)[   => Unclosed character class near index 6|(?x)[  |      ^\n(?x)[a => Unclosed character class near index 5|(?x)[a|     ^\n(?x)a{2,1} => Illegal repetition range near index 9|(?x)a{2,1}|         ^\n(?x)a{ 2} => Illegal repetition near index 6|(?x)a{ 2}|      ^\n(?x) (  => Unclosed group near index 7|(?x) ( \n(?x)a) => Unmatched closing ')' near index 4|(?x)a)|    ^\n(?x)a ) => Unmatched closing ')' near index 5|(?x)a )|     ^\n(?x)  ) => Unmatched closing ')' near index 5|(?x)  )|     ^\n(?x)\\k<q> => named capturing group <q> does not exist near index 8|(?x)\\k<q>|        ^\n(?x)a{ => Illegal repetition near index 6|(?x)a{\n(?x)[b-a] => Illegal character range near index 7|(?x)[b-a]|       ^\n"
+    );
+    assert_eq!(
+        prog(
+            r##"fun t(p: String) = try { Regex(p); "ok" } catch (e: Exception) { e.message!!.replace("\n", "|") }
+fun main() {
+    for (p in listOf("(?i)*a", "a(?i)*", "(?", "a(?", "(?i)+", "^*", "a$*", "(?i:a)*", "(?x)[a\n#c\n]"))
+        println(p.replace("\n", "\\n") + " => " + t(p))
+}
+"##
+        ),
+        "(?i)*a => Dangling meta character '*' near index 4|(?i)*a|    ^\na(?i)* => Dangling meta character '*' near index 5|a(?i)*|     ^\n(? => Unknown inline modifier near index 2|(?\na(? => Unknown inline modifier near index 3|a(?\n(?i)+ => Dangling meta character '+' near index 4|(?i)+|    ^\n^* => ok\na$* => ok\n(?i:a)* => ok\n(?x)[a\\n#c\\n] => ok\n"
+    );
+    assert_eq!(
+        prog(
+            r##"fun t(p: String, s: String) = try { val r = Regex(p); "" + r.containsMatchIn(s) + " " + r.find(s)?.value + " " + r.matches(s) } catch (e: Exception) { e.javaClass.simpleName + ": " + e.message!!.replace("\n", "|") }
+fun main() {
+    println(t("(?x)[ ]a]", "]"))
+    println(t("(?x)[ ^ a]", "b"))
+    println(t("(?x)[a\n#c\n]", "c"))
+    println(t("(?x)[a b c]+", "cab"))
+    println(t("(?x)[a #]", "a"))
+}
+"##
+        ),
+        "true ] true\nfalse null false\nfalse null false\ntrue cab true\nPatternSyntaxException: Unclosed character class near index 8|(?x)[a #]|        ^\n"
+    );
+}
+
+/// Variance reaches further: an inner class's members (a `private` one's too)
+/// against the outer type parameters, supertypes as `out` positions, a
+/// parameter's written type, a call to a top-level function with a concrete
+/// written result, and `also`/`apply` on a local. Messages and the valid
+/// program's output measured on kotlinc 2.4.21 / JRE 21.0.13.0.2.
+#[test]
+fn variance_reaches_inner_classes_supertypes_parameters_and_calls() {
+    for (src, msg) in [
+        (
+            r##"class Box<T>(var v: T) { fun put(x: T) { v = x }; fun get(): T = v }
+fun f(b: Box<String>) { val x: Box<Any> = b }
+fun main() {}
+"##,
+            "kotlin: initializer type mismatch: expected 'Box<Any>', actual 'Box<String>'.",
+        ),
+        (
+            r##"class Box<T>(var v: T) { fun put(x: T) { v = x }; fun get(): T = v }
+fun mk(): Box<String> = Box("s")
+fun main() { val c: Box<Any> = mk() }
+"##,
+            "kotlin: initializer type mismatch: expected 'Box<Any>', actual 'Box<String>'.",
+        ),
+        (
+            r##"class Box<T>(var v: T) { fun put(x: T) { v = x }; fun get(): T = v }
+fun main() { val b: Box<Number> = Box(1); val c: Box<Int> = b.also { } }
+"##,
+            "kotlin: initializer type mismatch: expected 'Box<Int>', actual 'Box<Number>'.",
+        ),
+        (
+            r##"class Box<T>(var v: T) { fun put(x: T) { v = x }; fun get(): T = v }
+fun g(b: Box<out Number>) { b.put(1) }
+fun main() {}
+"##,
+            "kotlin: receiver type 'Box<out Number>' contains out projection which prohibits the use of 'fun put(x: T): Unit'.",
+        ),
+        (
+            r##"class Box<T>(var v: T) { fun put(x: T) { v = x }; fun get(): T = v }
+fun g(c: Box<in Int>) { val x: Int = c.get() }
+fun main() {}
+"##,
+            "kotlin: initializer type mismatch: expected 'Int', actual 'CapturedType(in Int)'.",
+        ),
+        (
+            r##"class J<out T> { inner class K { fun f(x: T) {} } }
+fun main() {}
+"##,
+            "kotlin: type parameter 'T' is declared as 'out' but occurs in 'in' position in type 'T (of class J<out T>)'.",
+        ),
+        (
+            r##"class D<out T> : Comparable<T> { override fun compareTo(other: T): Int = 0 }
+fun main() {}
+"##,
+            "kotlin: type parameter 'T' is declared as 'out' but occurs in 'in' position in type 'Comparable<T (of class D<out T>)>'.",
+        ),
+        (
+            r##"interface Src<out T> { fun next(): T }
+abstract class M<in T> : Src<T>
+fun main() {}
+"##,
+            "kotlin: type parameter 'T' is declared as 'in' but occurs in 'out' position in type 'Src<T (of class M<in T>)>'.",
+        ),
+        (
+            r##"class J<out T> { private inner class PK { fun f(x: T) {} } }
+fun main() {}
+"##,
+            "kotlin: type parameter 'T' is declared as 'out' but occurs in 'in' position in type 'T (of class J<out T>)'.",
+        ),
+    ] {
+        let err = prog_err(src);
+        assert_eq!(err.lines().next(), Some(msg), "{src}");
+    }
+    assert_eq!(
+        prog(
+            r##"interface Src<out T> { fun next(): T }
+interface Snk<in T> { fun put(x: T) }
+class Box<T>(var v: T) { fun put(x: T) { v = x }; fun get(): T = v }
+class J<out T>(val t: T) {
+    inner class K { fun get(): T = t; private fun p(x: T) {} }
+}
+class Rep<out T>(private val x: T) : Src<T> { override fun next(): T = x }
+class Eat<in T> : Snk<T>, Comparable<T> { override fun put(x: T) { println("ate $x") }; override fun compareTo(other: T) = 0 }
+abstract class Wrap<out T> : Iterable<T>
+fun use(b: Box<String>): Box<String> { val c: Box<String> = b; val d: Box<out Any> = b; return c }
+fun mk(): Box<String> = Box("s")
+fun <T> gen(x: T): Box<T> = Box(x)
+fun main() {
+    val j = J("a"); println(j.K().get())
+    val s: Src<Any> = Rep("r"); println(s.next())
+    val e: Snk<String> = Eat<Any>(); e.put("x")
+    println(use(Box("u")).get())
+    val m: Box<String> = mk(); val m2: Box<out CharSequence> = mk(); println(m.get() + m2.get())
+    val g: Box<Any> = gen("q"); println(g.get())
+    val n: Box<Number> = Box(1); val n2: Box<Number> = n.also { }; println(n2.get())
+}
+"##
+        ),
+        "a\nr\nate x\nu\nss\nq\n1\n"
+    );
+}

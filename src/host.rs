@@ -3054,6 +3054,25 @@ fn facade_class() -> String {
 /// The JVM `(class, method)` a kotlinrs subroutine runs as, or `None` for one
 /// that has no frame of its own there: a lambda (inlined into its caller by
 /// `run`/`let`/…), or an internal entry.
+/// For a constructor sub's member name, whether it is the allocating WRAPPER
+/// (`$init`, `$ctorN`, `$init$superN`, which call the INTO form) or the
+/// constructor proper (`$into`, `$ctorN$into`, `$into$superN`); `None` for
+/// any other member. Both are the JVM's one `<init>` frame.
+fn ctor_wrapper(member: &str) -> Option<bool> {
+    if member == "$into" || member.starts_with("$into$super") {
+        return Some(false);
+    }
+    if member == "$init" || member.starts_with("$init$super") {
+        return Some(true);
+    }
+    let n = member.strip_prefix("$ctor")?;
+    match n.split_once('$') {
+        Some((d, "into")) if d.chars().all(|c| c.is_ascii_digit()) => Some(false),
+        None if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => Some(true),
+        _ => None,
+    }
+}
+
 fn jvm_frame(sub: &str) -> Option<(String, String)> {
     // A lambda's sub name carries its JVM class and method (see the
     // compiler's `LambdaCtx`); one compiled outside any function has none.
@@ -3076,7 +3095,9 @@ fn jvm_frame(sub: &str) -> Option<(String, String)> {
     if let Some((class, member)) = base.split_once('#') {
         let class = class.replace('.', "$");
         return match member {
-            "$init" | "$into" => Some((class, "<init>".to_string())),
+            m if ctor_wrapper(m).is_some() => Some((class, "<init>".to_string())),
+            // An `object`'s lazy initializer is its class initializer.
+            "$clinit" => Some((class, "<clinit>".to_string())),
             m if m.starts_with('$') => None,
             m => Some((class, m.to_string())),
         };
@@ -4133,6 +4154,8 @@ fn capture_stack_trace(vm: &VM, exc: &Value) {
     // A lambda's frame is inlined into its caller's on the JVM, so its line
     // is the caller's line there.
     let mut inlined_line = None;
+    // The class whose `$into` frame was pushed last (see the wrapper rule).
+    let mut into_class: Option<String> = None;
     let sub_of = |k: usize| {
         vm.frames
             .get(k)
@@ -4189,12 +4212,22 @@ fn capture_stack_trace(vm: &VM, exc: &Value) {
             match jvm_frame(name).filter(|_| !inlined) {
                 Some((class, method)) => {
                     let line = inlined_line.take().or(line);
-                    // A class lambda's bridge `invoke` calls the typed one,
-                    // both on the literal's line.
-                    if lambda_mode(name) == Some("cls") {
-                        frames.push((class.clone(), method.clone(), line));
+                    // A construction is two subs — `C#$init` allocates and calls
+                    // `C#$into`, which runs the initializers — and one JVM
+                    // `<init>` frame, whose line is the inner one's.
+                    let base = name.split_once("$ov").map_or(name, |(b, _)| b);
+                    let kind = base.split_once('#').and_then(|(_, m)| ctor_wrapper(m));
+                    let wrapper =
+                        kind == Some(true) && into_class.as_deref() == Some(class.as_str());
+                    into_class = (kind == Some(false)).then(|| class.clone());
+                    if !wrapper {
+                        // A class lambda's bridge `invoke` calls the typed one,
+                        // both on the literal's line.
+                        if lambda_mode(name) == Some("cls") {
+                            frames.push((class.clone(), method.clone(), line));
+                        }
+                        frames.push((class, method, line));
                     }
-                    frames.push((class, method, line));
                 }
                 None => {
                     inlined_line = inlined_line.or(line);
@@ -4216,7 +4249,14 @@ fn capture_stack_trace(vm: &VM, exc: &Value) {
         };
         at = ret.saturating_sub(1);
     }
-    while frames.len() > 1 && frames[0].1 == "<init>" {
+    // Only the THROWABLE's own constructors (a user throwable class and its
+    // supertypes): any other `<init>` at the head is the class whose
+    // initializer raised or constructed it, and the JVM keeps that frame.
+    let own = instance_tag(exc);
+    while frames.len() > 1
+        && frames[0].1 == "<init>"
+        && own.as_deref().is_some_and(|c| type_is_a(c, &frames[0].0))
+    {
         frames.remove(0);
     }
     if frames

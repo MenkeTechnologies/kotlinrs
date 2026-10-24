@@ -67,6 +67,9 @@ pub struct VarianceTable {
     user: HashMap<String, Option<Rc<ClassVariance>>>,
     /// Top-level function names: a call `F<A>(…)` to one constructs nothing.
     funs: HashSet<String>,
+    /// A top-level function's written result type, by name, where exactly
+    /// one non-extension function has the name and the type is concrete.
+    fun_rets: HashMap<String, Option<TypeExpr>>,
 }
 
 impl VarianceTable {
@@ -90,7 +93,19 @@ impl VarianceTable {
             }
         }
         let funs = program.funs.iter().map(|f| f.name.clone()).collect();
-        VarianceTable { user, funs }
+        let mut fun_rets: HashMap<String, Option<TypeExpr>> = HashMap::new();
+        for f in &program.funs {
+            let ret = f.ret_written.clone().filter(|_| f.recv.is_none());
+            fun_rets
+                .entry(f.name.clone())
+                .and_modify(|r| *r = None)
+                .or_insert(ret);
+        }
+        VarianceTable {
+            user,
+            funs,
+            fun_rets,
+        }
     }
 
     /// The user class a written type names, when exactly one does.
@@ -208,6 +223,7 @@ pub fn check_declaration_variance(program: &Program) -> Result<(), String> {
         for m in c.member_types.iter().filter(|m| !m.private) {
             let mut sites: Vec<(&TypeExpr, Variance, Params)> = Vec::new();
             match &m.kind {
+                MemberKind::Super(t) => sites.push((t, Out, all.clone())),
                 MemberKind::Prop { mutable, ty } => {
                     if let Some(t) = ty {
                         let pos = if *mutable { Inv } else { Out };
@@ -696,5 +712,16 @@ impl VarianceTable {
                 self.projection_of(recv, info, tp),
                 Some(TypeProj::Star | TypeProj::Arg(Variance::Out, _))
             )
+    }
+}
+
+impl VarianceTable {
+    /// The written result type of a call to the top-level function `name`,
+    /// when it is certain (see `fun_rets`).
+    pub fn fun_ret(&self, name: &str) -> Option<&TypeExpr> {
+        if self.user.contains_key(name) {
+            return None;
+        }
+        self.fun_rets.get(name)?.as_ref()
     }
 }

@@ -11,6 +11,32 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Constructor `<init>` frames, comments-mode syntax checks, variance through inner classes, supertypes, parameters and calls
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.13.0.2.
+
+| program | before | reference |
+| --- | --- | --- |
+| `class Z(val d: Int) { val q = 10 / d }`; `Z(0)`, `stackTrace[0]` | `MainKt.main-e(main.kt:21)` | `Z.<init>(main.kt:2)` |
+| `class N(val d: Int) { val c: Int = if (d > 0) N(d - 1).c else 1 / d }`; `N(2)` | no `<init>` frame | three `N.<init>(main.kt:14)` frames |
+| `object Ob { val v = 1 / zero() }`; the cause of `Ob.v`'s `ExceptionInInitializerError` | `MainKt.main(main.kt:10)` | `Ob.<clinit>(main.kt:10)` |
+| `Regex("(?x)a # (")`, `Regex("(?x:a #(\n)b")` | `Unclosed group …` | compile |
+| `Regex("(?x)[#a]")`, `Regex("(?x)[ ]")` | the engine's message | `Unclosed character class near index 7`, `… near index 6` |
+| `Regex("(?i)*a")`, `Regex("(?")` | the engine's message | `Dangling meta character '*' near index 4`, `Unknown inline modifier near index 2` |
+| `Regex("(?x)[ ^ a]").containsMatchIn("b")` | `true` | `false` — a `^` after whitespace is a literal |
+| `class J<out T> { inner class K { fun f(x: T) {} } }`; `class D<out T> : Comparable<T>` | compile | `type parameter 'T' is declared as 'out' but occurs in 'in' position …` |
+| `fun f(b: Box<String>) { val x: Box<Any> = b }`; `fun mk(): Box<String>` then `val c: Box<Any> = mk()` | compile | `initializer type mismatch: expected 'Box<Any>', actual 'Box<String>'.` |
+
+A construction is two subroutines — the allocating `C#$init` and the
+initializing `C#$into` — and the JVM has one `<init>` frame, so a wrapper
+frame directly outside its own class's INTO frame is folded into it instead of
+every leading `<init>` being stripped; only a throwable's own constructors
+are left out. A property initializer carries its declaration line. The
+syntax checker tracks comments mode by group as the rewrite does. Variance is
+checked on an inner class's members and on supertypes, and the written type of
+a parameter, a call to a top-level function with a concrete written result, and
+`also`/`apply` on a local reach the use-site checks.
+
 ## Regex comments mode and escapes, unsigned array storage, `(expr)()`, `lateinit` getter frames, statement lines, map-view iterator frames
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.13.0.2.
