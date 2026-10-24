@@ -136,12 +136,15 @@ The `infix` row is a parser gap.
 arguments are folded into inline flags at compile time, so only constant
 options (a single `RegexOption.X`, or `setOf`/`listOf` of them) are accepted; an
 option held in a variable is refused as `unresolved reference: RegexOption`.
-`CANON_EQ` is accepted and has no effect. One divergence is a different MESSAGE rather than a refusal: a pattern
-the engine rejects raises `java.util.regex.PatternSyntaxException` (catchable as
-the `IllegalArgumentException` it is), but the description after the class name
-is the Rust engine's, not `Pattern`'s `… near index N` with its caret line.
-Pattern dialects differ at the edges too — `fancy-regex` has no `\Q…\E`
-quoting, so such a pattern is refused rather than matched differently.
+`CANON_EQ` is accepted and has no effect. A refused pattern raises
+`java.util.regex.PatternSyntaxException` (catchable as the
+`IllegalArgumentException` it is). For the syntax errors `Pattern` reports in
+the constructs measured — unclosed and unmatched groups, unclosed classes and
+reversed ranges, dangling quantifiers, malformed and reversed counted
+repetitions, a trailing backslash, unknown inline modifiers, named groups and
+back-references — the pattern is checked first and the message is `Pattern`'s,
+`… near index N`, the pattern and the caret line. Any other refusal carries the
+Rust engine's description instead.
 
 ## A lone surrogate has no `String` to live in
 
@@ -486,36 +489,35 @@ can reach `value_eq` is boxed first, and those paths have not been audited.
 The `vararg` row is the secondary-constructor parser, which still refuses the
 modifier rather than mis-binding it.
 
-## Parity fan-out round 6: measured and not closed
+## Parity fan-out rounds 6–7: measured and not closed
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.13.0.2, compiled and run on the same
 JVM.
 
 | program | kotlinrs | reference |
 | --- | --- | --- |
-| `var b: Byte = 1; b += 1` | `2` | `assignment type mismatch: actual type is 'Int', but 'Byte' was expected.` |
-| `val x = 5; val b: Byte = x` | `5` | `initializer type mismatch: expected 'Byte', actual 'Int'.` |
-| `val l: List<Any> = byteArrayOf(1, 2).toList()`; `l.contains(1)`, `l[0] is Byte` | `true`, `false` | `false`, `true` |
 | `inline fun boom(): Int { throw … }`; `boom()` caught in `main` | `MainKt.main(main.kt:<boom's line>)` | `MainKt.main(main.kt:<a line past the end of the file>)` |
-| `val lz = { y: Int -> y / 0 }` on line 15, `listOf(1).map(lz)` on line 16 | `main$lambda$N(…:16)`, `main(…:16)` | `main$lambda$N(…:15)`, `main(…:25)` |
+| `val lz = { y: Int -> y / 0 }` on line 15, `listOf(1).map(lz)` on line 16 | `main(…:16)` for the caller | `main(…:25)` |
 | `emptyList<Int>().reduce { a, b -> a + b }`, `listOf(1, 2).first { it > 5 }`, `last { it > 5 }` on line 2 | `main(main.kt:2)` | `main(main.kt:6)`, `6`, `10` |
-| `mutableMapOf<Int, Int>().iterator().next()`, a `mutableSetOf` or `keys` iterator past its end | the user frames only | `LinkedHashMap$LinkedHashIterator.nextNode` and the `next` of the entry or key iterator in front |
+| a lambda `{ x: Int ->` on line 3, `println("in")` on 4, `10 / x` on 5 | `main$lambda$0(main.kt:4)` | `main$lambda$0(main.kt:5)` |
+| `mutableMapOf<Int, Int>().values.iterator().next()` | `ArrayList$Itr.next` in front | `LinkedHashMap$LinkedValueIterator.next` and `nextNode` |
 | `class L { lateinit var s: String }`; `L().s` read from outside `L` | `MainKt.main(…)` | `L.getS(main.kt:1)` in front: the read goes through the getter |
 | `class Box<out T>(var v: T)`; `class Sink<in T> { fun get(): T? = null }` | compiles | `type parameter 'T' is declared as 'out' but occurs in 'invariant' position …` / `… 'in' but occurs in 'out' position …` |
 | `val b: Box<Any> = Box<String>("s")`; `val xs: MutableList<Any> = mutableListOf<String>("a")` | compiles | `initializer type mismatch: expected 'Box<Any>', actual 'Box<String>'.` |
-| `object O { val a = b + 1; val b = 2 }` | `1` | `variable 'b' must be initialized.` |
-| `(1..10).reduceRightIndexed { i, a, b -> … }` | `91` | `unresolved reference 'reduceRightIndexed' on receiver of type 'IntRange'.` |
+| `Regex("(?x) a b # c")`, `Regex("\\0101")`, `Regex("\\cA")` | `PatternSyntaxException` (the engine's) | compiles |
+| `UByteArray(3).also { it[1] = 200u }.toString()`; `byteArrayOf(-1).toUByteArray()` | `UByteArray(storage=[0, 200, 0])`; `unresolved reference` | `UByteArray(storage=[0, -56, 0])`; `[255]` |
+| `(O.a)()` — a parenthesized callee | `expected RParen, found LParen` | invokes it |
+| `"a\nb".lineSequence()` | `unresolved reference: lineSequence on String` | the lines |
 
-The first two are a declaration type check this frontend does not make for any
-integral width (`val l: Long = x` is accepted the same way); only an
-out-of-range LITERAL is refused. The third is the erased-position box: a
-primitive array holds bare integers, so a member that copies one into a
-collection (`toList`, `asList`) hands back `Int`s — `LongArray` has the same
-gap. The `lateinit` row needs a frame the VM never runs: the getter is not a sub
-here. The variance, invariance and initialization-order rows are checks this
-frontend does not make — variance annotations are parsed and dropped. The
-three line rows are the JVM's inline-function line mapping: a body
-copied into its caller is numbered past the end of the file (the SMAP
-section), and a stack trace prints those numbers as they are. The lambda row's
-first frame is a line attribution miss of its own: the faulting op in the
-lambda body carries no line, so the frame takes the literal's following one.
+The numeric declaration checks apply where the frontend can tell a type for
+certain — a literal, a numeric local, arithmetic of those, a conversion — and
+stay silent elsewhere, so a mismatch hidden behind an untyped call is still
+accepted. The `lateinit` row needs a frame the VM never runs: the getter is not
+a sub here. The variance and invariance rows are checks this frontend does not
+make — variance annotations are parsed and dropped. The three inline line rows
+are the JVM's inline-function line mapping: a body copied into its caller is
+numbered past the end of the file (the SMAP section), and a stack trace prints
+those numbers as they are. The multi-line lambda row is a line attribution
+miss: the body's tail expression carries no line of its own, so the frame takes
+the nearest earlier one. The `(?x)` row is the engine's anchored second
+compilation, whose closing group the trailing comment swallows.

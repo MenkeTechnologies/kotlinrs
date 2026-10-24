@@ -118,6 +118,10 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   `1`, and overloads, extensions and `javaClass` see the type. Every operator
   promotes both to `Int`; `toByte()`/`toShort()`, `inc()`/`dec()` and `b++`
   narrow back, and an integer literal initializes one only when it fits.
+- **No implicit number conversion** — a numeric declaration, assignment or
+  argument takes only its own type (`val l: Long = x` for an `Int` `x`, `b += 1`
+  on a `Byte`, `f(x)` into a `Byte` parameter are refused with `kotlinc`'s
+  messages); an integer literal adopts any integral type it fits.
 - **Unsigned integers** — `UByte`/`UShort`/`UInt`/`ULong`, each a runtime type
   of its own (a heap box holding the value's bits), so `x is UInt` and `x is
   Int` differ and `1u != 1`. `u`/`U` literals with an optional `L` (`7uL`;
@@ -267,6 +271,8 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   group references or a transform lambda, `split`, `MatchResult` (`value`,
   `range`, `groupValues`, `groups`, `destructured`, `next()`), and the `String`
   members that take a `Regex`. `RegexOption` (constant arguments: a single option or a `setOf`/`listOf` of them) folds into inline flags; `Regex.escape` is modelled.
+  A pattern `Pattern` refuses raises `PatternSyntaxException` with `Pattern`'s
+  description, index and caret for the common syntax errors.
 - **Sorted collections with a comparator** — `sortedSetOf(cmp, …)`,
   `sortedMapOf(cmp, …)`, `TreeSet(cmp)`, `TreeMap(cmp)` order by the comparator
   and identify elements by it, as `java.util.TreeMap` does.

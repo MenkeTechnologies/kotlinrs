@@ -1885,6 +1885,8 @@ fn body_prop_class(p: &BodyProp, by_name: &HashMap<&str, &ClassDecl>) -> Option<
             "mapOf" | "mutableMapOf" | "hashMapOf" | "emptyMap" => Some("Map".to_string()),
             _ => None,
         },
+        // A lambda literal is a function value: `obj.f()` invokes it.
+        Expr::Lambda { .. } => Some("Function".to_string()),
         _ => None,
     }
 }
@@ -2749,6 +2751,81 @@ fn check_modifiers(
     Ok(())
 }
 
+/// The first of `later` that `body` reads before it is initialized: a bare
+/// name or `this.name`. A lambda's body runs later, so it is not looked into.
+fn first_uninit_read(body: &[Stmt], later: &[&str]) -> Option<String> {
+    let mut body = body.to_vec();
+    each_expr_mut(&mut body, &|x| {
+        if matches!(x, Expr::Lambda { .. }) {
+            *x = Expr::Null;
+        }
+    });
+    // A local of the same name declared in the body shadows the property.
+    let shadowed = |n: &str| {
+        stmt_any(
+            &body,
+            &|k| matches!(k, StmtKind::Let { name, .. } if name == n),
+        )
+    };
+    let found = std::cell::RefCell::new(None);
+    body_any(&body, &|x| {
+        let name = match x {
+            Expr::Var(n) => n,
+            Expr::Member { recv, name, .. } if matches!(&**recv, Expr::Var(t) if t == "this") => {
+                name
+            }
+            _ => return false,
+        };
+        let hit = later.contains(&name.as_str()) && !shadowed(name);
+        if hit {
+            *found.borrow_mut() = Some(name.clone());
+        }
+        hit
+    });
+    found.into_inner()
+}
+
+/// Kotlin initializes properties (and runs `init` blocks) in declaration
+/// order, and refuses an initializer that reads one declared below it:
+/// `variable 'b' must be initialized.` A constructor parameter of the same
+/// name is what such a read means, so `params` are never "later".
+fn check_props_init_order(
+    props: &[BodyProp],
+    params: &[&str],
+    inits: &[InitBlock],
+) -> Result<(), String> {
+    let later = |from: usize| -> Vec<&str> {
+        props[from..]
+            .iter()
+            .filter(|p| !p.deferred && !params.contains(&p.name.as_str()))
+            .map(|p| p.name.as_str())
+            .collect()
+    };
+    let refuse = |n: String| Err(format!("variable '{n}' must be initialized."));
+    for k in 0..=props.len() {
+        for b in inits.iter().filter(|b| b.after_props == k) {
+            if let Some(n) = first_uninit_read(&b.body, &later(k)) {
+                return refuse(n);
+            }
+        }
+        let Some(p) = props.get(k) else { break };
+        if p.lazy || p.delegate || p.deferred {
+            continue;
+        }
+        let stmt = [Stmt::new(0, StmtKind::Expr(p.init.clone()))];
+        if let Some(n) = first_uninit_read(&stmt, &later(k)) {
+            return refuse(n);
+        }
+    }
+    Ok(())
+}
+
+/// [`check_props_init_order`] for a class body.
+fn check_init_order(cd: &ClassDecl) -> Result<(), String> {
+    let params: Vec<&str> = cd.params.iter().map(|p| p.name.as_str()).collect();
+    check_props_init_order(&cd.obj_props, &params, &cd.inits)
+}
+
 /// The declarations of member `name`/`arity` that supertype `d` hands down:
 /// its own, or else those its supertypes hand down to it. A diamond yields one
 /// declaration twice, which the caller folds by owner.
@@ -2917,6 +2994,7 @@ fn build_class_meta(program: &Program) -> Result<HashMap<String, ClassMeta>, Str
             return Err(format!("class {} is its own supertype", cd.name));
         }
         check_modifiers(cd, &mro, &by_name)?;
+        check_init_order(cd)?;
 
         // A `by <delegate>` whose class cannot be named at compile time has no
         // `getValue` to call. Rejected here rather than left to become a plain
@@ -3445,6 +3523,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         }
     }
 
+    check_props_init_order(&program.props, &[], &[])?;
     let mut globals: HashMap<String, PropMeta> = HashMap::new();
     for p in &program.props {
         if globals
@@ -3656,6 +3735,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
     // first READ, which is the whole difference between the two forms.
     for p in &program.props {
         let mut sc = Scope::new();
+        c.mark_value_lambda(p);
         let t = c.compile_expr(&mut sc, &p.init)?;
         if p.lazy {
             c.b.emit(Op::Extended(KT_LAZY_NEW, 0), 0);
@@ -3886,6 +3966,7 @@ impl Compiler {
         let res: Result<(), String> = (|| {
             for (i, p) in cd.obj_props.iter().enumerate() {
                 self.emit_init_blocks(&mut sc, cd, i)?;
+                self.mark_value_lambda(p);
                 self.compile_expr(&mut sc, &p.init)?;
                 if p.lazy {
                     self.b.emit(Op::Extended(KT_LAZY_NEW, 0), cd.line);
@@ -3978,6 +4059,7 @@ impl Compiler {
         // slots are read back below in field order.
         let outer = self.building_object.replace(cd.name.clone());
         for p in &cd.obj_props {
+            self.mark_value_lambda(p);
             let t = self.compile_expr(&mut sc, &p.init)?;
             if p.lazy {
                 self.b.emit(Op::Extended(KT_LAZY_NEW, 0), cd.line);
@@ -4206,6 +4288,7 @@ impl Compiler {
             let res: Result<(), String> = (|| {
                 for (i, p) in cd.obj_props.iter().enumerate() {
                     self.emit_init_blocks(&mut sc, cd, i)?;
+                    self.mark_value_lambda(p);
                     self.compile_expr(&mut sc, &p.init)?;
                     if p.lazy {
                         self.b.emit(Op::Extended(KT_LAZY_NEW, 0), cd.line);
@@ -4438,6 +4521,7 @@ impl Compiler {
         let res: Result<(), String> = (|| {
             for (i, p) in cd.obj_props.iter().enumerate() {
                 self.emit_init_blocks(&mut sc, cd, i)?;
+                self.mark_value_lambda(p);
                 let t = self.compile_expr(&mut sc, &p.init)?;
                 if p.lazy {
                     self.b.emit(Op::Extended(KT_LAZY_NEW, 0), cd.line);
@@ -5364,19 +5448,15 @@ impl Compiler {
                 // unannotated one keeps the static type and needs no box — and
                 // must not get one: a BOXED `Long` in a `Long`-typed slot reached
                 // the integer division as a handle, and `x / 2` answered `0.0`.
-                // An integer literal adopts a `Byte`/`Short` declaration's type
-                // only when it fits; one that does not stays an `Int`, which
-                // the declaration then refuses.
-                if let (Some(t @ (Type::Byte | Type::Short)), Some(n)) = (ty, int_literal_of(init))
-                {
-                    let fits = match t {
-                        Type::Byte => i8::try_from(n).is_ok(),
-                        _ => i16::try_from(n).is_ok(),
-                    };
-                    if !fits {
-                        let want = if *t == Type::Byte { "Byte" } else { "Short" };
+                // Kotlin converts no number implicitly: a numeric declaration
+                // takes only its own type (an integer literal adopting it where
+                // it fits).
+                if let Some(t) = ty {
+                    if let Some(actual) = self.num_mismatch(sc, *t, init) {
                         return Err(format!(
-                            "initializer type mismatch: expected '{want}', actual 'Int'."
+                            "initializer type mismatch: expected '{}', actual '{}'.",
+                            num_label(*t),
+                            num_label(actual)
                         ));
                     }
                 }
@@ -5511,6 +5591,27 @@ impl Compiler {
                     self.compile_expr(sc, &full)?;
                     self.emit_delegate_set(dc)?;
                     return Ok(());
+                }
+                // A numeric local takes only its own type, and a compound
+                // assignment's result must be that type too: `b += 1` on a
+                // `Byte` is an `Int`.
+                if sc.slot(name).is_some() {
+                    let want = sc.ty(name);
+                    let actual = match op {
+                        None => self.num_mismatch(sc, want, value),
+                        Some(binop) if is_num_type(want) && arith_op(*binop) => self
+                            .certain_num(sc, value)
+                            .map(|u| promote_num(want, u))
+                            .filter(|r| *r != want),
+                        Some(_) => None,
+                    };
+                    if let Some(actual) = actual {
+                        return Err(format!(
+                            "assignment type mismatch: actual type is '{}', but '{}' was expected.",
+                            num_label(actual),
+                            num_label(want)
+                        ));
+                    }
                 }
                 // A bare `name = …` that is not a local but is a property of the
                 // enclosing class is an implicit-`this` field write.
@@ -6693,9 +6794,9 @@ impl Compiler {
                 // Against a collection the test is `equals` on each element, and
                 // a `Long` element is a box, so a `Long` value is boxed to match;
                 // a range compares the number and takes it unboxed.
-                let elements = self
-                    .infer_class(sc, container)
-                    .is_some_and(|c| is_element_collection(&c) || is_map_class(&c));
+                let elements = self.infer_class(sc, container).is_some_and(|c| {
+                    is_element_collection(&c) || is_map_class(&c) || is_array_class(&c)
+                });
                 if elements {
                     // `3 in xs` on a `Set<Long>` asks for the `Long` `3`; on a
                     // `Map<Long, _>` for that key.
@@ -7264,6 +7365,30 @@ impl Compiler {
         safe: bool,
         line: u32,
     ) -> Result<Type, String> {
+        // A range is an `Iterable`, not a `List`: the members only `List`
+        // declares do not exist on it.
+        if list_only_member(name) {
+            if let Some(class) = self.infer_class(sc, recv).filter(|c| c.ends_with("Range")) {
+                let elem = match self.infer_elem(sc, recv) {
+                    Type::Char => "Char",
+                    Type::Long => "Long",
+                    _ => "Int",
+                };
+                let kind = match recv {
+                    Expr::Step { .. } => "Progression",
+                    _ => "Range",
+                };
+                if matches!(class.as_str(), "IntRange" | "LongRange")
+                    && !self
+                        .extensions
+                        .contains_key(&(class.clone(), name.to_string()))
+                {
+                    return Err(format!(
+                        "unresolved reference '{name}' on receiver of type '{elem}{kind}'."
+                    ));
+                }
+            }
+        }
         // A member overload set: the declaration the arguments select.
         if self.member_overloads.contains(name) && !std::mem::take(&mut self.skip_overload) {
             let known = self
@@ -9598,7 +9723,10 @@ impl Compiler {
             nlr_target: self.nlr_target.clone(),
             catch_tag: catch_tag.map(str::to_string),
         });
-        self.b.emit(Op::LoadInt(name_idx as i64), 0);
+        // The body's first line rides on the name operand: the host reads it
+        // as the line of a body frame whose ops carry none (`LAMBDA_LINES`).
+        let body_line = body.first().map_or(0, |s| s.line);
+        self.b.emit(Op::LoadInt(name_idx as i64), body_line);
         self.b.emit(Op::LoadInt(effective.len() as i64), 0);
         self.b.emit(Op::LoadInt(caps.len() as i64), 0);
         self.b.emit(Op::CallBuiltin(KT_MAKE_CLOSURE, 0), 0);
@@ -13028,6 +13156,22 @@ impl Compiler {
             args,
         )?;
         self.mark_inlined_lambdas(&sig, &full);
+        // A numeric parameter takes only its own type. Checked for a
+        // function with one declaration, where nothing else could be meant.
+        if !self.overloads.contains_key(unmangled(name)) {
+            for (p, a) in sig.params.iter().zip(&full) {
+                if p.vararg.is_some() {
+                    continue;
+                }
+                if let Some(actual) = self.num_mismatch(sc, p.ty, a) {
+                    return Err(format!(
+                        "argument type mismatch: actual type is '{}', but '{}' was expected.",
+                        num_label(actual),
+                        num_label(p.ty)
+                    ));
+                }
+            }
+        }
         self.compile_call_args(sc, &sig.params, &full)?;
         // A local `fun` shadows a top-level one of the same name and
         // lives under its mangled sub. Its captures follow the real
@@ -13483,6 +13627,76 @@ impl Compiler {
             .remove(0)
     }
 
+    /// The numeric type `e` certainly has, where the frontend can tell for
+    /// sure: a literal, a numeric local, an arithmetic of such operands (at
+    /// their promoted width), or a numeric conversion. `None` everywhere else,
+    /// which is what keeps the declaration checks from guessing.
+    fn certain_num(&self, sc: &Scope, e: &Expr) -> Option<Type> {
+        let t = match e {
+            Expr::Int(n) => {
+                if i32::try_from(*n).is_ok() {
+                    Type::Int
+                } else {
+                    Type::Long
+                }
+            }
+            Expr::Long(_) => Type::Long,
+            Expr::Float(_) => Type::Double,
+            Expr::Float32(_) => Type::Float,
+            Expr::Var(n) if sc.slot(n).is_some() => sc.ty(n),
+            Expr::Unary {
+                op: UnOp::Neg,
+                expr,
+            } => self.certain_num(sc, expr)?.promoted(),
+            Expr::Binary { op, l, r } if arith_op(*op) => {
+                promote_num(self.certain_num(sc, l)?, self.certain_num(sc, r)?)
+            }
+            Expr::MethodCall {
+                recv,
+                name,
+                args,
+                safe: false,
+                ..
+            } if args.is_empty() && self.certain_num(sc, recv).is_some() => match name.as_str() {
+                "toByte" => Type::Byte,
+                "toShort" => Type::Short,
+                "toInt" => Type::Int,
+                "toLong" => Type::Long,
+                "toFloat" => Type::Float,
+                "toDouble" => Type::Double,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        is_num_type(t).then_some(t)
+    }
+
+    /// The type `e` has when it cannot initialize (or be assigned to) a
+    /// numeric binding of type `want`, else `None`. An integer literal adopts
+    /// any integral `want` it fits; a floating literal only its own width.
+    fn num_mismatch(&self, sc: &Scope, want: Type, e: &Expr) -> Option<Type> {
+        if !is_num_type(want) {
+            return None;
+        }
+        if let Some(n) = int_literal_of(e) {
+            let fits = match want {
+                Type::Byte => i8::try_from(n).is_ok(),
+                Type::Short => i16::try_from(n).is_ok(),
+                Type::Int => i32::try_from(n).is_ok(),
+                Type::Long => true,
+                _ => false,
+            };
+            let own = if i32::try_from(n).is_ok() {
+                Type::Int
+            } else {
+                Type::Long
+            };
+            return (!fits).then_some(own);
+        }
+        let actual = self.certain_num(sc, e)?;
+        (actual != want).then_some(actual)
+    }
+
     fn compile_erased(&mut self, sc: &mut Scope, e: &Expr) -> Result<Type, String> {
         let t = self.compile_expr(sc, e)?;
         // A member the lowering answers untyped (a range's `first()`, a
@@ -13918,6 +14132,22 @@ impl Compiler {
                 },
             ),
         ])
+    }
+
+    /// A parameterless lambda literal that initializes a property with no
+    /// written type is a `() -> R`: with no expected function type there is no
+    /// `it` (see [`Compiler::zero_arity_body`]).
+    fn mark_value_lambda(&mut self, p: &BodyProp) {
+        if let Expr::Lambda { params, body, .. } = &p.init {
+            if params.is_empty()
+                && !p.lazy
+                && !p.delegate
+                && p.ty == Type::Unknown
+                && p.class.is_none()
+            {
+                self.zero_arity_body = Some(body.as_ptr());
+            }
+        }
     }
 
     /// Mark `args`' trailing lambda literal, when it has no parameters, as one
@@ -15354,17 +15584,17 @@ impl Compiler {
                     t @ (Type::Int | Type::Long | Type::Double | Type::Float | Type::Char) => t,
                     _ => Type::Unknown,
                 },
-                "intArrayOf" => Type::Int,
-                "shortArrayOf" => Type::Short,
-                "byteArrayOf" => Type::Byte,
-                "longArrayOf" => Type::Long,
+                "intArrayOf" | "IntArray" => Type::Int,
+                "shortArrayOf" | "ShortArray" => Type::Short,
+                "byteArrayOf" | "ByteArray" => Type::Byte,
+                "longArrayOf" | "LongArray" => Type::Long,
                 // `LongRange(a, b)` / `IntRange(a, b)` — the constructor spellings.
                 "LongRange" if args.len() == 2 => Type::Long,
                 "IntRange" if args.len() == 2 => Type::Int,
-                "doubleArrayOf" => Type::Double,
-                "floatArrayOf" => Type::Float,
-                "charArrayOf" => Type::Char,
-                "booleanArrayOf" => Type::Boolean,
+                "doubleArrayOf" | "DoubleArray" => Type::Double,
+                "floatArrayOf" | "FloatArray" => Type::Float,
+                "charArrayOf" | "CharArray" => Type::Char,
+                "booleanArrayOf" | "BooleanArray" => Type::Boolean,
                 // `List(n) { i -> … }` and its siblings hold what the lambda answers.
                 "List" | "MutableList" | "Array" if args.len() == 2 => {
                     self.infer_lambda_result(sc, &args[1], &[(Type::Int, Type::Unknown)])
@@ -15383,9 +15613,8 @@ impl Compiler {
                 | "takeLastWhile" | "dropLastWhile" | "dropLast" | "dropWhile" | "distinct"
                 | "toList" | "toMutableList" | "toSet" | "toMutableSet" | "shuffled" | "slice"
                 | "subList" | "plus" | "minus" | "union" | "intersect" | "subtract"
-                | "asSequence" | "asIterable" | "constrainOnce" | "onEach" => {
-                    self.infer_elem(sc, recv)
-                }
+                | "asSequence" | "asIterable" | "constrainOnce" | "onEach" | "asList"
+                | "toTypedArray" | "copyOf" | "sliceArray" => self.infer_elem(sc, recv),
                 // A transform's elements are what its lambda answers.
                 "map" | "mapNotNull" | "mapIndexed" if args.len() == 1 => {
                     let elem = self.infer_elem(sc, recv);
@@ -17328,6 +17557,70 @@ fn tail_whens(body: &[Stmt], out: &mut Vec<usize>) {
         for c in &t.catches {
             tail_whens(&c.body, out);
         }
+    }
+}
+
+/// The stdlib members declared on `List` (or arrays) and not on `Iterable`, so
+/// a range — an `Iterable` — has none of them. Measured on kotlinc 2.4.21.
+fn list_only_member(name: &str) -> bool {
+    matches!(
+        name,
+        "reduceRight"
+            | "reduceRightIndexed"
+            | "reduceRightOrNull"
+            | "reduceRightIndexedOrNull"
+            | "foldRight"
+            | "foldRightIndexed"
+            | "asReversed"
+            | "slice"
+            | "binarySearch"
+            | "dropLast"
+            | "takeLast"
+            | "dropLastWhile"
+            | "takeLastWhile"
+            | "getOrElse"
+            | "getOrNull"
+            | "subList"
+            | "lastIndex"
+            | "indices"
+    )
+}
+
+/// The six numeric types — what a numeric declaration check applies to.
+fn is_num_type(t: Type) -> bool {
+    matches!(
+        t,
+        Type::Byte | Type::Short | Type::Int | Type::Long | Type::Float | Type::Double
+    )
+}
+
+/// The arithmetic operators, whose result is the operands' promoted type.
+fn arith_op(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+    )
+}
+
+/// The type an arithmetic operator on two numeric operands answers: the wider,
+/// with `Byte`/`Short` promoted to `Int` first.
+fn promote_num(a: Type, b: Type) -> Type {
+    let (a, b) = (a.promoted(), b.promoted());
+    [Type::Double, Type::Float, Type::Long]
+        .into_iter()
+        .find(|t| a == *t || b == *t)
+        .unwrap_or(Type::Int)
+}
+
+/// A numeric type's Kotlin name, for a diagnostic.
+fn num_label(t: Type) -> &'static str {
+    match t {
+        Type::Byte => "Byte",
+        Type::Short => "Short",
+        Type::Int => "Int",
+        Type::Long => "Long",
+        Type::Float => "Float",
+        _ => "Double",
     }
 }
 

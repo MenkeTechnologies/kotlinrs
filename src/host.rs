@@ -3161,6 +3161,9 @@ thread_local! {
     /// The read-only class behind [`LAST_OP`]'s receiver when it is a `List`
     /// (see [`ro_list`]); `None` for an `ArrayList`, and for any other kind.
     static LAST_RO: Cell<Option<RoList>> = const { Cell::new(None) };
+    /// The JVM class of the `Set`/`Map` an iterator receiver of [`LAST_OP`]
+    /// walks (see [`coll_jvm_class`]); empty for any other receiver.
+    static LAST_ITER_SRC: RefCell<String> = const { RefCell::new(String::new()) };
     /// Runtime-raised throwable → the JDK/stdlib frames in front of its user
     /// frames.
     static STACK_PREFIX: RefCell<std::collections::HashMap<u32, Vec<JdkFrame>>> =
@@ -3226,6 +3229,27 @@ fn note_op(name: &str, recv: &Value, arity: usize) {
         } else {
             None
         })
+    });
+    let iter_coll = with_obj(recv, |o| match o {
+        HeapObj::Iter { src, .. } => Some(src.clone()),
+        _ => None,
+    })
+    .flatten()
+    .and_then(|src| {
+        let shape = with_obj(&src, |o| match o {
+            HeapObj::Set(items) => Some((items.len(), true)),
+            HeapObj::Map(entries) => Some((entries.len(), false)),
+            _ => None,
+        })
+        .flatten()?;
+        Some(coll_jvm_class(&src, shape.0, shape.1).0)
+    });
+    LAST_ITER_SRC.with(|c| {
+        let mut c = c.borrow_mut();
+        c.clear();
+        if let Some(class) = iter_coll {
+            c.push_str(&class);
+        }
     });
 }
 
@@ -3878,6 +3902,99 @@ fn stdlib_prefix(
                 _ => Vec::new(),
             }
         }
+        // `next()` past the end of a `Set`'s or `Map`'s iterator: the JDK
+        // iterator class of the collection behind it.
+        ("java.util.NoSuchElementException", "next", _) if msg.is_empty() => {
+            let class = LAST_ITER_SRC.with(|c| c.borrow().clone());
+            let linked = jb(
+                "java.util.LinkedHashMap$LinkedHashIterator",
+                "nextNode",
+                "LinkedHashMap.java",
+                1025,
+            );
+            let hashed = jb(
+                "java.util.HashMap$HashIterator",
+                "nextNode",
+                "HashMap.java",
+                1607,
+            );
+            let empty = [
+                kt(
+                    "kotlin.collections.EmptyIterator",
+                    "next",
+                    "Collections.kt",
+                    21,
+                ),
+                kt(
+                    "kotlin.collections.EmptyIterator",
+                    "next",
+                    "Collections.kt",
+                    16,
+                ),
+            ];
+            match class.as_str() {
+                "java.util.LinkedHashMap" => vec![
+                    linked,
+                    jb(
+                        "java.util.LinkedHashMap$LinkedEntryIterator",
+                        "next",
+                        "LinkedHashMap.java",
+                        1058,
+                    ),
+                    jb(
+                        "java.util.LinkedHashMap$LinkedEntryIterator",
+                        "next",
+                        "LinkedHashMap.java",
+                        1055,
+                    ),
+                ],
+                "java.util.LinkedHashSet" => vec![
+                    linked,
+                    jb(
+                        "java.util.LinkedHashMap$LinkedKeyIterator",
+                        "next",
+                        "LinkedHashMap.java",
+                        1046,
+                    ),
+                ],
+                "java.util.HashMap" => vec![
+                    hashed,
+                    jb(
+                        "java.util.HashMap$EntryIterator",
+                        "next",
+                        "HashMap.java",
+                        1638,
+                    ),
+                    jb(
+                        "java.util.HashMap$EntryIterator",
+                        "next",
+                        "HashMap.java",
+                        1636,
+                    ),
+                ],
+                "java.util.HashSet" => {
+                    vec![
+                        hashed,
+                        jb(
+                            "java.util.HashMap$KeyIterator",
+                            "next",
+                            "HashMap.java",
+                            1628,
+                        ),
+                    ]
+                }
+                "kotlin.collections.EmptySet" | "kotlin.collections.EmptyMap" => empty.to_vec(),
+                "java.util.Collections$SingletonSet" | "java.util.Collections$SingletonMap" => {
+                    vec![jb(
+                        "java.util.Collections$1",
+                        "next",
+                        "Collections.java",
+                        5038,
+                    )]
+                }
+                _ => Vec::new(),
+            }
+        }
         // `ArrayList`'s own range checks, on a list every write works on.
         ("java.lang.IndexOutOfBoundsException", "add", K::List)
             if arity == 2 && msg.starts_with("Index: ") =>
@@ -4076,7 +4193,7 @@ fn stack_trace_array(exc: &Value) -> Option<Value> {
             element("", class, method, file.clone(), line.map_or(-1, i64::from))
         }))
         .collect();
-    Some(alloc(HeapObj::Array {
+    Some(alloc_array(HeapObj::Array {
         items,
         desc: "[Ljava.lang.StackTraceElement;".to_string(),
     }))
@@ -5584,9 +5701,34 @@ fn array_zero(desc: &str) -> Value {
         "[D" | "[F" => Value::Float(0.0),
         "[Z" => Value::Bool(false),
         "[C" => char_of(0),
-        "[I" | "[J" | "[S" | "[B" => Value::Int(0),
+        "[I" | "[J" => Value::Int(0),
+        "[S" | "[B" => narrow_elem(desc, Value::Int(0)),
         _ => Value::Undef,
     }
+}
+
+/// `v` as an element of an array with descriptor `desc`: a `ByteArray` or
+/// `ShortArray` holds its elements BOXED (see [`KT_BOX_NARROW`]), so an
+/// element that leaves the array — `toList()`, `first()`, a `for` — is still
+/// a `Byte`/`Short`. Every other array holds `v` as it is.
+fn narrow_elem(desc: &str, v: Value) -> Value {
+    match (desc, &v) {
+        ("[B", Value::Int(n)) => box_narrow(8, *n),
+        ("[S", Value::Int(n)) => box_narrow(16, *n),
+        _ => v,
+    }
+}
+
+/// Allocate `o`, boxing a `ByteArray`'s or `ShortArray`'s elements (see
+/// [`narrow_elem`]).
+fn alloc_array(o: HeapObj) -> Value {
+    alloc(match o {
+        HeapObj::Array { items, desc } if desc == "[B" || desc == "[S" => HeapObj::Array {
+            items: items.into_iter().map(|v| narrow_elem(&desc, v)).collect(),
+            desc,
+        },
+        other => other,
+    })
 }
 
 /// The element-type word `System.arraycopy` names an array by in its faults:
@@ -5701,7 +5843,7 @@ fn b_array_init(vm: &mut VM, _argc: u8) -> Value {
     } else {
         desc
     };
-    alloc(HeapObj::Array { items, desc })
+    alloc_array(HeapObj::Array { items, desc })
 }
 
 /// A copy of `v`'s range, when it is one — read out so its elements can be
@@ -7139,7 +7281,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             } else {
                 desc
             };
-            vm.push(alloc(HeapObj::Array { items, desc }));
+            vm.push(alloc_array(HeapObj::Array { items, desc }));
         }
         KT_ARRAY_NEW => {
             let desc = vm.pop().to_str();
@@ -7153,7 +7295,7 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
                 // initialization. `[C`'s slot is a CHAR, not the integer 0, so
                 // `CharArray(2)[0].code` resolves.
                 let zero = array_zero(&desc);
-                vm.push(alloc(HeapObj::Array {
+                vm.push(alloc_array(HeapObj::Array {
                     items: vec![zero; n as usize],
                     desc,
                 }));
@@ -7818,18 +7960,23 @@ fn b_make_closure(vm: &mut VM, _argc: u8) -> Value {
     let ncap = vm.pop().to_int() as usize;
     let params = vm.pop().to_int() as u8;
     let name_idx = vm.pop().to_int() as u16;
-    // The literal's line, which a stack trace names for a frame of its body
-    // whose ops carry none: that of the call or statement the literal is
-    // part of, the first op after it that has a line.
-    if let Some(line) = vm
-        .chunk
-        .lines
-        .iter()
-        .skip(vm.ip)
-        .take(64)
-        .copied()
-        .find(|l| *l != 0)
-    {
+    // The line a stack trace names for a frame of the body whose ops carry
+    // none: the body's first line, which the compiler puts on the name
+    // operand four ops back; failing that, the first line after the literal.
+    let own = vm
+        .ip
+        .checked_sub(4)
+        .and_then(|i| vm.chunk.lines.get(i).copied())
+        .filter(|l| *l != 0);
+    if let Some(line) = own.or_else(|| {
+        vm.chunk
+            .lines
+            .iter()
+            .skip(vm.ip)
+            .take(64)
+            .copied()
+            .find(|l| *l != 0)
+    }) {
         LAMBDA_LINES.with(|t| t.borrow_mut().insert(name_idx, line));
     }
     let mut captures = Vec::with_capacity(ncap);
@@ -14567,7 +14714,7 @@ fn kt_method_inner(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Res
         // each byte a signed `Byte`.
         (Value::Str(s), "toByteArray" | "encodeToByteArray") if args.is_empty() => {
             let items = s.bytes().map(|b| Value::Int(b as i8 as i64)).collect();
-            Ok(alloc(HeapObj::Array {
+            Ok(alloc_array(HeapObj::Array {
                 items,
                 desc: "[B".to_string(),
             }))
@@ -14596,7 +14743,7 @@ fn kt_method_inner(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Res
                 .iter()
                 .map(|u| char_of(*u as i64))
                 .collect();
-            Ok(alloc(HeapObj::Array {
+            Ok(alloc_array(HeapObj::Array {
                 items,
                 desc: "[C".to_string(),
             }))
@@ -15762,7 +15909,7 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                     return Ok(if name == "suppressedExceptions" {
                         alloc(HeapObj::List(items))
                     } else {
-                        alloc(HeapObj::Array {
+                        alloc_array(HeapObj::Array {
                             items,
                             desc: "[Ljava.lang.Throwable;".to_string(),
                         })
@@ -16205,7 +16352,7 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         "decodeToString" | "#stringOf" if args.is_empty() => {
             let bytes = with_obj(recv, |o| match o {
                 HeapObj::Array { items, desc } if desc == "[B" => {
-                    Some(items.iter().map(|b| b.to_int() as u8).collect::<Vec<u8>>())
+                    Some(items.iter().map(|b| num_i64(b) as u8).collect::<Vec<u8>>())
                 }
                 _ => None,
             })
@@ -16345,7 +16492,15 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             return Ok(args[0].clone());
         }
         "fill" if (1..=3).contains(&args.len()) => {
-            let v = args[0].clone();
+            let desc = with_obj(recv, |o| match o {
+                HeapObj::Array { desc, .. } => Some(desc.clone()),
+                _ => None,
+            })
+            .flatten();
+            let v = match desc {
+                Some(d) => narrow_elem(&d, args[0].clone()),
+                None => args[0].clone(),
+            };
             let from = args.get(1).map(Value::to_int);
             let to = args.get(2).map(Value::to_int);
             let out = with_obj_mut(recv, |o| match o {
@@ -17554,7 +17709,7 @@ fn sequence_member(
                     out
                 }
             };
-            return Some(Ok(alloc(HeapObj::Array { items: out, desc })));
+            return Some(Ok(alloc_array(HeapObj::Array { items: out, desc })));
         }
         "subList" => {
             let from = args.first().map(|v| v.to_int()).unwrap_or(0);
@@ -17800,7 +17955,7 @@ fn sequence_member(
                 "toShortArray" => "[S",
                 _ => "[B",
             };
-            return Some(Ok(alloc(HeapObj::Array {
+            return Some(Ok(alloc_array(HeapObj::Array {
                 items: items.to_vec(),
                 desc: desc.to_string(),
             })));
@@ -17808,7 +17963,7 @@ fn sequence_member(
         // `toTypedArray` answers a reference ARRAY (`Array<T>`), not a list: it
         // is `is Array<*>`, prints as `[L…;@hash` and has no `List` members.
         "toTypedArray" if args.is_empty() => {
-            return Some(Ok(alloc(HeapObj::Array {
+            return Some(Ok(alloc_array(HeapObj::Array {
                 items: items.to_vec(),
                 desc: array_desc(items),
             })))
@@ -18062,7 +18217,7 @@ fn sequence_member(
                 sort_vm(vm, &mut out, name == "sortedArrayDescending");
             }
             let desc = own_array_desc(recv, &out);
-            return Some(Ok(alloc(HeapObj::Array { items: out, desc })));
+            return Some(Ok(alloc_array(HeapObj::Array { items: out, desc })));
         }
         // `copyOf()` / `copyOf(newSize)` / `copyOfRange(from, to)` — a fresh
         // array of the receiver's own kind. `copyOf(n)` truncates or pads with
@@ -18077,7 +18232,7 @@ fn sequence_member(
             }
             let mut out: Vec<Value> = items.iter().take(n as usize).cloned().collect();
             out.resize(n as usize, array_zero(&desc));
-            return Some(Ok(alloc(HeapObj::Array { items: out, desc })));
+            return Some(Ok(alloc_array(HeapObj::Array { items: out, desc })));
         }
         "copyOfRange" if kind == SeqKind::Array && args.len() == 2 => {
             let desc = own_array_desc(recv, items);
@@ -18086,7 +18241,7 @@ fn sequence_member(
                 return Some(Err(e));
             }
             let out = items[from as usize..to as usize].to_vec();
-            return Some(Ok(alloc(HeapObj::Array { items: out, desc })));
+            return Some(Ok(alloc_array(HeapObj::Array { items: out, desc })));
         }
         "sorted" | "sortedDescending" => {
             let mut out = items.to_vec();
@@ -18704,6 +18859,17 @@ fn index_set(vm: &mut VM, recv: &Value, index: &Value, value: Value) -> Result<(
 }
 
 fn index_set_inner(vm: &mut VM, recv: &Value, index: &Value, value: Value) -> Result<(), String> {
+    // A `ByteArray`/`ShortArray` element is stored boxed (see [`narrow_elem`]),
+    // and the box is allocated before the heap is borrowed for the store.
+    let desc = with_obj(recv, |o| match o {
+        HeapObj::Array { desc, .. } => Some(desc.clone()),
+        _ => None,
+    })
+    .flatten();
+    let value = match desc {
+        Some(d) => narrow_elem(&d, value),
+        None => value,
+    };
     let pair = [index.clone(), value.clone()];
     if let Some(r) = sublist_write(vm, recv, "set", &pair, &mut |vm| {
         index_set(vm, recv, &pair[0], pair[1].clone()).map(|()| Value::Undef)

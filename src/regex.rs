@@ -49,8 +49,9 @@ impl Match {
     }
 }
 
-/// The JVM's exception class for a pattern the engine refuses. The description
-/// after it is the Rust engine's, not `Pattern`'s (see BUGS.md).
+/// The JVM's exception class for a refused pattern. The description after it
+/// is `Pattern`'s for the errors [`java_syntax_error`] recognises, the Rust
+/// engine's otherwise (see BUGS.md).
 fn syntax_error(e: impl std::fmt::Display) -> String {
     format!("java.util.regex.PatternSyntaxException: {e}")
 }
@@ -69,6 +70,9 @@ fn run_error(e: impl std::fmt::Display) -> String {
 
 impl KRegex {
     pub fn new(written: &str) -> Result<KRegex, String> {
+        if let Some((desc, index)) = java_syntax_error(written) {
+            return Err(syntax_error(pattern_message(written, &desc, index)));
+        }
         let pattern = &expand_quotes(written);
         let find = Engine::new(pattern).map_err(syntax_error)?;
         let entire = Engine::new(&format!(r"\A(?:{pattern})\z")).map_err(syntax_error)?;
@@ -241,6 +245,277 @@ fn to_match(c: &fancy_regex::Captures<'_>, n: usize) -> Match {
 /// `Regex.escape` answers — into the escaped literal the engine understands.
 /// An unterminated `\Q` quotes to the end of the pattern, as in Java; an escaped
 /// backslash (`\\`) is passed through whole so `\\Q` is not read as a quote.
+/// `PatternSyntaxException.getMessage()`: the description, the index, the
+/// pattern, and a caret under the index when it falls inside the pattern.
+fn pattern_message(pattern: &str, desc: &str, index: usize) -> String {
+    let mut m = format!("{desc} near index {index}\n{pattern}");
+    if index < pattern.chars().count() {
+        m.push('\n');
+        m.push_str(&" ".repeat(index));
+        m.push('^');
+    }
+    m
+}
+
+/// A scan's stop: `Some((description, index))` for an error `Pattern` reports
+/// in exactly that wording, `None` for a shape this checker does not decide —
+/// which it then leaves to the engine.
+type Stop = Option<(String, usize)>;
+
+fn stop<T>(desc: impl Into<String>, index: usize) -> Result<T, Stop> {
+    Err(Some((desc.into(), index)))
+}
+
+/// Whether the previous item can take a quantifier: an atom can, the start of
+/// a sequence (or a quantifier) cannot, and an anchor or an inline flag group
+/// is a case this checker does not decide.
+#[derive(Clone, Copy, PartialEq)]
+enum Prev {
+    Atom,
+    Start,
+    Unsure,
+}
+
+/// The first syntax error `java.util.regex.Pattern` reports for `p`, as its
+/// `(description, index)`, for the constructs whose wording and index were
+/// measured against JDK 21 — unclosed and unmatched groups, unclosed classes
+/// and reversed ranges, dangling quantifiers, malformed and reversed counted
+/// repetitions, a trailing backslash, inline modifiers, and named groups and
+/// back-references.
+fn java_syntax_error(p: &str) -> Stop {
+    let c: Vec<char> = p.chars().collect();
+    scan(&c).err().flatten()
+}
+
+fn scan(c: &[char]) -> Result<(), Stop> {
+    let n = c.len();
+    let at = |i: usize| c.get(i).copied().ok_or(None);
+    let mut names: Vec<String> = Vec::new();
+    let mut open = 0usize;
+    let mut prev = Prev::Start;
+    let mut i = 0;
+    while i < n {
+        match c[i] {
+            '\\' => {
+                let Ok(e) = at(i + 1) else {
+                    return stop("Unescaped trailing backslash", n);
+                };
+                if e == 'Q' {
+                    let mut j = i + 2;
+                    while j < n && !(c[j] == '\\' && c.get(j + 1) == Some(&'E')) {
+                        j += 1;
+                    }
+                    i = (j + 2).min(n);
+                } else if e == 'k' && c.get(i + 2) == Some(&'<') {
+                    let close = (i + 3..n).find(|&j| c[j] == '>').ok_or(None)?;
+                    let name: String = c[i + 3..close].iter().collect();
+                    if !names.contains(&name) {
+                        return stop(
+                            format!("named capturing group <{name}> does not exist"),
+                            close,
+                        );
+                    }
+                    i = close + 1;
+                } else if matches!(e, 'p' | 'P' | 'x' | 'N') && c.get(i + 2) == Some(&'{') {
+                    i = (i + 3..n).find(|&j| c[j] == '}').ok_or(None)? + 1;
+                } else {
+                    i += 2;
+                }
+                prev = Prev::Atom;
+            }
+            '[' => {
+                i = class_end(c, i)?;
+                prev = Prev::Atom;
+            }
+            '(' => {
+                if c.get(i + 1) == Some(&'?') {
+                    match at(i + 2)? {
+                        ':' | '=' | '!' | '>' => i += 3,
+                        '<' if matches!(c.get(i + 3), Some('=' | '!')) => i += 4,
+                        '<' => {
+                            let first = i + 3;
+                            if !at(first)?.is_ascii_alphabetic() {
+                                return stop(
+                                    "capturing group name does not start with a Latin letter",
+                                    first,
+                                );
+                            }
+                            let mut j = first;
+                            while at(j)?.is_ascii_alphanumeric() {
+                                j += 1;
+                            }
+                            if c[j] != '>' {
+                                return Err(None);
+                            }
+                            let name: String = c[first..j].iter().collect();
+                            if names.contains(&name) {
+                                return stop(
+                                    format!("Named capturing group <{name}> is already defined"),
+                                    j,
+                                );
+                            }
+                            names.push(name);
+                            i = j + 1;
+                        }
+                        _ => {
+                            // Inline flags: `(?imsx-u)` or `(?i:…)`.
+                            let mut j = i + 2;
+                            while c.get(j).is_some_and(|f| "idmsuxUc-".contains(*f)) {
+                                j += 1;
+                            }
+                            match at(j)? {
+                                ')' => {
+                                    i = j + 1;
+                                    prev = Prev::Unsure;
+                                    continue;
+                                }
+                                ':' => i = j + 1,
+                                _ => return stop("Unknown inline modifier", j),
+                            }
+                        }
+                    }
+                } else {
+                    i += 1;
+                }
+                open += 1;
+                prev = Prev::Start;
+            }
+            ')' => {
+                if open == 0 {
+                    if i == 0 {
+                        return Err(None);
+                    }
+                    return stop("Unmatched closing ')'", i - 1);
+                }
+                open -= 1;
+                i += 1;
+                prev = Prev::Atom;
+            }
+            '|' => {
+                i += 1;
+                prev = Prev::Start;
+            }
+            q @ ('*' | '+' | '?') => {
+                match prev {
+                    Prev::Start => return stop(format!("Dangling meta character '{q}'"), i),
+                    Prev::Unsure => return Err(None),
+                    Prev::Atom => {}
+                }
+                i += 1;
+                if matches!(c.get(i), Some('?' | '+')) {
+                    i += 1;
+                }
+                prev = Prev::Start;
+            }
+            '{' => {
+                if prev != Prev::Atom {
+                    return Err(None);
+                }
+                if !c.get(i + 1).is_some_and(char::is_ascii_digit) {
+                    return stop("Illegal repetition", i + 1);
+                }
+                let mut j = i + 1;
+                let min = bound(c, &mut j)?;
+                let mut max = min;
+                if c.get(j) == Some(&',') {
+                    j += 1;
+                    max = if at(j)?.is_ascii_digit() {
+                        bound(c, &mut j)?
+                    } else {
+                        i32::MAX
+                    };
+                }
+                if at(j)? != '}' {
+                    return Err(None);
+                }
+                if max < min {
+                    return stop("Illegal repetition range", j);
+                }
+                i = j + 1;
+                if matches!(c.get(i), Some('?' | '+')) {
+                    i += 1;
+                }
+                prev = Prev::Start;
+            }
+            '^' | '$' => {
+                i += 1;
+                prev = Prev::Unsure;
+            }
+            _ => {
+                i += 1;
+                prev = Prev::Atom;
+            }
+        }
+    }
+    if open > 0 {
+        return stop("Unclosed group", n);
+    }
+    Ok(())
+}
+
+/// The decimal bound of a counted repetition starting at `c[*j]`, advancing
+/// `*j` past it. One that overflows an `int` is `Illegal repetition range`
+/// at the digit that overflows it.
+fn bound(c: &[char], j: &mut usize) -> Result<i32, Stop> {
+    let mut v: i32 = 0;
+    while let Some(d) = c.get(*j).and_then(|x| x.to_digit(10)) {
+        v = match v.checked_mul(10).and_then(|v| v.checked_add(d as i32)) {
+            Some(v) => v,
+            None => return stop("Illegal repetition range", *j),
+        };
+        *j += 1;
+    }
+    Ok(v)
+}
+
+/// The index just past the character class opening at `c[start]`.
+fn class_end(c: &[char], start: usize) -> Result<usize, Stop> {
+    let n = c.len();
+    let mut j = start + 1;
+    if c.get(j) == Some(&'^') {
+        j += 1;
+    }
+    // A `]` first in the class is a literal.
+    if c.get(j) == Some(&']') {
+        j += 1;
+    }
+    let mut last: Option<char> = None;
+    while j < n {
+        match c[j] {
+            ']' => return Ok(j + 1),
+            '[' => {
+                j = class_end(c, j)?;
+                last = None;
+            }
+            '\\' => {
+                if matches!(c.get(j + 1), Some('p' | 'P' | 'x' | 'N')) && c.get(j + 2) == Some(&'{')
+                {
+                    j = (j + 3..n).find(|&k| c[k] == '}').ok_or(None)? + 1;
+                } else {
+                    j += 2;
+                }
+                last = None;
+            }
+            '-' if last.is_some() && !matches!(c.get(j + 1), Some(']' | '[' | '\\') | None) => {
+                if c[j + 1] < last.unwrap_or_default() {
+                    return stop("Illegal character range", j + 1);
+                }
+                j += 2;
+                last = None;
+            }
+            '&' if c.get(j + 1) == Some(&'&') => {
+                j += 2;
+                last = None;
+            }
+            ch => {
+                last = Some(ch);
+                j += 1;
+            }
+        }
+    }
+    stop("Unclosed character class", n - 1)
+}
+
 fn expand_quotes(pattern: &str) -> String {
     if !pattern.contains("\\Q") {
         return pattern.to_string();

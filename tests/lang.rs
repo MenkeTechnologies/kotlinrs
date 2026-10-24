@@ -10996,3 +10996,313 @@ fn conflicting_inherited_members_must_be_overridden() {
         "AB\n"
     );
 }
+
+/// A numeric declaration, assignment or argument takes only its own type —
+/// Kotlin converts no number implicitly — while an integer literal adopts any
+/// integral type it fits, branch by branch. Measured on kotlinc 2.4.21 / JRE 21.0.13.0.2.
+#[test]
+fn numeric_declarations_take_only_their_own_type() {
+    assert_eq!(
+        prog(
+            r##"fun f(b: Byte, l: Long, d: Double, i: Int = 3) = "$b $l $d $i"
+fun main() {
+    val c = true; val x = 5; var bb: Byte = 1; var ll = 2L; var dd = 1.5
+    val b: Byte = if (c) 1 else 2; println(b)
+    ll += 1; println(ll)
+    dd += 1; println(dd)
+    bb = 3; println(bb)
+    bb = (bb + 1).toByte(); println(bb)
+    val w: Byte = when (x) { 5 -> 1; else -> 2 }; println(w)
+    val big: Long = 2147483648; println(big)
+    val d: Double = x.toDouble(); println(d)
+    val n: Number = x; println(n)
+    println(f(1, 2, 2.5)); println(f(x.toByte(), 2L, x.toDouble(), x))
+}
+"##
+        ),
+        "1\n3\n2.5\n3\n4\n1\n2147483648\n5.0\n5\n1 2 2.5 3\n5 2 5.0 5\n"
+    );
+}
+
+/// The numeric mismatches `kotlinc` refuses, each with its diagnostic. Every
+/// program is a compile error on kotlinc 2.4.21 / JRE 21.0.13.0.2.
+#[test]
+fn numeric_type_mismatches_are_refused() {
+    let pre = "val c = true; val x = 5; var bb: Byte = 1; var ll = 2L; var ii = 3; ";
+    for (body, want) in [
+        (
+            "val b: Byte = x",
+            "initializer type mismatch: expected 'Byte', actual 'Int'.",
+        ),
+        (
+            "val b: Byte = 1 + 1",
+            "initializer type mismatch: expected 'Byte', actual 'Int'.",
+        ),
+        (
+            "val l: Long = x",
+            "initializer type mismatch: expected 'Long', actual 'Int'.",
+        ),
+        (
+            "val l: Long = x * 2",
+            "initializer type mismatch: expected 'Long', actual 'Int'.",
+        ),
+        (
+            "val s: Short = -x",
+            "initializer type mismatch: expected 'Short', actual 'Int'.",
+        ),
+        (
+            "val i: Int = 5L",
+            "initializer type mismatch: expected 'Int', actual 'Long'.",
+        ),
+        (
+            "val i: Int = 2147483648",
+            "initializer type mismatch: expected 'Int', actual 'Long'.",
+        ),
+        (
+            "val d: Double = 1",
+            "initializer type mismatch: expected 'Double', actual 'Int'.",
+        ),
+        (
+            "val f: Float = 1.0",
+            "initializer type mismatch: expected 'Float', actual 'Double'.",
+        ),
+        (
+            "val l: Long = bb",
+            "initializer type mismatch: expected 'Long', actual 'Byte'.",
+        ),
+        (
+            "bb += 1",
+            "assignment type mismatch: actual type is 'Int', but 'Byte' was expected.",
+        ),
+        (
+            "ii += 1L",
+            "assignment type mismatch: actual type is 'Long', but 'Int' was expected.",
+        ),
+        (
+            "ii = 5L",
+            "assignment type mismatch: actual type is 'Long', but 'Int' was expected.",
+        ),
+        (
+            "ll = x",
+            "assignment type mismatch: actual type is 'Int', but 'Long' was expected.",
+        ),
+    ] {
+        let err = prog_err(&format!("fun main() {{ {pre}{body}; println(c) }}"));
+        assert!(err.contains(want), "{body}: {err}");
+    }
+    for (src, want) in [
+        (
+            "fun f(b: Byte) = b\nfun main() { val x = 3; println(f(x)) }",
+            "argument type mismatch: actual type is 'Int', but 'Byte' was expected.",
+        ),
+        (
+            "fun f(l: Long) = l\nfun main() { val x = 3; println(f(x)) }",
+            "argument type mismatch: actual type is 'Int', but 'Long' was expected.",
+        ),
+        (
+            "fun f(d: Double) = d\nfun main() { println(f(1)) }",
+            "argument type mismatch: actual type is 'Int', but 'Double' was expected.",
+        ),
+    ] {
+        let err = prog_err(src);
+        assert!(err.contains(want), "{src}: {err}");
+    }
+}
+
+/// A range is an `Iterable`, not a `List`: the members only `List` declares
+/// are `unresolved reference` on it, named with the range's own class. Each
+/// refused program is a compile error on kotlinc 2.4.21 / JRE 21.0.13.0.2.
+#[test]
+fn list_only_members_are_not_on_ranges() {
+    for (expr, want) in [
+        (
+            "(1..4).reduceRightIndexed { i, a, b -> a + b }",
+            "'reduceRightIndexed' on receiver of type 'IntRange'",
+        ),
+        (
+            "(1..4).reduceRight { a, b -> a + b }",
+            "'reduceRight' on receiver of type 'IntRange'",
+        ),
+        (
+            "(1..4).foldRight(0) { a, b -> a + b }",
+            "'foldRight' on receiver of type 'IntRange'",
+        ),
+        (
+            "(1..4).takeLast(1)",
+            "'takeLast' on receiver of type 'IntRange'",
+        ),
+        (
+            "(1..4).getOrNull(1)",
+            "'getOrNull' on receiver of type 'IntRange'",
+        ),
+        (
+            "('a'..'d').takeLast(1)",
+            "'takeLast' on receiver of type 'CharRange'",
+        ),
+        (
+            "(1L..9L step 2).dropLast(1)",
+            "'dropLast' on receiver of type 'LongProgression'",
+        ),
+    ] {
+        let err = prog_err(&format!("fun main() {{ println({expr}) }}"));
+        assert!(
+            err.contains(&format!("unresolved reference {want}.")),
+            "{expr}: {err}"
+        );
+    }
+}
+/// The `Iterable` members a range does have, and the `List` members on a
+/// list built from one. Measured on kotlinc 2.4.21 / JRE 21.0.13.0.2.
+#[test]
+fn range_members_iterables_do_have() {
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    val r = 1..4
+    println(r.toList().takeLast(2)); println((1..4 step 2).toList().reduceRight { a, b -> a + b }); println(('a'..'d').last())
+    println(r.reversed()); println(r.lastIndexOf(3)); println(listOf(1, 2).foldRight(0) { a, b -> a + b })
+}
+"##
+        ),
+        "[3, 4]\n4\nd\n4 downTo 1 step 1\n2\n3\n"
+    );
+}
+/// A `ByteArray`/`ShortArray` element that leaves the array — `toList`,
+/// `asList`, `toSet`, `sorted`, `first` — is still a `Byte`/`Short`, so it
+/// equals no `Int`. Measured on kotlinc 2.4.21 / JRE 21.0.13.0.2.
+#[test]
+fn byte_and_short_arrays_hold_their_element_type() {
+    assert_eq!(
+        prog(
+            r##"fun main() {
+    val l: List<Any> = byteArrayOf(1, 2).toList()
+    println(l.contains(1)); println(l[0] is Byte); println(l.map { it is Byte })
+    val s: List<Any> = shortArrayOf(1).asList()
+    println(s[0] is Short)
+    val g: List<Any> = longArrayOf(1L).toList()
+    println(g.contains(1)); println(g[0] is Long)
+    val f: List<Any> = floatArrayOf(1.5f).toList()
+    println(f[0] is Float); println(f)
+    val bs: Set<Any> = byteArrayOf(1, 1, 2).toSet(); println(bs.contains(1)); println(bs.size)
+    val bl: Any = byteArrayOf(3).first(); println(bl is Byte)
+    val sm: List<Any> = byteArrayOf(3, 1).sorted(); println(sm[0] is Byte)
+    val mp: List<Any> = byteArrayOf(3).map { it }; println(mp[0] is Byte)
+}
+"##
+        ),
+        "false\ntrue\n[true, true]\ntrue\nfalse\ntrue\ntrue\n[1.5]\nfalse\n2\ntrue\ntrue\ntrue\n"
+    );
+}
+/// `next()` past the end of a `Set`'s or `Map`'s iterator has the frames of
+/// the JDK iterator behind the collection: `LinkedHashMap`'s, `HashMap`'s,
+/// `EmptyIterator`'s or `Collections$1`'s. Measured on kotlinc 2.4.21 / JRE 21.0.13.0.2.
+#[test]
+fn set_and_map_iterators_have_their_jdk_frames() {
+    assert_eq!(
+        prog(
+            r##"fun t(f: () -> Any?) = try { f(); "ok" } catch (e: Exception) { e.toString() + " @ " + e.stackTrace.dropLast(2).joinToString(" | ") }
+fun main() {
+    println(t { mutableMapOf<Int, Int>().iterator().next() })
+    println(t { mutableSetOf<Int>().iterator().next() })
+    println(t { mutableMapOf<Int, Int>().keys.iterator().next() })
+    println(t { mapOf<Int, Int>().iterator().next() })
+    println(t { setOf<Int>().iterator().next() })
+    println(t { setOf(1).iterator().let { it.next(); it.next() } })
+    println(t { setOf(1, 2).iterator().let { it.next(); it.next(); it.next() } })
+    println(t { mapOf(1 to 2).iterator().let { it.next(); it.next() } })
+    println(t { mapOf(1 to 2, 3 to 4).iterator().let { it.next(); it.next(); it.next() } })
+    println(t { hashMapOf<Int, Int>().iterator().next() })
+    println(t { hashSetOf<Int>().iterator().next() })
+}
+"##
+        ),
+        "java.util.NoSuchElementException @ java.base/java.util.LinkedHashMap$LinkedHashIterator.nextNode(LinkedHashMap.java:1025) | java.base/java.util.LinkedHashMap$LinkedEntryIterator.next(LinkedHashMap.java:1058) | java.base/java.util.LinkedHashMap$LinkedEntryIterator.next(LinkedHashMap.java:1055) | MainKt.main$lambda$0(main.kt:3) | MainKt.t(main.kt:1)\njava.util.NoSuchElementException @ java.base/java.util.LinkedHashMap$LinkedHashIterator.nextNode(LinkedHashMap.java:1025) | java.base/java.util.LinkedHashMap$LinkedKeyIterator.next(LinkedHashMap.java:1046) | MainKt.main$lambda$1(main.kt:4) | MainKt.t(main.kt:1)\njava.util.NoSuchElementException @ java.base/java.util.LinkedHashMap$LinkedHashIterator.nextNode(LinkedHashMap.java:1025) | java.base/java.util.LinkedHashMap$LinkedKeyIterator.next(LinkedHashMap.java:1046) | MainKt.main$lambda$2(main.kt:5) | MainKt.t(main.kt:1)\njava.util.NoSuchElementException @ kotlin.collections.EmptyIterator.next(Collections.kt:21) | kotlin.collections.EmptyIterator.next(Collections.kt:16) | MainKt.main$lambda$3(main.kt:6) | MainKt.t(main.kt:1)\njava.util.NoSuchElementException @ kotlin.collections.EmptyIterator.next(Collections.kt:21) | kotlin.collections.EmptyIterator.next(Collections.kt:16) | MainKt.main$lambda$4(main.kt:7) | MainKt.t(main.kt:1)\njava.util.NoSuchElementException @ java.base/java.util.Collections$1.next(Collections.java:5038) | MainKt.main$lambda$5(main.kt:8) | MainKt.t(main.kt:1)\njava.util.NoSuchElementException @ java.base/java.util.LinkedHashMap$LinkedHashIterator.nextNode(LinkedHashMap.java:1025) | java.base/java.util.LinkedHashMap$LinkedKeyIterator.next(LinkedHashMap.java:1046) | MainKt.main$lambda$6(main.kt:9) | MainKt.t(main.kt:1)\njava.util.NoSuchElementException @ java.base/java.util.Collections$1.next(Collections.java:5038) | MainKt.main$lambda$7(main.kt:10) | MainKt.t(main.kt:1)\njava.util.NoSuchElementException @ java.base/java.util.LinkedHashMap$LinkedHashIterator.nextNode(LinkedHashMap.java:1025) | java.base/java.util.LinkedHashMap$LinkedEntryIterator.next(LinkedHashMap.java:1058) | java.base/java.util.LinkedHashMap$LinkedEntryIterator.next(LinkedHashMap.java:1055) | MainKt.main$lambda$8(main.kt:11) | MainKt.t(main.kt:1)\njava.util.NoSuchElementException @ java.base/java.util.HashMap$HashIterator.nextNode(HashMap.java:1607) | java.base/java.util.HashMap$EntryIterator.next(HashMap.java:1638) | java.base/java.util.HashMap$EntryIterator.next(HashMap.java:1636) | MainKt.main$lambda$9(main.kt:12) | MainKt.t(main.kt:1)\njava.util.NoSuchElementException @ java.base/java.util.HashMap$HashIterator.nextNode(HashMap.java:1607) | java.base/java.util.HashMap$KeyIterator.next(HashMap.java:1628) | MainKt.main$lambda$10(main.kt:13) | MainKt.t(main.kt:1)\n"
+    );
+}
+/// A fault in a lambda body whose ops carry no line names the body's own line
+/// for the lambda's frame, not the next statement's. Measured on kotlinc 2.4.21 / JRE 21.0.13.0.2.
+#[test]
+fn a_lambda_frame_names_the_lambdas_line() {
+    assert_eq!(
+        prog(
+            r##"fun tr(e: Throwable) { println(e.stackTrace.joinToString(" | ")) }
+fun main() {
+    println("start")
+    val lz = { y: Int -> y / 0 }
+    try { lz(1) } catch (e: Exception) { tr(e) }
+    val h = { listOf(1)[3] }
+    try { h() } catch (e: Exception) { tr(e) }
+}
+"##
+        ),
+        "start\nMainKt.main$lambda$0(main.kt:4) | MainKt.main(main.kt:5) | MainKt.main(main.kt)\njava.base/java.util.Collections$SingletonList.get(Collections.java:5180) | MainKt.main$lambda$1(main.kt:6) | MainKt.main(main.kt:7) | MainKt.main(main.kt)\n"
+    );
+}
+/// A pattern `java.util.regex.Pattern` refuses raises `PatternSyntaxException`
+/// with `Pattern`'s description, index, pattern and caret, for unclosed and
+/// unmatched groups, classes and ranges, dangling quantifiers, counted
+/// repetitions, a trailing backslash, inline modifiers and named groups. Measured on kotlinc 2.4.21 / JRE 21.0.13.0.2.
+#[test]
+fn regex_syntax_errors_use_pattern_wording() {
+    assert_eq!(
+        prog(
+            r##"fun t(p: String) = try { Regex(p); "ok" } catch (e: IllegalArgumentException) { "[" + e.javaClass.simpleName + "] " + e.message!!.replace("\n", "\\n") }
+fun main() {
+    for (p in listOf("(", "a)", "[a", "*a", "a{2,1}", "\\", "a**", "(?<n>a)(?<n>b)", "x{", "[b-a]", "(?<1a>x)", "a{99999999999}", "\\k<zz>", "(?z)", "+", "?", "a|*", "((a)", "[]", "a{,3}"))
+        println(p + " => " + t(p))
+}
+"##
+        ),
+        "( => [PatternSyntaxException] Unclosed group near index 1\\n(\na) => [PatternSyntaxException] Unmatched closing ')' near index 0\\na)\\n^\n[a => [PatternSyntaxException] Unclosed character class near index 1\\n[a\\n ^\n*a => [PatternSyntaxException] Dangling meta character '*' near index 0\\n*a\\n^\na{2,1} => [PatternSyntaxException] Illegal repetition range near index 5\\na{2,1}\\n     ^\n\\ => [PatternSyntaxException] Unescaped trailing backslash near index 1\\n\\\na** => [PatternSyntaxException] Dangling meta character '*' near index 2\\na**\\n  ^\n(?<n>a)(?<n>b) => [PatternSyntaxException] Named capturing group <n> is already defined near index 11\\n(?<n>a)(?<n>b)\\n           ^\nx{ => [PatternSyntaxException] Illegal repetition near index 2\\nx{\n[b-a] => [PatternSyntaxException] Illegal character range near index 3\\n[b-a]\\n   ^\n(?<1a>x) => [PatternSyntaxException] capturing group name does not start with a Latin letter near index 3\\n(?<1a>x)\\n   ^\na{99999999999} => [PatternSyntaxException] Illegal repetition range near index 11\\na{99999999999}\\n           ^\n\\k<zz> => [PatternSyntaxException] named capturing group <zz> does not exist near index 5\\n\\k<zz>\\n     ^\n(?z) => [PatternSyntaxException] Unknown inline modifier near index 2\\n(?z)\\n  ^\n+ => [PatternSyntaxException] Dangling meta character '+' near index 0\\n+\\n^\n? => [PatternSyntaxException] Dangling meta character '?' near index 0\\n?\\n^\na|* => [PatternSyntaxException] Dangling meta character '*' near index 2\\na|*\\n  ^\n((a) => [PatternSyntaxException] Unclosed group near index 4\\n((a)\n[] => [PatternSyntaxException] Unclosed character class near index 1\\n[]\\n ^\na{,3} => [PatternSyntaxException] Illegal repetition near index 2\\na{,3}\\n  ^\n"
+    );
+}
+/// An initializer may read a property declared above it, a constructor
+/// parameter, a function, or — inside a lambda, which runs later — anything.
+/// Measured on kotlinc 2.4.21 / JRE 21.0.13.0.2.
+#[test]
+fn initializers_read_what_is_already_initialized() {
+    assert_eq!(
+        prog(
+            r##"object O { val a = { b + 1 }; val b = 2 }
+class K(val y: Int) { val x = y * 2; val z = f(); val w = 3; fun f() = w }
+class L { val p = 1; init { println("p=$p") }; val q = p + 1; init { val r = 5; println(q + r) } }
+fun main() { println(O.a()); println(K(1).x); println(K(1).z); L() }
+"##
+        ),
+        "3\n2\n0\np=1\n7\n"
+    );
+}
+
+/// An initializer (or `init` block) that reads a property declared below it
+/// is refused: `variable 'w' must be initialized.` Each program is a compile
+/// error on kotlinc 2.4.21 / JRE 21.0.13.0.2.
+#[test]
+fn reading_a_property_before_its_initializer_is_refused() {
+    for (src, name) in [
+        ("class K { init { println(y) }; val y = 3 }\nfun main() { K() }", "y"),
+        ("val a = b + 1\nval b = 2\nfun main() { println(a) }", "b"),
+        ("class K(val y: Int) { val x = y * 2; val z = w; val w = 1 }\nfun main() { println(K(1).x) }", "w"),
+        ("class K { val x = this.y * 2; val y = 3 }\nfun main() { println(K().x) }", "y"),
+        ("class K { var x = 1; val z = x + w; var w = 2 }\nfun main() { println(K().z) }", "w"),
+    ] {
+        let err = prog_err(src);
+        assert!(err.contains(&format!("variable '{name}' must be initialized.")), "{src}: {err}");
+    }
+}
+/// A parameterless lambda held in a property with no written type is a
+/// `() -> R` value, and `obj.prop()` invokes it. It printed the closure.
+/// Measured on kotlinc 2.4.21 / JRE 21.0.13.0.2.
+#[test]
+fn a_lambda_held_in_a_property_is_invoked() {
+    assert_eq!(
+        prog(
+            r##"val top = { 7 }
+val tg: (Int) -> Int = { it + 1 }
+class C { val z = { "z" }; val w: () -> String = { "w" } }
+object O { val a = { 5 }; val g: (Int) -> Int = { it * 2 }; val l by lazy { 9 } }
+fun main() { println(top()); println(tg(1)); println(C().z()); println(C().w()); println(O.a()); println(O.g(4)); println(O.l) }
+"##
+        ),
+        "7\n2\nz\nw\n5\n8\n9\n"
+    );
+}

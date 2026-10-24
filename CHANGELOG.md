@@ -11,6 +11,27 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Numeric type checks, range members, typed arrays, iterator frames, `Pattern` messages, initialization order
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.13.0.2.
+
+| program | before | reference |
+| --- | --- | --- |
+| `val x = 5; val b: Byte = x`; `val l: Long = x`; `val d: Double = 1`; `val i: Int = 5L` | runs | `initializer type mismatch: expected 'Byte', actual 'Int'.` (and so on) |
+| `var b: Byte = 1; b += 1`; `var i = 3; i = 5L` | runs | `assignment type mismatch: actual type is 'Int', but 'Byte' was expected.` |
+| `fun f(b: Byte) = b; f(x)` | runs | `argument type mismatch: actual type is 'Int', but 'Byte' was expected.` |
+| `(1..10).reduceRightIndexed { … }`, `(1..4).takeLast(1)`, `('a'..'d').takeLast(1)` | runs | `unresolved reference 'reduceRightIndexed' on receiver of type 'IntRange'.` |
+| `val l: List<Any> = byteArrayOf(1, 2).toList()`; `l.contains(1)`, `l[0] is Byte` | `true`, `false` | `false`, `true` |
+| `mutableMapOf<Int, Int>().iterator().next()`, a set's, `hashMapOf`'s, `setOf()`'s | user frames only | the `LinkedHashMap`/`HashMap`/`EmptyIterator`/`Collections$1` frames in front |
+| `val lz = { y: Int -> y / 0 }` on line 4 called on line 5 | `main$lambda$0(main.kt:5)` | `main$lambda$0(main.kt:4)` |
+| `Regex("a)")`, `Regex("[b-a]")`, `Regex("a{2,1}")`, `Regex("x{")`, `Regex("(?<n>a)(?<n>b)")` | the engine's description, or accepted | `Unmatched closing ')' near index 0` + pattern + caret, … |
+| `class K { init { println(y) }; val y = 3 }`, `val a = b + 1; val b = 2` | runs | `variable 'y' must be initialized.` |
+| `object O { val a = { 5 } }`; `O.a()` | `(lambda arity=1)` | `5` |
+
+A `ByteArray`/`ShortArray` keeps its elements boxed, so they leave the array as
+`Byte`s/`Short`s; a 300 000-read byte-array loop retires the same instructions
+as before (12.96–12.99 G against 12.96–12.98 G, debug build).
+
 ## Qualified `Delegates`, retried `lazy`, `toSortedSet(comparator)`, conflicting inherited members
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.13.0.2.
