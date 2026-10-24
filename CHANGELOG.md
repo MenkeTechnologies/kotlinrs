@@ -11,6 +11,37 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Regex comments mode and escapes, unsigned array storage, `(expr)()`, `lateinit` getter frames, statement lines, map-view iterator frames
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.13.0.2.
+
+| program | before | reference |
+| --- | --- | --- |
+| `Regex("(?x) a b # c").matches("ab")`, `Regex("a b # c", RegexOption.COMMENTS)` | `PatternSyntaxException` (the engine's) | `true` |
+| `Regex("(?x)[a b]").containsMatchIn(" ")` | `true` | `false` — comments mode drops whitespace inside a class too |
+| `Regex("\\0101")`, `Regex("\\cA")`, `Regex("\\c[")` | `PatternSyntaxException` | `A`, `\u0001`, `\u001b` |
+| `Regex("\\08")`, `Regex("\\c")` | the engine's message | `Illegal octal escape sequence near index 2`, `Illegal control escape sequence near index 1` |
+| `UByteArray(3).also { it[1] = 200u }` | `UByteArray(storage=[0, 200, 0])` | `UByteArray(storage=[0, -56, 0])` |
+| `byteArrayOf(-1, 2).toUByteArray()`, `ubyteArrayOf(255u, 1u).toByteArray().toList()` | `unresolved reference` | `UByteArray(storage=[-1, 2])`, `[-1, 1]` |
+| `(O.a)()`, `(h)(1)` | `expected RParen, found LParen` | invokes the value |
+| `class L { lateinit var s: String }`; `L().s` | `MainKt.main(…)` heads the trace | `L.getS(main.kt:1)` heads it |
+| `println("a")` on line 2, `val y = 10 / x` on line 3, in a function or lambda | `…(main.kt:2)` | `…(main.kt:3)` |
+| `mutableMapOf<Int, Int>().values.iterator().next()` | `ArrayList$Itr.next` in front | `LinkedHashMap$LinkedHashIterator.nextNode`, `LinkedHashMap$LinkedValueIterator.next` |
+
+A pattern is rewritten into the engine's dialect before it compiles: comments
+mode is applied here, flag scope by group included, so neither the engine's
+own comments mode (which keeps whitespace in a class) nor its anchored
+`\A(?:…)\z` compilation sees a comment; `\0` octal and `\cX` control escapes
+become code points; a quoted literal's whitespace survives comments mode. An
+unsigned array element is stored at the array's width and rendered as its
+signed storage. A non-`private` `lateinit` property's getter frame — declaring
+class, a companion, an `object` or the file facade, and the declaration line —
+is registered before `main` and put at the head of the trace of a read that
+faults. Every statement's first op carries the statement's line, so an op that
+has none (a division) is attributed to its own statement. A map's
+`keys`/`values`/`entries` iterator names the map's own iterator class for that
+projection (`LinkedHashMap`, `HashMap`, `TreeMap`).
+
 ## Variance: declaration-site positions, use-site projections, invariant initializers
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.13.0.2.

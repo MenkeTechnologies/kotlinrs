@@ -11575,3 +11575,257 @@ fn use_site_variance_violations_are_refused() {
         assert_eq!(err, format!("kotlin: {msg}\n"), "{body}");
     }
 }
+
+/// Valid `Pattern` syntax the engine reads differently: comments mode (whitespace
+/// and `#` comments dropped everywhere, scoped by group, from `(?x)` or
+/// `RegexOption.COMMENTS`), octal `\0n`/`\0nn`/`\0mnn` escapes, and `\cX`
+/// control escapes — plus `Pattern`'s refusals of a bad octal or control
+/// escape. Measured on kotlinc 2.4.21 / JRE 21.0.13.0.2.
+#[test]
+fn regex_comments_mode_octal_and_control_escapes() {
+    assert_eq!(
+        prog(
+            r##"fun t(p: String, s: String) = try { val r = Regex(p); "" + r.containsMatchIn(s) + " " + r.find(s)?.value?.map { it.code } + " " + r.matches(s) } catch (e: Exception) { e.javaClass.simpleName + ": " + e.message!!.replace("\n", "|") }
+fun main() {
+    println(t("\\08", "x"))
+    println(t("x\\0", "x"))
+    println(t("\\c", "x"))
+    println(t("(?x)[a b]", " "))
+    println(t("(?x)a\tb\nc", "abc"))
+    println(t("(?x)a#c\rb", "ab"))
+    println(t("(?x)\\Q a \\E", " a "))
+    println(t("(?x:a b)c d", "abc d"))
+    println(t("(?x)a(?-x) b", "a b"))
+    println(t("(?x)a(?-x: b) c", "a bc"))
+    println(t("(?ix)A b", "AB"))
+    println(t("a b(?x) c d", "a bcd"))
+    println(t("(?x)a{1, 2}", "aa"))
+    println(t("(?x)a {2}", "aa"))
+    println(t("(?x)a+ +", "aa"))
+    println(t("(?x)\\c A", "\u0001 A"))
+    println(t("[\\0101]", "A"))
+    println(t("[\\cA]", "\u0001"))
+    println(t("\\0101{2}", "AA"))
+    println(t("(?x)( a ) \\1", "aa"))
+    println(Regex("a b # c", RegexOption.COMMENTS).matches("ab"))
+    println(Regex("a b # c", setOf(RegexOption.COMMENTS, RegexOption.IGNORE_CASE)).matches("AB"))
+}
+"##
+        ),
+        "PatternSyntaxException: Illegal octal escape sequence near index 2|\\08|  ^\nPatternSyntaxException: Illegal octal escape sequence near index 3|x\\0\nPatternSyntaxException: Illegal control escape sequence near index 1|\\c| ^\nfalse null false\ntrue [97, 98, 99] true\ntrue [97, 98] true\ntrue [32, 97, 32] true\ntrue [97, 98, 99, 32, 100] true\ntrue [97, 32, 98] true\ntrue [97, 32, 98, 99] true\ntrue [65, 66] true\ntrue [97, 32, 98, 99, 100] true\ntrue [97, 97] true\ntrue [97, 97] true\ntrue [97, 97] true\ntrue [1] false\ntrue [65] true\ntrue [1] true\ntrue [65, 65] true\ntrue [97, 97] true\ntrue\ntrue\n"
+    );
+}
+
+/// `\cX` takes any operand (a `[` is not a class), and an octal escape reads
+/// three digits only when the first is at most 3. Measured on kotlinc 2.4.21 /
+/// JRE 21.0.13.0.2.
+#[test]
+fn regex_control_operand_and_octal_width() {
+    assert_eq!(
+        prog(
+            r##"fun t(p: String, s: String) = try { val r = Regex(p); "" + r.containsMatchIn(s) + " " + r.find(s)?.value?.map { it.code } + " " + r.matches(s) } catch (e: Exception) { e.javaClass.simpleName + ": " + e.message!!.replace("\n", "|") }
+fun main() {
+    println(t("\\c[", "\u001b"))
+    println(t("\\0377", "ÿ"))
+    println(t("\\0400", " 0"))
+    println(t("\\c@x", "\u0000x"))
+}
+"##
+        ),
+        "true [27] true\ntrue [255] true\ntrue [32, 48] true\ntrue [0, 120] true\n"
+    );
+}
+
+/// Unsigned arrays print their SIGNED storage, an unsigned literal stored into
+/// one takes the array's element width, the signed arrays convert with
+/// `toUByteArray()` and its siblings (and back with `toByteArray()`), and a
+/// parenthesized expression is invocable: `(O.a)()`. Measured on kotlinc
+/// 2.4.21 / JRE 21.0.13.0.2.
+#[test]
+fn unsigned_array_storage_and_parenthesized_callee() {
+    assert_eq!(
+        prog(
+            r##"@file:OptIn(ExperimentalUnsignedTypes::class)
+object O { val a = { 5 }; val f: (Int) -> Int = { it * 2 } }
+class C { val g = { "g" } }
+fun main() {
+    val a = UByteArray(2); a[0] = 255u
+    println(a[0] + 1u); println(a[0]); println(a[0]::class.simpleName); println(a)
+    println(UByteArray(3).also { it[1] = 200u })
+    println(byteArrayOf(-1, 2).toUByteArray())
+    println(byteArrayOf(-1, 2).toUByteArray().toList())
+    println(ubyteArrayOf(255u, 1u).toByteArray().toList())
+    println(UShortArray(2).also { it[0] = 65535u })
+    println(UIntArray(2).also { it[0] = 4000000000u })
+    println(ULongArray(1).also { it[0] = 18446744073709551615u })
+    println(shortArrayOf(-1).toUShortArray())
+    println(intArrayOf(-1, 7).toUIntArray().toList())
+    println(longArrayOf(-1).toULongArray())
+    println((O.a)())
+    println((O.f)(4))
+    println((C().g)())
+    val h = { x: Int -> x + 1 }
+    println((h)(1))
+    println(("ab")
+        .length)
+    println("a\nb\r\nc".lineSequence().toList())
+}
+"##
+        ),
+        "256\n255\nUByte\nUByteArray(storage=[-1, 0])\nUByteArray(storage=[0, -56, 0])\nUByteArray(storage=[-1, 2])\n[255, 2]\n[-1, 1]\nUShortArray(storage=[-1, 0])\nUIntArray(storage=[-294967296, 0])\nULongArray(storage=[-1])\nUShortArray(storage=[-1])\n[4294967295, 7]\nULongArray(storage=[-1])\n5\n8\ng\n2\n2\n[a, b, c]\n"
+    );
+}
+
+/// A read of a non-`private` `lateinit` property before its first write
+/// raises inside the property's GETTER, whose frame heads the trace: the
+/// declaring class (an inherited one, a companion, an `object`, or the file
+/// facade for a top-level property) and the declaration line. A `private` one
+/// and a local have no getter. Measured on kotlinc 2.4.21 / JRE 21.0.13.0.2.
+#[test]
+fn lateinit_reads_run_through_the_getter_frame() {
+    assert_eq!(
+        prog(
+            r##"class L {
+    private lateinit var p: String
+    lateinit var s: String
+    fun f() = p.length
+    fun g() = this.s.length
+}
+lateinit var top: String
+open class B { lateinit var q: String }
+class D : B() { fun h() = q }
+object Ob { lateinit var w: String }
+class M { companion object { lateinit var c: String } }
+lateinit var isOn: String
+fun t(b: () -> Unit) = try { b() } catch (e: Exception) { println(e.stackTrace.take(3).joinToString(" | ")) }
+fun main() {
+    t { L().f() }
+    t { L().g() }
+    t { println(top) }
+    t { D().h() }
+    t { Ob.w }
+    t { val x = L(); x.s }
+    t { M.c }
+    t { isOn }
+    lateinit var loc: String
+    t { loc }
+    val l = L(); l.s = "x"; println(l.s)
+    top = "y"; println(top)
+}
+"##
+        ),
+        "L.f(main.kt:4) | MainKt.main$lambda$0(main.kt:15) | MainKt.t(main.kt:13)\nL.getS(main.kt:3) | L.g(main.kt:5) | MainKt.main$lambda$1(main.kt:16)\nMainKt.getTop(main.kt:7) | MainKt.main$lambda$2(main.kt:17) | MainKt.t(main.kt:13)\nB.getQ(main.kt:8) | D.h(main.kt:9) | MainKt.main$lambda$3(main.kt:18)\nOb.getW(main.kt:10) | MainKt.main$lambda$4(main.kt:19) | MainKt.t(main.kt:13)\nL.getS(main.kt:3) | MainKt.main$lambda$5(main.kt:20) | MainKt.t(main.kt:13)\nM$Companion.getC(main.kt:11) | MainKt.main$lambda$6(main.kt:21) | MainKt.t(main.kt:13)\nMainKt.isOn(main.kt:12) | MainKt.main$lambda$7(main.kt:22) | MainKt.t(main.kt:13)\nMainKt.main$lambda$8(main.kt:24) | MainKt.t(main.kt:13) | MainKt.main(main.kt:24)\nx\ny\n"
+    );
+    let out = eval(
+        "class L { lateinit var s: String }\nfun main() {\n    val l = L()\n    println(l.s)\n}\n",
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Exception in thread \"main\" kotlin.UninitializedPropertyAccessException: lateinit property s has not been initialized\n\tat L.getS(main.kt:1)\n\tat MainKt.main(main.kt:4)\n\tat MainKt.main(main.kt)\n"
+    );
+}
+
+/// A fault raised by an op that carries no line of its own — a division —
+/// is attributed to the STATEMENT it is in, as the JVM's line table does,
+/// not to the statement before it: in a function, a `try` block and a
+/// multi-line lambda, whether the statement is the last one or not.
+/// Measured on kotlinc 2.4.21 / JRE 21.0.13.0.2.
+#[test]
+fn a_fault_takes_its_statements_line() {
+    assert_eq!(
+        prog(
+            r##"fun t(b: () -> Unit) = try { b() } catch (e: Exception) { println(e.stackTrace.take(2).joinToString(" | ")) }
+fun main() {
+    val f = { x: Int ->
+        println("in")
+        10 / x
+    }
+    t { f(0) }
+    val g = { x: Int ->
+        println("g")
+        val y = 10 / x
+        y
+    }
+    t { g(0) }
+    val h: (Int) -> Int = {
+        println("h")
+        listOf(1)[it]
+    }
+    t { h(5) }
+    t {
+        println("t")
+        10 / 0
+    }
+}
+"##
+        ),
+        "in\nMainKt.main$lambda$0(main.kt:5) | MainKt.main$lambda$1(main.kt:7)\ng\nMainKt.main$lambda$2(main.kt:10) | MainKt.main$lambda$3(main.kt:13)\nh\njava.base/java.util.Collections$SingletonList.get(Collections.java:5180) | MainKt.main$lambda$4(main.kt:16)\nt\nMainKt.main$lambda$6(main.kt:21) | MainKt.t(main.kt:1)\n"
+    );
+    assert_eq!(
+        prog(
+            r##"fun f(x: Int): Int {
+    println("a")
+    val y = 10 / x
+    return y
+}
+fun g(x: Int): Int {
+    println("b")
+    return 10 /
+        x
+}
+fun main() {
+    try { f(0) } catch (e: Exception) { println(e.stackTrace[0]) }
+    try { g(0) } catch (e: Exception) { println(e.stackTrace[0]) }
+    try {
+        println("c")
+        10 / 0
+    } catch (e: Exception) { println(e.stackTrace[0]) }
+}
+"##
+        ),
+        "a\nMainKt.f(main.kt:3)\nb\nMainKt.g(main.kt:8)\nc\nMainKt.main(main.kt:16)\n"
+    );
+}
+
+/// `next()` past the end of a map's `keys`/`values`/`entries` iterator raises
+/// inside the MAP's iterator class for that projection — `LinkedHashMap`,
+/// `HashMap`, a singleton map, an empty map, a `TreeMap` — whose JDK frames head
+/// the trace. Measured on kotlinc 2.4.21 / JRE 21.0.13.0.2.
+#[test]
+fn map_view_iterators_raise_in_the_maps_iterator_class() {
+    assert_eq!(
+        prog(
+            r##"fun t(name: String, b: () -> Unit) = try { b() } catch (e: Exception) { println(name + ": " + e + " @ " + e.stackTrace.take(4).joinToString(" | ")) }
+fun main() {
+    t("vals") { mutableMapOf<Int, Int>().values.iterator().next() }
+    t("keys") { mutableMapOf<Int, Int>().keys.iterator().next() }
+    t("ents") { mutableMapOf<Int, Int>().entries.iterator().next() }
+    t("hvals") { hashMapOf<Int, Int>().values.iterator().next() }
+    t("hkeys") { hashMapOf<Int, Int>().keys.iterator().next() }
+    t("hents") { hashMapOf<Int, Int>().entries.iterator().next() }
+    t("ivals") { mapOf(1 to 2).values.iterator().also { it.next() }.next() }
+    t("ikeys") { mapOf(1 to 2).keys.iterator().also { it.next() }.next() }
+    t("ients") { mapOf(1 to 2).entries.iterator().also { it.next() }.next() }
+    t("lvals") { mapOf(1 to 2, 3 to 4).values.iterator().also { it.next(); it.next() }.next() }
+    t("full") { mutableMapOf(1 to 2).values.iterator().also { it.next() }.next() }
+}
+"##
+        ),
+        "vals: java.util.NoSuchElementException @ java.base/java.util.LinkedHashMap$LinkedHashIterator.nextNode(LinkedHashMap.java:1025) | java.base/java.util.LinkedHashMap$LinkedValueIterator.next(LinkedHashMap.java:1052) | MainKt.main$lambda$0(main.kt:3) | MainKt.t(main.kt:1)\nkeys: java.util.NoSuchElementException @ java.base/java.util.LinkedHashMap$LinkedHashIterator.nextNode(LinkedHashMap.java:1025) | java.base/java.util.LinkedHashMap$LinkedKeyIterator.next(LinkedHashMap.java:1046) | MainKt.main$lambda$1(main.kt:4) | MainKt.t(main.kt:1)\nents: java.util.NoSuchElementException @ java.base/java.util.LinkedHashMap$LinkedHashIterator.nextNode(LinkedHashMap.java:1025) | java.base/java.util.LinkedHashMap$LinkedEntryIterator.next(LinkedHashMap.java:1058) | java.base/java.util.LinkedHashMap$LinkedEntryIterator.next(LinkedHashMap.java:1055) | MainKt.main$lambda$2(main.kt:5)\nhvals: java.util.NoSuchElementException @ java.base/java.util.HashMap$HashIterator.nextNode(HashMap.java:1607) | java.base/java.util.HashMap$ValueIterator.next(HashMap.java:1633) | MainKt.main$lambda$3(main.kt:6) | MainKt.t(main.kt:1)\nhkeys: java.util.NoSuchElementException @ java.base/java.util.HashMap$HashIterator.nextNode(HashMap.java:1607) | java.base/java.util.HashMap$KeyIterator.next(HashMap.java:1628) | MainKt.main$lambda$4(main.kt:7) | MainKt.t(main.kt:1)\nhents: java.util.NoSuchElementException @ java.base/java.util.HashMap$HashIterator.nextNode(HashMap.java:1607) | java.base/java.util.HashMap$EntryIterator.next(HashMap.java:1638) | java.base/java.util.HashMap$EntryIterator.next(HashMap.java:1636) | MainKt.main$lambda$5(main.kt:8)\nivals: java.util.NoSuchElementException @ java.base/java.util.Collections$1.next(Collections.java:5038) | MainKt.main$lambda$6(main.kt:9) | MainKt.t(main.kt:1) | MainKt.main(main.kt:9)\nikeys: java.util.NoSuchElementException @ java.base/java.util.Collections$1.next(Collections.java:5038) | MainKt.main$lambda$7(main.kt:10) | MainKt.t(main.kt:1) | MainKt.main(main.kt:10)\nients: java.util.NoSuchElementException @ java.base/java.util.Collections$1.next(Collections.java:5038) | MainKt.main$lambda$8(main.kt:11) | MainKt.t(main.kt:1) | MainKt.main(main.kt:11)\nlvals: java.util.NoSuchElementException @ java.base/java.util.LinkedHashMap$LinkedHashIterator.nextNode(LinkedHashMap.java:1025) | java.base/java.util.LinkedHashMap$LinkedValueIterator.next(LinkedHashMap.java:1052) | MainKt.main$lambda$9(main.kt:12) | MainKt.t(main.kt:1)\nfull: java.util.NoSuchElementException @ java.base/java.util.LinkedHashMap$LinkedHashIterator.nextNode(LinkedHashMap.java:1025) | java.base/java.util.LinkedHashMap$LinkedValueIterator.next(LinkedHashMap.java:1052) | MainKt.main$lambda$10(main.kt:13) | MainKt.t(main.kt:1)\n"
+    );
+    assert_eq!(
+        prog(
+            r##"fun t(name: String, b: () -> Unit) = try { b() } catch (e: Exception) { println(name + ": " + e + " @ " + e.stackTrace.take(4).joinToString(" | ")) }
+fun main() {
+    t("evals") { emptyMap<Int, Int>().values.iterator().next() }
+    t("ekeys") { emptyMap<Int, Int>().keys.iterator().next() }
+    t("eents") { mapOf<Int, Int>().entries.iterator().next() }
+    t("svals") { sortedMapOf(1 to 2).values.iterator().also { it.next() }.next() }
+    t("skeys") { sortedMapOf(1 to 2).keys.iterator().also { it.next() }.next() }
+}
+"##
+        ),
+        "evals: java.util.NoSuchElementException @ kotlin.collections.EmptyIterator.next(Collections.kt:21) | kotlin.collections.EmptyIterator.next(Collections.kt:16) | MainKt.main$lambda$0(main.kt:3) | MainKt.t(main.kt:1)\nekeys: java.util.NoSuchElementException @ kotlin.collections.EmptyIterator.next(Collections.kt:21) | kotlin.collections.EmptyIterator.next(Collections.kt:16) | MainKt.main$lambda$1(main.kt:4) | MainKt.t(main.kt:1)\neents: java.util.NoSuchElementException @ kotlin.collections.EmptyIterator.next(Collections.kt:21) | kotlin.collections.EmptyIterator.next(Collections.kt:16) | MainKt.main$lambda$2(main.kt:5) | MainKt.t(main.kt:1)\nsvals: java.util.NoSuchElementException @ java.base/java.util.TreeMap$PrivateEntryIterator.nextEntry(TreeMap.java:1519) | java.base/java.util.TreeMap$ValueIterator.next(TreeMap.java:1566) | MainKt.main$lambda$3(main.kt:6) | MainKt.t(main.kt:1)\nskeys: java.util.NoSuchElementException @ java.base/java.util.TreeMap$PrivateEntryIterator.nextEntry(TreeMap.java:1519) | java.base/java.util.TreeMap$KeyIterator.next(TreeMap.java:1575) | MainKt.main$lambda$4(main.kt:7) | MainKt.t(main.kt:1)\n"
+    );
+}

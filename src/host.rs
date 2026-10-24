@@ -2943,6 +2943,8 @@ fn reset_heap() {
     SUPPRESSED.with(|s| s.borrow_mut().clear());
     STACK_TRACES.with(|t| t.borrow_mut().clear());
     LAMBDA_LINES.with(|t| t.borrow_mut().clear());
+    LATEINIT_GETTERS.with(|t| t.borrow_mut().clear());
+    GETTER_FRAME.with(|f| f.borrow_mut().take());
     STACK_PREFIX.with(|t| t.borrow_mut().clear());
     INIT_DEPTH.with(|d| d.set(0));
     TYPES.with(|t| t.borrow_mut().clear());
@@ -2991,6 +2993,15 @@ thread_local! {
     /// throwable the runtime raised itself has none (see `stackTrace` below).
     static STACK_TRACES: RefCell<std::collections::HashMap<u32, Vec<TraceFrame>>> =
         RefCell::new(std::collections::HashMap::new());
+    /// `"Class\0prop"` (or `"\0prop"` for a top-level property) → the getter
+    /// frame a read of that non-`private` `lateinit` property runs through:
+    /// `(declaring class, getter, declaration line)`, the class empty for the
+    /// file facade. Registered before `main` (see `KT_LATEINIT` arg 4).
+    static LATEINIT_GETTERS: RefCell<std::collections::HashMap<String, TraceFrame>> =
+        RefCell::new(std::collections::HashMap::new());
+    /// The getter frame of the `lateinit` read now faulting, which heads the
+    /// trace [`record_runtime_trace`] records for it.
+    static GETTER_FRAME: RefCell<Option<TraceFrame>> = const { RefCell::new(None) };
 }
 
 /// The source file name a `StackTraceElement` names, and the facade class
@@ -3236,6 +3247,21 @@ fn note_op(name: &str, recv: &Value, arity: usize) {
     })
     .flatten()
     .and_then(|src| {
+        // A map's `keys`/`values`/`entries` view iterates with the MAP's
+        // own iterator class for that projection: `CLASS#view`.
+        if let Some((map, view)) = map_view_of(&src) {
+            let len = with_obj(&map, |o| match o {
+                HeapObj::Map(entries) => Some(entries.len()),
+                _ => None,
+            })
+            .flatten()?;
+            let view = match view {
+                MapView::Keys => "keys",
+                MapView::Values => "values",
+                MapView::Entries => "entries",
+            };
+            return Some(format!("{}#{view}", coll_jvm_class(&map, len, false).0));
+        }
         let shape = with_obj(&src, |o| match o {
             HeapObj::Set(items) => Some((items.len(), true)),
             HeapObj::Map(entries) => Some((entries.len(), false)),
@@ -3519,7 +3545,9 @@ fn jdk_prefix(class: &str, msg: &str) -> Vec<JdkFrame> {
             ]
         }
         ("java.util.NoSuchElementException", "next")
-            if kind == ReceiverKind::ArrayListIter && msg.is_empty() =>
+            if kind == ReceiverKind::ArrayListIter
+                && msg.is_empty()
+                && !LAST_ITER_SRC.with(|c| c.borrow().contains('#')) =>
         {
             vec![(
                 "java.base",
@@ -3906,6 +3934,19 @@ fn stdlib_prefix(
         // iterator class of the collection behind it.
         ("java.util.NoSuchElementException", "next", _) if msg.is_empty() => {
             let class = LAST_ITER_SRC.with(|c| c.borrow().clone());
+            let (class, view) = match class.split_once('#') {
+                Some((c, v)) => (c.to_string(), v.to_string()),
+                None => (class, String::new()),
+            };
+            let class = match (class.as_str(), view.as_str()) {
+                ("java.util.LinkedHashMap", "keys") => "java.util.LinkedHashSet".to_string(),
+                ("java.util.HashMap", "keys") => "java.util.HashSet".to_string(),
+                ("java.util.LinkedHashMap" | "java.util.HashMap", "values") => {
+                    format!("{class}#values")
+                }
+                ("java.util.TreeMap", "keys" | "values") => format!("{class}#{view}"),
+                _ => class,
+            };
             let linked = jb(
                 "java.util.LinkedHashMap$LinkedHashIterator",
                 "nextNode",
@@ -3970,6 +4011,47 @@ fn stdlib_prefix(
                         "next",
                         "HashMap.java",
                         1636,
+                    ),
+                ],
+                "java.util.LinkedHashMap#values" => vec![
+                    linked,
+                    jb(
+                        "java.util.LinkedHashMap$LinkedValueIterator",
+                        "next",
+                        "LinkedHashMap.java",
+                        1052,
+                    ),
+                ],
+                "java.util.TreeMap#keys" | "java.util.TreeMap#values" => vec![
+                    jb(
+                        "java.util.TreeMap$PrivateEntryIterator",
+                        "nextEntry",
+                        "TreeMap.java",
+                        1519,
+                    ),
+                    if view == "keys" {
+                        jb(
+                            "java.util.TreeMap$KeyIterator",
+                            "next",
+                            "TreeMap.java",
+                            1575,
+                        )
+                    } else {
+                        jb(
+                            "java.util.TreeMap$ValueIterator",
+                            "next",
+                            "TreeMap.java",
+                            1566,
+                        )
+                    },
+                ],
+                "java.util.HashMap#values" => vec![
+                    hashed,
+                    jb(
+                        "java.util.HashMap$ValueIterator",
+                        "next",
+                        "HashMap.java",
+                        1633,
                     ),
                 ],
                 "java.util.HashSet" => {
@@ -4410,6 +4492,18 @@ fn record_runtime_trace(vm: &VM, exc: &Value) {
         return;
     }
     capture_stack_trace(vm, exc);
+    if let Some((class, method, line)) = GETTER_FRAME.with(|f| f.borrow_mut().take()) {
+        let class = if class.is_empty() {
+            facade_class()
+        } else {
+            class
+        };
+        STACK_TRACES.with(|t| {
+            if let Some(frames) = t.borrow_mut().get_mut(id) {
+                frames.insert(0, (class, method, line));
+            }
+        });
+    }
     let head = with_obj(exc, |o| match o {
         HeapObj::Exc { class, msg } => Some(jdk_prefix(class, msg.as_deref().unwrap_or(""))),
         _ => None,
@@ -5715,6 +5809,20 @@ fn narrow_elem(desc: &str, v: Value) -> Value {
     match (desc, &v) {
         ("[B", Value::Int(n)) => box_narrow(8, *n),
         ("[S", Value::Int(n)) => box_narrow(16, *n),
+        // An unsigned literal stored into an unsigned array takes the
+        // array's element type, as `it[1] = 200u` does on a `UByteArray`.
+        (d, Value::Obj(_)) if unsigned_array_storage(d).is_some() => match unsigned_box(&v) {
+            Some((bits, u)) => {
+                let want = unsigned_bits(d.trim_start_matches("kotlin.").trim_end_matches("Array"))
+                    .unwrap_or(bits);
+                if want == bits {
+                    v
+                } else {
+                    make_unsigned(want, u)
+                }
+            }
+            None => v,
+        },
         _ => v,
     }
 }
@@ -6016,6 +6124,20 @@ fn unsigned_array_storage(desc: &str) -> Option<&'static str> {
         "kotlin.UIntArray" => Some("[I"),
         "kotlin.ULongArray" => Some("[J"),
         _ => None,
+    }
+}
+
+/// The signed value an unsigned box is stored as on the JVM — its bits read
+/// as two's complement at its own width (`200u` as a `UByte` is `-56`). Any
+/// other value is itself.
+fn unsigned_storage_value(v: &Value) -> Value {
+    match unsigned_box(v) {
+        Some((bits, u)) if bits < 64 => {
+            let shift = 64 - u32::from(bits);
+            Value::Int(((u << shift) as i64) >> shift)
+        }
+        Some((_, u)) => Value::Int(u as i64),
+        None => v.clone(),
     }
 }
 
@@ -6504,6 +6626,16 @@ fn lateinit_fault(name: &str) -> String {
     )
 }
 
+/// Raise [`lateinit_fault`] for the read of `name` keyed `key` in
+/// [`LATEINIT_GETTERS`], with its getter's frame at the head of the trace when
+/// the read goes through one.
+fn lateinit_read_fault(vm: &mut VM, key: &str, name: &str) {
+    let frame = LATEINIT_GETTERS.with(|t| t.borrow().get(key).cloned());
+    GETTER_FRAME.with(|f| *f.borrow_mut() = frame);
+    fault(vm, lateinit_fault(name));
+    GETTER_FRAME.with(|f| f.borrow_mut().take());
+}
+
 /// Stop the run with `msg` — or, when the message names a JVM throwable and the
 /// program contains a `try`, raise it as a catchable exception instead.
 ///
@@ -6742,7 +6874,8 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             .flatten();
             match got {
                 Some(v) if is_lateinit_unset(&v) => {
-                    fault(vm, lateinit_fault(&name));
+                    let key = format!("{}\0{name}", instance_tag(&obj).unwrap_or_default());
+                    lateinit_read_fault(vm, &key, &name);
                     vm.push(Value::Undef);
                 }
                 Some(v) => vm.push(v),
@@ -6940,6 +7073,20 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
         }
         KT_RANDOM => b_random(vm, arg),
         KT_LATEINIT if arg == 0 => vm.push(lateinit_unset()),
+        // Register a `lateinit` getter frame: [key, class, method, line].
+        // The first registration of a key wins, which is the most derived
+        // declaration when the compiler emits them in resolution order.
+        KT_LATEINIT if arg == 4 => {
+            let line = vm.pop().to_int() as u32;
+            let method = vm.pop().to_str();
+            let class = vm.pop().to_str();
+            let key = vm.pop().to_str();
+            LATEINIT_GETTERS.with(|t| {
+                t.borrow_mut()
+                    .entry(key)
+                    .or_insert((class, method, Some(line)));
+            });
+        }
         KT_LATEINIT if arg == 3 => {
             let v = vm.pop();
             vm.push(Value::Bool(!is_lateinit_unset(&v)));
@@ -6948,7 +7095,12 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
             let name = vm.pop().to_str();
             let v = vm.pop();
             if is_lateinit_unset(&v) {
-                fault(vm, lateinit_fault(&name));
+                // A top-level property's name arrives `\0`-prefixed: its read
+                // goes through the facade's getter. A local's has none.
+                match name.strip_prefix('\0') {
+                    Some(plain) => lateinit_read_fault(vm, &name, plain),
+                    None => fault(vm, lateinit_fault(&name)),
+                }
                 vm.push(Value::Undef);
             } else {
                 vm.push(v);
@@ -18020,6 +18172,26 @@ fn sequence_member(
         // by definition and the `as…` views wrap the receiver. Same elements,
         // different class, and the difference shows in an out-of-range message.
         "toList" => return Some(Ok(alloc_ro_list(items.to_vec()))),
+        // `ByteArray.toUByteArray()` and its siblings: the same bits, read as
+        // the unsigned type of the signed array's width.
+        "toUByteArray" | "toUShortArray" | "toUIntArray" | "toULongArray" if args.is_empty() => {
+            let (bits, from) = match name {
+                "toUByteArray" => (8, "[B"),
+                "toUShortArray" => (16, "[S"),
+                "toUIntArray" => (32, "[I"),
+                _ => (64, "[J"),
+            };
+            if recv.and_then(array_items).map(|(d, _)| d).as_deref() != Some(from) {
+                return None;
+            }
+            return Some(Ok(alloc_array(HeapObj::Array {
+                items: items
+                    .iter()
+                    .map(|v| make_unsigned(bits, num_i64(v) as u64))
+                    .collect(),
+                desc: format!("kotlin.{}", &name[2..]),
+            })));
+        }
         // `toIntArray()` and the other primitive-array conversions: the same
         // elements in an array of that descriptor.
         "toIntArray" | "toLongArray" | "toDoubleArray" | "toFloatArray" | "toBooleanArray"
@@ -18036,8 +18208,10 @@ fn sequence_member(
                 "toShortArray" => "[S",
                 _ => "[B",
             };
+            // An unsigned array's elements convert to their signed storage
+            // (`ubyteArrayOf(255u).toByteArray()` is `[-1]`).
             return Some(Ok(alloc_array(HeapObj::Array {
-                items: items.to_vec(),
+                items: items.iter().map(unsigned_storage_value).collect(),
                 desc: desc.to_string(),
             })));
         }
@@ -19749,7 +19923,10 @@ fn display_obj(id: u32) -> String {
             // generated `toString` renders the storage's elements:
             // `UIntArray(storage=[1, 2])`.
             HeapObj::Array { desc, items } if unsigned_array_storage(desc).is_some() => {
-                let elems: Vec<String> = items.iter().map(kotlin_string).collect();
+                let elems: Vec<String> = items
+                    .iter()
+                    .map(|v| kotlin_string(&unsigned_storage_value(v)))
+                    .collect();
                 format!(
                     "{}(storage=[{}])",
                     desc.trim_start_matches("kotlin."),

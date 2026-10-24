@@ -501,26 +501,28 @@ JVM.
 | `inline fun boom(): Int { throw … }`; `boom()` caught in `main` | `MainKt.main(main.kt:<boom's line>)` | `MainKt.main(main.kt:<a line past the end of the file>)` |
 | `val lz = { y: Int -> y / 0 }` on line 15, `listOf(1).map(lz)` on line 16 | `main(…:16)` for the caller | `main(…:25)` |
 | `emptyList<Int>().reduce { a, b -> a + b }`, `listOf(1, 2).first { it > 5 }`, `last { it > 5 }` on line 2 | `main(main.kt:2)` | `main(main.kt:6)`, `6`, `10` |
-| a lambda `{ x: Int ->` on line 3, `println("in")` on 4, `10 / x` on 5 | `main$lambda$0(main.kt:4)` | `main$lambda$0(main.kt:5)` |
-| `mutableMapOf<Int, Int>().values.iterator().next()` | `ArrayList$Itr.next` in front | `LinkedHashMap$LinkedValueIterator.next` and `nextNode` |
-| `class L { lateinit var s: String }`; `L().s` read from outside `L` | `MainKt.main(…)` | `L.getS(main.kt:1)` in front: the read goes through the getter |
-| `Regex("(?x) a b # c")`, `Regex("\\0101")`, `Regex("\\cA")` | `PatternSyntaxException` (the engine's) | compiles |
-| `UByteArray(3).also { it[1] = 200u }.toString()`; `byteArrayOf(-1).toUByteArray()` | `UByteArray(storage=[0, 200, 0])`; `unresolved reference` | `UByteArray(storage=[0, -56, 0])`; `[255]` |
-| `(O.a)()` — a parenthesized callee | `expected RParen, found LParen` | invokes it |
-| `"a\nb".lineSequence()` | `unresolved reference: lineSequence on String` | the lines |
+| `Regex("(?x)[#a]")` | `PatternSyntaxException` with the engine's description | `Unclosed character class near index 7` — in comments mode `#` opens a comment inside a class too |
+| `class Z(val d: Int) { val q = 10 / d }`; `Z(0)` caught, `stackTrace[0]` | `MainKt.main(main.kt:<call line>)` | `Z.<init>(main.kt:2)` |
 
 The numeric declaration checks apply where the frontend can tell a type for
 certain — a literal, a numeric local, arithmetic of those, a conversion — and
 stay silent elsewhere, so a mismatch hidden behind an untyped call is still
-accepted. The `lateinit` row needs a frame the VM never runs: the getter is not
-a sub here. Variance is checked since round 8 (CHANGELOG); what it
+accepted. Variance is checked since round 8 (CHANGELOG); what it
 does not reach is listed under "Variance — what is not checked". The three inline line rows
-are the JVM's inline-function line mapping: a body copied into its caller is
-numbered past the end of the file (the SMAP section), and a stack trace prints
-those numbers as they are. The multi-line lambda row is a line attribution
-miss: the body's tail expression carries no line of its own, so the frame takes
-the nearest earlier one. The `(?x)` row is the engine's anchored second
-compilation, whose closing group the trailing comment swallows.
+are the JVM's inline-function line mapping (the class file's SMAP), measured
+in round 8: the file's own lines map to themselves up to its line count plus
+one, and every inlined call site — in the class file's method order, synthetic
+lambda methods after the declared ones, and nested inlinings each taking a range
+of their own — is then given a fresh range covering the inlined function's
+first to last line with code. A STANDARD-LIBRARY inline function (`map`,
+`first`, `reduce`; not the `@InlineOnly` ones such as `println`) takes a range
+too, sized by its own source, so every user inline call after one in the same
+class file shifts by an amount that needs a table of the stdlib's ranges. That
+table is the missing piece. The `(?x)[#a]` row is the syntax checker, which
+runs before comments are stripped and does not track the flag. The `<init>`
+row is a constructor's frame: the constructor is lowered as more than one
+subroutine, and the leading `<init>` frames are dropped to hide a throwable's
+OWN constructor, which takes the raising class's with them.
 
 ## Variance — what is not checked
 

@@ -202,6 +202,7 @@ fn deferred_prop(p: CtorProp, nullable: bool) -> BodyProp {
         type_args: p.type_args,
         type_param_of: p.type_param_of,
         deferred: true,
+        lateinit_getter: None,
     }
 }
 
@@ -454,7 +455,7 @@ pub fn parse_program(src: &str) -> Result<Program, String> {
             let mods = p.modifiers();
             if matches!(p.peek(), Tok::Val | Tok::Var) {
                 if mods.lateinit {
-                    prog.props.push(p.lateinit_prop()?);
+                    prog.props.push(p.lateinit_prop(mods.private_)?);
                     continue;
                 }
                 prog.props.push(p.body_prop()?);
@@ -711,6 +712,7 @@ fn expand_interface_delegation(prog: &mut Program) -> Result<(), String> {
                     type_args: Vec::new(),
                     type_param_of: None,
                     deferred: false,
+                    lateinit_getter: None,
                 },
             );
             if builtin {
@@ -1872,7 +1874,7 @@ impl Parser {
                     // storage to put one in, so it is rejected there.
                     Tok::Val | Tok::Var => {
                         if mods.lateinit {
-                            obj_props.push(self.lateinit_prop()?);
+                            obj_props.push(self.lateinit_prop(mods.private_)?);
                             continue;
                         }
                         // `val x: T get() = …` is a computed property: a
@@ -2221,6 +2223,7 @@ impl Parser {
                 type_args: Vec::new(),
                 type_param_of: None,
                 deferred: false,
+                lateinit_getter: None,
             });
         }
 
@@ -2251,6 +2254,7 @@ impl Parser {
             type_args: Vec::new(),
             type_param_of: None,
             deferred: false,
+            lateinit_getter: None,
         });
         props.append(&mut comp.obj_props);
         comp.obj_props = props;
@@ -2753,7 +2757,8 @@ impl Parser {
     /// `lateinit var name: T` as a class-body or top-level property. It starts
     /// out holding the unset marker ([`Expr::LateinitUnset`]), which every read
     /// checks.
-    fn lateinit_prop(&mut self) -> Result<BodyProp, String> {
+    fn lateinit_prop(&mut self, private: bool) -> Result<BodyProp, String> {
+        let line = self.line();
         let (name, annot) = self.lateinit_decl()?;
         Ok(BodyProp {
             name,
@@ -2766,6 +2771,7 @@ impl Parser {
             type_args: annot.args,
             type_param_of: None,
             deferred: false,
+            lateinit_getter: (!private).then_some(line),
         })
     }
 
@@ -3131,6 +3137,7 @@ impl Parser {
                     type_args,
                     type_param_of,
                     deferred: false,
+                    lateinit_getter: None,
                 });
             }
             let init = self.expr()?;
@@ -3145,6 +3152,7 @@ impl Parser {
                 type_args,
                 type_param_of,
                 deferred: false,
+                lateinit_getter: None,
             });
         }
         // `var f: Double get() = … set(v) { … }` with no initializer: accessors
@@ -3168,6 +3176,7 @@ impl Parser {
             type_args,
             type_param_of,
             deferred: false,
+            lateinit_getter: None,
         })
     }
 
@@ -4663,8 +4672,12 @@ impl Parser {
     /// associative and chainable (`a.b.c()`). Binds tighter than the prefix
     /// unary operators, so `-a.b` is `-(a.b)`, matching Kotlin.
     fn postfix(&mut self) -> Result<Expr, String> {
+        // A parenthesized primary is invocable too: `(O.a)()` calls the value
+        // the parentheses produce. It holds only until a postfix op extends it.
+        let mut parenthesized = self.at(&Tok::LParen);
         let mut e = self.primary()?;
         loop {
+            let grouped = std::mem::take(&mut parenthesized);
             // Not-null assertion `expr!!` — two consecutive `!` tokens (`!=`
             // lexes as a single `NotEq`, so this only fires on a literal `!!`).
             if self.at(&Tok::Not) && matches!(self.peek_at(1), Tok::Not) {
@@ -4716,7 +4729,7 @@ impl Parser {
             // is never swallowed, and required to be glued to the previous
             // token so a statement-leading `(1..3).forEach { … }` after
             // `f()` stays a separate statement, exactly as Kotlin parses it.
-            if self.at(&Tok::LParen) && self.glued_to_prev() && invocable(&e) {
+            if self.at(&Tok::LParen) && self.glued_to_prev() && (grouped || invocable(&e)) {
                 let line = self.line();
                 self.advance();
                 let mut args = Vec::new();

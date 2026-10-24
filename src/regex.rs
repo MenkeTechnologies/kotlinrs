@@ -73,7 +73,7 @@ impl KRegex {
         if let Some((desc, index)) = java_syntax_error(written) {
             return Err(syntax_error(pattern_message(written, &desc, index)));
         }
-        let pattern = &expand_quotes(written);
+        let pattern = &translate(written);
         let find = Engine::new(pattern).map_err(syntax_error)?;
         let entire = Engine::new(&format!(r"\A(?:{pattern})\z")).map_err(syntax_error)?;
         let names = find
@@ -241,10 +241,6 @@ fn to_match(c: &fancy_regex::Captures<'_>, n: usize) -> Match {
     }
 }
 
-/// Rewrite `\Q…\E` quotations — `Pattern.quote`'s output, and what
-/// `Regex.escape` answers — into the escaped literal the engine understands.
-/// An unterminated `\Q` quotes to the end of the pattern, as in Java; an escaped
-/// backslash (`\\`) is passed through whole so `\\Q` is not read as a quote.
 /// `PatternSyntaxException.getMessage()`: the description, the index, the
 /// pattern, and a caret under the index when it falls inside the pattern.
 fn pattern_message(pattern: &str, desc: &str, index: usize) -> String {
@@ -316,6 +312,12 @@ fn scan(c: &[char]) -> Result<(), Stop> {
                         );
                     }
                     i = close + 1;
+                } else if e == '0' && !c.get(i + 2).is_some_and(|d| d.is_digit(8)) {
+                    return stop("Illegal octal escape sequence", i + 2);
+                } else if e == 'c' && i + 2 >= n {
+                    return stop("Illegal control escape sequence", i + 1);
+                } else if e == 'c' {
+                    i += 3; // `\cX` — the `X` is the operand, whatever it is
                 } else if matches!(e, 'p' | 'P' | 'x' | 'N') && c.get(i + 2) == Some(&'{') {
                     i = (i + 3..n).find(|&j| c[j] == '}').ok_or(None)? + 1;
                 } else {
@@ -516,37 +518,152 @@ fn class_end(c: &[char], start: usize) -> Result<usize, Stop> {
     stop("Unclosed character class", n - 1)
 }
 
-fn expand_quotes(pattern: &str) -> String {
-    if !pattern.contains("\\Q") {
-        return pattern.to_string();
+/// A literal character in the form the engine reads the same way under every
+/// flag: whitespace and `#` as a `\x{…}` escape (the engine's own comments
+/// mode would otherwise drop them), anything else through
+/// [`fancy_regex::escape`].
+fn literal(out: &mut String, ch: char) {
+    if ch.is_whitespace() || ch == '#' {
+        out.push_str(&format!("\\x{{{:X}}}", ch as u32));
+    } else {
+        out.push_str(&fancy_regex::escape(ch.encode_utf8(&mut [0; 4])));
     }
+}
+
+/// Whether `ch` ends a comment in `Pattern`'s comments mode.
+fn line_end(ch: char) -> bool {
+    matches!(ch, '\n' | '\r' | '\u{85}' | '\u{2028}' | '\u{2029}')
+}
+
+/// Rewrite a `java.util.regex.Pattern` source into the engine's dialect where
+/// the two read the same text differently:
+///
+/// * `\Q…\E` quotations — `Pattern.quote`'s output, and what `Regex.escape`
+///   answers — become escaped literals. An unterminated `\Q` quotes to the end.
+/// * `\0n`, `\0nn`, `\0mnn` (`m` ≤ 3) are octal escapes, not back-references.
+/// * `\cX` is the control character `X ^ 64`.
+/// * Comments mode (`(?x)`, `RegexOption.COMMENTS`) drops whitespace and `#`
+///   comments EVERYWHERE, inside a character class too, scoped by group the
+///   way the flag is. They are removed here rather than left to the engine,
+///   whose comments mode keeps whitespace in a class and whose anchored
+///   `\A(?:…)\z` compilation a trailing comment would swallow.
+///
+/// Errors are `scan`'s to report, so a malformed escape is passed through.
+fn translate(pattern: &str) -> String {
+    let c: Vec<char> = pattern.chars().collect();
+    let n = c.len();
     let mut out = String::with_capacity(pattern.len());
-    let mut chars = pattern.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
+    let mut x = false;
+    // The comments flag in force outside each open group.
+    let mut saved: Vec<bool> = Vec::new();
+    let mut class = 0usize;
+    let mut i = 0;
+    let skip_space = |mut i: usize, x: bool| {
+        while x && i < n && (c[i].is_whitespace() || c[i] == '#') {
+            if c[i] == '#' {
+                while i < n && !line_end(c[i]) {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        i
+    };
+    while i < n {
+        let ch = c[i];
+        if x && (ch.is_whitespace() || ch == '#') {
+            i = skip_space(i, x);
             continue;
         }
-        match chars.peek() {
-            Some('Q') => {
-                chars.next();
-                let mut literal = String::new();
-                while let Some(q) = chars.next() {
-                    if q == '\\' && chars.peek() == Some(&'E') {
-                        chars.next();
-                        break;
+        match ch {
+            '\\' if i + 1 < n => {
+                let e = c[i + 1];
+                i += 2;
+                match e {
+                    'Q' => {
+                        while i < n && !(c[i] == '\\' && c.get(i + 1) == Some(&'E')) {
+                            literal(&mut out, c[i]);
+                            i += 1;
+                        }
+                        i = (i + 2).min(n);
                     }
-                    literal.push(q);
+                    '0' if c.get(i).is_some_and(|d| d.is_digit(8)) => {
+                        let most = if c[i] <= '3' { 3 } else { 2 };
+                        let mut v = 0u32;
+                        let mut k = 0;
+                        while k < most && c.get(i).is_some_and(|d| d.is_digit(8)) {
+                            v = v * 8 + c[i].to_digit(8).unwrap_or(0);
+                            i += 1;
+                            k += 1;
+                        }
+                        out.push_str(&format!("\\x{{{v:X}}}"));
+                    }
+                    'c' if skip_space(i, x) < n => {
+                        i = skip_space(i, x);
+                        out.push_str(&format!("\\x{{{:X}}}", c[i] as u32 ^ 64));
+                        i += 1;
+                    }
+                    _ => {
+                        out.push('\\');
+                        out.push(e);
+                    }
                 }
-                out.push_str(&fancy_regex::escape(&literal));
+                continue;
             }
-            Some(&next) => {
-                chars.next();
-                out.push('\\');
-                out.push(next);
+            '[' => {
+                class += 1;
+                // A `]` first in the class (after an optional `^`) is a literal.
+                out.push('[');
+                i += 1;
+                for lead in ['^', ']'] {
+                    if c.get(i) == Some(&lead) {
+                        out.push(lead);
+                        i += 1;
+                    }
+                }
+                continue;
             }
-            None => out.push('\\'),
+            ']' if class > 0 => class -= 1,
+            '(' if class == 0 => {
+                saved.push(x);
+                if c.get(i + 1) == Some(&'?') {
+                    let mut j = i + 2;
+                    let mut on = true;
+                    let mut next = x;
+                    while let Some(f) = c.get(j).filter(|f| "idmsuxUc-".contains(**f)) {
+                        match f {
+                            '-' => on = false,
+                            'x' => next = on,
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    match c.get(j) {
+                        // `(?x)` changes the flag for the rest of the ENCLOSING
+                        // group, so nothing is pushed for it.
+                        Some(')') if j > i + 2 => {
+                            saved.pop();
+                            x = next;
+                        }
+                        Some(':') => x = next,
+                        _ => {}
+                    }
+                }
+            }
+            ')' if class == 0 => {
+                if let Some(s) = saved.pop() {
+                    x = s;
+                }
+            }
+            _ => {}
         }
+        if ch.is_whitespace() {
+            literal(&mut out, ch);
+        } else {
+            out.push(ch);
+        }
+        i += 1;
     }
     out
 }

@@ -751,6 +751,10 @@ pub struct BodyProp {
     /// `init` block: `init` holds the JVM default, and the constructor may
     /// write the property even when it is a `val`.
     pub deferred: bool,
+    /// For a non-`private` `lateinit` property, the line it is declared on:
+    /// a read of it before the first write goes through its getter, whose
+    /// frame (`L.getS(main.kt:<line>)`) heads the JVM trace.
+    pub lateinit_getter: Option<u32>,
 }
 
 /// A primary-constructor parameter with its property kind.

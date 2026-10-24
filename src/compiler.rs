@@ -2140,6 +2140,9 @@ fn linearize(name: &str, parents: &HashMap<String, Vec<String>>) -> Vec<String> 
 
 pub struct Compiler {
     b: ChunkBuilder,
+    /// `(first op, line)` of every statement lowered, patched into the
+    /// chunk's line table once it is built (see the end of `compile_catchable`).
+    stmt_lines: Vec<(usize, u32)>,
     /// Declared variance and written member signatures of every generic
     /// class, for the use-site variance checks (see [`crate::variance`]).
     variance: crate::variance::VarianceTable,
@@ -3588,6 +3591,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
 
     let mut c = Compiler {
         b: ChunkBuilder::new(),
+        stmt_lines: Vec::new(),
         variance: crate::variance::VarianceTable::new(program),
         fun_sig,
         overloads,
@@ -3719,6 +3723,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
     c.emit_tostring_registry();
     c.emit_equality_registry();
     c.emit_enum_registry(program);
+    c.emit_lateinit_getters(program);
     let user_calls: HashSet<String> = program
         .funs
         .iter()
@@ -3850,7 +3855,18 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
     let end = c.b.current_pos();
     c.b.patch_jump(end_jump, end);
     let catchable = c.has_try;
-    Ok((c.b.build(), catchable))
+    let mut chunk = c.b.build();
+    // A statement's first op carries the statement's line when it was
+    // lowered without one, so an op later in the statement that also has none
+    // (a division, an operator call) is attributed to the statement — the line
+    // the JVM's line table gives it — rather than to whatever earlier
+    // statement last set a line.
+    for (at, line) in c.stmt_lines {
+        if let Some(l) = chunk.lines.get_mut(at).filter(|l| **l == 0) {
+            *l = line;
+        }
+    }
+    Ok((chunk, catchable))
 }
 
 impl Compiler {
@@ -4942,6 +4958,61 @@ impl Compiler {
         }
     }
 
+    /// Publish the getter frame of every non-`private` `lateinit` property, for
+    /// each class that inherits it (in resolution order, so the most derived
+    /// declaration registers first) and for the file facade: a read before the
+    /// first write raises inside that getter on the JVM. See `KT_LATEINIT` arg 4.
+    fn emit_lateinit_getters(&mut self, program: &Program) {
+        let getter = |p: &str| {
+            let mut cs = p.chars();
+            match (cs.next(), p.strip_prefix("is")) {
+                (_, Some(rest)) if rest.starts_with(|c: char| c.is_uppercase()) => p.to_string(),
+                (Some(f), _) => format!("get{}{}", f.to_uppercase(), cs.as_str()),
+                (None, _) => String::new(),
+            }
+        };
+        let declared: HashMap<&str, Vec<(&str, u32)>> = program
+            .classes
+            .iter()
+            .map(|c| {
+                let props = c
+                    .obj_props
+                    .iter()
+                    .filter_map(|p| Some((p.name.as_str(), p.lateinit_getter?)))
+                    .collect();
+                (c.name.as_str(), props)
+            })
+            .collect();
+        let mut regs: Vec<(String, String, String, u32)> = Vec::new();
+        let mut tags: Vec<&String> = self.classes.keys().collect();
+        tags.sort();
+        for tag in tags {
+            for owner in &self.classes[tag].mro {
+                for (name, line) in declared.get(owner.as_str()).into_iter().flatten() {
+                    regs.push((format!("{tag}\0{name}"), owner.clone(), getter(name), *line));
+                }
+            }
+        }
+        for p in &program.props {
+            if let Some(line) = p.lateinit_getter {
+                regs.push((
+                    format!("\0{}", p.name),
+                    String::new(),
+                    getter(&p.name),
+                    line,
+                ));
+            }
+        }
+        for (key, class, method, line) in regs {
+            for s in [key, class, method] {
+                let k = self.b.add_constant(Value::str(s));
+                self.b.emit(Op::LoadConst(k), 0);
+            }
+            self.b.emit(Op::LoadInt(i64::from(line)), 0);
+            self.b.emit(Op::Extended(KT_LATEINIT, 4), 0);
+        }
+    }
+
     /// Publish every `enum` class tag, so the runtime can give its constants the
     /// `toString` and the ordering an enum has (see [`KT_ENUM_REG`]).
     fn emit_enum_registry(&mut self, program: &Program) {
@@ -5302,6 +5373,9 @@ impl Compiler {
     }
 
     fn compile_stmt_inner(&mut self, sc: &mut Scope, s: &Stmt) -> Result<(), String> {
+        if s.line != 0 {
+            self.stmt_lines.push((self.b.current_pos(), s.line));
+        }
         // In debug mode, a stack-neutral marker carrying this statement's source
         // line precedes the statement — the `--dap` hook reads it to decide
         // whether to stop here. `Op::Extended(KT_DBG_LINE, 0)` pushes nothing (the
@@ -6584,7 +6658,7 @@ impl Compiler {
                         self.emit_delegate_get(p.delegate, name)?;
                     }
                     if self.lateinit_globals.contains(name) {
-                        self.emit_lateinit_check(name, 0);
+                        self.emit_lateinit_check(&format!("\0{name}"), 0);
                     }
                     return Ok(p.ty);
                 }
@@ -10932,6 +11006,7 @@ impl Compiler {
     /// for the unset marker: raise `UninitializedPropertyAccessException` on
     /// it, leave any other value in place.
     fn emit_lateinit_check(&mut self, name: &str, line: u32) {
+        // A top-level property arrives as `\0name` (see `KT_LATEINIT` arg 2).
         let nidx = self.b.add_constant(Value::str(name.to_string()));
         self.b.emit(Op::LoadConst(nidx), line);
         self.b.emit(Op::Extended(KT_LATEINIT, 2), line);
@@ -12364,7 +12439,7 @@ impl Compiler {
                             self.emit_delegate_get(p.delegate.clone(), name)?;
                         }
                         if self.lateinit_globals.contains(name) {
-                            self.emit_lateinit_check(name, line);
+                            self.emit_lateinit_check(&format!("\0{name}"), line);
                         }
                         for a in args {
                             self.compile_expr(sc, a)?;
@@ -15024,6 +15099,9 @@ impl Compiler {
         // is emitted here; the fallback arm defers to `compile_stmt`, which emits
         // its own marker.
         let mark = |c: &mut Self| {
+            if last.line != 0 {
+                c.stmt_lines.push((c.b.current_pos(), last.line));
+            }
             if c.debug && last.line != 0 {
                 c.b.emit(Op::Extended(KT_DBG_LINE, 0), last.line);
             }
