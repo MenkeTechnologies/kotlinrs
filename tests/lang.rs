@@ -10868,3 +10868,131 @@ fun main() {
         "kotlin.collections.ArrayDeque.removeFirst(ArrayDeque.kt:147) | MainKt.main$lambda$0(main.kt:3) | MainKt.t(main.kt:1)\nkotlin.collections.ArrayDeque.removeLast(ArrayDeque.kt:168) | MainKt.main$lambda$1(main.kt:4) | MainKt.t(main.kt:1)\nkotlin.collections.ArrayDeque.first(ArrayDeque.kt:102) | MainKt.main$lambda$2(main.kt:5) | MainKt.t(main.kt:1)\nkotlin.collections.ArrayDeque.last(ArrayDeque.kt:112) | MainKt.main$lambda$3(main.kt:6) | MainKt.t(main.kt:1)\nkotlin.collections.CollectionsKt___CollectionsKt.first(_Collections.kt:209) | MainKt.main$lambda$4(main.kt:7) | MainKt.t(main.kt:1)\nkotlin.collections.CollectionsKt___CollectionsKt.last(_Collections.kt:413) | MainKt.main$lambda$5(main.kt:8) | MainKt.t(main.kt:1)\nkotlin.collections.CollectionsKt___CollectionsKt.single(_Collections.kt:605) | MainKt.main$lambda$6(main.kt:9) | MainKt.t(main.kt:1)\nkotlin.collections.CollectionsKt___CollectionsKt.single(_Collections.kt:608) | MainKt.main$lambda$7(main.kt:10) | MainKt.t(main.kt:1)\nkotlin.collections.CollectionsKt___CollectionsKt.single(_Collections.kt:619) | MainKt.main$lambda$8(main.kt:11) | MainKt.t(main.kt:1)\nkotlin.collections.CollectionsKt___CollectionsKt.random(_Collections.kt:573) | MainKt.main$lambda$9(main.kt:12) | MainKt.t(main.kt:1)\nkotlin.sequences.SequencesKt___SequencesKt.first(_Sequences.kt:117) | MainKt.main$lambda$10(main.kt:13) | MainKt.t(main.kt:1)\nkotlin.sequences.SequencesKt___SequencesKt.last(_Sequences.kt:249) | MainKt.main$lambda$11(main.kt:14) | MainKt.t(main.kt:1)\nkotlin.text.StringsKt___StringsKt.last(_Strings.kt:194) | MainKt.main$lambda$12(main.kt:15) | MainKt.t(main.kt:1)\nkotlin.text.StringsKt___StringsKt.take(_Strings.kt:581) | MainKt.main$lambda$13(main.kt:16) | MainKt.t(main.kt:1)\nkotlin.text.StringsKt___StringsKt.takeLast(_Strings.kt:606) | MainKt.main$lambda$14(main.kt:17) | MainKt.t(main.kt:1)\nkotlin.text.StringsKt___StringsKt.drop(_Strings.kt:350) | MainKt.main$lambda$15(main.kt:18) | MainKt.t(main.kt:1)\nkotlin.collections.CollectionsKt___CollectionsKt.take(_Collections.kt:906) | MainKt.main$lambda$16(main.kt:19) | MainKt.t(main.kt:1)\nkotlin.collections.CollectionsKt___CollectionsKt.takeLast(_Collections.kt:930) | MainKt.main$lambda$17(main.kt:20) | MainKt.t(main.kt:1)\nkotlin.collections.CollectionsKt___CollectionsKt.drop(_Collections.kt:693) | MainKt.main$lambda$18(main.kt:21) | MainKt.t(main.kt:1)\nkotlin.collections.CollectionsKt___CollectionsKt.dropLast(_Collections.kt:732) | MainKt.main$lambda$19(main.kt:22) | MainKt.t(main.kt:1)\nkotlin.text.StringsKt__StringsKt.padStart(Strings.kt:217) | kotlin.text.StringsKt__StringsKt.padStart(Strings.kt:238) | kotlin.text.StringsKt__StringsKt.padStart$default(Strings.kt:237) | MainKt.main$lambda$20(main.kt:23) | MainKt.t(main.kt:1)\nkotlin.text.StringsKt__StringsKt.padStart(Strings.kt:217) | kotlin.text.StringsKt__StringsKt.padStart(Strings.kt:238) | MainKt.main$lambda$21(main.kt:24) | MainKt.t(main.kt:1)\nkotlin.text.StringsKt__StringsKt.padEnd(Strings.kt:252) | kotlin.text.StringsKt__StringsKt.padEnd(Strings.kt:273) | kotlin.text.StringsKt__StringsKt.padEnd$default(Strings.kt:272) | MainKt.main$lambda$22(main.kt:25) | MainKt.t(main.kt:1)\nkotlin.collections.SlidingWindowKt.checkWindowSizeStep(SlidingWindow.kt:9) | kotlin.collections.CollectionsKt___CollectionsKt.windowed(_Collections.kt:3765) | kotlin.collections.CollectionsKt___CollectionsKt.chunked(_Collections.kt:3556) | MainKt.main$lambda$23(main.kt:26) | MainKt.t(main.kt:1)\nkotlin.collections.SlidingWindowKt.checkWindowSizeStep(SlidingWindow.kt:9) | kotlin.collections.CollectionsKt___CollectionsKt.windowed(_Collections.kt:3765) | kotlin.collections.CollectionsKt___CollectionsKt.windowed$default(_Collections.kt:3764) | MainKt.main$lambda$24(main.kt:27) | MainKt.t(main.kt:1)\nkotlin.collections.SlidingWindowKt.checkWindowSizeStep(SlidingWindow.kt:9) | kotlin.text.StringsKt___StringsKt.windowed(_Strings.kt:2453) | kotlin.text.StringsKt___StringsKt.windowed(_Strings.kt:2431) | kotlin.text.StringsKt___StringsKt.chunked(_Strings.kt:2319) | MainKt.main$lambda$25(main.kt:28) | MainKt.t(main.kt:1)\nkotlin.text.CharsKt__CharKt.digitToInt(Char.kt:23) | MainKt.main$lambda$26(main.kt:29) | MainKt.t(main.kt:1)\nkotlin.text.CharsKt__CharJVMKt.checkRadix(CharJVM.kt:312) | kotlin.text.CharsKt__CharKt.digitToIntOrNull(Char.kt:74) | kotlin.text.CharsKt__CharKt.digitToInt(Char.kt:42) | MainKt.main$lambda$27(main.kt:30) | MainKt.t(main.kt:1)\nkotlin.text.CharsKt__CharJVMKt.checkRadix(CharJVM.kt:312) | MainKt.main$lambda$28(main.kt:31) | MainKt.t(main.kt:1)\njava.base/java.util.ArrayList.rangeCheckForAdd(ArrayList.java:838) | java.base/java.util.ArrayList.add(ArrayList.java:510) | MainKt.main$lambda$29(main.kt:32) | MainKt.t(main.kt:1)\njava.base/java.util.Collections$SingletonList.get(Collections.java:5180) | MainKt.main$lambda$30(main.kt:33) | MainKt.t(main.kt:1)\njava.base/java.util.AbstractList.subListRangeCheck(AbstractList.java:509) | java.base/java.util.AbstractList.subList(AbstractList.java:499) | MainKt.main$lambda$31(main.kt:34) | MainKt.t(main.kt:1)\njava.base/java.util.AbstractList.subListRangeCheck(AbstractList.java:509) | java.base/java.util.ArrayList.subList(ArrayList.java:1190) | MainKt.main$lambda$32(main.kt:35) | MainKt.t(main.kt:1)\njava.base/java.util.AbstractList.rangeCheckForAdd(AbstractList.java:634) | java.base/java.util.AbstractList.listIterator(AbstractList.java:340) | MainKt.main$lambda$33(main.kt:36) | MainKt.t(main.kt:1)\njava.base/java.util.ArrayList.rangeCheckForAdd(ArrayList.java:838) | java.base/java.util.ArrayList.listIterator(ArrayList.java:1005) | MainKt.main$lambda$34(main.kt:37) | MainKt.t(main.kt:1)\nIndex: 5, Size: 1\n"
     );
 }
+
+/// `kotlin.properties.Delegates` spelled out needs no import, and is the same
+/// object the import names: `observable`, `vetoable` and `notNull` through
+/// it. Bare `Delegates` without the import is `unresolved reference`, since
+/// `kotlin.properties` is not a default import. Measured on kotlinc 2.4.21 / JRE 21.0.13.0.2.
+#[test]
+fn the_delegates_object_may_be_spelled_out() {
+    assert_eq!(
+        prog(
+            r##"var obs: Int by kotlin.properties.Delegates.observable(0) { _, o, n -> println("$o -> $n") }
+var vet: Int by kotlin.properties.Delegates.vetoable(0) { _, _, n -> n >= 0 }
+class C { var nn: String by kotlin.properties.Delegates.notNull() }
+fun main() {
+    obs = 3; obs = 7; vet = 5; vet = -1; println(vet)
+    val c = C()
+    try { println(c.nn) } catch (e: IllegalStateException) { println(e.message) }
+    c.nn = "set"; println(c.nn)
+}
+"##
+        ),
+        "0 -> 3\n3 -> 7\n5\nProperty nn should be initialized before get.\nset\n"
+    );
+    let err = prog_err(
+        "var obs: Int by Delegates.observable(0) { _, o, n -> println(\"$o -> $n\") }\nfun main() { obs = 1 }",
+    );
+    assert!(err.contains("unresolved reference: Delegates"), "{err}");
+}
+
+/// A `lazy` initializer that throws leaves the value uninitialized, so the
+/// next read runs it again — a `by lazy` binding, a class property and a
+/// `Lazy` read through `value` alike — and `isInitialized()` stays false.
+/// It cached the throwing read's `null`. Measured on kotlinc 2.4.21 / JRE 21.0.13.0.2.
+#[test]
+fn a_lazy_initializer_that_throws_runs_again() {
+    assert_eq!(
+        prog(
+            r##"var n = 0
+val x: Int by lazy { n++; if (n < 3) throw IllegalStateException("boom $n"); n * 10 }
+class C { val y by lazy { n++; if (n < 5) error("c $n"); "ok $n" } }
+fun main() {
+    repeat(3) { try { println(x) } catch (e: Exception) { println(e.message) } }
+    println(x)
+    val c = C()
+    repeat(3) { try { println(c.y) } catch (e: Exception) { println(e.message) } }
+    val l = lazy { n++; if (n < 7) throw RuntimeException("v $n"); n }
+    repeat(2) { try { println(l.value) } catch (e: Exception) { println(e.message + " " + l.isInitialized()) } }
+    println(l.isInitialized())
+}
+"##
+        ),
+        "boom 1\nboom 2\n30\n30\nc 4\nok 5\nok 5\nv 6 false\n7\ntrue\n"
+    );
+}
+
+/// `toSortedSet(comparator)` on an `Iterable` is a `TreeSet` ordered by the
+/// comparator; `String` has no such overload. Measured on kotlinc 2.4.21 / JRE 21.0.13.0.2.
+#[test]
+fn to_sorted_set_takes_a_comparator() {
+    assert_eq!(
+        prog(
+            r##"data class P(val name: String, val age: Int)
+fun main() {
+    val ps = listOf(P("b", 3), P("a", 1))
+    println(ps.toSortedSet(compareBy { it.name }))
+    println(listOf(3, 1, 2).toSortedSet())
+    println(listOf(3, 1, 2).toSortedSet(reverseOrder()))
+    println(setOf("b", "a").toSortedSet())
+    extra()
+}
+fun extra() {
+    val s = listOf("ccc", "a", "bb").toSortedSet(compareBy { it.length })
+    println(s); println(s.first()); println(s.javaClass.name)
+}
+"##
+        ),
+        "[P(name=a, age=1), P(name=b, age=3)]\n[1, 2, 3]\n[3, 2, 1]\n[a, b]\n[a, bb, ccc]\na\njava.util.TreeSet\n"
+    );
+    // `too many arguments for 'fun CharSequence.toSortedSet(): SortedSet<Char>'`
+    // on the reference.
+    let err = prog_err(r#"println("hello".toSortedSet(reverseOrder()))"#);
+    assert!(err.contains("toSortedSet"), "{err}");
+}
+
+/// A class or interface that inherits two different declarations of one
+/// member, at least one with a body, and declares none itself must override
+/// it. A diamond's single declaration and two abstract ones need nothing.
+/// Each refused program is a compile error on kotlinc 2.4.21 / JRE 21.0.13.0.2
+/// with the wording asserted.
+#[test]
+fn conflicting_inherited_members_must_be_overridden() {
+    for (src, want) in [
+        (
+            "interface A { fun f() = \"A\" }\ninterface B { fun f() = \"B\" }\nclass C : A, B\nfun main() { println(C().f()) }",
+            "class 'C' must override 'f' because it inherits multiple interface methods for it.",
+        ),
+        (
+            "interface A { fun f() = \"A\" }\ninterface B { fun f(): String }\nclass C : A, B\nfun main() { println(C().f()) }",
+            "class 'C' must override 'f' because it inherits multiple interface methods for it.",
+        ),
+        (
+            "open class P { open fun f() = \"P\" }\ninterface I { fun f() = \"I\" }\nclass C : P(), I\nfun main() { println(C().f()) }",
+            "class 'C' must override 'f' because it inherits multiple implementations for it.",
+        ),
+        (
+            "interface A { fun f() = \"A\" }\ninterface B { fun f() = \"B\" }\ninterface D : A, B\nfun main() { println(1) }",
+            "interface 'D' must override 'f' because it inherits multiple interface methods for it.",
+        ),
+        (
+            "interface A { val p: Int get() = 1 }\ninterface B { val p: Int get() = 2 }\nclass C : A, B\nfun main() { println(C().p) }",
+            "class 'C' must override 'p' because it inherits multiple interface methods for it.",
+        ),
+    ] {
+        let err = prog_err(src);
+        assert!(err.contains(want), "{src}: {err}");
+    }
+    assert_eq!(
+        prog("interface A { fun f() = \"A\" }\ninterface B : A\ninterface E : A\nclass C : B, E\nfun main() { println(C().f()) }"),
+        "A\n"
+    );
+    assert_eq!(
+        prog("interface A { fun f(): String }\ninterface B { fun f(): String }\nabstract class C : A, B\nclass D : C() { override fun f() = \"D\" }\nfun main() { println(D().f()) }"),
+        "D\n"
+    );
+    assert_eq!(
+        prog("interface A { fun f() = \"A\" }\ninterface B { fun f() = \"B\" }\nclass C : A, B { override fun f() = super<A>.f() + super<B>.f() }\nfun main() { println(C().f()) }"),
+        "AB\n"
+    );
+}

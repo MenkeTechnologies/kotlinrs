@@ -222,8 +222,9 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
 - **Delegated properties** — `by lazy`, a user delegate declaring
   `operator fun getValue`/`setValue` (on a class, top-level or local
   property, handed the property's `KProperty` so `property.name` reads), and
-  `Delegates.observable`/`vetoable`/`notNull` on a class, top-level or local
-  property, and a `Map`/`MutableMap` as a delegate (`val name: String by m`).
+  `Delegates.observable`/`vetoable`/`notNull` (under `import
+  kotlin.properties.Delegates`, or spelled `kotlin.properties.Delegates`) on a
+  class, top-level or local property, and a `Map`/`MutableMap` as a delegate (`val name: String by m`).
 - **Property accessors with a backing field** — `var x = 0 get() = … set(v)
   { field = … }` on a class property, `field` included; a bodyless `private
   set` is accepted. The accessors compile as methods of the owner and the
@@ -731,7 +732,8 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   function; a local of the same name shadows one. `val z: Int by lazy { … }` —
   on a top-level property, a class property **or a local `val`** — runs its block
   at the **first read** and caches the result, so an initializer with an effect
-  fires at use rather than at startup. `lazy { … }` is also a VALUE in its own
+  fires at use rather than at startup; one that throws caches nothing, and the
+  next read runs it again. `lazy { … }` is also a VALUE in its own
   right (`val c = lazy { … }`), building the same cell the delegate stores and
   read through `.value` and `.isInitialized()` — the second of which must not
   force it, since asking the question would otherwise answer it. `lazy` is the

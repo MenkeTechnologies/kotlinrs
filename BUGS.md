@@ -500,13 +500,21 @@ JVM.
 | `val lz = { y: Int -> y / 0 }` on line 15, `listOf(1).map(lz)` on line 16 | `main$lambda$N(…:16)`, `main(…:16)` | `main$lambda$N(…:15)`, `main(…:25)` |
 | `emptyList<Int>().reduce { a, b -> a + b }`, `listOf(1, 2).first { it > 5 }`, `last { it > 5 }` on line 2 | `main(main.kt:2)` | `main(main.kt:6)`, `6`, `10` |
 | `mutableMapOf<Int, Int>().iterator().next()`, a `mutableSetOf` or `keys` iterator past its end | the user frames only | `LinkedHashMap$LinkedHashIterator.nextNode` and the `next` of the entry or key iterator in front |
+| `class L { lateinit var s: String }`; `L().s` read from outside `L` | `MainKt.main(…)` | `L.getS(main.kt:1)` in front: the read goes through the getter |
+| `class Box<out T>(var v: T)`; `class Sink<in T> { fun get(): T? = null }` | compiles | `type parameter 'T' is declared as 'out' but occurs in 'invariant' position …` / `… 'in' but occurs in 'out' position …` |
+| `val b: Box<Any> = Box<String>("s")`; `val xs: MutableList<Any> = mutableListOf<String>("a")` | compiles | `initializer type mismatch: expected 'Box<Any>', actual 'Box<String>'.` |
+| `object O { val a = b + 1; val b = 2 }` | `1` | `variable 'b' must be initialized.` |
+| `(1..10).reduceRightIndexed { i, a, b -> … }` | `91` | `unresolved reference 'reduceRightIndexed' on receiver of type 'IntRange'.` |
 
 The first two are a declaration type check this frontend does not make for any
 integral width (`val l: Long = x` is accepted the same way); only an
 out-of-range LITERAL is refused. The third is the erased-position box: a
 primitive array holds bare integers, so a member that copies one into a
 collection (`toList`, `asList`) hands back `Int`s — `LongArray` has the same
-gap. The three line rows are the JVM's inline-function line mapping: a body
+gap. The `lateinit` row needs a frame the VM never runs: the getter is not a sub
+here. The variance, invariance and initialization-order rows are checks this
+frontend does not make — variance annotations are parsed and dropped. The
+three line rows are the JVM's inline-function line mapping: a body
 copied into its caller is numbered past the end of the file (the SMAP
 section), and a stack trace prints those numbers as they are. The lambda row's
 first frame is a line attribution miss of its own: the faulting op in the

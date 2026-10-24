@@ -10418,6 +10418,9 @@ fn b_lazy_get(vm: &mut VM, _argc: u8) -> Value {
     // The thunk runs with the heap borrow released — it is user code and may
     // allocate, or read this very cell.
     match invoke_closure(vm, &thunk, &[]) {
+        // An initializer that threw leaves the cell uninitialized: the next
+        // read runs it again, as `SynchronizedLazyImpl` does.
+        Ok(v) if unwinding() => v,
         Ok(v) => {
             with_obj_mut(&cell, |o| {
                 if let HeapObj::Lazy { value, .. } = o {
@@ -16948,6 +16951,9 @@ fn obj_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             // The thunk is user code and may allocate, so it runs with no heap
             // borrow held — the snapshot above is what releases it.
             let v = invoke_closure(vm, &thunk, &[])?;
+            if unwinding() {
+                return Ok(v);
+            }
             with_obj_mut(recv, |o| {
                 if let HeapObj::Lazy { value, .. } = o {
                     *value = Some(v.clone());

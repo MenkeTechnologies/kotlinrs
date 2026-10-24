@@ -154,8 +154,22 @@ fn is_observable_delegate(e: &Expr) -> bool {
     match e {
         Expr::MethodCall { recv, name, .. } => {
             matches!(name.as_str(), "observable" | "vetoable" | "notNull")
-                && matches!(&**recv, Expr::Var(v) if v == "Delegates")
+                && is_delegates_object(recv)
         }
+        _ => false,
+    }
+}
+
+/// Whether `e` spells the `Delegates` object: bare, or fully qualified as
+/// `kotlin.properties.Delegates`.
+fn is_delegates_object(e: &Expr) -> bool {
+    match e {
+        Expr::Var(v) => v == "Delegates",
+        Expr::Member { recv, name, .. } if name == "Delegates" => matches!(
+            &**recv,
+            Expr::Member { recv: k, name: p, .. }
+                if p == "properties" && matches!(&**k, Expr::Var(v) if v == "kotlin")
+        ),
         _ => false,
     }
 }
@@ -2292,6 +2306,9 @@ pub struct Compiler {
     /// class itself, or `java.util.*`), which is what makes a bare
     /// `PriorityQueue(…)` resolve.
     pq_imported: bool,
+    /// `import kotlin.properties.Delegates` (or `.*`): `kotlin.properties` is not
+    /// a default import, so the bare `Delegates` needs one.
+    delegates_imported: bool,
     /// True when the program contains a `try`/`throw` anywhere. Only then are the
     /// per-statement unwind checks (and the suppressible print builtins) emitted,
     /// so an exception-free program keeps byte-identical bytecode — and its
@@ -2686,6 +2703,7 @@ fn check_modifiers(
                             .any(|p| p.name == name && p.kind != PropKind::None)
                 })
     };
+    check_inherited_conflicts(cd, by_name)?;
     for m in &cd.methods {
         let found = inherited(&m.name, m.params.len());
         match (m.is_override, found) {
@@ -2727,6 +2745,98 @@ fn check_modifiers(
             }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+/// The declarations of member `name`/`arity` that supertype `d` hands down:
+/// its own, or else those its supertypes hand down to it. A diamond yields one
+/// declaration twice, which the caller folds by owner.
+fn handed_down<'a>(
+    d: &'a ClassDecl,
+    name: &str,
+    arity: usize,
+    by_name: &HashMap<&str, &'a ClassDecl>,
+    out: &mut Vec<(&'a ClassDecl, &'a FunDecl)>,
+) {
+    if let Some(m) = d
+        .methods
+        .iter()
+        .find(|m| m.name == name && m.params.len() == arity)
+    {
+        out.push((d, m));
+        return;
+    }
+    for p in &d.parents {
+        if let Some(pd) = by_name.get(p.as_str()) {
+            handed_down(pd, name, arity, by_name, out);
+        }
+    }
+}
+
+/// A class or interface that inherits two DIFFERENT declarations of one member,
+/// at least one of them with a body, and declares none of its own, must
+/// override it: Kotlin will not pick between them. `kotlinc` words it by what
+/// is inherited — `multiple implementations` when a superclass supplies one,
+/// `multiple interface methods` otherwise.
+fn check_inherited_conflicts(
+    cd: &ClassDecl,
+    by_name: &HashMap<&str, &ClassDecl>,
+) -> Result<(), String> {
+    if cd.parents.len() < 2 {
+        return Ok(());
+    }
+    let mut members: Vec<(&str, usize)> = Vec::new();
+    for p in &cd.parents {
+        let Some(pd) = by_name.get(p.as_str()) else {
+            continue;
+        };
+        let mut stack = vec![*pd];
+        while let Some(d) = stack.pop() {
+            for m in &d.methods {
+                if !members.contains(&(m.name.as_str(), m.params.len())) {
+                    members.push((m.name.as_str(), m.params.len()));
+                }
+            }
+            stack.extend(d.parents.iter().filter_map(|q| by_name.get(q.as_str())));
+        }
+    }
+    for (name, arity) in members {
+        if cd
+            .methods
+            .iter()
+            .any(|m| m.name == name && m.params.len() == arity)
+        {
+            continue;
+        }
+        let mut found = Vec::new();
+        for p in &cd.parents {
+            if let Some(pd) = by_name.get(p.as_str()) {
+                handed_down(pd, name, arity, by_name, &mut found);
+            }
+        }
+        let mut owners: Vec<&str> = found.iter().map(|(d, _)| d.name.as_str()).collect();
+        owners.sort_unstable();
+        owners.dedup();
+        if owners.len() < 2 || found.iter().all(|(_, m)| m.is_abstract) {
+            continue;
+        }
+        let what = if found.iter().any(|(d, m)| !d.is_interface && !m.is_abstract) {
+            "implementations"
+        } else {
+            "interface methods"
+        };
+        let kind = if cd.is_interface {
+            "interface"
+        } else {
+            "class"
+        };
+        return Err(format!(
+            "{kind} '{}' must override '{}' because it inherits multiple {what} for it. (line {})",
+            cd.name,
+            unmangled(name),
+            cd.line
+        ));
     }
     Ok(())
 }
@@ -3437,6 +3547,7 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         math_star: false,
         random_imported: false,
         pq_imported: false,
+        delegates_imported: false,
         jrandom_imported: false,
         has_try: uses_exceptions(program),
         cur_ret: None,
@@ -3455,6 +3566,10 @@ pub fn compile_catchable(program: &Program, debug: bool) -> Result<(Chunk, bool)
         .any(|i| i.alias.is_none() && (i.path == "java.util.Random" || i.path == "java.util.*"));
     c.pq_imported = program.imports.iter().any(|i| {
         i.alias.is_none() && (i.path == "java.util.PriorityQueue" || i.path == "java.util.*")
+    });
+    c.delegates_imported = program.imports.iter().any(|i| {
+        i.alias.is_none()
+            && (i.path == "kotlin.properties.Delegates" || i.path == "kotlin.properties.*")
     });
     c.random_imported = program.imports.iter().any(|i| {
         i.alias.is_none() && (i.path == "kotlin.random.Random" || i.path == "kotlin.random.*")
@@ -7727,6 +7842,46 @@ impl Compiler {
                 },
             );
         }
+        // `x.toSortedSet(comparator)` — a `TreeSet` ordered by the comparator,
+        // holding the receiver's elements: `TreeSet(comparator)` and then its
+        // `addAll`, as the stdlib's `toCollection(TreeSet(comparator))` is.
+        if name == "toSortedSet"
+            && args.len() == 1
+            && !safe
+            && !self.infer(sc, recv).is_str()
+            && self.class_meta("TreeSet").is_none()
+        {
+            let tmp = format!("$sortedSet{}", self.b.current_pos());
+            let mark = sc.enter();
+            self.compile_expr(
+                sc,
+                &Expr::Call {
+                    name: "TreeSet".to_string(),
+                    args: args.to_vec(),
+                    line,
+                },
+            )?;
+            let slot = sc.declare_obj(&tmp, Type::Obj, false, Some("TreeSet".to_string()));
+            self.b.emit(Op::SetSlot(slot), line);
+            let add = Expr::MethodCall {
+                recv: Box::new(Expr::Var(tmp.clone())),
+                name: "addAll".to_string(),
+                args: vec![Expr::MethodCall {
+                    recv: Box::new(recv.clone()),
+                    name: "toList".to_string(),
+                    args: Vec::new(),
+                    safe: false,
+                    line,
+                }],
+                safe: false,
+                line,
+            };
+            self.compile_expr(sc, &add)?;
+            self.b.emit(Op::Pop, line);
+            self.b.emit(Op::GetSlot(slot), line);
+            sc.exit(mark);
+            return Ok(Type::Obj);
+        }
         // `x.orEmpty()` — the nullable-receiver extension, lowered as the elvis
         // it is defined to be. The EMPTY it falls back to depends on the
         // receiver's declared type and not on its value (a `null` `String?`
@@ -7768,16 +7923,20 @@ impl Compiler {
         // A stdlib factory on an object this frontend does not otherwise model,
         // so the receiver is recognized by spelling and the call becomes the
         // intrinsic that builds the delegate.
-        if matches!(name, "observable" | "vetoable")
-            && args.len() == 2
-            && self.qualifier(sc, recv).as_deref() == Some("Delegates")
-        {
+        let delegates = match self.qualifier(sc, recv).as_deref() {
+            Some("kotlin.properties.Delegates") => true,
+            Some("Delegates") if matches!(name, "observable" | "vetoable" | "notNull") => {
+                if !self.delegates_imported {
+                    return Err("unresolved reference: Delegates".to_string());
+                }
+                true
+            }
+            _ => false,
+        };
+        if matches!(name, "observable" | "vetoable") && args.len() == 2 && delegates {
             return self.compile_call(sc, &format!("__{name}"), args, line);
         }
-        if name == "notNull"
-            && args.is_empty()
-            && self.qualifier(sc, recv).as_deref() == Some("Delegates")
-        {
+        if name == "notNull" && args.is_empty() && delegates {
             self.b.emit(Op::LoadUndef, line);
             self.b.emit(Op::LoadUndef, line);
             self.b.emit(Op::Extended(KT_OBSERVE, 2), line);

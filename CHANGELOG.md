@@ -11,6 +11,19 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Qualified `Delegates`, retried `lazy`, `toSortedSet(comparator)`, conflicting inherited members
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.13.0.2.
+
+| program | before | reference |
+| --- | --- | --- |
+| `var o: Int by kotlin.properties.Delegates.observable(0) { … }` | `unresolved reference: properties` | runs |
+| `Delegates.observable(…)` with no `import kotlin.properties.Delegates` | runs | `unresolved reference 'Delegates'.` |
+| `val x by lazy { …throw… }` read twice, the first read throwing | `null` the second time | the initializer runs again |
+| `listOf(P("b", 3), P("a", 1)).toSortedSet(compareBy { it.name })` | `unresolved reference: toSortedSet on List` | `[P(name=a, age=1), P(name=b, age=3)]` |
+| `interface A { fun f() = "A" }`, `interface B { fun f() = "B" }`, `class C : A, B` | `A` | `class 'C' must override 'f' because it inherits multiple interface methods for it.` |
+| `open class P { open fun f() = "P" }`, `interface I { fun f() = "I" }`, `class C : P(), I` | `P` | `… because it inherits multiple implementations for it.` |
+
 ## `Byte` and `Short` are types of their own
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.13.0.2.
