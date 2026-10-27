@@ -336,7 +336,7 @@ pub const KT_OBJ_INIT_ENTER: u16 = 154;
 pub const KT_OBJ_INIT_EXIT: u16 = 155;
 /// `KT_ITER_MORE`: the loop test of a `for` over a collection. Stack
 /// `[iterable, i, n0, m0]`, `n0` the size and `m0` the modification count
-/// ([`mod_count`]) at the loop's head; pushes whether to run another pass. It is the JDK iterator's protocol over a size check: a
+/// (`mod_count`) at the loop's head; pushes whether to run another pass. It is the JDK iterator's protocol over a size check: a
 /// collection whose size the body changed ends the loop if the cursor now
 /// sits at its end (`hasNext` is `cursor != size`) and otherwise raises
 /// `ConcurrentModificationException`, which is what `next()`'s modification
@@ -349,7 +349,7 @@ pub const KT_ITER_MORE: u16 = 156;
 /// the `LoadUndef; ReturnValue` stub the compiler places just before the
 /// entry. Stack-neutral; one dispatched op on the ordinary path.
 pub const KT_DEPTH_GUARD: u16 = 157;
-/// `KT_MODCOUNT`: a collection's modification count — see [`mod_count`].
+/// `KT_MODCOUNT`: a collection's modification count — see `mod_count`.
 /// Stack `[collection]`; pushes an `Int`.
 pub const KT_MODCOUNT: u16 = 159;
 /// `KT_UNSIGNED`: box an unsigned value. Stack `[value, typeName]`; the value
@@ -367,7 +367,7 @@ pub const KT_UNSIGNED: u16 = 160;
 /// 300 MB and 1.5 s in a debug build.
 pub const MAX_CALL_DEPTH: usize = 1_000_000;
 
-/// `KT_UNIT`: push `kotlin.Unit` — see [`unit_value`]. Stack `[]`.
+/// `KT_UNIT`: push `kotlin.Unit` — see `unit_value`. Stack `[]`.
 pub const KT_UNIT: u16 = 158;
 
 /// `KT_SEQ_NEW`: build the lazy `Sequence` a `sequence { … }` block denotes.
