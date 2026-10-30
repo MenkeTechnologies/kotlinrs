@@ -12283,3 +12283,28 @@ fn a_maps_keys_and_values_sum_at_the_maps_type_argument_width() {
         "-2147483648\n-2147483648\n-2\n3000000001\n"
     );
 }
+
+#[test]
+fn an_untyped_collection_plus_a_number_is_the_collection_plus() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.13. `fun <T> id(x: T) = x`
+    // answers its argument's type, and a left operand of no static type under
+    // `+`/`-` is decided by its value — a `List` adds or removes the element.
+    // Before, a native add coerced the list handle to a number: `5.0`.
+    assert_eq!(
+        stdout(
+            "fun <T> id(x: T) = x\n\
+             fun <T> first(xs: List<T>) = xs[0]\n\
+             fun main() {\n\
+             \x20   println(id(listOf(1)) + 5)\n\
+             \x20   println(first(listOf(listOf(1))) + 5)\n\
+             \x20   println(first(listOf(setOf(1))) + 2)\n\
+             \x20   println(first(listOf(listOf(1, 2))) - 1)\n\
+             \x20   println(first(listOf(3)) + 4)\n\
+             \x20   println(first(listOf(2.5)) + 1)\n\
+             \x20   println(first(listOf('a')) + 1)\n\
+             \x20   println(id(2000000000) + id(2000000000))\n\
+             }"
+        ),
+        "[1, 5]\n[1, 5]\n[1, 2]\n[2]\n7\n3.5\nb\n-294967296\n"
+    );
+}

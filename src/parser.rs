@@ -1447,6 +1447,23 @@ impl Parser {
             None if is_expr_body => Type::Unknown,
             None => Type::Unit,
         };
+        // `fun <T> id(x: T) = x` — an expression body that IS a parameter
+        // declared with a type variable has that variable as its result type,
+        // so the call site reads the width off the argument exactly as it does
+        // for a written `: T`.
+        let ret_type_param_of = ret_type_param_of.or_else(|| {
+            let [Stmt {
+                kind: StmtKind::Return(Some(Expr::Var(v))),
+                ..
+            }] = &body[..]
+            else {
+                return None;
+            };
+            (ret_annot.is_none() && is_expr_body)
+                .then(|| params.iter().position(|p| &p.name == v))
+                .flatten()
+                .filter(|i| param_tps.get(*i).is_some_and(|t| t.is_some()))
+        });
         // The written signature, published only now that the body (and any
         // local `fun` in it) has been read.
         let ret_written = sig_ret_written

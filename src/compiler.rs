@@ -10881,6 +10881,18 @@ impl Compiler {
                 self.emit_operator_call(sc, l, r, fname)?;
                 return Ok(Type::Obj);
             }
+            // An untyped left operand against a PRIMITIVE right one under the
+            // two conventions a collection also answers: `id(xs) + 5` may be a
+            // `List`'s `plus`, which a native op would answer by coercing the
+            // handle to a number. The value decides, and the result stays
+            // untyped — it is a number exactly when the operand was.
+            if lt == Type::Unknown
+                && matches!(fname, "plus" | "minus")
+                && !matches!(rt, Type::Unknown | Type::Obj)
+            {
+                self.emit_operator_call(sc, l, r, fname)?;
+                return Ok(Type::Unknown);
+            }
         }
 
         // `<`/`>`/`<=`/`>=` on a class declaring `compareTo` are that

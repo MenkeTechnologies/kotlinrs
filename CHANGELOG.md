@@ -11,6 +11,23 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## An untyped left operand under `+`/`-` is decided by its value
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.13.
+
+| program | before | reference |
+| --- | --- | --- |
+| `fun <T> id(x: T) = x`; `id(listOf(1)) + 5` | `5.0` | `[1, 5]` |
+| `fun <T> first(xs: List<T>) = xs[0]`; `first(listOf(listOf(1, 2))) - 1` | `-1.0` | `[2]` |
+| `fun <T> id(x: T) = x`; `id(2000000000) + id(2000000000)` | `4000000000` | `-294967296` |
+
+An expression-bodied function whose body is a parameter declared with a type
+variable answers that variable, so the call site reads the type off the
+argument as it does for a written `: T`. A left operand that is still untyped,
+against a primitive right one, goes through the runtime operator for `plus` and
+`minus` — the two conventions a collection also answers — instead of a native
+op that coerced a collection handle to a number.
+
 ## A map's `keys` and `values` carry its type arguments
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.13.

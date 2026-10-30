@@ -372,15 +372,9 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
 
 | program | kotlinrs | reference |
 | --- | --- | --- |
-| `fun <T> id(x: T) = x`; `println(id(listOf(1)) + 5)` | `5.0` | `[1, 5]` |
 | `open class M(val c: Int)`; `class N(c: Int) : M(c)`; `operator fun M.plus(o: M)` and `operator fun N.plus(o: M)`; `listOf<M>(N(1), M(2)).reduce { a, b -> a + b }` | `unresolved reference: plus on N` | `M.plus`, chosen by the static type `M` |
 
-The first is an untyped left operand against a PRIMITIVE right one: the native
-`Add` coerces a heap handle to a number. Routing every untyped arithmetic site
-through the runtime operator would close it at the cost of a builtin call on
-each one; an untyped left operand against a heap right one is already routed.
-
-The second is extension choice by static type. A receiver of no static type
+The first is extension choice by static type. A receiver of no static type
 picks among user-class extensions by the value's runtime class, which is only
 sound when no one instance could match two candidates; where it could (an
 extension on a class and on its subclass), the chain declines and the call
