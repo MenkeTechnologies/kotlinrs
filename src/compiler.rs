@@ -9943,6 +9943,50 @@ impl Compiler {
         fits.next().is_none().then(|| first.0.clone())
     }
 
+    /// The constructor `::C` refers to. With one constructor it is that one.
+    /// With several, Kotlin chooses by the expected function type —
+    /// [`Compiler::lambda_hint`] — among those of its arity whose parameter
+    /// types fit, and a reference that no expected type singles out is an
+    /// `overload resolution ambiguity`, as `kotlinc` reports it.
+    fn ctor_ref_target(
+        &self,
+        meta: &ClassMeta,
+        name: &str,
+        line: u32,
+    ) -> Result<Vec<Param>, String> {
+        let primary = meta.has_primary.then(|| {
+            meta.ctor_params
+                .iter()
+                .map(|p| p.as_param())
+                .collect::<Vec<Param>>()
+        });
+        let all: Vec<Vec<Param>> = primary
+            .into_iter()
+            .chain(meta.sec_params.iter().cloned())
+            .collect();
+        if all.len() <= 1 {
+            return Ok(all
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| meta.ctor_params.iter().map(|p| p.as_param()).collect()));
+        }
+        let fits = |params: &&Vec<Param>| {
+            self.lambda_hint.as_ref().is_some_and(|hint| {
+                params.len() == hint.len()
+                    && params.iter().zip(hint).all(|(p, (t, _))| {
+                        *t == Type::Unknown || p.ty == *t || p.ty == Type::Obj && p.class.is_none()
+                    })
+            })
+        };
+        let mut fitting = all.iter().filter(fits);
+        match (fitting.next(), fitting.next()) {
+            (Some(one), None) => Ok(one.clone()),
+            _ => Err(format!(
+                "overload resolution ambiguity: no single constructor of `{name}` fits `::{name}` (line {line})"
+            )),
+        }
+    }
+
     fn compile_fun_ref(
         &mut self,
         sc: &mut Scope,
@@ -9969,17 +10013,28 @@ impl Compiler {
                 };
                 return self.compile_expr(sc, &lam(n, body));
             }
-            if let Some(meta) = self.classes.get(name) {
-                // `::C` is C's PRIMARY constructor, so its arity is that
-                // parameter list's — including any that carry a default, which
-                // is the type Kotlin gives the reference.
-                let n = meta.ctor_params.len();
+            if let Some(meta) = self.classes.get(name).cloned() {
+                // `::C` names one of C's constructors, all of its parameters
+                // counted — including any that carry a default, which is the
+                // type Kotlin gives the reference.
+                let params = self.ctor_ref_target(&meta, name, line)?;
                 let body = Expr::Call {
                     name: name.to_string(),
-                    args: args(n),
+                    args: args(params.len()),
                     line,
                 };
-                return self.compile_expr(sc, &lam(n, body));
+                // The parameters carry the constructor's own types, so the
+                // call inside selects the constructor the reference named.
+                let lam = Expr::Lambda {
+                    params: params
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| (param(i), p.ty))
+                        .collect(),
+                    body: vec![Stmt::new(line, StmtKind::Expr(body))],
+                    catch_tag: None,
+                };
+                return self.compile_expr(sc, &lam);
             }
             if matches!(name, "println" | "print") {
                 let body = Expr::Call {
@@ -13708,14 +13763,29 @@ impl Compiler {
                 }
                 _ => a,
             };
-            match params.get(i).map(|p| p.ty) {
-                Some(Type::Float) => {
-                    self.compile_expr(sc, a)?;
-                }
-                _ => {
-                    self.compile_erased(sc, a)?;
-                }
+            // A lambda or callable reference bound to a function-typed
+            // parameter takes that type's parameters as its expected ones, as
+            // an annotated `val f: (String) -> P = ::P` does.
+            let hinted = matches!(a, Expr::Lambda { .. } | Expr::FunRef { .. })
+                .then(|| {
+                    params
+                        .get(i)
+                        .and_then(|p| p.written.as_ref())
+                        .and_then(written_fn_params)
+                })
+                .flatten();
+            let had_hint = hinted.is_some();
+            if let Some(h) = hinted {
+                self.lambda_hint = Some(h.into_iter().map(|t| (t, Type::Unknown)).collect());
             }
+            let res = match params.get(i).map(|p| p.ty) {
+                Some(Type::Float) => self.compile_expr(sc, a),
+                _ => self.compile_erased(sc, a),
+            };
+            if had_hint {
+                self.lambda_hint = None;
+            }
+            res?;
         }
         Ok(())
     }
@@ -17333,6 +17403,30 @@ fn bind_named_args(
         .zip(&bound)
         .all(|(p, b)| *b || p.default.is_some() || p.vararg.is_some())
         .then_some((ps, ts))
+}
+
+/// The parameter types a written function type names — `(String, Int) -> P`
+/// answers `[String, Int]` — or `None` for any other annotation. A parameter
+/// that is not one of the primitive names is `Unknown`.
+fn written_fn_params(w: &TypeExpr) -> Option<Vec<Type>> {
+    match w {
+        TypeExpr::Func {
+            params, recv: None, ..
+        } => Some(
+            params
+                .iter()
+                .map(|p| match p {
+                    TypeExpr::Named {
+                        name,
+                        args,
+                        nullable: false,
+                    } if args.is_empty() => Type::from_name(name),
+                    _ => Type::Unknown,
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
 }
 
 /// Whether `name` is one of the receiver-taking scope functions.

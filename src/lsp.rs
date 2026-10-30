@@ -535,7 +535,7 @@ const CORPUS: &[Entry] = &[
         "::",
         "Operators",
         "::fn\nType::member\nreceiver::member",
-        "Callable reference: names a function as a VALUE. With no receiver it is a top-level function or a primary constructor; with a TYPE receiver it is unbound, so the resulting function takes the receiver as its first parameter; with any other expression it is bound, and that receiver is evaluated once where the reference is written. `Type::class` is not supported.",
+        "Callable reference: names a function as a VALUE. With no receiver it is a top-level function or a constructor — of a class with several, the one the expected function type selects (a `val` annotation, or the function-typed parameter it is passed to), and without one an overload resolution ambiguity, as `kotlinc` reports it; with a TYPE receiver it is unbound, so the resulting function takes the receiver as its first parameter; with any other expression it is bound, and that receiver is evaluated once where the reference is written. `Type::class` is the class reference.",
         "fun inc(x: Int) = x + 1\nprintln(listOf(1, 2).map(::inc))            // [2, 3]\nprintln(listOf(\"aa\", \"b\").map(String::length))   // [2, 1]",
     ),
     (

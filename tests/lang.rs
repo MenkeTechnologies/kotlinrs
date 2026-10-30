@@ -12200,3 +12200,42 @@ fn an_enum_initializes_on_first_use_with_its_companion() {
          ExceptionInInitializerError java.lang.IllegalStateException: boom\nNoClassDefFoundError\n"
     );
 }
+
+#[test]
+fn a_constructor_reference_selects_by_the_expected_function_type() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.13. With several constructors,
+    // `::P` names the one the expected function type selects — from a `val`
+    // annotation, a function-typed parameter, or a collection member's lambda.
+    assert_eq!(
+        stdout(
+            "class P(val a: Int) {\n\
+             \x20   var tag = \"p\"\n\
+             \x20   constructor(s: String) : this(s.length) { tag = \"s\" }\n\
+             \x20   override fun toString() = \"P($a,$tag)\"\n\
+             }\n\
+             fun mk(f: (String) -> P) = f(\"xyz\")\n\
+             fun main() {\n\
+             \x20   val f: (String) -> P = ::P\n\
+             \x20   println(f(\"abcd\"))\n\
+             \x20   val g: (Int) -> P = ::P\n\
+             \x20   println(g(7))\n\
+             \x20   println(listOf(1, 2).map(::P))\n\
+             \x20   println(mk(::P))\n\
+             }"
+        ),
+        "P(4,s)\nP(7,p)\n[P(1,p), P(2,p)]\nP(3,s)\n"
+    );
+    // kotlinc: `overload resolution ambiguity between candidates` — with no
+    // expected type there is nothing to choose by. Before, the primary was
+    // taken silently.
+    let out = eval(
+        "class P(val a: Int) { constructor(s: String) : this(s.length) }\n\
+         fun main() { val f = ::P; println(f) }",
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("overload resolution ambiguity"),
+        "stderr was: {err}"
+    );
+}

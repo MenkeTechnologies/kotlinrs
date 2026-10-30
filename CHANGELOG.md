@@ -11,6 +11,20 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## A constructor reference selects by the expected function type
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.13.
+
+| program | before | reference |
+| --- | --- | --- |
+| `class P(val a: Int) { constructor(s: String) : this(s.length) }`; `val f = ::P` | compiles, the primary | `overload resolution ambiguity between candidates` |
+| the same `P`; `fun mk(f: (String) -> P) = f("xyz")`; `mk(::P).a` | the primary, holding `"xyz"` | `3` — the `String` secondary |
+
+`::C` of a class with several constructors names the one whose arity and
+parameter types the expected function type fits. A lambda or callable
+reference passed to a function-typed parameter of a user function now takes
+that type's parameters as its expected ones, as an annotated `val` already did.
+
 ## An enum initializes on first use, with its companion
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.13.

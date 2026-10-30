@@ -604,7 +604,7 @@ println(x ?: 0)   // 0</code></pre>
           <pre><code class="lang-kotlin">::fn
 Type::member
 receiver::member</code></pre>
-          <p>Callable reference: names a function as a VALUE. With no receiver it is a top-level function or a primary constructor; with a TYPE receiver it is unbound, so the resulting function takes the receiver as its first parameter; with any other expression it is bound, and that receiver is evaluated once where the reference is written. <code>Type::class</code> is not supported.</p>
+          <p>Callable reference: names a function as a VALUE. With no receiver it is a top-level function or a constructor — of a class with several, the one the expected function type selects (a <code>val</code> annotation, or the function-typed parameter it is passed to), and without one an overload resolution ambiguity, as <code>kotlinc</code> reports it; with a TYPE receiver it is unbound, so the resulting function takes the receiver as its first parameter; with any other expression it is bound, and that receiver is evaluated once where the reference is written. <code>Type::class</code> is the class reference.</p>
           <pre><code class="lang-kotlin">fun inc(x: Int) = x + 1
 println(listOf(1, 2).map(::inc))            // [2, 3]
 println(listOf("aa", "b").map(String::length))   // [2, 1]</code></pre>
