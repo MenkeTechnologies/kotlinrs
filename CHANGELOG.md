@@ -11,6 +11,22 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## An enum initializes on first use, with its companion
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.13.
+
+| program | before | reference |
+| --- | --- | --- |
+| `enum class F { A; init { println("F init") } }`; `println("start"); F.A` | `F init` before `start` | `start`, then `F init` |
+| `enum class F { A; companion object { init { println("comp") } } }`; `F.A` | nothing | `comp` |
+
+The companion that holds an enum's constants is built on first use like any
+other object with an effectful initializer, so the constants, then the
+companion's own properties and `init` blocks, run at the enum's first access
+— the JVM's class initialization. A companion `init` block keeps its place
+among the companion's own properties rather than being displaced by the
+constants prepended ahead of them.
+
 ## A passing `require`/`check` answers `Unit`
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.13.

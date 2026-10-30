@@ -3953,18 +3953,14 @@ impl Compiler {
     /// then reads back through the instance, which is where a member called
     /// from an initializer finds it.
     ///
-    /// Not for an object with a superclass or captures, nor for the companion
-    /// of an `enum`: the enum lowering builds its constants as ordinary
-    /// initializers and relies on them being evaluated into slots first.
+    /// Not for an object with a superclass or captures. The companion that
+    /// holds an `enum`'s constants IS chained, which is what builds them on
+    /// the enum's first use (the JVM's class initialization) rather than at
+    /// program start; a constant read back while the companion is still being
+    /// built finds the field already written, as on the JVM.
     fn object_chained(&self, cd: &ClassDecl) -> bool {
         let m = &self.classes[&cd.name];
-        m.base.is_none()
-            && m.throwable_base.is_none()
-            && m.captures.is_empty()
-            && !m.is_enum
-            && cd.name.strip_suffix("$Companion").map_or(true, |owner| {
-                !self.classes.get(owner).is_some_and(|o| o.is_enum)
-            })
+        m.base.is_none() && m.throwable_base.is_none() && m.captures.is_empty() && !m.is_enum
     }
 
     /// With `as_sub`, the object is built by the subroutine `Object#$clinit`, which

@@ -12165,3 +12165,38 @@ fn require_and_check_answer_the_unit_object() {
         "true\ntrue\ntrue\nkotlin.Unit\n"
     );
 }
+
+#[test]
+fn an_enum_initializes_on_first_use_with_its_companion() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.13. The constants are built by
+    // the enum's class initializer, on first access — after `start`, not
+    // before `main` — and the companion's own properties and `init` blocks
+    // run in that same initializer, after the constants. Before, the
+    // constants were built at program start and the companion `init` block
+    // never ran. A throwing initializer fails the first access with
+    // `ExceptionInInitializerError` and every later one with
+    // `NoClassDefFoundError`.
+    assert_eq!(
+        stdout(
+            "enum class F(val v: Int) {\n\
+             \x20   A(1), B(2);\n\
+             \x20   init { println(\"F init $name\") }\n\
+             \x20   companion object {\n\
+             \x20       val y = 5.also { println(\"comp y\") }\n\
+             \x20       init { println(\"F comp ${A.v}\") }\n\
+             \x20   }\n\
+             }\n\
+             enum class Bad(val x: Int) { ONE(1); init { if (x == 1) throw IllegalStateException(\"boom\") } }\n\
+             fun main() {\n\
+             \x20   println(\"start\")\n\
+             \x20   println(F.A.v)\n\
+             \x20   println(F.B.v)\n\
+             \x20   println(F.y)\n\
+             \x20   try { println(Bad.ONE) } catch (e: Throwable) { println(e::class.simpleName + \" \" + e.cause) }\n\
+             \x20   try { println(Bad.ONE) } catch (e: Throwable) { println(e::class.simpleName) }\n\
+             }"
+        ),
+        "start\nF init A\nF init B\ncomp y\nF comp 1\n1\n2\n5\n\
+         ExceptionInInitializerError java.lang.IllegalStateException: boom\nNoClassDefFoundError\n"
+    );
+}

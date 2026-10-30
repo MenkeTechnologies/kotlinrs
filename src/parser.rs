@@ -2378,6 +2378,11 @@ impl Parser {
             lateinit_getter: None,
             line: 0,
         });
+        // The companion's own `init` blocks keep their place among ITS
+        // properties, so they count the constants prepended ahead of them.
+        for b in &mut comp.inits {
+            b.after_props += props.len();
+        }
         props.append(&mut comp.obj_props);
         comp.obj_props = props;
 
