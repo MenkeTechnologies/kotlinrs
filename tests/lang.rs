@@ -12325,3 +12325,29 @@ fn a_builtin_member_operator_beats_a_user_extension_of_the_same_name() {
         "V(x=6)\nV(x=6)\n20\n1|a\n"
     );
 }
+
+#[test]
+fn with_default_answers_getvalue_from_the_default_and_delegates_the_rest() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.13. `withDefault` wraps the map:
+    // `getValue` of an absent key asks the default, `get`/`[]` still answer
+    // null, and every read and write goes to (and shows) the map it wraps.
+    assert_eq!(
+        stdout(
+            "fun main() {\n\
+             \x20   println(mapOf(\"x\" to 1).withDefault { it.length * 10 }.getValue(\"yyy\"))\n\
+             \x20   val base = mutableMapOf(\"a\" to 1)\n\
+             \x20   val m = base.withDefault { 0 }\n\
+             \x20   println(m.getValue(\"a\")); println(m.getValue(\"zz\")); println(m[\"zz\"])\n\
+             \x20   m[\"b\"] = 2\n\
+             \x20   println(base)\n\
+             \x20   base[\"c\"] = 3\n\
+             \x20   println(m); println(m == base)\n\
+             \x20   m.getOrPut(\"y\") { 8 }; m.remove(\"a\"); println(base)\n\
+             \x20   println(m.withDefault { -1 }.getValue(\"q\"))\n\
+             \x20   try { base.getValue(\"zz\") } catch (e: NoSuchElementException) { println(e.message) }\n\
+             }"
+        ),
+        "30\n1\n0\nnull\n{a=1, b=2}\n{a=1, b=2, c=3}\ntrue\n{b=2, c=3, y=8}\n-1\n\
+         Key zz is missing in the map.\n"
+    );
+}

@@ -289,17 +289,6 @@ The first is the capture limit of a LOCAL class, which is hoisted to the top
 level with no link back to its construction sites. Object expressions, hoisted
 the same way, capture since round 20 (see CHANGELOG).
 
-## Round 17: measured and still missing
-
-Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
-
-| program | kotlinrs | reference |
-| --- | --- | --- |
-| `mutableMapOf("a" to 1).withDefault { 0 }.getValue("zz")` | `unresolved reference: withDefault on Map` | `0` |
-
-`withDefault` is a VIEW over the receiver, and maps here have no view
-representation (see "Collection views").
-
 ## Round 20: measured and not closed
 
 Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
@@ -407,7 +396,6 @@ Measured on `kotlinc` 2.4.21 / JDK 25.0.5, compiled and run on the same JVM.
 
 | program | kotlinrs | reference |
 | --- | --- | --- |
-| `mapOf("x" to 1).withDefault { it.length * 10 }.getValue("yyy")` | `unresolved reference: withDefault on Map` | `30` |
 | `class K { val y = 1; var Int.ext: Int get() = this + y; set(v) { println("set $v") }; fun go() { 5.ext = 3; println(5.ext) } }` — a MEMBER extension `var` with a setter | `member extension property ext with a setter is not supported (line 3)` | `set 3`, `6` |
 
 The member extension row fails loudly by design: only the top-level form

@@ -1290,6 +1290,38 @@ thread_local! {
         RefCell::new(std::collections::HashMap::new());
 }
 
+thread_local! {
+    /// `m.withDefault { … }` view → `(m, default)`. The view is a live copy of
+    /// `m` for reads (see [`refresh_view`]); every member call on it is made on
+    /// `m` itself, except `getValue`, which consults the default for an absent
+    /// key — Kotlin's `MapWithDefault`/`MutableMapWithDefault`, which delegate
+    /// everything else to the map they wrap.
+    static DEFAULT_MAPS: RefCell<std::collections::HashMap<u32, (Value, Value)>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+fn default_map_of(view: &Value) -> Option<(Value, Value)> {
+    let Value::Obj(id) = view else { return None };
+    DEFAULT_MAPS.with(|t| t.borrow().get(id).cloned())
+}
+
+/// `map.withDefault(default)`: a new view over `map` — over the map a view
+/// already wraps, since a second `withDefault` replaces the first default.
+fn with_default(map: &Value, default: &Value) -> Value {
+    let backing = default_map_of(map).map_or_else(|| map.clone(), |(m, _)| m);
+    let entries = with_obj(&backing, |o| match o {
+        HeapObj::Map(entries) => entries.clone(),
+        _ => Vec::new(),
+    })
+    .unwrap_or_default();
+    let view = alloc(HeapObj::Map(entries));
+    if let Value::Obj(id) = view {
+        track_view(&view, &backing);
+        DEFAULT_MAPS.with(|t| t.borrow_mut().insert(id, (backing, default.clone())));
+    }
+    view
+}
+
 fn register_map_view(view: &Value, map: &Value, kind: MapView) {
     if let Value::Obj(id) = view {
         track_view(view, map);
@@ -1525,7 +1557,9 @@ fn refresh_view(id: u32) {
     let map_view = map_view_of(&me);
     let sub = sublist_of(&me);
     let reversed = REVERSED_VIEWS.with(|t| t.borrow().get(&id).cloned());
+    let defaulted = default_map_of(&me).map(|(m, _)| m);
     let backing = match (&map_view, &sub, &reversed) {
+        _ if defaulted.is_some() => defaulted.clone().unwrap(),
         (Some((map, _)), _, _) => map.clone(),
         (_, Some((list, _, _)), _) => list.clone(),
         (_, _, Some(list)) => list.clone(),
@@ -1537,7 +1571,18 @@ fn refresh_view(id: u32) {
     if now == seen {
         return;
     }
-    if let Some((map, kind)) = map_view {
+    if defaulted.is_some() {
+        let entries = with_obj(&backing, |o| match o {
+            HeapObj::Map(entries) => entries.clone(),
+            _ => Vec::new(),
+        })
+        .unwrap_or_default();
+        HEAP.with(|h| {
+            if let Some(HeapObj::Map(xs)) = h.borrow_mut().get_mut(id as usize) {
+                *xs = entries;
+            }
+        });
+    } else if let Some((map, kind)) = map_view {
         refresh_map_view(&me, &map, kind);
     } else {
         let all = list_snapshot(&backing).unwrap_or_default();
@@ -11177,6 +11222,10 @@ fn coll_hof(
     // neither is the type whose diagnostics Kotlin spells.
     kind: SeqKind,
 ) -> Result<Value, String> {
+    // A `withDefault` view delegates every member to the map it wraps.
+    if let Some((map, _)) = default_map_of(recv) {
+        return coll_hof(vm, name, &map, extras, clo, kind);
+    }
     // An in-place higher-order write through a `subList` view reaches the
     // backing list.
     if let Some(r) = sublist_write(vm, recv, name, extras, &mut |vm| {
@@ -14017,6 +14066,22 @@ fn jdk_integral_static(recv: &Value, name: &str, args: &[Value]) -> Option<Resul
 /// host bodies answer the absent value — answer `kotlin.Unit` itself, so
 /// `println(xs.clear())` prints it as the JVM does.
 fn kt_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    if let Some((map, default)) = default_map_of(recv) {
+        return match (name, args) {
+            ("getValue", [k]) => match key_position(vm, &map, k) {
+                Some(_) => kt_method(vm, &map, "get", args),
+                None => invoke_closure(vm, &default, args),
+            },
+            ("withDefault", [d]) => Ok(with_default(&map, d)),
+            _ => kt_method(vm, &map, name, args),
+        };
+    }
+    if name == "withDefault"
+        && args.len() == 1
+        && with_obj(recv, |o| matches!(o, HeapObj::Map(_))).unwrap_or(false)
+    {
+        return Ok(with_default(recv, &args[0]));
+    }
     let unit = matches!(
         (name, args.len()),
         (
@@ -19146,6 +19211,10 @@ fn store_at(items: &mut [Value], i: i64, value: Value, kind: &str) -> Result<(),
 
 /// `recv[index] = value` — list set (bounds-checked) or map put.
 fn index_set(vm: &mut VM, recv: &Value, index: &Value, value: Value) -> Result<(), String> {
+    // `m[k] = v` through a `withDefault` view writes the map it wraps.
+    if let Some((map, _)) = default_map_of(recv) {
+        return index_set(vm, &map, index, value);
+    }
     note_op("set", recv, 2);
     comod_check(recv)?;
     // `range[k] = v` on a sorted map's range view is its `put`.

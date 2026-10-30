@@ -11,6 +11,20 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## `withDefault`
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.13.
+
+| program | before | reference |
+| --- | --- | --- |
+| `mapOf("x" to 1).withDefault { it.length * 10 }.getValue("yyy")` | `unresolved reference: withDefault on Map` | `30` |
+| `val m = base.withDefault { 0 }; m["b"] = 2; println(base)` | refused | `{a=1, b=2}` |
+
+`withDefault` answers a view over the map: `getValue` of an absent key asks the
+default, and every other member, index read and write is made on the map it
+wraps, whose later writes the view shows. A second `withDefault` replaces the
+default over the same map, as `MapWithDefault` does.
+
 ## A built-in member operator beats a user extension of the same name
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.13.
