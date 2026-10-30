@@ -156,7 +156,7 @@ const CORPUS: &[Entry] = &[
         "class",
         "Keywords & Declarations",
         "class Name(val p: T, …) : Super(args), Iface { … }",
-        "Declares a class. Only the primary constructor exists — there are no secondary constructors and no `init` block. A `val`/`var` primary-constructor parameter becomes a stored property; a plain parameter does not. The supertype list may name one class and any number of interfaces.",
+        "Declares a class. A `val`/`var` primary-constructor parameter becomes a stored property; a plain parameter does not. The body may declare properties, `init` blocks and secondary constructors (`constructor(…) : this(…)`, or `: super(…)` when the class has no primary constructor); property initializers and `init` blocks run in declaration order, before a secondary's body. A call selects among the constructors by argument count, types and names, defaults filled — an `enum class` constant's arguments included. The supertype list may name one class and any number of interfaces; its constructor arguments select the primary or a secondary constructor of that class the way a call does.",
         "open class Animal(val name: String)\nclass Dog(n: String) : Animal(n)\nfun main() { println(Dog(\"rex\").name) }   // rex",
     ),
     (
