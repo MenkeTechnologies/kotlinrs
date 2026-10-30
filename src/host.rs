@@ -1830,6 +1830,15 @@ fn is_sequence_view(v: &Value) -> bool {
 
 /// Allocate a `List` that a read-only member produced, tagged so its
 /// out-of-range diagnostic names the class Kotlin would have handed back.
+/// Whether `v` is `kotlin.collections.ReversedListReadOnly` — the
+/// `asReversed()` view of a list that is not a `MutableList`, which implements
+/// the read-only `List` only.
+fn is_ro_reversed(v: &Value) -> bool {
+    let Value::Obj(id) = v else { return false };
+    REVERSED_VIEWS.with(|t| t.borrow().contains_key(id))
+        && LIST_IMPL.with(|t| t.borrow().get(id) == Some(&ListImpl::ReadOnly))
+}
+
 fn alloc_ro_list(items: Vec<Value>) -> Value {
     let v = alloc(HeapObj::List(items));
     tag_list_impl(&v, ListImpl::ReadOnly);
@@ -7200,7 +7209,9 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
                 vm.push(Value::Undef);
             } else {
                 // Kotlin's own `TypeIntrinsics` check, spelled its own way.
-                let msg = if ty == "MutableList" && ro_list(&v) == Some(RoList::Empty) {
+                let msg = if ty == "MutableList" && is_ro_reversed(&v) {
+                    "java.lang.ClassCastException: kotlin.collections.ReversedListReadOnly cannot be cast to kotlin.collections.MutableList".to_string()
+                } else if ty == "MutableList" && ro_list(&v) == Some(RoList::Empty) {
                     "java.lang.ClassCastException: kotlin.collections.EmptyList cannot be cast to kotlin.collections.MutableList".to_string()
                 } else if matches!(ty.as_str(), "MutableSet" | "MutableMap") && is_empty_literal(&v)
                 {
@@ -20486,9 +20497,11 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         // `emptyList()` and every collapsing member answer — implements the
         // read-only `List` only, where every other list class is a
         // `java.util.List` and so passes as a `MutableList`.
+        // So is `ReversedListReadOnly`, a read-only list's `asReversed()`.
         "MutableList" => {
             with_obj(v, |o| matches!(o, HeapObj::List(_))).unwrap_or(false)
                 && ro_list(v) != Some(RoList::Empty)
+                && !is_ro_reversed(v)
         }
         // A range is an `Iterable` but not a `Collection`: `IntRange` implements
         // no `size`.

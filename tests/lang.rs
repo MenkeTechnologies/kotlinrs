@@ -12239,3 +12239,26 @@ fn a_constructor_reference_selects_by_the_expected_function_type() {
         "stderr was: {err}"
     );
 }
+
+#[test]
+fn a_read_only_lists_reversed_view_is_not_a_mutable_list() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.13: `asReversed()` of a read-only
+    // list is `ReversedListReadOnly`, which is not a `MutableList` — the cast
+    // throws and the type test is false. A `MutableList`'s view still is one.
+    // Before, the cast succeeded and the write went through.
+    assert_eq!(
+        stdout(
+            "fun main() {\n\
+             \x20   val r = listOf(1, 2).asReversed()\n\
+             \x20   println(r is MutableList<*>)\n\
+             \x20   println((r as? MutableList<Int>) == null)\n\
+             \x20   try { (r as MutableList<Int>)[0] = 5 } catch (e: ClassCastException) { println(e.message) }\n\
+             \x20   val m = mutableListOf(1, 2).asReversed() as MutableList<Int>; m[0] = 9; println(m)\n\
+             \x20   println(emptyList<Int>().asReversed() is MutableList<*>)\n\
+             }"
+        ),
+        "false\ntrue\n\
+         kotlin.collections.ReversedListReadOnly cannot be cast to kotlin.collections.MutableList\n\
+         [9, 1]\nfalse\n"
+    );
+}

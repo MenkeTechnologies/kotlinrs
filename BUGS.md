@@ -105,12 +105,8 @@ overflow) and succeeds for the second. Same category as the `%2147483647d` entry
 (CHANGELOG, "Collection views read live") and a sorted collection's
 `headMap`/`tailMap`/`subMap`/`headSet`/`tailSet`/`subSet`/`descending…` ranges
 (CHANGELOG, "Sorted-collection ranges are live views") read their backing
-object live. One divergence remains, measured on `kotlinc` 2.4.21 /
-JRE 21.0.12.1:
-
-| program | kotlinrs | reference |
-| --- | --- | --- |
-| `(listOf(1, 2).asReversed() as MutableList<Int>)[0] = 5` | succeeds | `ClassCastException: kotlin.collections.ReversedListReadOnly cannot be cast to kotlin.collections.MutableList` |
+object live, and a read-only list's `asReversed()` is
+`ReversedListReadOnly`, which no `MutableList` cast or test accepts.
 
 A live view is a heap copy re-taken whenever its backing object was written
 since the last copy; reads that walk a view (`for`, indexing) read the backing

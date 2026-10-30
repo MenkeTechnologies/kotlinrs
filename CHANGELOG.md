@@ -11,6 +11,15 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## A read-only list's `asReversed()` is not a `MutableList`
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.13.
+
+| program | before | reference |
+| --- | --- | --- |
+| `(listOf(1, 2).asReversed() as MutableList<Int>)[0] = 5` | succeeds | `ClassCastException: kotlin.collections.ReversedListReadOnly cannot be cast to kotlin.collections.MutableList` |
+| `listOf(1, 2).asReversed() is MutableList<*>` | `true` | `false` |
+
 ## A constructor reference selects by the expected function type
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.13.
