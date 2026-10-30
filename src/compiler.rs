@@ -15906,6 +15906,22 @@ impl Compiler {
                 _ => Type::Int,
             },
             Expr::Step { recv, .. } => self.infer_elem(sc, recv),
+            // A map's `keys` and `values` hold its key and value type
+            // arguments, written or inferred from its `k to v` pairs.
+            Expr::Member { recv, name, .. } if name == "keys" || name == "values" => {
+                let map = self.gen_ty(sc, recv);
+                let is_map = map.class.as_deref().is_some_and(|c| c.ends_with("Map"));
+                match &map.args[..] {
+                    [k, v] if is_map => {
+                        if name == "keys" {
+                            k.ty
+                        } else {
+                            v.ty
+                        }
+                    }
+                    _ => Type::Unknown,
+                }
+            }
             Expr::Call { name, args, .. } => match name.as_str() {
                 "listOf" | "setOf" | "mutableListOf" | "mutableSetOf" | "arrayOf"
                 | "listOfNotNull" | "sequenceOf" => {

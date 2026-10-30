@@ -12262,3 +12262,24 @@ fn a_read_only_lists_reversed_view_is_not_a_mutable_list() {
          [9, 1]\nfalse\n"
     );
 }
+
+#[test]
+fn a_maps_keys_and_values_sum_at_the_maps_type_argument_width() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.13. A map's `values` and `keys`
+    // hold its value and key types — inferred from the pairs or written in
+    // the annotation — so an `Int` total wraps at 32 bits and a `Long` one
+    // does not. Before, the `Int` totals were computed at 64 bits.
+    assert_eq!(
+        stdout(
+            "fun main() {\n\
+             \x20   println(mapOf(\"a\" to Int.MAX_VALUE, \"b\" to 1).values.sum())\n\
+             \x20   val m = mutableMapOf(Int.MAX_VALUE to \"x\", 1 to \"y\")\n\
+             \x20   println(m.keys.sum())\n\
+             \x20   val w: Map<String, Int> = mapOf(\"a\" to Int.MAX_VALUE, \"b\" to Int.MAX_VALUE)\n\
+             \x20   println(w.values.sum())\n\
+             \x20   println(mapOf(\"a\" to 3000000000L, \"b\" to 1L).values.sum())\n\
+             }"
+        ),
+        "-2147483648\n-2147483648\n-2\n3000000001\n"
+    );
+}

@@ -300,23 +300,6 @@ Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 `withDefault` is a VIEW over the receiver, and maps here have no view
 representation (see "Collection views").
 
-## Round 19: `sum()` over an `Int` collection the frontend cannot type
-
-Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1. The total of an `Int` collection
-wraps at 32 bits; kotlinrs applies that width from the receiver's STATIC
-element type, because a `List` holding plain integers cannot say at run time
-whether they are `Int`s or unboxed `Long`s (`generateSequence(3000000000L) { …
-}`, a `Long` range's `toList()`, `scan` over `Long`s all hold the latter). Where
-the element type is not visible statically the total is computed at 64 bits:
-
-| program | kotlinrs | reference |
-| --- | --- | --- |
-| `println(mapOf("a" to Int.MAX_VALUE, "b" to 1).values.sum())` | `2147483648` | `-2147483648` |
-
-A literal, an annotated binding or parameter (`xs: List<Int>`), an `IntArray`,
-and the results of `map`/`mapIndexed`/`mapNotNull`/`List(n) { … }`/`sumOf { … }`
-whose lambda result is an `Int` all carry the width.
-
 ## Round 20: measured and not closed
 
 Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.

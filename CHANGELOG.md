@@ -11,6 +11,20 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## A map's `keys` and `values` carry its type arguments
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.13.
+
+| program | before | reference |
+| --- | --- | --- |
+| `println(mapOf("a" to Int.MAX_VALUE, "b" to 1).values.sum())` | `2147483648` | `-2147483648` |
+| `val w: Map<String, Int> = mapOf("a" to Int.MAX_VALUE, "b" to Int.MAX_VALUE)`; `w.values.sum()` | `4294967294` | `-2` |
+
+The element type of `m.keys` / `m.values` is the map's key / value type
+argument, from its annotation or its `k to v` pairs, so the members that take
+their width from the element type (`sum`, the lambda parameters of `map` and
+friends) see it.
+
 ## A read-only list's `asReversed()` is not a `MutableList`
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.13.
