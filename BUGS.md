@@ -118,18 +118,6 @@ directly, so a loop over a view stays linear while the backing is written. A
 sorted range is recomputed at the next member call, render, `in` or `for`,
 since its comparator may be user code that needs the VM.
 
-## Still missing, with the measurement
-
-Each of these fails LOUDLY — an `unresolved reference` or a parse error — so
-none is a wrong answer. They are recorded with what the reference produces so
-the next round starts from a measurement rather than a guess.
-
-| program | kotlinrs | reference |
-| --- | --- | --- |
-| `infix fun Int.pw(n: Int) = …; 2 pw 10` | `expected RParen, found Ident("pw")` | `1024` |
-
-The `infix` row is a parser gap.
-
 ## `Regex` — what differs
 
 `Regex` runs on `fancy-regex`, not `java.util.regex.Pattern`. `RegexOption`
@@ -217,19 +205,6 @@ holds `Int`s and boxes nothing, and every native `Op::Add` still sees a
 `Value::Int`. Only a `Long` entering a position that keeps no type boxes, which
 is the same short list a `Float` does.
 
-## `Map` members and key widths, newly measured
-
-Found while pinning `Map` behaviour around the key index. Each is a feature gap
-or an erasure limit, not a wrong answer produced silently — except the first,
-which is.
-
-| program | kotlinrs | reference |
-| --- | --- | --- |
-| `fun main() { data class K(val a: Int); … }` (a LOCAL data class) | `unexpected token Class` | compiles |
-
-Everything this table used to hold is closed. `m[1]` and `m[1L]` are two keys
-now, as they are on the JVM.
-
 ## More `unresolved reference`, newly measured
 
 Each fails loudly with a diagnostic rather than answering wrongly. Recorded so
@@ -285,7 +260,6 @@ Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 | program | kotlinrs | reference |
 | --- | --- | --- |
 | `java.util.LinkedList<Int>()` | `unresolved reference: java` | the JDK list |
-| `(-1).toUInt()` / `5u + 3u` | `unresolved reference: toUInt on Int` / parse error | `4294967295` / `8` |
 
 
 ## `sin` and `cos` — the reference is a platform intrinsic
@@ -347,31 +321,13 @@ A literal, an annotated binding or parameter (`xs: List<Int>`), an `IntArray`,
 and the results of `map`/`mapIndexed`/`mapNotNull`/`List(n) { … }`/`sumOf { … }`
 whose lambda result is an `Int` all carry the width.
 
-## Round 19: measured and not closed
-
-Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
-
-| program | kotlinrs | reference |
-| --- | --- | --- |
-| `println(UInt.MAX_VALUE)` (any unsigned type or `u` literal) | `expected RParen, found Ident("u")` | `4294967295` |
-
 ## Round 20: measured and not closed
 
 Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 
 | program | kotlinrs | reference |
 | --- | --- | --- |
-| `val a = 5u; println(a - 7u)` (any unsigned literal or type) | `expected RParen, found Ident("u")` | `4294967294` |
-| `println(ULong.MAX_VALUE)` | `kotlin: unresolved reference: ULong` | `18446744073709551615` |
 | `println(listOf(1, 2).stream().findFirst())` | `unresolved reference: Stream.findFirst (its java.util.Optional result is not modelled)` | `Optional[1]` |
-
-Unsigned types need a design decision rather than a member port. `UInt`,
-`UShort` and `UByte` values fit a non-negative `i64` and would only need new
-static types (32/16/8-bit masking on `+ - *`, `toInt()` reinterpretation), but
-`ULong` values at or above 2^63 share their bit pattern with negative `Long`s:
-printing, comparing and dividing one correctly after it has passed through an
-untyped collection needs the width carried on the value at run time, which is
-the same substrate as consistent `Long` boxing.
 
 `java.util.Optional` is not modelled, so the stream terminals that answer one
 (`findFirst`, `findAny`, `max`, `min`, `average`, one-argument `reduce`) are
@@ -399,9 +355,6 @@ older build-then-extend construction, because the message, the cause and the
 captured values are assembled around the finished instance. Its `init` blocks
 may still not call a member of their own class, and a virtual call from a
 superclass initializer lands on the superclass's method.
-
-**Unsigned types** are not modelled at all (`5u`, `UInt`, `toUInt()`); see Round
-20 for the representation question.
 
 ## A lazy pipeline materializes at its first non-lazy intermediate
 
@@ -442,7 +395,6 @@ Measured on `kotlinc` 2.4.21 / JRE 21.0.12.1.
 | --- | --- | --- |
 | `fun <T> id(x: T) = x`; `println(id(listOf(1)) + 5)` | `5.0` | `[1, 5]` |
 | `open class M(val c: Int)`; `class N(c: Int) : M(c)`; `operator fun M.plus(o: M)` and `operator fun N.plus(o: M)`; `listOf<M>(N(1), M(2)).reduce { a, b -> a + b }` | `unresolved reference: plus on N` | `M.plus`, chosen by the static type `M` |
-| `val a = arrayOf(1, 2); val l = a.asList(); a[0] = 7; println(l)` | `[1, 2]` | `[7, 2]` — a write to the ARRAY shows through the view; writes through the view reach the array since round 21 |
 
 The first is an untyped left operand against a PRIMITIVE right one: the native
 `Add` coerces a heap handle to a number. Routing every untyped arithmetic site
