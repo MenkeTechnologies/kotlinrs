@@ -11,6 +11,28 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## Enum secondary constructors, enum constant defaults and named arguments, `String` member result types
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.13.
+
+| program | before | reference |
+| --- | --- | --- |
+| `enum class F(val v: Int) { A(1), B("abc"); constructor(s: String) : this(s.length) }` | `class F: secondary constructor delegates to itself` | `B.v` is `3` |
+| `enum class G { P(1), R; val k: String; constructor(i: Int) { k = "int$i" }; constructor() { k = "none" } }` | `enum constant G.P takes 0 argument(s), but 1 were given` | `P.k` is `int1`, `R.k` is `none` |
+| `enum class E(val a: Int = 5, val b: String = "z") { X(), Z(b = "q") }` | `expected RParen, found Assign` | `X.a` is `5`, `Z.b` is `q` |
+| `class K(val v: Int) { constructor(s: String) : this(s.length) }`; `K("ab".padStart(5)).v`, `K("x".repeat(2)).v` | `   ab`, `xx` — the `Int` primary | `5`, `2` — the `String` secondary |
+
+A constant passes `name` and `ordinal` as NAMED arguments, and every secondary
+constructor of an enum carries the same two as trailing parameters and forwards
+them through its delegation, so a constant selects among the primary and the
+secondaries, fills defaults and binds named arguments exactly as any other
+construction site does. Constructor selection binds named arguments by name
+before checking their types. An enum that writes no primary constructor has
+none, as any other class: its implicit primary takes only the two `Enum`
+properties and is reached by delegation alone. The `kotlin.text` members that answer a
+`String` for a `String` receiver (`repeat`, `padStart`, `substring`, …) are
+typed `String`, so the argument they produce selects a `String` constructor.
+
 ## Constructor `<init>` frames, comments-mode syntax checks, variance through inner classes, supertypes, parameters and calls
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.13.0.2.

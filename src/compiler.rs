@@ -4766,7 +4766,20 @@ impl Compiler {
                 };
                 (target, sec.params.clone(), None)
             } else {
-                let args: Vec<Expr> = explicit_this.map(|d| d.args.clone()).unwrap_or_default();
+                // An enum's primary also takes the two `Enum` properties, which
+                // every enum secondary carries as its trailing parameters (see
+                // `thread_enum_props` in the parser); a secondary with no clause
+                // forwards them, and nothing else, to it.
+                let args: Vec<Expr> = match explicit_this {
+                    Some(d) => d.args.clone(),
+                    None if meta.is_enum => ["name", "ordinal"]
+                        .map(|p| Expr::Named {
+                            name: p.to_string(),
+                            value: Box::new(Expr::Var(p.to_string())),
+                        })
+                        .to_vec(),
+                    None => Vec::new(),
+                };
                 let (target_sec, params) = match explicit_this {
                     Some(_) => self.select_ctor(&sc, &meta, &args),
                     None => (
@@ -14462,38 +14475,63 @@ impl Compiler {
         let spread = args.iter().any(|a| matches!(a, Expr::Spread(_)));
         let takes_spread = |params: &[Param]| !spread || params.iter().any(|p| p.vararg.is_some());
 
-        let primary_fits = argc >= required
-            && argc <= primary.len()
-            && meta.has_primary
-            && takes_spread(&primary)
-            && params_accept(&primary, &arg_types);
-        if primary_fits {
+        // A call with named arguments binds by name, so its arguments are
+        // checked against the parameters they actually land on.
+        let named = args.iter().any(|a| matches!(a, Expr::Named { .. }));
+        let bound = |params: &[Param]| {
+            if !takes_spread(params) {
+                return None;
+            }
+            if named {
+                return bind_named_args(params, args, &arg_types);
+            }
+            let required = params
+                .iter()
+                .filter(|p| p.default.is_none() && p.vararg.is_none())
+                .count();
+            // A `vararg` takes any number of trailing arguments.
+            let unbounded = params.iter().any(|p| p.vararg.is_some());
+            (argc >= required && (unbounded || argc <= params.len()))
+                .then(|| (params.to_vec(), arg_types.clone()))
+        };
+
+        let primary_bound = if meta.has_primary {
+            bound(&primary)
+        } else {
+            None
+        };
+        // The primary's own count check never let a `vararg` absorb extra
+        // positional arguments; that is kept as it was.
+        let primary_counts = named || (argc >= required && argc <= primary.len());
+        if primary_counts
+            && primary_bound
+                .as_ref()
+                .is_some_and(|(p, t)| params_accept(p, t))
+        {
             return (None, primary);
         }
-        let sec = meta
-            .sec_arities
+        let fitting: Vec<(usize, bool)> = (0..meta.sec_params.len())
+            .filter_map(|i| bound(&meta.sec_params[i]).map(|(p, t)| (i, params_accept(&p, &t))))
+            .collect();
+        let sec = fitting
             .iter()
-            .enumerate()
-            .filter(|(i, n)| {
-                let params = &meta.sec_params[*i];
-                let required = params
-                    .iter()
-                    .filter(|p| p.default.is_none() && p.vararg.is_none())
-                    .count();
-                // A `vararg` takes any number of trailing arguments.
-                let unbounded = params.iter().any(|p| p.vararg.is_some());
-                argc >= required && (unbounded || argc <= **n) && takes_spread(params)
-            })
-            .map(|(i, _)| i)
             // Prefer a secondary whose parameter types match; fall back to the
             // first of that arity so an unresolvable argument type still picks
             // one rather than failing.
-            .find(|i| params_accept(&meta.sec_params[*i], &arg_types))
+            .find(|(_, accepts)| *accepts)
+            .map(|(i, _)| *i)
             .or_else(|| {
-                meta.sec_arities
-                    .iter()
-                    .position(|n| *n == argc)
-                    .filter(|_| !meta.has_primary || argc < required || argc > primary.len())
+                if named {
+                    fitting
+                        .first()
+                        .map(|(i, _)| *i)
+                        .filter(|_| primary_bound.is_none())
+                } else {
+                    meta.sec_arities
+                        .iter()
+                        .position(|n| *n == argc)
+                        .filter(|_| !meta.has_primary || argc < required || argc > primary.len())
+                }
             });
         match sec {
             Some(i) => (Some(i), meta.sec_params[i].clone()),
@@ -17260,6 +17298,47 @@ fn params_accept(params: &[Param], args: &[Type]) -> bool {
     })
 }
 
+/// Bind a call that writes named arguments to `params` the way Kotlin does:
+/// the positional arguments in order (a `vararg` absorbing the rest of them),
+/// then each named one to the parameter of that name. Answers the parameters
+/// paired with the types of the arguments they receive, for [`params_accept`],
+/// or `None` when the call cannot bind — a name that is not a parameter or is
+/// bound twice, a positional argument past the last parameter, or a parameter
+/// left unbound that has no default and is not a `vararg`.
+fn bind_named_args(
+    params: &[Param],
+    args: &[Expr],
+    arg_types: &[Type],
+) -> Option<(Vec<Param>, Vec<Type>)> {
+    let mut bound = vec![false; params.len()];
+    let (mut ps, mut ts) = (Vec::new(), Vec::new());
+    let mut next = 0;
+    for (a, t) in args.iter().zip(arg_types) {
+        let i = match a {
+            Expr::Named { name, .. } => params.iter().position(|p| &p.name == name)?,
+            _ if next < params.len() => {
+                let i = next;
+                if params[i].vararg.is_none() {
+                    next += 1;
+                }
+                i
+            }
+            _ => return None,
+        };
+        if bound[i] && params[i].vararg.is_none() {
+            return None;
+        }
+        bound[i] = true;
+        ps.push(params[i].clone());
+        ts.push(*t);
+    }
+    params
+        .iter()
+        .zip(&bound)
+        .all(|(p, b)| *b || p.default.is_some() || p.vararg.is_some())
+        .then_some((ps, ts))
+}
+
 /// Whether `name` is one of the receiver-taking scope functions.
 fn is_scope_fn(name: &str) -> bool {
     matches!(
@@ -17969,6 +18048,41 @@ fn nullable_if_safe(t: Type, safe: bool) -> Type {
         Type::Char => Type::Unknown,
         other => other,
     }
+}
+
+/// The `kotlin.text` members whose result on a `String` receiver is a `String`
+/// whatever their arguments.
+fn is_string_to_string(name: &str) -> bool {
+    matches!(
+        name,
+        "repeat"
+            | "padStart"
+            | "padEnd"
+            | "substring"
+            | "substringBefore"
+            | "substringAfter"
+            | "substringBeforeLast"
+            | "substringAfterLast"
+            | "replace"
+            | "replaceFirst"
+            | "removePrefix"
+            | "removeSuffix"
+            | "removeSurrounding"
+            | "trimStart"
+            | "trimEnd"
+            | "trimIndent"
+            | "trimMargin"
+            | "prependIndent"
+            | "replaceIndent"
+            | "take"
+            | "takeLast"
+            | "drop"
+            | "dropLast"
+            | "reversed"
+            | "replaceFirstChar"
+            | "capitalize"
+            | "decapitalize"
+    )
 }
 
 fn method_ret_type(name: &str) -> Type {
@@ -18913,8 +19027,9 @@ impl Compiler {
 
 impl Compiler {
     /// The static result type of `recv.name(..)` when the table in
-    /// [`method_ret_type`] has none: a `Long` receiver's arithmetic, bitwise and
-    /// clamping members answer a `Long` too, and naming it lets the value be
+    /// [`method_ret_type`] has none: a `String` receiver's [`is_string_to_string`]
+    /// members answer a `String`, and a `Long` receiver's arithmetic, bitwise
+    /// and clamping members answer a `Long` too, and naming it lets the value be
     /// boxed (`xs.map { it.toLong().coerceAtMost(3) }`) where a result of
     /// unknown width reads back as an `Int`.
     fn long_member_ret(&self, sc: &Scope, recv: &Expr, name: &str, args: &[Expr]) -> Type {
@@ -18952,10 +19067,15 @@ impl Compiler {
                 | "coerceAtMost"
                 | "coerceIn"
         );
-        if ty == Type::Unknown && preserves_long && self.infer(sc, recv) == Type::Long {
-            Type::Long
-        } else {
-            ty
+        if ty != Type::Unknown {
+            return ty;
+        }
+        match self.infer(sc, recv) {
+            Type::Long if preserves_long => Type::Long,
+            // Without this, `C("x".repeat(2))` could not tell a
+            // `constructor(s: String)` from a primary taking an `Int`.
+            Type::String if is_string_to_string(name) => Type::String,
+            _ => ty,
         }
     }
 }

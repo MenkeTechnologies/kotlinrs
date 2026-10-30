@@ -2626,6 +2626,89 @@ fn a_secondary_constructor_calls_super_with_its_own_parameters() {
 }
 
 #[test]
+fn an_enum_constant_selects_a_secondary_constructor() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.13. An enum's constants select among
+    // its constructors like any call: `B("abc")` reaches the String secondary,
+    // `C` the no-argument one, `D(2.5)` a secondary that delegates to another
+    // secondary; and an enum with no primary constructor at all builds every
+    // constant through a secondary. `name` and `ordinal` reach each instance
+    // through the delegation.
+    assert_eq!(
+        stdout(
+            "enum class F(val v: Int) {\n\
+             \x20   A(1), B(\"abc\"), C, D(2.5);\n\
+             \x20   constructor(s: String) : this(s.length)\n\
+             \x20   constructor() : this(v = 42)\n\
+             \x20   constructor(d: Double) : this(\"x\".repeat(d.toInt()))\n\
+             }\n\
+             enum class G {\n\
+             \x20   P(1), Q(\"s\"), R;\n\
+             \x20   val k: String\n\
+             \x20   constructor(i: Int) { k = \"int$i\" }\n\
+             \x20   constructor(s: String) { k = \"str$s\" }\n\
+             \x20   constructor() { k = \"none\" }\n\
+             }\n\
+             fun main() {\n\
+             \x20   for (f in F.values()) println(\"$f ${f.v} ${f.ordinal}\")\n\
+             \x20   for (g in G.entries) println(\"$g ${g.k} ${g.name} ${g.ordinal}\")\n\
+             \x20   println(F.valueOf(\"B\").v)\n\
+             }"
+        ),
+        "A 1 0\nB 3 1\nC 42 2\nD 2 3\nP int1 P 0\nQ strs Q 1\nR none R 2\n3\n"
+    );
+}
+
+#[test]
+fn an_enum_constant_takes_defaults_and_named_arguments() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.13. A constant may omit a defaulted
+    // parameter and name the ones it passes, with or without a body.
+    assert_eq!(
+        stdout(
+            "enum class E(val a: Int = 5, val b: String = \"z\") {\n\
+             \x20   X(), Y(1), Z(b = \"q\"), W(b = \"w\", a = 7) { override fun f() = \"body$a\" };\n\
+             \x20   open fun f() = \"base\"\n\
+             }\n\
+             fun main() { for (e in E.entries) println(\"$e ${e.a} ${e.b} ${e.ordinal} ${e.f()}\") }"
+        ),
+        "X 5 z 0 base\nY 1 z 1 base\nZ 5 q 2 base\nW 7 w 3 body7\n"
+    );
+    // Too many arguments is still reported in the constant's own terms, not
+    // as a clash with the hidden `name`/`ordinal` parameters. A defaulted
+    // parameter makes the count a maximum.
+    let out = eval("enum class E(val a: Int = 0) { X(1, 2) }\nfun main() { println(E.X.a) }");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("enum constant E.X takes at most 1 argument(s), but 2 were given"),
+        "stderr was: {err}"
+    );
+}
+
+#[test]
+fn a_string_member_result_selects_the_string_constructor() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.13. `padStart`, `repeat` and
+    // `substring` answer a `String`, so each argument below selects the
+    // `String` secondary — before, the result had no static type and was
+    // stored into the `Int` primary as is.
+    assert_eq!(
+        stdout(
+            "class K(val v: Int) {\n\
+             \x20   var via = \"primary\"\n\
+             \x20   constructor(s: String) : this(s.length) { via = \"string\" }\n\
+             \x20   constructor(d: Double) : this(\"x\".repeat(d.toInt()))\n\
+             }\n\
+             fun main() {\n\
+             \x20   val s = \"ab\".padStart(5)\n\
+             \x20   val k = K(s); println(\"${k.v} ${k.via}\")\n\
+             \x20   val d = K(3.0); println(\"${d.v} ${d.via}\")\n\
+             \x20   val t = K(\"abcdef\".substring(2)); println(\"${t.v} ${t.via}\")\n\
+             }"
+        ),
+        "5 string\n3 string\n4 string\n"
+    );
+}
+
+#[test]
 fn a_class_property_may_delegate_to_the_stdlib_observable() {
     // This pinned a compile error for a program the reference accepts (`1`,
     // measured on kotlinc 2.4.21): `Delegates.observable` is supplied by the

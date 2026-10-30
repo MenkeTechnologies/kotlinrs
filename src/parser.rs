@@ -609,6 +609,63 @@ fn entry_class_name(cls: &str, entry: &str) -> String {
     format!("{cls}${entry}")
 }
 
+/// The named call argument `name = value`.
+fn named_arg(name: &str, value: Expr) -> Expr {
+    Expr::Named {
+        name: name.to_string(),
+        value: Box::new(value),
+    }
+}
+
+/// Carry the two properties `Enum` declares through an `enum class`'s
+/// secondary constructors. The primary takes `name` and `ordinal` as trailing
+/// parameters (see the `enum` header lowering), and every secondary reaches the
+/// primary by delegation, so each secondary takes the same two and forwards
+/// them by name: `constructor(s: String) : this(s.length)` becomes
+/// `constructor(s: String, name: String, ordinal: Int) : this(s.length, name =
+/// name, ordinal = ordinal)`. One with no clause is left without one; the
+/// compiler hands the primary those two. An enum constructor cannot call
+/// `super(…)`.
+fn thread_enum_props(cls: &str, secondaries: &mut [SecondaryCtor]) -> Result<(), String> {
+    for sec in secondaries {
+        if let Some(p) = sec
+            .params
+            .iter()
+            .find(|p| p.name == "name" || p.name == "ordinal")
+        {
+            return Err(format!(
+                "enum class {cls}: a constructor parameter named `{}` is not supported (line {})",
+                p.name, sec.line
+            ));
+        }
+        if sec.deleg.as_ref().is_some_and(|d| d.is_super) {
+            return Err(format!(
+                "enum class {cls}: an enum constructor cannot call `super(…)` (line {})",
+                sec.line
+            ));
+        }
+        for (pname, ty) in [("name", Type::String), ("ordinal", Type::Int)] {
+            sec.params.push(Param {
+                name: pname.to_string(),
+                written: None,
+                ty,
+                class: None,
+                default: None,
+                vararg: None,
+                type_args: Vec::new(),
+                type_param_of: None,
+                fn_recv: None,
+            });
+            // With no clause the compiler forwards the two itself, to the
+            // primary — which, when none was written, no call site selects.
+            if let Some(d) = &mut sec.deleg {
+                d.args.push(named_arg(pname, Expr::Var(pname.to_string())));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A plain (uninterpolated) string literal expression.
 fn str_lit(s: &str) -> Expr {
     Expr::Str(vec![StrExpr::Text(s.to_string())])
@@ -1637,6 +1694,11 @@ impl Parser {
         // are the only construction sites, so a user never sees the extra
         // parameters. Appending (rather than prepending) keeps the DECLARED
         // parameters at the positions an entry's argument list writes them.
+        // An enum that writes no primary but declares secondary constructors
+        // has none, as any other class: its constants select among the
+        // secondaries, and the implicit primary (which takes only the two
+        // `Enum` properties) is reached by delegation alone.
+        let wrote_primary = has_primary;
         let has_primary = has_primary || is_enum;
         if is_enum {
             for (pname, ty) in [("name", Type::String), ("ordinal", Type::Int)] {
@@ -1962,13 +2024,19 @@ impl Parser {
         let is_abstract = mods.abstract_ || (is_enum && methods.iter().any(|m| m.is_abstract));
         let is_open = mods.open || (is_enum && entries.iter().any(|e| e.body.is_some()));
         if is_enum {
+            thread_enum_props(&name, &mut secondaries)?;
             // The constants, `values()`, `valueOf` and `entries` all live on the
             // enum's companion, which is how `E.RED` already resolves — an enum
             // may also declare a companion of its own, so they are MERGED into
             // it rather than replacing it.
-            companion = Some(Box::new(
-                self.lower_enum_entries(&name, entries, &params, companion, line)?,
-            ));
+            companion = Some(Box::new(self.lower_enum_entries(
+                &name,
+                entries,
+                &params,
+                &secondaries,
+                companion,
+                line,
+            )?));
         }
 
         self.type_params = outer_tps;
@@ -2029,7 +2097,7 @@ impl Parser {
             super_args,
             delegates,
             companion,
-            has_primary,
+            has_primary: has_primary && (wrote_primary || secondaries.is_empty()),
             inits,
             secondaries,
             abstract_props,
@@ -2054,7 +2122,7 @@ impl Parser {
             if self.at(&Tok::LParen) {
                 self.advance();
                 while !self.at(&Tok::RParen) {
-                    args.push(self.expr()?);
+                    args.push(self.call_arg()?);
                     if self.at(&Tok::Comma) {
                         self.advance();
                     } else {
@@ -2125,12 +2193,10 @@ impl Parser {
         cls: &str,
         entries: Vec<EnumEntry>,
         params: &[CtorProp],
+        secondaries: &[SecondaryCtor],
         companion: Option<Box<ClassDecl>>,
         line: u32,
     ) -> Result<ClassDecl, String> {
-        // Everything the constants supply beyond their written arguments: the
-        // declared parameters minus the two `Enum` ones this lowering appended.
-        let declared = params.len().saturating_sub(2);
         let mut comp = match companion {
             Some(c) => *c,
             None => ClassDecl {
@@ -2170,22 +2236,51 @@ impl Parser {
         // user's own companion declares — a companion property may read `E.RED`,
         // but a constant can never read a user property.
         let mut props = Vec::with_capacity(entries.len() + 1);
+        // The most positional arguments any constructor takes: the declared
+        // parameters, minus the two `Enum` ones every constructor carries.
+        // Past that a constant names the hidden ones, so it is reported here
+        // in the constant's own terms.
+        let most = std::iter::once(params.len())
+            .chain(secondaries.iter().map(|s| s.params.len()))
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(2);
+        let variadic = secondaries
+            .iter()
+            .any(|s| s.params.iter().any(|p| p.vararg.is_some()));
+        // With one constructor and no defaults, a constant passes exactly the
+        // declared parameters.
+        let exact = secondaries.is_empty() && params.iter().all(|p| p.default.is_none());
         for (ordinal, e) in entries.iter().enumerate() {
-            if e.args.len() != declared {
+            let positional = e
+                .args
+                .iter()
+                .filter(|a| !matches!(a, Expr::Named { .. }))
+                .count();
+            if exact && e.args.len() != most {
                 return Err(format!(
-                    "enum constant {cls}.{} takes {} argument(s), but {} were given (line {})",
+                    "enum constant {cls}.{} takes {most} argument(s), but {} were given (line {})",
                     e.name,
-                    declared,
                     e.args.len(),
                     e.line
                 ));
             }
-            // `E(<written args>, "NAME", ordinal)` — or, for a constant with a
-            // body, `E$NAME()`, whose synthetic subclass forwards the same
-            // arguments to `E`'s constructor.
+            if positional > most && !variadic {
+                return Err(format!(
+                    "enum constant {cls}.{} takes at most {most} argument(s), but {positional} were given (line {})",
+                    e.name, e.line
+                ));
+            }
+            // `E(<written args>, name = "NAME", ordinal = n)` — or, for a
+            // constant with a body, `E$NAME()`, whose synthetic subclass
+            // forwards the same arguments to `E`'s constructor. The two `Enum`
+            // properties go by NAME, so the written arguments select among the
+            // primary and the secondary constructors (each of which carries
+            // the same two, see [`thread_enum_props`]) and fill defaults
+            // exactly as they would at any other construction site.
             let mut args = e.args.clone();
-            args.push(str_lit(&e.name));
-            args.push(Expr::Int(ordinal as i64));
+            args.push(named_arg("name", str_lit(&e.name)));
+            args.push(named_arg("ordinal", Expr::Int(ordinal as i64)));
             let init = match &e.body {
                 None => Expr::Call {
                     name: cls.to_string(),
@@ -2466,7 +2561,7 @@ impl Parser {
             self.eat(&Tok::LParen)?;
             let mut args = Vec::new();
             while !self.at(&Tok::RParen) {
-                args.push(self.expr()?);
+                args.push(self.call_arg()?);
                 if self.at(&Tok::Comma) {
                     self.advance();
                 } else {
