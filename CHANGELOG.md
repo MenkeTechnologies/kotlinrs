@@ -11,6 +11,18 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## A built-in member operator beats a user extension of the same name
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.13.
+
+| program | before | reference |
+| --- | --- | --- |
+| `data class V(val x: Int) { operator fun times(k: Int) = V(x * k) }`, `operator fun Int.times(v: V) = v * this`; `V(2) * 3` | `unresolved reference: x` | `V(x=6)` |
+
+An operator extension on a built-in type is consulted only where the built-in
+member operator does not take the operand types, as Kotlin's members-first rule
+has it.
+
 ## An untyped left operand under `+`/`-` is decided by its value
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.13.

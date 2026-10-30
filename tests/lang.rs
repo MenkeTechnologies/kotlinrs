@@ -12308,3 +12308,20 @@ fn an_untyped_collection_plus_a_number_is_the_collection_plus() {
         "[1, 5]\n[1, 5]\n[1, 2]\n[2]\n7\n3.5\nb\n-294967296\n"
     );
 }
+
+#[test]
+fn a_builtin_member_operator_beats_a_user_extension_of_the_same_name() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.13. `x * k` over two `Int`s is
+    // `Int.times(Int)`, a member, so `operator fun Int.times(v: V)` is not a
+    // candidate there — before, it was chosen and the member body failed with
+    // `unresolved reference: x`.
+    assert_eq!(
+        stdout(
+            "data class V(val x: Int) { operator fun times(k: Int) = V(x * k) }\n\
+             operator fun Int.times(v: V) = v * this\n\
+             operator fun Int.plus(s: String) = \"$this|$s\"\n\
+             fun main() { println(V(2) * 3); println(3 * V(2)); println(4 * 5); println(1 + \"a\") }"
+        ),
+        "V(x=6)\nV(x=6)\n20\n1|a\n"
+    );
+}

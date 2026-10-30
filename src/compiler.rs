@@ -10835,9 +10835,14 @@ impl Compiler {
             }
             // An operator EXTENSION on the left operand's known type —
             // `operator fun Pair<Int, Int>.plus(o: Pair<Int, Int>)`.
-            if self
-                .recv_type_name(sc, l)
-                .is_some_and(|t| self.extensions.contains_key(&(t, fname.to_string())))
+            // A MEMBER wins over an extension of the same name, so where the
+            // built-in operator applies to both operands' types the extension
+            // is not consulted: `operator fun Int.times(v: V)` leaves
+            // `x * k` over two `Int`s alone.
+            if !builtin_operator_applies(fname, lt, rt)
+                && self
+                    .recv_type_name(sc, l)
+                    .is_some_and(|t| self.extensions.contains_key(&(t, fname.to_string())))
             {
                 return self.compile_member(sc, l, fname, std::slice::from_ref(r), false, 0);
             }
@@ -17454,6 +17459,25 @@ fn written_fn_params(w: &TypeExpr) -> Option<Vec<Type>> {
                 .collect(),
         ),
         _ => None,
+    }
+}
+
+/// Whether the standard library's own MEMBER operator `fname` takes these
+/// operand types: numeric arithmetic, `Char` plus or minus an integer, `Char`
+/// minus `Char`, and a `String`'s `plus`.
+fn builtin_operator_applies(fname: &str, l: Type, r: Type) -> bool {
+    let number = |t: Type| {
+        matches!(
+            t,
+            Type::Int | Type::Byte | Type::Short | Type::Long | Type::Float | Type::Double
+        )
+    };
+    let arith = matches!(fname, "plus" | "minus" | "times" | "div" | "rem");
+    match (l, r) {
+        (Type::Char, Type::Char) => fname == "minus",
+        (Type::Char, r) => matches!(fname, "plus" | "minus") && r.is_int(),
+        (l, _) if l.is_str() => fname == "plus",
+        (l, r) => arith && number(l) && number(r),
     }
 }
 

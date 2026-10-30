@@ -407,13 +407,11 @@ Measured on `kotlinc` 2.4.21 / JDK 25.0.5, compiled and run on the same JVM.
 
 | program | kotlinrs | reference |
 | --- | --- | --- |
-| `data class V(val x: Int) { operator fun times(k: Int) = V(x * k) }`, `operator fun Int.times(v: V) = v * this`; `V(2) * 3` | `unresolved reference: x` | `V(x=6)` — the member operator, not the `Int` extension |
 | `mapOf("x" to 1).withDefault { it.length * 10 }.getValue("yyy")` | `unresolved reference: withDefault on Map` | `30` |
 | `class K { val y = 1; var Int.ext: Int get() = this + y; set(v) { println("set $v") }; fun go() { 5.ext = 3; println(5.ext) } }` — a MEMBER extension `var` with a setter | `member extension property ext with a setter is not supported (line 3)` | `set 3`, `6` |
 
-Without the `Int.times` extension the member call answers `V(x=6)`; the cause
-inside the operator lowering has not been traced. The member extension row
-fails loudly by design: only the top-level form lowers its setter.
+The member extension row fails loudly by design: only the top-level form
+lowers its setter.
 
 ## Parity fan-out rounds 6–7: measured and not closed
 
