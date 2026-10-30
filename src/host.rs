@@ -10693,12 +10693,13 @@ fn b_precond(vm: &mut VM, argc: u8) -> Value {
         vals.next().unwrap_or(Value::Undef)
     };
     let message = vals.next();
-    // `require`/`check` fail on a false condition; the `…NotNull` pair fails on
-    // Kotlin `null` and otherwise ANSWERS the value, which is what lets
-    // `val x = checkNotNull(maybe)` stand in for the value. `error`/`TODO`
+    // `require`/`check` fail on a false condition and otherwise answer `Unit`
+    // — the object itself, so `check(ok) == Unit` holds; the `…NotNull` pair
+    // fails on Kotlin `null` and otherwise ANSWERS the value, which is what
+    // lets `val x = checkNotNull(maybe)` stand in for the value. `error`/`TODO`
     // always fail.
     let (ok, value) = match name.as_str() {
-        "require" | "check" => (truthy(&subject), Value::Undef),
+        "require" | "check" => (truthy(&subject), unit_value()),
         "requireNotNull" | "checkNotNull" => (!matches!(subject, Value::Undef), subject.clone()),
         _ => (false, Value::Undef),
     };

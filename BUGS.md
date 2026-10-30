@@ -314,7 +314,6 @@ Each fails loudly. Measured on `kotlinc` 2.4.20 / JRE 21.0.12.1.
 | program | kotlinrs | reference |
 | --- | --- | --- |
 | `fun m() { val k = 2; class L { fun f() = k }; println(L().f()) }` | `unresolved reference: k` | `2` |
-| `println(check(true) == Unit)` | `unresolved reference: Unit` | `true` |
 
 The first is the capture limit of a LOCAL class, which is hoisted to the top
 level with no link back to its construction sites. Object expressions, hoisted

@@ -11,6 +11,14 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## A passing `require`/`check` answers `Unit`
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.13.
+
+| program | before | reference |
+| --- | --- | --- |
+| `println(check(true) == Unit)` | `false` | `true` |
+
 ## Enum secondary constructors, enum constant defaults and named arguments, `String` member result types
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.13.

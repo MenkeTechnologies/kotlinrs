@@ -12146,3 +12146,22 @@ fun main() {
         "a\nr\nate x\nu\nss\nq\n1\n"
     );
 }
+
+#[test]
+fn require_and_check_answer_the_unit_object() {
+    // Measured on kotlinc 2.4.21 / JRE 21.0.13: a passing `require`/`check`
+    // returns `Unit` itself, so it compares equal (and identical) to `Unit`.
+    // Before, it rendered as `kotlin.Unit` but compared unequal.
+    assert_eq!(
+        stdout(
+            "fun main() {\n\
+             \x20   val u = check(true)\n\
+             \x20   println(u == Unit)\n\
+             \x20   println(u === Unit)\n\
+             \x20   println(require(1 > 0) == Unit)\n\
+             \x20   println(check(true))\n\
+             }"
+        ),
+        "true\ntrue\ntrue\nkotlin.Unit\n"
+    );
+}
