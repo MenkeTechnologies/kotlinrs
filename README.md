@@ -33,6 +33,7 @@ No JVM, no `kotlinc`, no `.class` files.
 - [\[0x02\] Usage](#0x02-usage)
 - [\[0x03\] Language Features](#0x03-language-features)
 - [\[0x04\] Command-Line Flags](#0x04-command-line-flags)
+- [\[0x04a\] Embedding](#0x04a-embedding)
 - [\[0x05\] Architecture](#0x05-architecture)
 - [\[0x06\] Status & Roadmap](#0x06-status--roadmap)
 - [\[0xFF\] License](#0xff-license)
@@ -625,7 +626,9 @@ The M0 subset, all lowered to fusevm bytecode and exercised by the test suite:
   that status (no `finally` runs, pending output is flushed), `System.currentTimeMillis()`,
   `System.nanoTime()`, `System.lineSeparator()`, `System.getenv(name)`,
   `measureTimeMillis { … }` / `measureNanoTime { … }`, and
-  `System.out`/`System.err` `print`/`println`. `main(args)` receives an empty
+  `System.out`/`System.err` `print`/`println`, and `readLine()` / `readln()` from
+  stdin (`readLine()` is `null` at end of input, `readln()` throws
+  `ReadAfterEOFException`). `main(args)` receives an empty
   `Array<String>`. A default-imported package may be spelled out
   (`kotlin.collections.listOf(1)`).
 - **First-class lambdas** — `{ it * 2 }`, `{ a, b -> a + b }`, function-type
@@ -1033,6 +1036,27 @@ to a cached cdylib whose exported functions are callable by name from Kotlin
 (via `fusevm::ffi`). Editor tooling (`--lsp`, `--dap`) and a generated
 [reference page](https://menketechnologies.github.io/kotlinrs/reference.html)
 share the language-server corpus, so they never drift.
+
+## [0x04a] EMBEDDING
+
+`kotlinrs::run_program(src: &str, input: &str) -> Result<String, String>` runs a
+program from Rust and returns its stdout.
+
+- `src` declares `fun main` or is a bare snippet (wrapped in `main`, as `-e` does).
+- `input` is the program's stdin: `readLine()` / `readln()` read it line by line.
+- `print` / `println` output is returned, never written to the process stdout;
+  `System.err` output still goes to stderr.
+- Each call runs on its own interpreter thread with fresh state, so calls from
+  several threads at once keep their output separate.
+- `Err` on a parse or compile error, an uncaught exception, a nonzero
+  `exitProcess` / `System.exit`, or an internal panic. `exitProcess(0)` returns
+  `Ok` with the output written so far.
+
+```rust
+let src = "fun main() { val name = readln(); println(\"hello, $name\") }";
+let out = kotlinrs::run_program(src, "world\n")?;
+assert_eq!(out, "hello, world\n");
+```
 
 ## [0x05] ARCHITECTURE
 

@@ -4540,6 +4540,82 @@ thread_local! {
     static EXC_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+thread_local! {
+    /// An embedded run's stdout buffer (see [`crate::embed`]). `None` — the CLI
+    /// case — writes to the process stdout.
+    static STDOUT_CAPTURE: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// An embedded run's stdin: the whole text and the read offset. `None`
+    /// reads the process stdin.
+    static STDIN_TEXT: RefCell<Option<(String, usize)>> = const { RefCell::new(None) };
+    /// The status `exitProcess(n)` / `System.exit(n)` stopped the run with.
+    static EXIT_CODE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Route this thread's program stdout into a buffer and serve `input` as its
+/// stdin, until [`end_embedded_io`].
+pub fn begin_embedded_io(input: &str) {
+    STDOUT_CAPTURE.with(|c| *c.borrow_mut() = Some(String::new()));
+    STDIN_TEXT.with(|s| *s.borrow_mut() = Some((input.to_string(), 0)));
+}
+
+/// Restore process stdin/stdout for this thread and return what the program
+/// printed since [`begin_embedded_io`].
+pub fn end_embedded_io() -> String {
+    STDIN_TEXT.with(|s| s.borrow_mut().take());
+    STDOUT_CAPTURE
+        .with(|c| c.borrow_mut().take())
+        .unwrap_or_default()
+}
+
+/// The one stdout path for program output: the print builtins and the VM's
+/// output sink (native `Op::Print`/`Op::PrintLn`) both land here.
+pub fn write_stdout(s: &str) {
+    let captured = STDOUT_CAPTURE.with(|c| match c.borrow_mut().as_mut() {
+        Some(buf) => {
+            buf.push_str(s);
+            true
+        }
+        None => false,
+    });
+    if !captured {
+        print!("{s}");
+    }
+}
+
+/// One line of program stdin with its `\n` / `\r\n` terminator removed, or
+/// `None` at end of input — what Kotlin's `readLine()` returns.
+fn read_stdin_line() -> Option<String> {
+    let embedded = STDIN_TEXT.with(|s| {
+        s.borrow_mut().as_mut().map(|(text, pos)| {
+            if *pos >= text.len() {
+                return None;
+            }
+            let end = text[*pos..].find('\n').map_or(text.len(), |i| *pos + i);
+            let line = text[*pos..end].trim_end_matches('\r').to_string();
+            *pos = (end + 1).min(text.len());
+            Some(line)
+        })
+    });
+    if let Some(line) = embedded {
+        return line;
+    }
+    use std::io::{BufRead, Write};
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    match std::io::stdin().lock().read_line(&mut line) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => {
+            let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+            Some(trimmed.to_string())
+        }
+    }
+}
+
+/// Take the status a `System.exit` / `exitProcess` call stopped the run with.
+pub fn take_exit_code() -> Option<i32> {
+    EXIT_CODE.with(|c| c.take())
+}
+
 /// Declare whether the program about to run contains a `try` (see
 /// `EXC_ENABLED`). Called by the runner after compiling and before `VM::run`.
 pub fn set_catchable(on: bool) {
@@ -5221,8 +5297,8 @@ fn b_println(vm: &mut VM, argc: u8) -> Value {
     let arg = if argc > 0 { Some(vm.pop()) } else { None };
     if !unwinding() {
         match arg {
-            Some(v) => println!("{}", v.to_str()),
-            None => println!(),
+            Some(v) => write_stdout(&format!("{}\n", v.to_str())),
+            None => write_stdout("\n"),
         }
     }
     Value::Undef
@@ -5232,7 +5308,7 @@ fn b_print(vm: &mut VM, argc: u8) -> Value {
     let arg = if argc > 0 { Some(vm.pop()) } else { None };
     if !unwinding() {
         if let Some(v) = arg {
-            print!("{}", v.to_str());
+            write_stdout(&v.to_str());
         }
     }
     Value::Undef
@@ -21580,11 +21656,28 @@ fn b_system(vm: &mut VM, argc: u8) -> Value {
     args.reverse();
     let text = |args: &[Value]| args.first().map(|v| v.to_str()).unwrap_or_default();
     match name.as_str() {
+        // Stop the run and hand the status back to the runner rather than
+        // ending the process: the CLI exits with it, an embedded run reports it.
+        // Like the JVM's, no `finally` block runs on the way out.
         "exit" => {
             let code = args.first().map_or(0, |v| v.to_int()) as i32;
-            let _ = std::io::stdout().flush();
-            let _ = std::io::stderr().flush();
-            std::process::exit(code);
+            EXIT_CODE.with(|c| c.set(Some(code)));
+            vm.request_halt();
+            Value::Undef
+        }
+        // `readLine()` is null at end of input; `readln()` throws there.
+        "readLine" | "readln" => {
+            if unwinding() {
+                return Value::Undef;
+            }
+            match read_stdin_line() {
+                Some(line) => Value::str(line),
+                None if name == "readln" => {
+                    fault(vm, "kotlin.io.ReadAfterEOFException: EOF has already been reached");
+                    Value::Undef
+                }
+                None => Value::Undef,
+            }
         }
         "currentTimeMillis" => {
             let ms = std::time::SystemTime::now()

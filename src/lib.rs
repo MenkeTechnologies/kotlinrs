@@ -15,6 +15,7 @@ pub mod ast;
 pub mod cli;
 pub mod compiler;
 pub mod dap;
+pub mod embed;
 pub mod fdlibm;
 pub mod host;
 pub mod lexer;
@@ -28,6 +29,7 @@ pub mod token;
 pub mod unicode_jdk;
 pub mod variance;
 
+pub use embed::run_program;
 use lexer::Lexer;
 use token::Tok;
 

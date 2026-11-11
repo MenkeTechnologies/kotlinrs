@@ -786,6 +786,20 @@ const CORPUS: &[Entry] = &[
         "print(\"a\"); print(\"b\")   // ab",
     ),
     (
+        "readLine",
+        "Builtin Functions",
+        "readLine(): String?",
+        "Reads one line of stdin without its `\\n` / `\\r\\n` terminator; `null` at end of input.",
+        "val line = readLine() ?: \"\"\nprintln(line.uppercase())",
+    ),
+    (
+        "readln",
+        "Builtin Functions",
+        "readln(): String",
+        "Reads one line of stdin without its terminator; at end of input it throws `kotlin.io.ReadAfterEOFException: EOF has already been reached`.",
+        "val n = readln().toInt()\nprintln(n * 2)",
+    ),
+    (
         "List",
         "Builtin Functions",
         "List(size: Int, init: (Int) -> T): List<T>\nMutableList(size: Int, init: (Int) -> T): MutableList<T>",

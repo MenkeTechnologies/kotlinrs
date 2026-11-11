@@ -84,6 +84,7 @@ pub fn run_source_on_this_thread(src: &str) -> Result<i32, String> {
     let program = parser::parse_program(&src)?;
     let (chunk, catchable) = compiler::compile_catchable(&program, false)?;
     let _ = host::take_error(); // clear any stale fault from a prior run
+    let _ = host::take_exit_code();
                                 // A runtime fault that names a JVM throwable is catchable only in a program
                                 // that has a `try` — the only program whose bytecode carries the unwind
                                 // checks that would deliver it to a handler. The compile that emitted
@@ -96,6 +97,9 @@ pub fn run_source_on_this_thread(src: &str) -> Result<i32, String> {
     // numeric policy: `'a' + 1` and `c < 'z'` — native ops even where the
     // compiler cannot see a type — reach Kotlin instead of being coerced.
     host::install_numeric(&mut vm);
+    // Native `Op::Print`/`Op::PrintLn` take the same stdout path as the print
+    // builtins, so an embedded run captures both.
+    vm.set_output_sink(Box::new(host::write_stdout));
     // Arm the tracing tier: a hot loop whose body is native fusevm ops gets
     // recorded and compiled to native code instead of dispatched forever.
     // `kotlin --tiers` reports whether a given script actually reaches it.
@@ -107,7 +111,7 @@ pub fn run_source_on_this_thread(src: &str) -> Result<i32, String> {
             if let Some(err) = host::take_error() {
                 return Err(err);
             }
-            Ok(0)
+            Ok(host::take_exit_code().unwrap_or(0))
         }
         VMResult::Error(e) => Err(e),
     }

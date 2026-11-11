@@ -11603,6 +11603,8 @@ impl Compiler {
             {
                 self.compile_system(sc, name, args, line)
             }
+            // `kotlin.io` stdin reads, served by the same host builtin.
+            "readLine" | "readln" if args.is_empty() => self.compile_system(sc, name, args, line),
             // `run { … }` with no receiver: a block evaluated on the spot for
             // its value. The closure takes no parameter at all, which is what
             // separates it from the receiver form.
@@ -15449,6 +15451,7 @@ impl Compiler {
             }
             Expr::Call { name, args, .. } => match name.as_str() {
                 "println" | "print" => Type::Unit,
+                "readln" if args.is_empty() => Type::String,
                 "listOf" | "mutableListOf" | "arrayListOf" | "emptyList" | "ArrayList"
                 | "mapOf" | "mutableMapOf" | "hashMapOf" | "emptyMap" | "setOf"
                 | "mutableSetOf" | "hashSetOf" | "linkedSetOf" | "sortedSetOf" | "emptySet"
@@ -19131,6 +19134,8 @@ impl Compiler {
             "lineSeparator" => (name, Type::String),
             "getenv" => (name, Type::Unknown),
             "err.println" | "err.print" => (name, Type::Unit),
+            "readLine" => (name, Type::Unknown),
+            "readln" => (name, Type::String),
             "measureTimeMillis" | "measureNanoTime" => {
                 let elapsed = if name == "measureTimeMillis" {
                     "elapsedMillis"
