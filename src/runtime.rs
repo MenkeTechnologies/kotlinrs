@@ -85,11 +85,11 @@ pub fn run_source_on_this_thread(src: &str) -> Result<i32, String> {
     let (chunk, catchable) = compiler::compile_catchable(&program, false)?;
     let _ = host::take_error(); // clear any stale fault from a prior run
     let _ = host::take_exit_code();
-                                // A runtime fault that names a JVM throwable is catchable only in a program
-                                // that has a `try` — the only program whose bytecode carries the unwind
-                                // checks that would deliver it to a handler. The compile that emitted
-                                // those checks already decided it, so the flag rides back out with the
-                                // chunk rather than costing a second walk of the whole program.
+    // A runtime fault that names a JVM throwable is catchable only in a program
+    // that has a `try` — the only program whose bytecode carries the unwind
+    // checks that would deliver it to a handler. The compile that emitted
+    // those checks already decided it, so the flag rides back out with the
+    // chunk rather than costing a second walk of the whole program.
     host::set_catchable(catchable);
     let mut vm = VM::new(chunk);
     host::install(&mut vm);

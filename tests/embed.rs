@@ -41,8 +41,15 @@ fn errors_and_exit_status() {
     assert!(run_program("fun main() { val x = }", "").is_err());
     let err = run_program("println(\"x\")\nthrow IllegalStateException(\"boom\")", "").unwrap_err();
     assert!(err.contains("boom"), "{err}");
-    assert_eq!(run_program("println(\"x\")\nkotlin.system.exitProcess(3)", "").unwrap_err(), "exit status 3");
-    let out = run_program("println(\"before\")\nSystem.exit(0)\nprintln(\"after\")", "").unwrap();
+    assert_eq!(
+        run_program("println(\"x\")\nkotlin.system.exitProcess(3)", "").unwrap_err(),
+        "exit status 3"
+    );
+    let out = run_program(
+        "println(\"before\")\nSystem.exit(0)\nprintln(\"after\")",
+        "",
+    )
+    .unwrap();
     assert_eq!(out, "before\n");
 }
 

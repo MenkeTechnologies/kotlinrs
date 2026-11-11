@@ -21673,7 +21673,10 @@ fn b_system(vm: &mut VM, argc: u8) -> Value {
             match read_stdin_line() {
                 Some(line) => Value::str(line),
                 None if name == "readln" => {
-                    fault(vm, "kotlin.io.ReadAfterEOFException: EOF has already been reached");
+                    fault(
+                        vm,
+                        "kotlin.io.ReadAfterEOFException: EOF has already been reached",
+                    );
                     Value::Undef
                 }
                 None => Value::Undef,
