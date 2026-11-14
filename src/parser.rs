@@ -3359,8 +3359,8 @@ impl Parser {
         let mut depth = 0i32;
         let mut want = true;
         let mut saw_reified = false;
-        for i in start..self.pos {
-            match &self.toks[i].tok {
+        for t in &self.toks[start..self.pos] {
+            match &t.tok {
                 Tok::Lt => {
                     depth += 1;
                     want = depth == 1;
