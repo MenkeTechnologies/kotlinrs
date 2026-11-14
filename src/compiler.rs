@@ -7945,6 +7945,19 @@ impl Compiler {
             self.b.emit(Op::Extended(KT_F32, 0), line);
             return Ok(Type::Float);
         }
+        // `Int.absoluteValue` is `Math.abs(int)`, which leaves `Int.MIN_VALUE`
+        // as itself — its negation does not fit. The host negates in 64 bits
+        // with no receiver width to narrow by, so a statically-`Int` receiver
+        // is narrowed here, exactly as the `abs(Int)` call is.
+        if name == "absoluteValue" && args.is_empty() && !safe && self.infer(sc, recv) == Type::Int
+        {
+            self.compile_expr(sc, recv)?;
+            let nidx = self.b.add_constant(Value::str("absoluteValue"));
+            self.b.emit(Op::LoadConst(nidx), line);
+            self.b.emit(Op::CallBuiltin(KT_METHOD_VM, 0), line);
+            self.emit_wrap32();
+            return Ok(Type::Int);
+        }
         // `Pair.copy(…)` / `Triple.copy(…)` — both are `data class`es in the
         // stdlib, so `copy` takes each component by position or by name and
         // defaults the rest to the receiver's. Lowered to the constructor over
@@ -10755,9 +10768,17 @@ impl Compiler {
         // object. So they resolve before every rule below, all of which exist
         // to pick a STRUCTURAL comparison.
         if matches!(op, BinOp::RefEq | BinOp::RefNe) {
+            // Two operands statically `Double`/`Float` compare as primitives —
+            // `0.0 === -0.0` is the IEEE `==`, `true`. Anywhere else a floating
+            // operand is a box, and two boxes holding different bit patterns
+            // are never one object: `compareValues(0.0, -0.0)`'s `a === b`
+            // short-circuit is `false` there and the comparison goes on to
+            // `compareTo`. The host's `1` variant asks for that box identity.
+            let floating = |t: Type| matches!(t, Type::Double | Type::Float);
+            let boxed = !(floating(self.infer(sc, l)) && floating(self.infer(sc, r)));
             self.compile_expr(sc, l)?;
             self.compile_expr(sc, r)?;
-            self.b.emit(Op::Extended(KT_IDENTITY, 0), 0);
+            self.b.emit(Op::Extended(KT_IDENTITY, u8::from(boxed)), 0);
             if op == BinOp::RefNe {
                 self.b.emit(Op::LogNot, 0);
             }
@@ -11216,7 +11237,7 @@ impl Compiler {
         // arguments select, on the implicit `this`.
         if self.member_overloads.contains(name)
             && self.cur_class.is_some()
-            && !self.declares_fun(name)
+            && !self.local_sigs.contains_key(name)
         {
             let this = Expr::Var("this".to_string());
             if let Some(m) = self
@@ -12489,11 +12510,12 @@ impl Compiler {
                 if let Some(meta) = self.class_meta(name).cloned() {
                     return self.compile_construct(sc, &meta, args, line);
                 }
-                // A free user function.
+                // A free user function — a top-level one only when no implicit
+                // receiver declares the name (see `implicit_receiver_declares`).
                 if let Some(sig) = self
                     .local_sigs
                     .get(name)
-                    .or_else(|| self.fun_sig.get(name))
+                    .or_else(|| self.top_level_sig(sc, name))
                     .cloned()
                 {
                     return self.compile_user_fun_call(sc, name, sig, args, line);
@@ -13368,6 +13390,44 @@ impl Compiler {
         }
     }
 
+    /// Whether an unqualified call `name(…)` finds a candidate on an IMPLICIT
+    /// RECEIVER — a method (own or inherited) or function-typed property of the
+    /// class being lowered, a method of its companion, a method of an
+    /// enclosing class reached from an `inner class`, or an extension on
+    /// `this`. Kotlin's resolution tower consults every implicit receiver
+    /// before the top-level scope, so any of these hides a top-level `fun` of
+    /// the same name: `class A { val s = total(); fun total() = 1 }` calls the
+    /// member even beside a top-level `fun total(vararg xs: Int)`. A local
+    /// `fun` is closer still, and the caller tests it first.
+    fn implicit_receiver_declares(&self, sc: &Scope, name: &str) -> bool {
+        if sc.slot("this").is_none() {
+            return false;
+        }
+        let declares = |m: &ClassMeta| {
+            m.methods.keys().any(|k| unmangled(k) == name)
+                || m.prop(name)
+                    .is_some_and(|p| p.class.as_deref() == Some("Function"))
+        };
+        let cur = self.cur_class.as_ref();
+        cur.and_then(|c| self.classes.get(c)).is_some_and(declares)
+            || cur
+                .and_then(|c| self.companion_of(c))
+                .is_some_and(|c| self.classes[&c].methods.contains_key(name))
+            || self.outer_receiver(sc, declares).is_some()
+            || self
+                .resolve_ext(sc, &Expr::Var("this".into()), name)
+                .is_some()
+    }
+
+    /// The signature of the top-level `fun` an unqualified call to `name` would
+    /// reach, or `None` when an implicit receiver hides it.
+    fn top_level_sig(&self, sc: &Scope, name: &str) -> Option<&FnSig> {
+        if self.implicit_receiver_declares(sc, name) {
+            return None;
+        }
+        self.fun_sig.get(name)
+    }
+
     fn companion_of(&self, cls: &str) -> Option<String> {
         let comp = companion_name(cls);
         (self.classes.contains_key(cls) && self.classes.contains_key(&comp)).then_some(comp)
@@ -13481,7 +13541,16 @@ impl Compiler {
         if self.class_meta(name).is_some() {
             return None;
         }
-        let Some(sig) = self.local_sigs.get(name).or_else(|| self.fun_sig.get(name)) else {
+        if let Some(sig) = self.local_sigs.get(name) {
+            let named = args.iter().any(|a| matches!(a, Expr::Named { .. }));
+            return (named || call_fits(sig, args)).then(|| (name.to_string(), sig.clone()));
+        }
+        // A top-level function sits at the OUTERMOST level of the resolution
+        // tower: a member or extension of an implicit receiver is found first.
+        if self.implicit_receiver_declares(sc, name) {
+            return None;
+        }
+        let Some(sig) = self.fun_sig.get(name) else {
             return self.select_overload(sc, name, args);
         };
         // A named argument the function lacks is ITS diagnostic, not a reason
@@ -15504,7 +15573,9 @@ impl Compiler {
                     }
                     // An unqualified call inside an extension body is a call on
                     // its receiver (`fun Int.quad() = dbl().dbl()`).
-                    if !self.declares_fun(name) && sc.slot("this").is_some() {
+                    if (!self.declares_fun(name) || self.implicit_receiver_declares(sc, name))
+                        && sc.slot("this").is_some()
+                    {
                         if let Some(t) =
                             self.ext_ret(sc, &Expr::Var("this".into()), name, args.len())
                         {
@@ -16301,7 +16372,7 @@ impl Compiler {
                 let sig = self
                     .local_sigs
                     .get(name)
-                    .or_else(|| self.fun_sig.get(name))
+                    .or_else(|| self.top_level_sig(sc, name))
                     .or(ov.as_ref())?;
                 Some(TypeArg {
                     ty: sig.ret,
@@ -16758,7 +16829,11 @@ impl Compiler {
                     _ => {}
                 }
                 // A local `fun` shadows a top-level one, as at the call.
-                match self.local_sigs.get(name).or_else(|| self.fun_sig.get(name)) {
+                match self
+                    .local_sigs
+                    .get(name)
+                    .or_else(|| self.top_level_sig(sc, name))
+                {
                     Some(s) => s.ret_class.clone(),
                     None => self
                         .select_overload(sc, name, args)

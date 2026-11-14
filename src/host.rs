@@ -7365,7 +7365,13 @@ fn handle_coercion(vm: &mut VM, id: u16, arg: u8) {
         KT_IDENTITY => {
             let b = vm.pop();
             let a = vm.pop();
-            vm.push(Value::Bool(identical(&a, &b)));
+            vm.push(Value::Bool(match (&a, &b) {
+                // Boxed floating values (see the compiler's `===` lowering):
+                // one box holds one bit pattern, so `0.0` and `-0.0` are two
+                // objects, and a `NaN` can be the same object as itself.
+                (Value::Float(x), Value::Float(y)) if arg == 1 => x.to_bits() == y.to_bits(),
+                _ => identical(&a, &b),
+            }));
         }
         KT_NOTNULL => {
             let v = vm.pop();

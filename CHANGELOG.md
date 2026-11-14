@@ -11,6 +11,26 @@ on.
 Earlier rounds are recorded in [README.md](README.md) under
 `[0x06] STATUS & ROADMAP`; this file starts at the round that introduced it.
 
+## A member of an implicit receiver beats a top-level function; boxed `-0.0`; `Int.absoluteValue`
+
+Measured on `kotlinc` 2.4.21 / JRE 21.0.13.
+
+| program | before | reference |
+| --- | --- | --- |
+| `fun total(vararg xs: Int) = xs.sum()` and `data class D(val a: Int) { val s = total(); fun total() = a + 1 }`; `D(4).s` | `0` | `5` |
+| a top-level `fun g()` beside an inherited member, a companion method, an enclosing class's method from an `inner class`, an extension on the `run` receiver, or a function-typed property of the same name | the top-level `g` | the receiver's |
+| `compareValues(0.0, -0.0)`, `nullsFirst<Double>().compare(0.0, -0.0)`, `compareValuesBy(0.0, -0.0, { it })` | `0` | `1` |
+| `Int.MIN_VALUE.absoluteValue` | `2147483648` | `-2147483648` |
+
+An unqualified call now consults every implicit receiver — the class being
+lowered (own and inherited methods, function-typed properties), its companion,
+the enclosing instance of an `inner class`, and extensions on `this` — before the
+top-level scope, as Kotlin's resolution tower does; a local `fun` still wins
+over all of them. `===` with an operand that is not statically `Double`/`Float`
+compares floating values by bits, since a box holds one bit pattern: that is
+the `a === b` short-circuit `compareValues` and `nullsFirst` take before
+`compareTo`. `Int.absoluteValue` narrows to 32 bits as `abs(Int)` already did.
+
 ## `withDefault`
 
 Measured on `kotlinc` 2.4.21 / JRE 21.0.13.

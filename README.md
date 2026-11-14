@@ -934,7 +934,13 @@ program can observe the answer without boxing: `1 === 1` and `"x" === "x"` are
 artifacts of boxing are not modelled — an `Any`-typed integer outside the
 `Integer` cache (`val a: Any = 1000; val b: Any = 1000; a === b` is `false` on
 the JVM) and a `String` assembled at run time rather than folded at compile
-time. Nothing else here models a box, so neither does this.
+time. Nothing else here models a box, so neither does this. One part of a
+floating box IS modelled, because it changes answers rather than artifacts: a
+box holds one bit pattern, so where either operand is not statically
+`Double`/`Float` the two are compared by bits — `0.0` and `-0.0` are two objects
+there, which is what lets `compareValues(0.0, -0.0)` (whose first step is
+`a === b`) go on to `compareTo` and answer `1`. Statically `Double` operands
+stay primitives: `val z = 0.0; z === -0.0` is the IEEE `==`, `true`.
 
 `==` itself does not short-circuit on identity: it lowers to
 `Intrinsics.areEqual(a, b)`, so a declared `equals` runs even for `x == x`. A
